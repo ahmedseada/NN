@@ -327,12 +327,15 @@ data loading, telemetry, memory limits and thread budgets. The suite runs on eve
 
 ## Status
 
-* **Verified on real hardware (main branch).** The original 24 tests pass on both the CPU and an
-  NVIDIA GeForce RTX 5050 Laptop GPU (Blackwell).
-* **This branch** adds 26 tests (50 in total) covering classification, normalization, embeddings,
-  convolution, pooling, LSTM/GRU, attention, schedulers and number types. They pass on the CPU.
-  The 26 new GPU kernels (51 in total) assemble without errors or register spills for sm_50, sm_75,
-  sm_86, sm_90 and sm_120 (checked with `ptxas`), but they still need a run on a GPU. Run
-  `dotnet run -c Release --project tests/NeuralSharp.Tests` on an NVIDIA machine to verify them.
+* **Verified on real hardware.** All 50 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
+  Laptop GPU (Blackwell), 100 of 100. That covers every GPU kernel: matrix products, softmax,
+  normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
+  training of classifiers, a CNN, an LSTM and a transformer.
+* The 51 GPU kernels also assemble without errors or register spills for sm_50, sm_75, sm_86, sm_90
+  and sm_120 (checked with `ptxas`), covering Maxwell through Blackwell.
 * Everything computes in float32. Tensors hold up to 2³¹ elements, and embedding ids must be below
   2²⁴ (the largest integer a float stores exactly).
+* Small models such as the samples are dominated by kernel-launch overhead on the GPU. Recurrent
+  models are hit hardest, since they launch kernels for every time step. The GPU pays off with wide
+  layers, large batches and convolutions: the CNN test trains faster on the RTX 5050 than on a
+  16-thread CPU.
