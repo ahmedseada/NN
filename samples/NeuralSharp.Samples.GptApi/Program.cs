@@ -83,13 +83,17 @@ api.MapPost("/generate/stream", Results<ServerSentEventsResult<object>, ProblemH
 var ollama = app.MapGroup("/api").WithTags("Ollama-compatible");
 var ndjson = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
-ollama.MapPost("/chat", (OllamaChatRequest request, ChatService chat, CancellationToken cancellationToken) =>
+// The body is read as JSON whatever the Content-Type says (Ollama clients and `curl -d` often send none or form).
+ollama.MapPost("/chat", async (HttpRequest http, ChatService chat, CancellationToken cancellationToken) =>
     {
+        OllamaChatRequest request;
         try
         {
+            request = await JsonSerializer.DeserializeAsync<OllamaChatRequest>(http.Body, ndjson, cancellationToken)
+                ?? throw new FormatException("empty request body");
             ChatService.Translate(request);                                // validate before anything is streamed
         }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or FormatException)
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or FormatException or JsonException)
         {
             return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
         }

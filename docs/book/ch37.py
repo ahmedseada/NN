@@ -4,9 +4,47 @@ from gen import *
 PART = "VI"
 
 # Measured by: dotnet run -c Release --project samples/NeuralSharp.Samples.Summarizer -- --cpu  (see RESULTS)
-M = {k: "…" for k in ("params", "r1", "lead_r1", "exact", "numbers", "train_s", "ms", "vocab")}   # filled after the full run
-RESULTS = ""
-EXAMPLES = ""
+M = {"params": "391,489", "r1": "0.999", "lead_r1": "0.503", "exact": "90 %", "numbers": "100 %",
+     "train_s": "895", "ms": "7.7", "vocab": "289"}
+
+RESULTS = """
+    8000 training / 400 test reports, vocabulary 289 words
+    Abstractive transformer: 3 layers, dim 96, 391,489 parameters, 12 epochs
+    Epoch 12/12 ...  val_loss 0.0164
+    Trained in 895 s; validation loss per summary token 0.0164
+
+    Summarizer                    ROUGE-1  ROUGE-2  ROUGE-L  exact   numbers right
+      First sentence               0.503    0.227    0.463    0 %       0 %
+      Most central sentence        0.368    0.107    0.357    0 %       2 %
+      Abstractive transformer      0.999    0.981    0.983   90 %     100 %
+
+    Generation: 7.7 ms per summary, 11.9 tokens each (greedy, KV cache, cpu)
+
+    Per kind (abstractive, exact match):
+      match     64 %
+      weather  100 %
+      company   97 %
+      fire     100 %
+"""
+
+EXAMPLES = """
+    report:    ionix reported results for the third quarter . the company plans to open 12 new stores . a year earlier
+               revenue was 15 million dollars . chief executive jonas thanked the staff . the company employs about 54
+               hundred people . revenue was 21 million dollars .
+    reference: ionix revenue rose from 15 to 21 million dollars in the third quarter .
+    generated: ionix revenue rose from 15 to 21 million dollars in the third quarter.
+
+    report:    here is the weather report for granton on tuesday . the high will be 22 degrees and the low will be 16
+               degrees . roads may be busy in the evening . air quality will be good . there is a 0 percent chance of
+               rain . a warmer week is expected .
+    reference: granton will reach 22 degrees on tuesday with little chance of rain .
+    generated: granton will reach 22 degrees on tuesday with little chance of rain.
+
+    report:    the sharks played the owls in irvale on monday . farid was named player of the match . the owls scored 4
+               goals . the sharks scored 5 goals . a crowd of 16 thousand fans watched the game .
+    reference: the sharks beat the owls 5 to 4 in irvale .
+    generated: the owls beat the sharks 5 to 4 in irvale .                          <- wrong winner
+"""
 
 LAYOUT = """
     Training sequence (96 token ids):
@@ -71,7 +109,7 @@ def build():
             f"Model: a decoder-only transformer over words ({M['params']} parameters), trained on \"report &lt;sum&gt; summary &lt;end&gt;\" with the loss masked to the summary.",
             "Generation: <code>WordTokenizer</code> + <code>TextGenerator</code>, greedy, stopping at <code>&lt;end&gt;</code>.",
             f"Result: ROUGE-1 {M['r1']} against {M['lead_r1']} for the best extractive baseline; {M['exact']} of summaries exactly right, {M['numbers']} with every number right.",
-            f"Cost: training {M['train_s']} s on the CPU; {M['ms']} ms per summary.",
+            f"Cost: training {M['train_s']} s on the 4-core CPU (shared with another training run); {M['ms']} ms per summary.",
         ),
         h2("37.1 Reports that need more than copying"),
         para("<code>Reports.cs</code> generates the data. Each report starts with a scene-setting sentence, followed by "
@@ -130,6 +168,17 @@ def build():
              "It rewards the right words, not the right facts: \"the tigers beat the tigers 4 to 0\" still scores well. "
              "That is why the sample also counts exact summaries and summaries with every number right and in order."),
         output(EXAMPLES, caption="Summaries of new reports"),
+        para("Weather, fire and company summaries are almost always exactly right, including the comparisons (\"rose\", "
+             "\"rain likely\"). Match summaries are exact only 64 % of the time, and every failure looks like the last "
+             "example: the scores are right and in the right order (larger first), but the winner is the wrong team. The "
+             "model has learned to find the larger number, but not reliably which team it belongs to: that needs a link "
+             "between two words several positions apart (\"the sharks scored 5\"), in sentences whose order is random. "
+             "ROUGE barely notices (0.999), because the words are all correct; the exact-match check exposes it. "
+             "Remedies to try: more match reports, more epochs or a wider model, then measure again."),
+        trap("trusting word overlap for facts",
+             "<p>A summary with the teams swapped has the same words as the reference and scores almost perfectly on "
+             "ROUGE-1, yet states the opposite result. Always add checks of the facts that matter for your use: "
+             "names, numbers, who did what.</p>"),
         honestbox("What these numbers do and do not show",
                   "<p>The reports are synthetic and follow four templates, so a small model can learn them almost "
                   "perfectly; on real news the same model would need far more data and a larger vocabulary (sub-word "

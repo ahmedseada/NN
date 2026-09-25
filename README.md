@@ -40,7 +40,9 @@ samples/
   NeuralSharp.Samples.Sequences       sentiment with negation: bag-of-words vs LSTM, GRU, Transformer
   NeuralSharp.Samples.Ocr             OCR: CNN character recognizer + line segmentation, reads PGM images
   NeuralSharp.Samples.Transformer     small GPT: character-level causal transformer that generates text
-  NeuralSharp.Samples.GptApi          ASP.NET Core Web API + browser UI serving the GPT (Scalar docs, streaming)
+  NeuralSharp.Samples.GptApi          ASP.NET Core Web API + browser UI serving the GPT (Scalar docs, streaming, Ollama-style /api/chat)
+  NeuralSharp.Samples.ReRanker        search re-ranking: BM25 first stage + transformer cross-encoder, listwise training
+  NeuralSharp.Samples.Summarizer      summarization: extractive baselines vs a word-level transformer (WordTokenizer + TextGenerator)
   Shared/SampleOptions.cs             command-line options shared by the samples (train / predict modes)
   Shared/Gpt/                         GPT model, generation with metrics, training (console + Web API)
 tests/NeuralSharp.Tests             self-contained test runner (runs on every available device)
@@ -57,7 +59,9 @@ tests/NeuralSharp.Tests             self-contained test runner (runs on every av
 | `Sequences` | Embedding, LSTM, GRU, Transformer vs an order-blind baseline | LSTM/GRU/Transformer 99.5–100%, bag of words 70% |
 | `Ocr` | CNN over 36 characters, projection-profile segmentation, PGM input | 100% per character, 99.9% of characters across whole lines |
 | `Transformer` | decoder-only GPT: causal attention, sparse cross-entropy, sampling | 89% next-character accuracy, 100% real words generated |
-| `GptApi` | serving a model: REST + server-sent events, Scalar, browser UI | about 600 characters/s on 4 CPU cores |
+| `GptApi` | serving a model: REST + server-sent events, Scalar, browser UI, Ollama-compatible `/api/chat` | about 600 characters/s on 4 CPU cores |
+| `ReRanker` | two-stage search: BM25 + cross-encoder, hard negatives, listwise loss, placeholder tokens for unseen names | Hit@1 on unseen towns 27.1% (BM25) → 86.6% re-ranked, 6.9 ms per question, 180 s training |
+| `Summarizer` | word-level decoder-only transformer, loss masking, greedy generation with a stop token, ROUGE | ROUGE-1 0.999 vs 0.503 (first sentence), 90% exact, 7.7 ms per summary |
 
 ### Train and predict modes
 
@@ -70,6 +74,8 @@ dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --pre
 dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences -- --predict --input "the movie was not good;not bad at all"
 dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --predict --input "HELLO WORLD 2026"
 dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --predict --image scan.pgm
+dotnet run -c Release --project samples/NeuralSharp.Samples.ReRanker -- --predict --input "how many people live in armor"
+dotnet run -c Release --project samples/NeuralSharp.Samples.Summarizer -- --predict --input "the lions played the owls in kelso on friday . the owls scored 2 goals . the lions scored 4 goals ."
 dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --predict --input "the old wizard " --temperature 0.8
 ```
 
@@ -319,7 +325,7 @@ local LLM servers:
 
 | Type | Purpose |
 |------|---------|
-| `ITokenizer`, `CharTokenizer` | text ↔ token ids |
+| `ITokenizer`, `CharTokenizer`, `WordTokenizer` | text ↔ token ids (characters; words, numbers, punctuation and `<special>` tokens) |
 | `GenerationOptions` | `Temperature`, `TopK`, `TopP`, `MinP`, `RepeatPenalty`, `RepeatLastN`, `PresencePenalty`, `FrequencyPenalty`, `Seed`, `NumCtx`, `NumPredict`, `Stop`, plus `UseCache`, `UseGraph`, `ChunkSize` |
 | `TextGenerator` | streams a continuation: prompt truncated to `NumCtx`, sliding context window, stop sequences (never partially emitted), done reason `stop` / `length`, prompt and generation timings |
 | `ChatMessage`, `ToolDefinition`, `ToolCall` | conversations with `system`, `user`, `assistant` and `tool` roles, and function tools |
@@ -474,7 +480,7 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 62 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 63 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
@@ -486,7 +492,7 @@ streaming parser, keep-alive expiry). The suite runs on every available device.
 
 * **Verified on real hardware.** 51 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
   Laptop GPU (Blackwell), 102 of 102. The 5 newer decoding tests (KV cache, batched decoding, graph
-  replay, sampler, fused kernels) and the 6 newest ones (sampler filters and penalties, generation layer)
+  replay, sampler, fused kernels) and the 7 newest ones (sampler filters and penalties, generation layer, word tokenizer)
   pass on the CPU and still need a run on a GPU. That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.

@@ -246,7 +246,7 @@ def build():
         honestbox("What a small model can and cannot do here",
                   "<p>The chat model above is a character-level GPT trained for about an hour on the CPU on synthetic "
                   "conversations; it learned the format (thinking, a tool call with the right JSON, an answer citing the "
-                  "tool result), not the world. The Generation layer is the same for a real chat model: what changes is "
+                  "tool result) but not to copy facts from the tool result (Table 22.5). The Generation layer is the same for a real chat model: what changes is "
                   "the size of the network and the data it was trained on. The model decides <i>whether</i> to call a "
                   "tool; your code runs the tool and sends the result back as a <code>tool</code> message.</p>"),
         h2("22.6 Keeping models loaded"),
@@ -322,12 +322,125 @@ def build():
         ], PART),
         footer("Tokenizer", "Unknown token", "Temperature", "Top-k sampling", "Top-p sampling", "Min-p sampling",
                "Repetition penalty", "Stop sequence", "Context window", "Streaming", "Chat template", "Tool calling",
-               "Thinking", "Keep-alive", "NDJSON"),
+               "Thinking", "Keep-alive", "NDJSON", "Hallucination"),
     )
 
 
-# Filled from measured runs (chat model and Web API); see the Transformer and GptApi samples.
-CHAT_REQUEST = ""
-CHAT_PROMPT = ""
-CHAT_DEMO_STATIONS = ""
-API_STATIONS = ""
+# Measured: the chat model saved by the Transformer sample's --chat mode, and the GptApi sample serving it.
+CHAT_REQUEST = """
+    var webFetch = new ToolDefinition("web_fetch", "Fetch a page from the allowlisted search results.",
+        JsonNode.Parse(\"\"\"{"type":"object","properties":{"url":{"type":"string",
+            "description":"Absolute http(s) URL from the allowlist."}},"required":["url"]}\"\"\"));
+    var messages = new List<ChatMessage>
+    {
+        new("system", "You are a helpful assistant. Cite sources as [1], [2] when a research pack is present."),
+        new("user", "What is the latest Ollama version?"),
+    };
+    var options = new GenerationOptions { Temperature = 1f, TopK = 20, TopP = 0.95f, MinP = 0f,
+        RepeatPenalty = 1f, NumCtx = 4096, NumPredict = 300, Seed = 7 };
+
+    var chat = new ChatGenerator(new TextGenerator(gpt.Model, new CharTokenizer(gpt.Config.Vocabulary), gpt.Config.Context));
+    var request = new ChatRequest(messages, [webFetch], Think: true, Options: options);
+    Console.WriteLine(chat.RenderPrompt(request));
+"""
+
+CHAT_PROMPT = """
+    <|im_start|>system
+    You are a helpful assistant. Cite sources as [1], [2] when a research pack is present.
+
+    # Tools
+
+    You may call one or more functions. Function signatures:
+    <tools>
+    {"type":"function","function":{"name":"web_fetch","description":"Fetch a page from the allowlisted search ...}}}
+    </tools>
+
+    For each call, return <tool_call>{"name": <function-name>, "arguments": <args-json-object>}</tool_call><|im_end|>
+    <|im_start|>user
+    What is the latest Ollama version?<|im_end|>
+    <|im_start|>assistant
+"""
+
+CHAT_DEMO_STATIONS = mex("two turns with a tool",
+    "The model is the character-level chat model that the Transformer sample trains with <code>--chat true</code> "
+    "(350,380 parameters, context 256, trained 3,244 s on synthetic ChatML conversations). The loop streams each turn, "
+    "runs the tool call by hand, and sends the result back as a <code>tool</code> message.",
+    """
+    for (int turn = 1; turn <= 2; turn++)
+    {
+        ChatMessage? final = null;
+        foreach (var chunk in chat.Stream(new ChatRequest(messages, [webFetch], Think: true, Options: options)))
+        {
+            if (chunk.Delta.Thinking.Length > 0) Console.WriteLine($"thinking: {JsonSerializer.Serialize(chunk.Delta.Thinking)}");
+            if (chunk.Delta.Content.Length > 0) Console.WriteLine($"content:  {JsonSerializer.Serialize(chunk.Delta.Content)}");
+            foreach (var c in chunk.Delta.ToolCalls) Console.WriteLine($"tool_call: {c.Name} {c.Arguments.ToJsonString()}");
+            if (chunk.Done) final = chunk.Message;                     // Content, Thinking and ToolCalls together
+        }
+        messages.Add(final!);
+        if (final!.ToolCalls is not { Count: > 0 } calls) break;
+        string url = calls[0].Arguments["url"]!.GetValue<string>();
+        string page = $"[1] {url}: Ollama 0.12.3 is the latest release.";   // your code runs the tool
+        messages.Add(new("tool", page, ToolName: "web_fetch"));
+    }
+    """,
+    out="""
+    --- turn 1
+    content:  "\\n"
+    tool_call: web_fetch {"url":"https://ollama.com/releases"}
+    done: stop, prompt 255, generated 94
+    --- turn 2
+    thinking: "\\nThe p"   thinking: "age says"   thinking: " Ollama "   thinking: "6.29.7 i"
+    thinking: "s the la"   thinking: "test rel"   thinking: "ease.\\n"
+    content:  "The late"   content:  "st Ollam"   content:  "a versio"   content:  "n is 7.2"   content:  "8.7 [1]."
+    done: stop, prompt 255, generated 109
+    """,
+    after="The format is right in both turns: a well-formed tool call with a sensible URL, then reasoning and an "
+          "answer that cites the source as [1]. The fact is wrong: the page said 0.12.3, and the model wrote two "
+          "different, invented versions. Section 22.7 measures how often each happens.")
+
+API_STATIONS = "".join([
+    snippet("""
+        $ dotnet run -c Release --project samples/NeuralSharp.Samples.GptApi -- \\
+              --Gpt:ChatModelPath=models/chat.weights
+        $ curl -N localhost:5080/api/chat -d '{
+            "model": "qwen3.8:27b", "stream": true, "think": true, "keep_alive": "30m",
+            "options": { "temperature": 1, "top_k": 20, "top_p": 0.95, "min_p": 0, "repeat_penalty": 1,
+                         "presence_penalty": 0, "num_ctx": 4096, "num_predict": 2048 },
+            "messages": [
+              { "role": "system", "content": "You are a helpful assistant. Cite sources as [1], [2] when a research pack is present." },
+              { "role": "user", "content": "What is the latest Ollama version?" } ],
+            "tools": [ { "type": "function", "function": { "name": "web_fetch",
+              "description": "Fetch a page from the allowlisted search results.",
+              "parameters": { "type": "object", "required": ["url"],
+                "properties": { "url": { "type": "string", "description": "Absolute http(s) URL from the allowlist." } } } } } ]
+          }'
+        """, caption="An Ollama request, unchanged (no Content-Type header needed)"),
+    output("""
+        {"model":"qwen3.8:27b","created_at":"2026-09-25T17:28:08.72Z","message":{"role":"assistant","content":"","thinking":"\\nThe u"},"done":false}
+        {"model":"qwen3.8:27b","created_at":"2026-09-25T17:28:08.73Z","message":{"role":"assistant","content":"","thinking":"ser want"},"done":false}
+        ... 7 more thinking lines: "The user wants the latest Ollama version. I should fetch the release page."
+        {"model":"qwen3.8:27b","created_at":"2026-09-25T17:28:08.88Z","message":{"role":"assistant","content":"",
+          "tool_calls":[{"function":{"name":"web_fetch","arguments":{"url":"https://ollama.com/releases"},"index":0}}]},"done":false}
+        {"model":"qwen3.8:27b","created_at":"2026-09-25T17:28:08.88Z","message":{"role":"assistant","content":""},"done":true,
+          "done_reason":"stop","total_duration":316002600,"load_duration":0,"prompt_eval_count":255,
+          "prompt_eval_duration":95529200,"eval_count":192,"eval_duration":220047600}
+        """, caption="The streamed response: 12 NDJSON lines (timestamps shortened)"),
+    para("The response echoes the requested model name; any name selects the served model. <code>num_ctx 4096</code> is "
+         "capped by the model's context of 256 characters, so the prompt (about 560 characters with the tool "
+         "definition) is cut to its last 255 (<code>prompt_eval_count</code>). <code>GET /api/ps</code> right after the "
+         "request shows <code>\"expires_at\":\"2026-09-25T17:58:21Z\"</code>: 30 minutes, from <code>keep_alive</code>."),
+    reftable(["20 runs of each request (no seed)", "Result"], [
+        ["Turn 1: calls <code>web_fetch</code> with <code>https://ollama.com/releases</code>", "20 of 20"],
+        ["Turn 1: thinks before calling", "10 of 20"],
+        ["Turn 2 (tool result added, <code>\"stream\": false</code>): answer cites [1]", "20 of 20"],
+        ["Turn 2: thinks before answering", "17 of 20"],
+        ["Turn 2: answer states the version from the page (0.12.3)", "0 of 20; 20 different invented versions"],
+    ], caption="Table 22.5 — What the small chat model learned, measured through the API"),
+    para("A typical second answer: <code>{\"thinking\":\"The page says Ollama 19.12.0 is the latest release.\", "
+         "\"content\":\"The latest Ollama version is 1.20.3 [1].\"}</code>. The invented versions follow the pattern of the "
+         "training data (a number up to 19, then up to 29, then up to 9): the model learned what versions look like, "
+         "not to copy the one in the tool result. Copying a string from earlier in the context is a separate skill "
+         "that small models acquire late; a larger model, more training, or word-level tokens (a version as one "
+         "token) all help. This is exactly the failure called <b>hallucination</b> in large models, and why answers "
+         "that cite a source should be checked against it."),
+])

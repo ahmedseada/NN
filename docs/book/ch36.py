@@ -79,12 +79,12 @@ RESULTS = """
     BM25 alone:            Hit@1 27.1 %   MRR@10 0.429   Recall@20 94.9 %
 
     Cross-encoder: 2 layers, dim 64, 81,345 parameters; groups of 8 (1 answer + 7 hard negatives), 12 epochs
-    Epoch 12/12  loss 0.000171  accuracy 1.0000  val_loss 0.000006  val_accuracy 1.0000  15422.9 ms  177 samples/s  *
-    Trained in 188 s
+    Epoch 12/12  loss 0.000171  accuracy 1.0000  val_loss 0.000006  val_accuracy 1.0000  14020.0 ms  195 samples/s  *
+    Trained in 180 s
 
     BM25 + cross-encoder:  Hit@1 86.6 %   MRR@10 0.895   Recall@20 94.9 %
-    The re-ranker can only order what the first stage found: of the 94.9 % of questions whose answer is among the 20 candidates, it puts 91.3 % first.
-    Re-ranking cost: 7.36 ms per question (20 pairs in one batch, cpu)
+    The re-ranker can only order what the first stage found: of the 94.9 % of questions whose answer is among the 20 candidates, it puts 91.2 % first.
+    Re-ranking cost: 6.90 ms per question (20 pairs in one batch, cpu)
 
     Hit@1 per aspect (unseen towns)      BM25   re-ranked
       population                          0 %      67 %
@@ -121,7 +121,7 @@ def build():
             "Re-ranker: 2 transformer layers read \"&lt;cls&gt; question &lt;sep&gt; passage\" and output one score (81,345 parameters).",
             "Training: one answer + 7 hard negatives per question, softmax cross-entropy over the 8 scores, with the ordinary <code>Trainer</code>.",
             "Rare words (town names) become placeholders <code>&lt;w0&gt;</code>, <code>&lt;w1&gt;</code>…: without them 57.5 % first on unseen towns, with them 86.6 %.",
-            "Cost: 7.4 ms per question to score 20 candidates on the CPU; training 188 s.",
+            "Cost: 6.9 ms per question to score 20 candidates on the CPU; training 180 s.",
         ),
         h2("36.1 The task and the data"),
         diagram("Figure 36.1 — Two-stage search", stages_svg(),
@@ -191,12 +191,12 @@ def build():
         output(RESULTS, caption="dotnet run -c Release --project samples/NeuralSharp.Samples.ReRanker -- --cpu"),
         para("Re-ranking lifts Hit@1 from 27.1 % to 86.6 % and MRR@10 from 0.43 to 0.90 (glossary <b>MRR</b>). The "
              "re-ranker cannot recover an answer the first stage missed, so 94.9 % is its ceiling; of the reachable "
-             "answers it ranks 91.3 % first. The remaining errors are mostly questions whose answer is missing from the 20 "
+             "answers it ranks 91.2 % first. The remaining errors are mostly questions whose answer is missing from the 20 "
              "candidates (the river question above: its answer, \"tormor sits on the banks of the reed .\", has no "
              "\"river\", and BM25 leaves it out of its top 20), so the next improvement is a larger candidate list or a better first stage, "
              "not a bigger re-ranker."),
         reftable(["Candidates re-ranked", "Effect"], [
-            ["More (50–100)", "Higher ceiling (recall); cost grows linearly (7.4 ms per 20 here)"],
+            ["More (50–100)", "Higher ceiling (recall); cost grows linearly (6.9 ms per 20 here)"],
             ["Fewer (5–10)", "Cheaper; the re-ranker can only fix small ordering mistakes"],
             ["Batch all candidates in one call", "One <code>Predict</code> of [20, 28] ids instead of 20 calls"],
         ], caption="Table 36.2 — Tuning the second stage"),
@@ -217,7 +217,7 @@ def build():
         practice([
             (1, "Why is BM25 run over the whole collection but the cross-encoder only over 20 passages?",
              "BM25 costs microseconds per passage and needs no model; the cross-encoder runs a transformer per pair "
-             "(7.4 ms per 20 here), far too slow for every passage of a large collection."),
+             "(6.9 ms per 20 here), far too slow for every passage of a large collection."),
             (1, "What does Recall@20 of 94.9 % limit?",
              "The best possible Hit@1 of the two-stage system: the re-ranker only orders the 20 candidates."),
             (2, "Change the sample to re-rank 50 candidates. What do you expect for Recall, Hit@1 and cost?",

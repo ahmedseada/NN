@@ -549,6 +549,11 @@
   "hint": "",
   "see": "{ch:recurrent}"
  },
+ "Hallucination": {
+  "def": "Fluent output that states something false or unsupported, such as a model inventing a fact instead of using the source it was given.",
+  "hint": "",
+  "see": "{ch:textgen}"
+ },
  "Hard negative": {
   "def": "A wrong example that looks right (for example a passage the first stage ranks highly), used in training so the model learns fine distinctions.",
   "hint": "",
