@@ -117,6 +117,39 @@ EVAL = """
 """
 
 
+TRANSFORMER = """
+    static Sequential BuildTransformer(int T, Random? r = null) => new()
+    {
+        new Linear(1, 32, random: r),                             // each value → a 32-wide vector
+        new PositionalEncoding(T, 32),                            // where in the window it is
+        new TransformerEncoderLayer(32, heads: 4, ffDim: 64, dropout: 0f, random: r),
+        new TransformerEncoderLayer(32, heads: 4, ffDim: 64, dropout: 0f, random: r),
+        new LayerNorm(32),
+        new Lambda(x => x.Narrow(1, T - 1, 1).Reshape(-1, 32), "LastStep"),   // the newest step sees the whole window
+        new Linear(32, 1, random: r),                             // next value
+    };
+"""
+
+COMPARISON = """
+    All 1,000 training days: window 28, 972 training windows, 3 seeds (mean, min–max)
+      model         params       next-day MAE         14-day MAE  epochs  train s
+      GRU            3,297      5.1 (4.8–5.7)      6.2 (5.3–7.0)      24      1.8
+      Transformer   17,249      5.0 (4.8–5.2)     9.8 (4.9–14.2)      23      7.9
+    Only the last 250 training days: window 28, 250 training windows, 3 seeds (mean, min–max)
+      GRU            3,297      5.3 (5.2–5.5)      5.9 (5.4–6.2)      46      1.3
+      Transformer   17,249      5.1 (5.1–5.2)      5.0 (4.0–6.8)      35      3.6
+    Longer window (16 weeks): window 112, 888 training windows, 3 seeds (mean, min–max)
+      GRU            3,297      5.1 (4.9–5.2)      6.3 (4.4–8.2)      30      7.2
+      Transformer   17,249      4.7 (4.6–5.0)      5.5 (3.9–6.9)      30     48.7
+"""
+
+LATENCY = """
+    window   28  GRU               602 µs      Transformer       787 µs
+    window  112  GRU             1,193 µs      Transformer     1,994 µs
+    window  448  GRU             3,306 µs      Transformer     8,836 µs
+"""
+
+
 def build():
     return page(
         chapter_open(
@@ -131,6 +164,7 @@ def build():
             "Fit the scaler on the training period only.",
             "Result: next-day MAE 5.7, against 6.6 for \"same weekday last week\" and 17.1 for \"same as yesterday\".",
             "Multi-step forecasts feed each prediction back; errors grow with the horizon (14-day MAE 6.3).",
+            "GRU or transformer (Section 29.4): the same accuracy within noise; the GRU trains 3–7× faster with 5× fewer parameters.",
         ),
         h2("29.1 Windows"),
         diagram("Figure 29.1 — Sliding windows over a series", windows_svg(),
@@ -185,11 +219,40 @@ def build():
             ["Predict H days at once", "Targets of H values and <code>Linear(h, H)</code>: no feedback, errors do not compound"],
             ["Many related series (all stores)", "Train one model on windows from every series; add a series embedding (" + ch("recommender") + ")"],
             ["Uncertainty", "Train two outputs (value and spread) or use Monte-Carlo dropout (" + ch("norm") + ")"],
-            ["Long histories", "A causal transformer (" + ch("attention") + ", Practice 12.5) or a longer window"],
+            ["Long histories", "A longer window, or a transformer (" + ch("attention") + "; compared in Section 29.4)"],
         ], caption="Table 29.1 — Forecasting extensions"),
         trap("forecasting with the training-period scaler forgotten",
              "<p>The model predicts scaled values; apply <code>InverseTransform</code> with the same scaler, and when feeding "
              "predictions back, keep them scaled (as the loop above does) and unscale only for output.</p>"),
+        h2("29.4 GRU or transformer? Measured"),
+        para("A GRU reads the window one step at a time and carries a state; a transformer lets every step attend to "
+             "every other step at once (" + ch("recurrent") + ", " + ch("attention") + "). Which is better for "
+             "forecasting? The comparison below keeps everything else fixed: the same series, windows, scaler, "
+             "optimizer (Adam 3e-3), clipping, early stopping (patience 8, at most 60 epochs) and evaluation, and "
+             "repeats each run with three seeds, because a single run of a small model can mislead."),
+        snippet(TRANSFORMER, caption="The transformer forecaster: a drop-in replacement for Build()"),
+        output(COMPARISON, caption="GRU vs transformer on the CPU (mean over seeds 1–3, with the range)"),
+        para("<b>Accuracy is a tie.</b> The next-day errors differ by 0.1–0.4 visitors on a series whose noise alone "
+             "averages 4, and the ranges overlap; both beat the baselines of Section 29.2 (6.6 and 17.1) in every setting. The transformer is slightly ahead with the longer window and, "
+             "perhaps surprisingly, with only 250 training days; the GRU was not better on little data here. The "
+             "14-day figures come from a single two-week stretch and swing widely with the seed (3.9 to 14.2 for "
+             "the transformer), so they cannot separate the models."),
+        para("<b>Cost is not a tie.</b> The GRU has 3,297 parameters against 17,249, trains 2.8 to 6.8 times faster, and "
+             "answers faster, with a gap that grows with the window: a transformer's attention compares every step "
+             "with every other (work growing with the square of the window), a GRU does a fixed amount of work per step."),
+        output(LATENCY, caption="Latency of one prediction (batch 1, CPU, after warm-up)"),
+        reftable(["Situation", "Choose", "Why"], [
+            ["Short windows, small data, a CPU or small device", "GRU (or LSTM)", "Same accuracy, far cheaper to train and run"],
+            ["Readings arrive one at a time (streaming sensors)", "GRU", "Update the state with each new value; no window to re-read"],
+            ["Long windows, many series, a GPU", "Transformer", "Attention reaches any step directly and runs in parallel on the GPU"],
+            ["Text, retrieval, generation", "Transformer", ch("gpt") + ", " + ch("reranker") + ", " + ch("summarizer")],
+            ["Unsure", "Both, measured", "Run this comparison on your own data with several seeds and a baseline"],
+        ], caption="Table 29.2 — Choosing the sequence model"),
+        honestbox("One series, one conclusion",
+                  "<p>These numbers come from one synthetic series with a clean weekly and yearly rhythm. On data with long, "
+                  "irregular dependencies, or with many series and a GPU, the balance can move towards the transformer; "
+                  "on tiny devices it moves further towards the GRU. The method transfers: fix everything else, vary the "
+                  "model, repeat with several seeds, and compare against a baseline.</p>"),
         practice([
             (1, "Why is the test set built with <code>Windows(split, series.Length)</code> rather than from a random 20% of all windows?",
              "Forecasts must be evaluated on a period after the training data; random windows would overlap training windows and leak the future."),
@@ -201,10 +264,13 @@ def build():
             (2, "Change the model to predict the next 7 days in one shot.",
              "Make each target the 7 values after the window (<code>float[count, 7]</code>), end with <code>Linear(32, 7)</code>, and "
              "stop windows 7 days before the end of each period."),
+            (2, "The transformer's 14-day MAE ranged from 4.9 to 14.2 over three seeds. What would you do before claiming one model forecasts two weeks better?",
+             "Evaluate many forecast origins (for example a 14-day forecast starting at every day of the test period) and "
+             "more seeds, then compare the averages and their spread; one two-week stretch is a sample of one."),
             (3, "Add the weekday as a second input feature per step and compare against the univariate model.",
              "Build windows <code>[T, 2]</code> with the scaled value and weekday/6 at each step, use <code>WithFeatureShape(T, 2)</code> and "
              "<code>GRU(2, 32)</code>. With an explicit weekday the model needs less effort to learn the weekly rhythm."),
         ], PART),
         footer("Time series", "Forecasting", "Sliding window", "Baseline", "Horizon", "Recursive forecasting",
-               "Data leakage", "GRU"),
+               "Data leakage", "GRU", "Transformer", "Attention"),
     )
