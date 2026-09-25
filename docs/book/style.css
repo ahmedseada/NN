@@ -132,3 +132,9 @@ table.ref.key td:first-child { white-space: nowrap; }
                border-radius: 2pt; padding: 0.5pt 5pt; margin-top: 3pt; }
 .cpugpu .lbl.cpu { background: #56606a; }
 .cpugpu .lbl.gpu { background: #0f6b5c; }
+
+/* code must show the characters typed: no programming ligatures (=> must not become an arrow) */
+code, .f, pre, .mono { font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
+sup, sub { font-size: 7.8pt; line-height: 0; }
+/* practice + key-terms travel together at a chapter's end */
+.chapter-end { break-inside: avoid; }

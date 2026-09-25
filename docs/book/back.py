@@ -11,7 +11,7 @@ HERE = pathlib.Path(__file__).parent
 def answer_key(part):
     rows = [[num, ans] for num, ans in ANSWERS.get(part, [])]
     return page(topbar("BACK MATTER", "ANSWER KEY"), h1("ANSWER KEY", f"Part {part}"),
-                reftable(["No.", "Answer"], rows).replace('class="ref"', 'class="ref key"'), new=True)
+                reftable(["No.", "Answer"], rows, atomic=False).replace('class="ref"', 'class="ref key"'), new=True)
 
 
 def footer_terms(chapter_files):

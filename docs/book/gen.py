@@ -144,11 +144,13 @@ def trap(title, text):
     return f'<div class="station box trap"><div class="title">Trap · {title}</div>{text}</div>'
 
 
-def reftable(headers, rows, caption=None):
+def reftable(headers, rows, caption=None, atomic=True):
+    """atomic=False lets a long table (e.g. an Answer Key) run across pages; rows never split."""
     head = "".join(f"<th>{h}</th>" for h in headers)
     body = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
     cap = f'<div class="cap">{caption}</div>' if caption else ""
-    return f'<div class="station">{cap}<table class="ref"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+    cls = "station" if atomic else "flow"
+    return f'<div class="{cls}">{cap}<table class="ref"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
 def deriv(title, steps):
@@ -197,6 +199,10 @@ def footer(*terms):
 
 
 def page(*stations, new=False):
+    stations = list(stations)
+    # keep the last Practice block and the key-terms strip on the same page
+    if len(stations) >= 2 and stations[-1].startswith('<div class="terms">') and 'class="station practice"' in stations[-2]:
+        stations[-2:] = [f'<div class="chapter-end">{stations[-2]}{stations[-1]}</div>']
     cls = "page newpage" if new else "page"
     return f'<section class="{cls}">{"".join(stations)}</section>'
 
