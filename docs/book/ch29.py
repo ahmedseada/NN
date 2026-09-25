@@ -120,25 +120,26 @@ EVAL = """
 TRANSFORMER = """
     static Sequential BuildTransformer(int T, Random? r = null) => new()
     {
-        new Linear(1, 32, random: r),                             // each value → a 32-wide vector
-        new PositionalEncoding(T, 32),                            // where in the window it is
+        new Linear(1, 32, random: r),                   // each value → 32 numbers
+        new PositionalEncoding(T, 32),                  // its place in the window
         new TransformerEncoderLayer(32, heads: 4, ffDim: 64, dropout: 0f, random: r),
         new TransformerEncoderLayer(32, heads: 4, ffDim: 64, dropout: 0f, random: r),
         new LayerNorm(32),
-        new Lambda(x => x.Narrow(1, T - 1, 1).Reshape(-1, 32), "LastStep"),   // the newest step sees the whole window
-        new Linear(32, 1, random: r),                             // next value
+        // keep the newest step (it has attended to the whole window)
+        new Lambda(x => x.Narrow(1, T - 1, 1).Reshape(-1, 32), "LastStep"),
+        new Linear(32, 1, random: r),                   // next value
     };
 """
 
 COMPARISON = """
-    All 1,000 training days: window 28, 972 training windows, 3 seeds (mean, min–max)
+    All 1,000 training days: window 28, 972 training windows
       model         params       next-day MAE         14-day MAE  epochs  train s
       GRU            3,297      5.1 (4.8–5.7)      6.2 (5.3–7.0)      24      1.8
       Transformer   17,249      5.0 (4.8–5.2)     9.8 (4.9–14.2)      23      7.9
-    Only the last 250 training days: window 28, 250 training windows, 3 seeds (mean, min–max)
+    Only the last 250 training days: window 28, 250 training windows
       GRU            3,297      5.3 (5.2–5.5)      5.9 (5.4–6.2)      46      1.3
       Transformer   17,249      5.1 (5.1–5.2)      5.0 (4.0–6.8)      35      3.6
-    Longer window (16 weeks): window 112, 888 training windows, 3 seeds (mean, min–max)
+    Longer window (16 weeks): window 112, 888 training windows
       GRU            3,297      5.1 (4.9–5.2)      6.3 (4.4–8.2)      30      7.2
       Transformer   17,249      4.7 (4.6–5.0)      5.5 (3.9–6.9)      30     48.7
 """
@@ -243,7 +244,7 @@ def build():
         output(LATENCY, caption="Latency of one prediction (batch 1, CPU, after warm-up)"),
         reftable(["Situation", "Choose", "Why"], [
             ["Short windows, small data, a CPU or small device", "GRU (or LSTM)", "Same accuracy, far cheaper to train and run"],
-            ["Readings arrive one at a time (streaming sensors)", "GRU", "Update the state with each new value; no window to re-read"],
+            ["Readings arrive one at a time (streaming sensors)", "GRU", "Work per step is fixed; a recurrent state can be carried from value to value, while attention re-reads the window"],
             ["Long windows, many series, a GPU", "Transformer", "Attention reaches any step directly and runs in parallel on the GPU"],
             ["Text, retrieval, generation", "Transformer", ch("gpt") + ", " + ch("reranker") + ", " + ch("summarizer")],
             ["Unsure", "Both, measured", "Run this comparison on your own data with several seeds and a baseline"],
