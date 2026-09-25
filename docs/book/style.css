@@ -114,3 +114,21 @@ table.ref td code { font-size: 8.8pt; }
 
 /* answer key */
 table.ref.key td:first-child { white-space: nowrap; }
+
+/* part title page */
+.partpage { padding-top: 55mm; }
+.partpage .partnum { font-size: 11pt; font-weight: 700; color: var(--teal); letter-spacing: .2em; }
+.partpage .partname { font-size: 28pt; font-weight: 700; line-height: 1.1; margin: 4pt 0 8pt 0; }
+.partpage .partpurpose { font-size: 11pt; color: #2b3238; max-width: 150mm; }
+.partpage .partch { list-style: none; padding: 0; margin-top: 12mm; font-size: 10pt; }
+.partpage .partch li { padding: 3pt 0; border-bottom: 0.6pt solid var(--line); }
+.partpage .partch .pn { display: inline-block; width: 22pt; font-weight: 700; color: var(--teal); }
+.toc li.l0 { font-weight: 700; margin-top: 10pt; font-size: 9.6pt; }
+
+/* CPU / GPU pair */
+.cpugpu { border: 1pt solid #b7d8d0; background: #fbfdfc; }
+.cpugpu .title { color: var(--teal); }
+.cpugpu .lbl { display: inline-block; font-size: 7.8pt; font-weight: 700; letter-spacing: .1em; color: #fff;
+               border-radius: 2pt; padding: 0.5pt 5pt; margin-top: 3pt; }
+.cpugpu .lbl.cpu { background: #56606a; }
+.cpugpu .lbl.gpu { background: #0f6b5c; }

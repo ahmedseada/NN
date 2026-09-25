@@ -32,6 +32,7 @@ def network_svg():
 
 def build():
     CURRENT["chapter"] = "1"
+    CURRENT["part"] = "I"
     return page(
         topbar("PART I · THE LIBRARY", "CHAPTER 1"),
         h1("CHAPTER 1", "Getting Started: Your First Network on CPU and GPU"),
@@ -45,20 +46,20 @@ def build():
             "example in this book works unchanged on both.",
             "Training is always the same four lines: forward, loss, <code>Backward()</code>, <code>Step()</code>.",
             "Tensors own device memory: create per-step tensors inside a <code>TensorScope</code>.",
-            "Tiny networks such as XOR run faster on the CPU; the GPU wins once each step carries real work (Chapter 16).",
+            f"Tiny networks such as XOR run faster on the CPU; the GPU wins once each step carries real work ({ch('performance')}).",
         ),
         h2("1.1 What is in the library"),
         para("Everything lives under the <code>NeuralSharp</code> namespace. You only ever need the handful of "
              "sub-namespaces below; the backends are internal and chosen for you by the device."),
         reftable(["Namespace", "What you use it for", "Chapter"], [
             ["<code>NeuralSharp</code>", "<code>Tensor</code>, <code>Device</code>, <code>Autograd</code>, <code>TensorScope</code>, "
-             "<code>Losses</code>, <code>ComputeResources</code>, <code>TokenSampler</code>, <code>ComputeGraph</code>", "2–4, 10, 15"],
+             "<code>Losses</code>, <code>ComputeResources</code>, <code>TokenSampler</code>, <code>ComputeGraph</code>", f"{ch('devices',None)}–{ch('autograd',None)}, {ch('losses',None)}, {ch('generation',None)}"],
             ["<code>NeuralSharp.Layers</code>", "<code>Sequential</code>, <code>Linear</code>, activations, <code>Conv2d</code>, "
-             "<code>LSTM</code>, attention, normalization, <code>Embedding</code>", "5–9"],
-            ["<code>NeuralSharp.Optimizers</code>", "<code>Sgd</code>, <code>Adam</code>, <code>AdamW</code>, learning-rate schedules", "11"],
-            ["<code>NeuralSharp.Data</code>", "<code>Dataset</code>, CSV loading, scalers, <code>DataLoader</code>", "12"],
-            ["<code>NeuralSharp.Training</code>", "<code>Trainer</code>, <code>Metric</code>, <code>RegressionReport</code>", "13"],
-            ["<code>NeuralSharp.Diagnostics</code>", "telemetry hooks, loggers, JSON Lines, channels", "14"],
+             "<code>LSTM</code>, attention, normalization, <code>Embedding</code>", f"{ch('modules',None)}–{ch('attention',None)}"],
+            ["<code>NeuralSharp.Optimizers</code>", "<code>Sgd</code>, <code>Adam</code>, <code>AdamW</code>, learning-rate schedules", f"{ch('optimizers',None)}–{ch('schedules',None)}"],
+            ["<code>NeuralSharp.Data</code>", "<code>Dataset</code>, CSV loading, scalers, <code>DataLoader</code>", ch("data", None)],
+            ["<code>NeuralSharp.Training</code>", "<code>Trainer</code>, <code>Metric</code>, <code>RegressionReport</code>", f"{ch('metrics',None)}, {ch('trainer',None)}"],
+            ["<code>NeuralSharp.Diagnostics</code>", "telemetry hooks, loggers, JSON Lines, channels", ch("telemetry", None)],
         ], caption="Table 1.1 — The public namespaces"),
         h2("1.2 Setting up"),
         deriv("Setup, step by step", [
@@ -127,7 +128,7 @@ def build():
         mex("the complete program, CPU version",
             "Create a console app (<code>dotnet new console</code>), reference the library and replace "
             "<code>Program.cs</code> with this. It uses the low-level training loop so every step is visible; "
-            "Chapter 13 shows the same thing with the <code>Trainer</code>.",
+            f"{ch('trainer')} shows the same thing with the <code>Trainer</code>.",
             """
             using NeuralSharp;
             using NeuralSharp.Layers;
@@ -217,7 +218,7 @@ def build():
         trap("expecting the GPU to win on XOR",
              "<p>Each GPU operation has a fixed launch cost of a few microseconds. XOR has 33 parameters and 4 "
              "samples, so the CPU finishes first. The GPU pays off with wide layers, large batches, convolutions "
-             "and transformers: the GPT of Chapter 24 trains about 8× faster on a laptop RTX 5050 than on its CPU.</p>"),
+             "and transformers: the GPT of " + ch("gpt") + " trains about 8× faster on a laptop RTX 5050 than on its CPU.</p>"),
         h2("1.7 Saving the model and using it later"),
         mex("train once, predict many times",
             None,

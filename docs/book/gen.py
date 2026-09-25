@@ -210,7 +210,96 @@ def svg_text(x, y, s, size=9, fill="#1a1f23", anchor="middle"):
     return f'<text x="{x}" y="{y}" {SVG_FONT} font-size="{size}" fill="{fill}" text-anchor="{anchor}">{s}</text>'
 
 
+# ---------------------------------------------------------------- roadmap (single source for cross-references)
+
+PARTS = {
+    "I": ("Foundations", "Devices, tensors, memory and gradients: the four ideas under every NeuralSharp program."),
+    "II": ("Building Networks", "Every layer in the library: what it computes, its shapes, and how to combine it."),
+    "III": ("Training", "Losses, metrics, optimizers, schedules, data pipelines, the Trainer and telemetry."),
+    "IV": ("Performance and Internals", "Making it fast, generating text quickly, and how the CPU and CUDA backends work."),
+    "V": ("Projects: Tabular Data and Time Series", "Complete projects on numbers in rows and in time."),
+    "VI": ("Projects: Vision, Sequences and Text", "Complete projects on images, characters, sentences and language models."),
+    "VII": ("Projects: Shipping and Integration", "Putting trained models to work in real .NET applications."),
+}
+
+CHAPTERS = [  # (key, part, title)
+    ("start", "I", "Getting Started: Your First Network on CPU and GPU"),
+    ("devices", "I", "Devices, Backends and Compute Resources"),
+    ("tensors", "I", "Tensors"),
+    ("memory", "I", "Memory and Tensor Lifetime"),
+    ("autograd", "I", "Autograd: How Gradients Are Computed"),
+    ("modules", "II", "Modules, Sequential and Model Files"),
+    ("dense", "II", "Dense Layers and Activations"),
+    ("norm", "II", "Normalization and Dropout"),
+    ("embedding", "II", "Embeddings"),
+    ("conv", "II", "Convolution and Pooling"),
+    ("recurrent", "II", "Recurrent Layers: LSTM and GRU"),
+    ("attention", "II", "Attention and Transformers"),
+    ("losses", "III", "Losses"),
+    ("metrics", "III", "Metrics"),
+    ("optimizers", "III", "Optimizers"),
+    ("schedules", "III", "Learning-Rate Schedules and Gradient Clipping"),
+    ("data", "III", "Data: Datasets, CSV, Scalers and Loaders"),
+    ("trainer", "III", "The Trainer"),
+    ("telemetry", "III", "Telemetry: Logging and Tracking Everything"),
+    ("performance", "IV", "Performance Tuning"),
+    ("generation", "IV", "Fast Generation: KV Cache, Sampling and CUDA Graphs"),
+    ("cpu", "IV", "Inside the CPU Backend"),
+    ("cuda", "IV", "Inside the CUDA Backend"),
+    ("testing", "IV", "Testing, Gradient Checking and Debugging"),
+    ("regression", "V", "Regression: Predicting House Prices"),
+    ("binary", "V", "Binary Classification"),
+    ("multiclass", "V", "Multi-Class Classification"),
+    ("timeseries", "V", "Time-Series Forecasting"),
+    ("anomaly", "V", "Anomaly Detection with Autoencoders"),
+    ("recommender", "V", "Recommenders and Categorical Embeddings"),
+    ("cnn", "VI", "Image Classification with CNNs"),
+    ("ocr", "VI", "OCR: Reading Characters"),
+    ("sentiment", "VI", "Sequence Classification and Sentiment"),
+    ("gpt", "VI", "GPT Text Generation"),
+    ("inference", "VII", "Inference Modes and Model Files in Practice"),
+    ("webapi", "VII", "Serving Models over HTTP"),
+    ("finetune", "VII", "Fine-Tuning, Freezing and Multi-Output Models"),
+    ("projecttypes", "VII", "NeuralSharp in Every .NET Project Type"),
+]
+CH = {key: i for i, (key, _, _) in enumerate(CHAPTERS, 1)}
+
+
+def ch(key, word="Chapter"):
+    """Cross-reference to a chapter by key, e.g. ch('trainer') -> 'Chapter 18'."""
+    return f"{word} {CH[key]}" if word else str(CH[key])
+
+
+def chapter_open(key, brief_text, *glance_items):
+    """Topbar + heading + brief + at-a-glance for chapter `key`; also sets CURRENT for the Answer Key."""
+    n = CH[key]
+    part, title = CHAPTERS[n - 1][1], CHAPTERS[n - 1][2]
+    CURRENT["chapter"] = str(n)
+    CURRENT["part"] = part
+    return (topbar(f"PART {part} · {PARTS[part][0].upper()}", f"CHAPTER {n}") + h1(f"CHAPTER {n}", title)
+            + brief(brief_text) + glance(*glance_items))
+
+
+def partpage(part):
+    """Part title page: name, purpose and the chapters it contains."""
+    name, purpose = PARTS[part]
+    rows = "".join(f'<li><span class="pn">{i}</span>{t}</li>'
+                   for i, (_, p, t) in enumerate(CHAPTERS, 1) if p == part)
+    aid = _anchor(f"part {part} {name}")
+    TOC.append((0, f"Part {part} · {name}", aid))
+    return (f'<section class="page newpage partpage" id="{aid}"><div class="partnum">PART {part}</div>'
+            f'<div class="partname">{name}</div><p class="partpurpose">{purpose}</p>'
+            f'<ol class="partch">{rows}</ol></section>')
+
+
+def cpugpu(title, cpu, gpu, note=None):
+    """The CPU and GPU versions of the same code, labelled, in one atomic station."""
+    n = f"<p>{note}</p>" if note else ""
+    return (f'<div class="station box cpugpu"><div class="title">CPU and GPU · {title}</div>'
+            f'<div class="lbl cpu">CPU</div>{code(cpu)}<div class="lbl gpu">GPU</div>{code(gpu)}{n}</div>')
+
+
 # collected while building
 ANSWERS = {}
 TOC = []
-CURRENT = {"chapter": "0"}
+CURRENT = {"chapter": "0", "part": "I"}

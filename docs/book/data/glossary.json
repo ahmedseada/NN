@@ -1,19 +1,287 @@
 {
-  "Adam": {"def": "Optimizer that keeps a running mean of each parameter's gradient and of its square, and steps by their ratio, so every parameter gets its own step size.", "hint": "Two moving averages plus a bias correction for the first steps.", "see": "Chapter 11"},
-  "Autograd": {"def": "The mechanism that records every operation on tensors that require gradients (the tape) and replays it backwards on <code>Backward()</code> to compute all gradients.", "hint": "Reverse-mode application of the chain rule.", "see": "Chapter 4"},
-  "Chain rule": {"def": "The rule for differentiating a composition: the derivative of an outer function applied to an inner one is the outer derivative times the inner derivative. Autograd applies it once per recorded operation.", "hint": "Rates of change multiply along a chain.", "see": "Pre-Calc volume <i>Numbers, Shapes, and Functions</i>, function composition; any calculus text for the derivative form"},
-  "Device": {"def": "Where a tensor's numbers live and where operations on it run: <code>Device.Cpu</code> or <code>Device.Cuda(n)</code>. Operands of one operation must share a device.", "hint": "", "see": "Chapter 2"},
-  "Epoch": {"def": "One full pass over the training data. Training usually runs many epochs.", "hint": "", "see": "Chapter 13"},
-  "Gradient": {"def": "For every parameter, how much the loss changes when that parameter is nudged; the optimizer moves each parameter against its gradient.", "hint": "The vector of partial derivatives; its negative points downhill.", "see": "Chapter 4; Activation Functions volume for gradient effects of each activation"},
-  "Loss": {"def": "A single number that measures how wrong the predictions are; training minimizes it.", "hint": "", "see": "Chapter 10"},
-  "Module": {"def": "Anything that maps input tensors to output tensors and may own parameters: a layer, an activation, or a <code>Sequential</code> of them.", "hint": "", "see": "Chapter 5"},
-  "MSE": {"def": "Mean squared error: the average of the squared differences between prediction and target. The default loss for regression.", "hint": "Squaring punishes large errors more than small ones.", "see": "Chapter 10"},
-  "Optimizer": {"def": "The object that updates parameters from their gradients: <code>Sgd</code>, <code>Adam</code>, <code>AdamW</code>.", "hint": "", "see": "Chapter 11"},
-  "Parameter": {"def": "A tensor the network learns (weights and biases). Created with gradient tracking on and exposed through <code>Module.Parameters()</code>.", "hint": "", "see": "Chapter 5"},
-  "ReLU": {"def": "Activation that keeps positive inputs and replaces negative ones with zero. Cheap and the usual default in deep networks; a unit whose input stays negative stops learning.", "hint": "Gradient is 1 for positive inputs and 0 otherwise.", "see": "Activation Functions volume, ReLU"},
-  "Sigmoid": {"def": "Activation that squashes any number into the range 0 to 1; used for probabilities of yes/no outputs.", "hint": "S-shaped curve; its slope is largest at 0 and vanishes far from it.", "see": "Activation Functions volume, Sigmoid; Pre-Calc volume, exponential functions"},
-  "Tanh": {"def": "Activation that squashes any number into the range −1 to 1; zero-centred, a good default for small networks.", "hint": "A rescaled and shifted sigmoid.", "see": "Activation Functions volume, Tanh"},
-  "Tensor": {"def": "An n-dimensional array of 32-bit floats with a shape and a device. The basic data type of the library.", "hint": "", "see": "Chapter 3"},
-  "TensorScope": {"def": "A <code>using</code> block that disposes every tensor created inside it when it ends, returning device memory to the pool.", "hint": "", "see": "Chapter 3"},
-  "XOR": {"def": "Exclusive or: the output is 1 when exactly one of two inputs is 1. The smallest problem a network without a hidden layer cannot solve.", "hint": "The two classes cannot be split by one straight line.", "see": "Activation Functions volume, XOR impossibility chapter"}
+ "Adam": {
+  "def": "Optimizer that keeps a running mean of each parameter's gradient and of its square, and steps by their ratio, so every parameter gets its own step size.",
+  "hint": "Two moving averages plus a bias correction for the first steps.",
+  "see": "{ch:optimizers}"
+ },
+ "ArgMax": {
+  "def": "The position of the largest value along the last dimension; turns class scores into a predicted class index.",
+  "hint": "",
+  "see": "{ch:tensors}"
+ },
+ "Asynchronous execution": {
+  "def": "GPU operations return as soon as they are queued and run later in order; reading a value waits for them.",
+  "hint": "",
+  "see": "{ch:devices}"
+ },
+ "Autograd": {
+  "def": "The mechanism that records every operation on tensors that require gradients (the tape) and replays it backwards on <code>Backward()</code> to compute all gradients.",
+  "hint": "Reverse-mode application of the chain rule.",
+  "see": "{ch:autograd}"
+ },
+ "Backend": {
+  "def": "The internal engine behind a device (CPU or CUDA) that allocates memory and implements the math primitives.",
+  "hint": "",
+  "see": "{ch:devices}, {ch:cpu}, {ch:cuda}"
+ },
+ "Backward pass": {
+  "def": "The second half of a training step: gradients flow from the loss back through the recorded operations to the parameters.",
+  "hint": "Local derivatives multiplied along each path and summed over paths.",
+  "see": "{ch:autograd}"
+ },
+ "Broadcasting": {
+  "def": "Reusing a smaller tensor across the leading dimensions of a larger one, as when a bias vector is added to every row of a batch. In NeuralSharp only <code>+</code> broadcasts.",
+  "hint": "",
+  "see": "{ch:tensors}"
+ },
+ "Chain rule": {
+  "def": "The rule for differentiating a composition: the derivative of an outer function applied to an inner one is the outer derivative times the inner derivative. Autograd applies it once per recorded operation.",
+  "hint": "Rates of change multiply along a chain.",
+  "see": "Pre-Calc volume <i>Numbers, Shapes, and Functions</i>, function composition; any calculus text for the derivative form"
+ },
+ "Computation graph": {
+  "def": "The record of which operation produced which tensor, built during the forward pass and consumed by <code>Backward()</code>.",
+  "hint": "A directed graph without cycles; Backward visits it in reverse topological order.",
+  "see": "{ch:autograd}"
+ },
+ "ComputeResources": {
+  "def": "Static class that caps CPU threads and per-device memory and reports memory usage.",
+  "hint": "",
+  "see": "{ch:devices}"
+ },
+ "CUDA": {
+  "def": "NVIDIA's platform for general computing on GPUs. NeuralSharp uses only its driver API, which ships with the display driver.",
+  "hint": "",
+  "see": "{ch:devices}, {ch:cuda}"
+ },
+ "Detach": {
+  "def": "A tensor that shares data with another but has no history, so gradients stop there.",
+  "hint": "",
+  "see": "{ch:autograd}"
+ },
+ "Device": {
+  "def": "Where a tensor's numbers live and where operations on it run: <code>Device.Cpu</code> or <code>Device.Cuda(n)</code>. Operands of one operation must share a device.",
+  "hint": "",
+  "see": "{ch:devices}"
+ },
+ "Dispose": {
+  "def": "Returning a tensor's memory to the device cache immediately (<code>using</code> calls it automatically).",
+  "hint": "",
+  "see": "{ch:memory}"
+ },
+ "Epoch": {
+  "def": "One full pass over the training data. Training usually runs many epochs.",
+  "hint": "",
+  "see": "{ch:trainer}"
+ },
+ "Evaluation mode": {
+  "def": "Module state for inference, set by <code>Eval()</code>: dropout is off and normalization uses its running statistics. <code>Train()</code> switches back.",
+  "hint": "",
+  "see": "{ch:memory}, {ch:norm}"
+ },
+ "Finalizer": {
+  "def": "A .NET safety net that frees a tensor's memory if it was never disposed; it runs late and unpredictably.",
+  "hint": "",
+  "see": "{ch:memory}"
+ },
+ "Finite difference": {
+  "def": "An estimate of a derivative from function values: (f(x + h) − f(x − h)) / 2h. Used to check gradients.",
+  "hint": "The slope of a short chord approximates the slope of the tangent.",
+  "see": "{ch:autograd}; Pre-Calc volume <i>Numbers, Shapes, and Functions</i>, rates of change"
+ },
+ "Float32": {
+  "def": "The 32-bit floating-point number type (<code>float</code>) in which every tensor stores and computes its values; about 7 significant digits.",
+  "hint": "",
+  "see": "{ch:tensors}"
+ },
+ "GFLOP/s": {
+  "def": "Billions of floating-point operations per second; the usual measure of arithmetic throughput.",
+  "hint": "",
+  "see": "{ch:devices}, {ch:performance}"
+ },
+ "Gradient": {
+  "def": "For every parameter, how much the loss changes when that parameter is nudged; the optimizer moves each parameter against its gradient.",
+  "hint": "The vector of partial derivatives; its negative points downhill.",
+  "see": "{ch:autograd}; Activation Functions volume for gradient effects of each activation"
+ },
+ "Gradient accumulation": {
+  "def": "Summing gradients over several smaller batches before one optimizer step, to emulate a larger batch.",
+  "hint": "",
+  "see": "{ch:autograd}"
+ },
+ "InUse": {
+  "def": "Bytes of device memory currently held by live tensors, as reported by <code>MemoryUsage.InUse</code>.",
+  "hint": "",
+  "see": "{ch:memory}"
+ },
+ "Kernel": {
+  "def": "A function that runs on the GPU in many parallel threads, one launch per operation.",
+  "hint": "",
+  "see": "{ch:cuda}"
+ },
+ "Leaf": {
+  "def": "A tensor created directly rather than by a recorded operation: data, targets, parameters. Gradients are kept on leaves.",
+  "hint": "",
+  "see": "{ch:autograd}"
+ },
+ "Loss": {
+  "def": "A single number that measures how wrong the predictions are; training minimizes it.",
+  "hint": "",
+  "see": "{ch:losses}"
+ },
+ "Matrix product": {
+  "def": "The product of an [m, k] and a [k, n] matrix: each output element is the dot product of a row and a column. <code>MatMul</code> in NeuralSharp.",
+  "hint": "Rows times columns.",
+  "see": "{ch:tensors}"
+ },
+ "Memory cache": {
+  "def": "Freed device memory blocks kept per size for reuse, so repeated steps allocate nothing new.",
+  "hint": "",
+  "see": "{ch:memory}"
+ },
+ "Memory leak": {
+  "def": "Memory that is never freed because tensors created repeatedly are neither disposed nor scoped; seen as <code>InUse</code> growing every step.",
+  "hint": "",
+  "see": "{ch:memory}"
+ },
+ "Memory limit": {
+  "def": "A cap on tensor memory per device set through <code>ComputeResources</code>; crossing it throws <code>ResourceLimitExceededException</code>.",
+  "hint": "",
+  "see": "{ch:devices}"
+ },
+ "Module": {
+  "def": "Anything that maps input tensors to output tensors and may own parameters: a layer, an activation, or a <code>Sequential</code> of them.",
+  "hint": "",
+  "see": "{ch:modules}"
+ },
+ "MSE": {
+  "def": "Mean squared error: the average of the squared differences between prediction and target. The default loss for regression.",
+  "hint": "Squaring punishes large errors more than small ones.",
+  "see": "{ch:losses}"
+ },
+ "NoGrad": {
+  "def": "A scope in which operations are not recorded for autograd; used for inference and evaluation.",
+  "hint": "",
+  "see": "{ch:autograd}"
+ },
+ "Normal distribution": {
+  "def": "The bell-shaped distribution of values around a mean with a given standard deviation; used to initialize weights and add noise.",
+  "hint": "About 68% of values lie within one standard deviation of the mean.",
+  "see": "{ch:tensors}; any introductory statistics text"
+ },
+ "One-hot": {
+  "def": "A vector of zeros with a single 1 at the position of a class index.",
+  "hint": "",
+  "see": "{ch:tensors}, {ch:losses}"
+ },
+ "Optimizer": {
+  "def": "The object that updates parameters from their gradients: <code>Sgd</code>, <code>Adam</code>, <code>AdamW</code>.",
+  "hint": "",
+  "see": "{ch:optimizers}"
+ },
+ "Parameter": {
+  "def": "A tensor the network learns (weights and biases). Created with gradient tracking on and exposed through <code>Module.Parameters()</code>.",
+  "hint": "",
+  "see": "{ch:modules}"
+ },
+ "PTX": {
+  "def": "NVIDIA's portable GPU assembly language. NeuralSharp writes its kernels in PTX; the driver compiles them for the installed GPU.",
+  "hint": "",
+  "see": "{ch:cuda}"
+ },
+ "Rank": {
+  "def": "The number of dimensions of a tensor: 0 for a scalar, 1 for a vector, 2 for a matrix.",
+  "hint": "",
+  "see": "{ch:tensors}"
+ },
+ "Reference counting": {
+  "def": "Tracking how many tensors share a memory block, so it is freed only when the last one is.",
+  "hint": "",
+  "see": "{ch:memory}"
+ },
+ "ReLU": {
+  "def": "Activation that keeps positive inputs and replaces negative ones with zero. Cheap and the usual default in deep networks; a unit whose input stays negative stops learning.",
+  "hint": "Gradient is 1 for positive inputs and 0 otherwise.",
+  "see": "Activation Functions volume, ReLU"
+ },
+ "Reserved": {
+  "def": "InUse + Cached: all memory the library currently holds from the system on a device.",
+  "hint": "",
+  "see": "{ch:memory}"
+ },
+ "Reshape": {
+  "def": "Viewing the same data with a different shape (same element count, same order); no copy.",
+  "hint": "",
+  "see": "{ch:tensors}"
+ },
+ "Row-major": {
+  "def": "Storage order in which the last dimension changes fastest: a matrix is stored row after row.",
+  "hint": "",
+  "see": "{ch:tensors}"
+ },
+ "Scalar": {
+  "def": "A single number; as a tensor, rank 0 with shape [].",
+  "hint": "",
+  "see": "{ch:tensors}"
+ },
+ "SGD": {
+  "def": "Stochastic gradient descent: move each parameter by −learning rate × gradient, optionally with momentum.",
+  "hint": "Step downhill in proportion to the slope.",
+  "see": "{ch:optimizers}"
+ },
+ "Shape": {
+  "def": "The list of a tensor's dimension lengths, outermost first, e.g. [32, 1, 28, 28].",
+  "hint": "",
+  "see": "{ch:tensors}"
+ },
+ "Sigmoid": {
+  "def": "Activation that squashes any number into the range 0 to 1; used for probabilities of yes/no outputs.",
+  "hint": "S-shaped curve; its slope is largest at 0 and vanishes far from it.",
+  "see": "Activation Functions volume, Sigmoid; Pre-Calc volume, exponential functions"
+ },
+ "SIMD": {
+  "def": "Single instruction, multiple data: CPU instructions that process 4 to 16 floats at once. The CPU backend uses them through <code>Vector&lt;float&gt;</code>.",
+  "hint": "",
+  "see": "{ch:devices}, {ch:cpu}"
+ },
+ "Softmax": {
+  "def": "Turns a row of scores into probabilities: exponentiate each score and divide by the row total.",
+  "hint": "Larger scores get exponentially larger shares; the row sums to 1.",
+  "see": "{ch:tensors}; Activation Functions volume, Softmax; Pre-Calc volume, exponential functions"
+ },
+ "Streaming multiprocessor": {
+  "def": "One of the GPU's independent processing units (SMs); a GPU has from a few to over a hundred, each running many threads.",
+  "hint": "",
+  "see": "{ch:devices}, {ch:cuda}"
+ },
+ "Synchronize": {
+  "def": "Waiting until all queued work on a device has finished: <code>device.Synchronize()</code>.",
+  "hint": "",
+  "see": "{ch:devices}"
+ },
+ "Tanh": {
+  "def": "Activation that squashes any number into the range −1 to 1; zero-centred, a good default for small networks.",
+  "hint": "A rescaled and shifted sigmoid.",
+  "see": "Activation Functions volume, Tanh"
+ },
+ "Tensor": {
+  "def": "An n-dimensional array of 32-bit floats with a shape and a device. The basic data type of the library.",
+  "hint": "",
+  "see": "{ch:tensors}"
+ },
+ "TensorScope": {
+  "def": "A <code>using</code> block that disposes every tensor created inside it when it ends, returning device memory to the pool.",
+  "hint": "",
+  "see": "{ch:memory}"
+ },
+ "View": {
+  "def": "A tensor that shares another tensor's memory (from <code>Reshape</code>, <code>Flatten</code>, <code>Detach</code>).",
+  "hint": "",
+  "see": "{ch:memory}"
+ },
+ "XOR": {
+  "def": "Exclusive or: the output is 1 when exactly one of two inputs is 1. The smallest problem a network without a hidden layer cannot solve.",
+  "hint": "The two classes cannot be split by one straight line.",
+  "see": "Activation Functions volume, XOR impossibility chapter"
+ }
 }

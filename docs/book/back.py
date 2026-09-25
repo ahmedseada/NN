@@ -2,6 +2,7 @@
 import ast
 import json
 import pathlib
+import re
 from gen import *
 
 HERE = pathlib.Path(__file__).parent
@@ -34,7 +35,8 @@ def glossary(chapter_files):
             continue
         e = data[term]
         hint = f' <i>Hint:</i> {e["hint"]}' if e.get("hint") else ""
-        see = f' <span class="cap">See: {e["see"]}.</span>' if e.get("see") else ""
+        see_text = re.sub(r"\{ch:(\w+)\}", lambda m: ch(m.group(1)), e.get("see", ""))
+        see = f' <span class="cap">See: {see_text}.</span>' if see_text else ""
         entries.append(f'<div class="entry"><dt>{term}</dt><dd>{e["def"]}{hint}{see}</dd></div>')
     if missing:
         raise ValueError(f"glossary.json lacks: {missing}")

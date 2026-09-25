@@ -19,21 +19,24 @@ import front
 import back
 
 HERE = pathlib.Path(__file__).parent
-CHAPTERS = ["ch01"]          # extended per Part as content groups are written
+CHAPTERS = ["ch01", "ch02", "ch03", "ch04", "ch05"]   # extended per Part as content groups are written
 PARTS = ["I"]
 
 
 def assemble():
-    chapter_html = []
-    for name in CHAPTERS:
-        mod = importlib.import_module(name)
-        chapter_html.append(esc_check(mod.build(), name))
+    """Builds every page in reading order; Contents is generated last (it needs the TOC) and inserted after the cover."""
+    body = [esc_check(front.how_to_use(), "how to use")]
+    for part in PARTS:
+        body.append(gen.partpage(part))
+        for name in CHAPTERS:
+            mod = importlib.import_module(name)
+            if mod.PART == part:
+                html = esc_check(mod.build(), name)
+                body.append(html.replace('<section class="page">', '<section class="page newpage">', 1))
     files = [HERE / f"{n}.py" for n in CHAPTERS]
-    backm = [esc_check(back.answer_key(p), f"answer key {p}") for p in PARTS]
-    backm.append(esc_check(back.glossary(files), "glossary"))
-    body = [esc_check(front.cover(), "cover"), esc_check(front.contents(), "contents")]
-    body += [c.replace('<section class="page">', '<section class="page newpage">', 1) for c in chapter_html]
-    body += backm
+    body += [esc_check(back.answer_key(p), f"answer key {p}") for p in PARTS]
+    body.append(esc_check(back.glossary(files), "glossary"))
+    body = [esc_check(front.cover(), "cover"), esc_check(front.contents(), "contents")] + body
     esc_check("".join(body), "full document body")
     css = (HERE / "style.css").read_text(encoding="utf-8")
     return f'<!doctype html><html lang="en"><head><meta charset="utf-8"><style>{css}</style></head><body>{"".join(body)}</body></html>'
