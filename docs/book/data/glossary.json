@@ -970,7 +970,7 @@
   "see": "{ch:ocr}"
  },
  "Placeholder token": {
-  "def": "A generic token such as <w0> that stands for a rare word, numbered by first appearance, so a model can match words it has never seen.",
+  "def": "A generic token such as &lt;w0&gt; that stands for a rare word, numbered by first appearance, so a model can match words it has never seen.",
   "hint": "",
   "see": "{ch:reranker}"
  },
