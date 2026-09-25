@@ -1,8 +1,11 @@
 namespace NeuralSharp.Optimizers;
 
-/// <summary>Stochastic gradient descent with optional momentum: v = μv + g; p -= lr·v.</summary>
-public sealed class Sgd(IEnumerable<Tensor> parameters, float learningRate = 0.01f, float momentum = 0f) : Optimizer(parameters, learningRate)
+/// <summary>Stochastic gradient descent with optional momentum and L2 weight decay: g += λp; v = μv + g; p -= lr·v.</summary>
+public sealed class Sgd(IEnumerable<Tensor> parameters, float learningRate = 0.01f, float momentum = 0f, float weightDecay = 0f) : Optimizer(parameters, learningRate)
 {
+    /// <summary>L2 penalty λ added to the gradients.</summary>
+    public float WeightDecay { get; } = weightDecay;
+
     private Tensor?[]? _velocity;
 
     /// <summary>Momentum factor μ (0 disables momentum).</summary>
@@ -12,6 +15,7 @@ public sealed class Sgd(IEnumerable<Tensor> parameters, float learningRate = 0.0
     public override void Step()
     {
         _velocity ??= new Tensor?[Parameters.Count];
+        ApplyCoupledWeightDecay(WeightDecay);
         for (int i = 0; i < Parameters.Count; i++)
         {
             var p = Parameters[i];

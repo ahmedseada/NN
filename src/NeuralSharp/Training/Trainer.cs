@@ -20,6 +20,15 @@ public sealed record Metric(string Name, Func<Tensor, Tensor, Tensor> BatchMean,
 
     /// <summary>Root mean squared error (in the units of the targets).</summary>
     public static Metric RootMeanSquaredError { get; } = new("rmse", Losses.MeanSquaredError, Math.Sqrt);
+
+    /// <summary>
+    /// Classification accuracy: the arg-max of each prediction row matches the arg-max of the one-hot target.
+    /// For single-column outputs it compares probabilities with 0.5 (see <see cref="BinaryAccuracy"/>).
+    /// </summary>
+    public static Metric Accuracy { get; } = new("accuracy", (p, t) => Tensor.MatchRate(p, t, 0.5f));
+
+    /// <summary>Binary accuracy for a single output column: (prediction ≥ threshold) == (target ≥ 0.5). Use threshold 0 for logits.</summary>
+    public static Metric BinaryAccuracy(float threshold = 0.5f) => new("accuracy", (p, t) => Tensor.MatchRate(p, t, threshold));
 }
 
 /// <summary>Loss and metrics of a model on a dataset.</summary>
@@ -88,6 +97,12 @@ public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tens
     /// <summary>Minimum decrease of the monitored loss that counts as an improvement.</summary>
     public double MinImprovement { get; init; }
 
+    /// <summary>Adjusts the learning rate after every epoch (e.g. <see cref="CosineAnnealing"/>).</summary>
+    public LearningRateScheduler? Scheduler { get; init; }
+
+    /// <summary>When set, gradients are clipped to this global L2 norm before each step (recommended for RNNs).</summary>
+    public float? MaxGradientNorm { get; init; }
+
     private Device Device => Model.Parameters().FirstOrDefault()?.Device ?? Device.Default;
 
     /// <summary>Trains for up to <paramref name="epochs"/> passes over <paramref name="train"/>.</summary>
@@ -139,7 +154,8 @@ public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tens
                 var batchLoss = Loss(predictions, batch.Targets);
                 Optimizer.ZeroGrad();
                 batchLoss.Backward();
-                double? gradientNorm = Telemetry.IsEnabled(TelemetryLevel.Gradients) ? GradientNorm() : null;
+                double? gradientNorm = MaxGradientNorm is { } maxNorm ? Optimizer.ClipGradientNorm(maxNorm)
+                    : Telemetry.IsEnabled(TelemetryLevel.Gradients) ? Optimizer.GradientNorm() : null;
                 Optimizer.Step();
                 Accumulate(sums, batchLoss, predictions, batch.Targets, batch.Size);
                 samples += batch.Size;
@@ -184,6 +200,7 @@ public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tens
                 Telemetry.EpochCompleted(summary);
             }
 
+            Scheduler?.Step();
             if (EarlyStoppingPatience is { } patience && epochsWithoutImprovement >= patience)
             {
                 history.StoppedEarly = true;
@@ -296,25 +313,6 @@ public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tens
         }
 
         return (values[0] / n, metrics);
-    }
-
-    private double GradientNorm()
-    {
-        double total = 0;
-        using (Autograd.NoGrad())
-        {
-            foreach (var p in Model.Parameters())
-            {
-                if (p.Grad is { } g)
-                {
-                    using var squared = g.Square();
-                    using var sum = squared.Sum();
-                    total += sum.Item();
-                }
-            }
-        }
-
-        return Math.Sqrt(total);
     }
 }
 

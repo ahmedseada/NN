@@ -56,9 +56,11 @@ foreach (var device in devices)
 Console.WriteLine($"{passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
 
-internal static class Tests
+internal static partial class Tests
 {
-    public static readonly (string Name, Action<Device> Run)[] All =
+    public static (string Name, Action<Device> Run)[] All => [.. Basic, .. Advanced];
+
+    private static readonly (string Name, Action<Device> Run)[] Basic =
     [
         ("matmul matches reference (all transposes, beta 0 and 1)", MatMulReference),
         ("element-wise ops match reference", ElementWiseReference),
@@ -513,10 +515,10 @@ internal static class Tests
     }
 
     /// <summary>Compares autograd's gradient of f at a random point with central finite differences.</summary>
-    private static void GradCheck(Device device, int[] shape, Func<Tensor, Tensor> f, bool avoidZero = false)
+    internal static void GradCheck(Device device, int[] shape, Func<Tensor, Tensor> f, bool avoidZero = false, float tolerance = 2e-2f, float scale = 1f)
     {
         var random = new Random(shape.Sum() * 31 + shape.Length);
-        var x0 = RandomArray(random, shape.Aggregate(1, (a, b) => a * b));
+        var x0 = RandomArray(random, shape.Aggregate(1, (a, b) => a * b), scale);
         if (avoidZero)
         {
             for (int i = 0; i < x0.Length; i++)
@@ -548,10 +550,10 @@ internal static class Tests
             }
         }
 
-        AssertClose(numeric, analytic, 2e-2f, "gradient");
+        AssertClose(numeric, analytic, tolerance, "gradient");
     }
 
-    private static float[] RandomArray(Random random, int n, float scale = 1f)
+    internal static float[] RandomArray(Random random, int n, float scale = 1f)
     {
         var values = new float[n];
         for (int i = 0; i < n; i++)
@@ -562,7 +564,7 @@ internal static class Tests
         return values;
     }
 
-    private static void AssertClose(float[] expected, float[] actual, float tolerance, string what)
+    internal static void AssertClose(float[] expected, float[] actual, float tolerance, string what)
     {
         Check(expected.Length == actual.Length, $"{what}: length {actual.Length}, expected {expected.Length}");
         for (int i = 0; i < expected.Length; i++)
@@ -575,7 +577,7 @@ internal static class Tests
         }
     }
 
-    private static void Check(bool condition, string message)
+    internal static void Check(bool condition, string message)
     {
         if (!condition)
         {

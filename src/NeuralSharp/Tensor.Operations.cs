@@ -83,45 +83,6 @@ public sealed partial class Tensor
 
     // ---------------------------------------------------------------- linear algebra and reductions
 
-    /// <summary>Matrix product of a [m, k] tensor with a [k, n] tensor, giving [m, n].</summary>
-    public Tensor MatMul(Tensor other)
-    {
-        ThrowIfDisposed();
-        other.ThrowIfDisposed();
-        CheckSameDevice(this, other);
-        if (Rank != 2 || other.Rank != 2 || _shape[1] != other._shape[0])
-        {
-            throw new ArgumentException($"MatMul needs shapes [m, k] and [k, n], got {FormatShape(_shape)} and {FormatShape(other._shape)}.");
-        }
-
-        long start = Telemetry.Start(TelemetryLevel.Operations);
-        int m = _shape[0], k = _shape[1], n = other._shape[1];
-        var c = Empty([m, n], Device);
-        Backend.MatMul(Storage, other.Storage, c.Storage, m, n, k, transA: false, transB: false, beta: 0f);
-
-        if (WillRecord(this, other))
-        {
-            var a = this;
-            var b = other;
-            c.Record("matmul", g =>
-            {
-                if (a.RequiresGrad)
-                {
-                    // dA += dC · Bᵀ
-                    a.Backend.MatMul(g.Storage, b.Storage, a.GradStorage(), m, k, n, transA: false, transB: true, beta: 1f);
-                }
-
-                if (b.RequiresGrad)
-                {
-                    // dB += Aᵀ · dC
-                    b.Backend.MatMul(a.Storage, g.Storage, b.GradStorage(), k, n, m, transA: true, transB: false, beta: 1f);
-                }
-            }, a, b);
-        }
-
-        return Traced("matmul", c, start);
-    }
-
     /// <summary>Sum of all elements, as a scalar tensor.</summary>
     public Tensor Sum() => Reduce(1f);
 
@@ -162,7 +123,7 @@ public sealed partial class Tensor
 
     // ---------------------------------------------------------------- implementations
 
-    private static readonly string[] UnaryNames = ["sigmoid", "tanh", "relu", "square", "abs"];
+    private static readonly string[] UnaryNames = ["sigmoid", "tanh", "relu", "square", "abs", "exp", "log", "gelu"];
 
     private Tensor Unary(UnaryOp op)
     {
@@ -214,7 +175,8 @@ public sealed partial class Tensor
     {
         a.ThrowIfDisposed();
         b.ThrowIfDisposed();
-        bool rowBroadcast = b.Rank == 1 && a.Rank >= 1 && a._shape[^1] == b._shape[0] && a.Rank != 1;
+        // b broadcasts when its shape equals the trailing dimensions of a (a bias [F] over [N, F], a mask [T, T] over [B, T, T]).
+        bool rowBroadcast = b.Rank >= 1 && b.Rank < a.Rank && a.Shape[(a.Rank - b.Rank)..].SequenceEqual(b.Shape);
         if (!rowBroadcast)
         {
             return ElementWise(BinaryOp.Add, a, b);

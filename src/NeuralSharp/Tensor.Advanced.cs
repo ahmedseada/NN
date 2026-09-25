@@ -1,0 +1,582 @@
+using System.Numerics;
+using NeuralSharp.Backends;
+using NeuralSharp.Diagnostics;
+
+namespace NeuralSharp;
+
+// N-D operations: batched matrix products, softmax, reductions along an axis, permute / narrow / concat,
+// and the internal building blocks of the normalization, embedding, convolution and pooling layers.
+public sealed partial class Tensor
+{
+    // ---------------------------------------------------------------- element-wise
+
+    /// <summary>eˣ, element-wise.</summary>
+    public Tensor Exp() => Unary(UnaryOp.Exp);
+
+    /// <summary>Natural logarithm, element-wise.</summary>
+    public Tensor Log() => Unary(UnaryOp.Log);
+
+    /// <summary>Gaussian error linear unit (tanh approximation), the usual transformer activation.</summary>
+    public Tensor Gelu() => Unary(UnaryOp.Gelu);
+
+    // ---------------------------------------------------------------- matrix products
+
+    /// <summary>
+    /// Matrix product. Supports [m, k] × [k, n] → [m, n]; batched [b, m, k] × [b, k, n] → [b, m, n];
+    /// and [..., k] × [k, n] → [..., n] (a weight shared across leading dimensions).
+    /// The transpose flags use the last two dimensions of an operand transposed, without copying.
+    /// </summary>
+    public Tensor MatMul(Tensor other, bool transposeA = false, bool transposeB = false)
+    {
+        ThrowIfDisposed();
+        other.ThrowIfDisposed();
+        CheckSameDevice(this, other);
+        if (Rank == 2 && other.Rank == 2)
+        {
+            return MatMulCore(this, other, 1, transposeA, transposeB);
+        }
+
+        if (Rank == 3 && other.Rank == 3)
+        {
+            if (_shape[0] != other._shape[0])
+            {
+                throw new ArgumentException($"Batched MatMul needs equal batch sizes, got {FormatShape(_shape)} and {FormatShape(other._shape)}.");
+            }
+
+            return MatMulCore(this, other, _shape[0], transposeA, transposeB);
+        }
+
+        if (Rank > 2 && other.Rank == 2 && !transposeA)
+        {
+            int k = _shape[^1];
+            var flat = Reshape(-1, k);
+            var product = MatMulCore(flat, other, 1, false, transposeB);
+            int[] outShape = [.. _shape[..^1], product._shape[1]];
+            return product.Reshape(outShape);
+        }
+
+        throw new ArgumentException($"MatMul does not support shapes {FormatShape(_shape)} and {FormatShape(other._shape)}.");
+    }
+
+    private static Tensor MatMulCore(Tensor a, Tensor b, int batch, bool transA, bool transB)
+    {
+        int ra = a._shape[^2], ca = a._shape[^1], rb = b._shape[^2], cb = b._shape[^1];
+        int m = transA ? ca : ra, k = transA ? ra : ca;
+        int kb = transB ? cb : rb, n = transB ? rb : cb;
+        if (k != kb)
+        {
+            throw new ArgumentException($"MatMul inner dimensions differ: {FormatShape(a._shape)}{(transA ? "ᵀ" : "")} × {FormatShape(b._shape)}{(transB ? "ᵀ" : "")}.");
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var c = Empty(a.Rank == 3 ? [batch, m, n] : [m, n], a.Device);
+        a.Backend.BatchedMatMul(a.Storage, b.Storage, c.Storage, batch, m, n, k, transA, transB, 0f);
+        if (WillRecord(a, b))
+        {
+            c.Record("matmul", g =>
+            {
+                var backend = a.Backend;
+                if (a.RequiresGrad)
+                {
+                    if (!transA)
+                    {
+                        backend.BatchedMatMul(g.Storage, b.Storage, a.GradStorage(), batch, m, k, n, false, !transB, 1f);
+                    }
+                    else
+                    {
+                        backend.BatchedMatMul(b.Storage, g.Storage, a.GradStorage(), batch, k, m, n, transB, true, 1f);
+                    }
+                }
+
+                if (b.RequiresGrad)
+                {
+                    if (!transB)
+                    {
+                        backend.BatchedMatMul(a.Storage, g.Storage, b.GradStorage(), batch, k, n, m, !transA, false, 1f);
+                    }
+                    else
+                    {
+                        backend.BatchedMatMul(g.Storage, a.Storage, b.GradStorage(), batch, n, k, m, true, transA, 1f);
+                    }
+                }
+            }, a, b);
+        }
+
+        return Traced("matmul", c, start);
+    }
+
+    // ---------------------------------------------------------------- softmax and classification
+
+    /// <summary>Softmax over the last dimension: each row becomes a probability distribution.</summary>
+    public Tensor Softmax() => SoftmaxCore(log: false);
+
+    /// <summary>log(softmax(x)) over the last dimension, computed stably (used by cross-entropy).</summary>
+    public Tensor LogSoftmax() => SoftmaxCore(log: true);
+
+    private Tensor SoftmaxCore(bool log)
+    {
+        ThrowIfDisposed();
+        RequireRank(1, log ? "LogSoftmax" : "Softmax");
+        int cols = _shape[^1], rows = cols == 0 ? 0 : Size / cols;
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty(_shape, Device);
+        Backend.Softmax(Storage, y.Storage, rows, cols, log);
+        string name = log ? "log_softmax" : "softmax";
+        if (WillRecord(this))
+        {
+            var x = this;
+            y.Record(name, g => x.Backend.SoftmaxBackward(y.Storage, g.Storage, x.GradStorage(), rows, cols, log), x);
+        }
+
+        return Traced(name, y, start);
+    }
+
+    /// <summary>Index of the largest value along the last dimension (as floats); the result drops that dimension.</summary>
+    public Tensor ArgMax()
+    {
+        ThrowIfDisposed();
+        RequireRank(1, "ArgMax");
+        int cols = _shape[^1], rows = cols == 0 ? 0 : Size / cols;
+        var y = Empty(_shape[..^1], Device);
+        Backend.ArgMax(Storage, y.Storage, rows, cols);
+        return y;
+    }
+
+    /// <summary>
+    /// Fraction of rows predicted correctly, as a scalar: argmax match for multi-column outputs, or
+    /// (prediction ≥ threshold) == (target ≥ 0.5) for a single column.
+    /// </summary>
+    internal static Tensor MatchRate(Tensor predictions, Tensor targets, float threshold)
+    {
+        CheckSameShape(predictions, targets);
+        int cols = predictions._shape[^1], rows = cols == 0 ? 0 : predictions.Size / cols;
+        using var matches = Empty([rows], predictions.Device, track: false);
+        predictions.Backend.ClassMatch(predictions.Storage, targets.Storage, matches.Storage, rows, cols, threshold);
+        using (Autograd.NoGrad())
+        {
+            return matches.Mean();
+        }
+    }
+
+    // ---------------------------------------------------------------- reductions along a dimension
+
+    /// <summary>Sums along <paramref name="dim"/> (negative counts from the end); keepDim leaves it as size 1.</summary>
+    public Tensor Sum(int dim, bool keepDim = false) => ReduceAxis(dim, keepDim, mean: false);
+
+    /// <summary>Averages along <paramref name="dim"/> (negative counts from the end); keepDim leaves it as size 1.</summary>
+    public Tensor Mean(int dim, bool keepDim = false) => ReduceAxis(dim, keepDim, mean: true);
+
+    private Tensor ReduceAxis(int dim, bool keepDim, bool mean)
+    {
+        ThrowIfDisposed();
+        dim = NormalizeDim(dim);
+        var (outer, size, inner) = Split(dim);
+        float scale = mean && size > 0 ? 1f / size : 1f;
+        int[] shape = keepDim ? [.. _shape[..dim], 1, .. _shape[(dim + 1)..]] : [.. _shape[..dim], .. _shape[(dim + 1)..]];
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty(shape, Device);
+        Backend.SumAxis(Storage, y.Storage, outer, size, inner, scale, accumulate: false);
+        if (WillRecord(this))
+        {
+            var x = this;
+            y.Record("sum_axis", g => x.Backend.BroadcastAxis(g.Storage, x.GradStorage(), outer, size, inner, scale), x);
+        }
+
+        return Traced("sum_axis", y, start);
+    }
+
+    // ---------------------------------------------------------------- shape operations
+
+    /// <summary>Reorders dimensions: output dimension k is input dimension <paramref name="dims"/>[k]. Copies the data.</summary>
+    public Tensor Permute(params ReadOnlySpan<int> dims)
+    {
+        ThrowIfDisposed();
+        if (dims.Length != Rank)
+        {
+            throw new ArgumentException($"Permute needs {Rank} dimensions, got {dims.Length}.");
+        }
+
+        int[] perm = [.. dims];
+        var seen = new bool[Rank];
+        for (int k = 0; k < Rank; k++)
+        {
+            perm[k] = NormalizeDim(perm[k]);
+            if (seen[perm[k]])
+            {
+                throw new ArgumentException($"Permute dimensions must be distinct: [{string.Join(", ", dims.ToArray())}].");
+            }
+
+            seen[perm[k]] = true;
+        }
+
+        var strides = Strides(_shape);
+        int[] outShape = [.. perm.Select(p => _shape[p])];
+        int[] inStrides = [.. perm.Select(p => strides[p])];
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty(outShape, Device);
+        Backend.Permute(Storage, y.Storage, outShape, inStrides, accumulate: false);
+        if (WillRecord(this))
+        {
+            var x = this;
+            var yStrides = Strides(outShape);
+            var inverse = new int[Rank];
+            for (int k = 0; k < Rank; k++)
+            {
+                inverse[perm[k]] = k;
+            }
+
+            int[] backStrides = [.. inverse.Select(k => yStrides[k])];
+            y.Record("permute", g => x.Backend.Permute(g.Storage, x.GradStorage(), x._shape, backStrides, accumulate: true), x);
+        }
+
+        return Traced("permute", y, start);
+    }
+
+    /// <summary>Swaps two dimensions (copies the data).</summary>
+    public Tensor Transpose(int dim0 = -2, int dim1 = -1)
+    {
+        int[] perm = [.. Enumerable.Range(0, Rank)];
+        (perm[NormalizeDim(dim0)], perm[NormalizeDim(dim1)]) = (perm[NormalizeDim(dim1)], perm[NormalizeDim(dim0)]);
+        return Permute(perm);
+    }
+
+    /// <summary>Merges dimensions from <paramref name="startDim"/> onward into one, e.g. [N, C, H, W] → [N, C·H·W].</summary>
+    public Tensor Flatten(int startDim = 1)
+    {
+        startDim = NormalizeDim(startDim);
+        return Reshape([.. _shape[..startDim], -1]);
+    }
+
+    /// <summary>The slice [start, start + length) along <paramref name="dim"/> (copied).</summary>
+    public Tensor Narrow(int dim, int start, int length)
+    {
+        ThrowIfDisposed();
+        dim = NormalizeDim(dim);
+        if (start < 0 || length < 0 || start + length > _shape[dim])
+        {
+            throw new ArgumentOutOfRangeException(nameof(start), $"Narrow [{start}, {start + length}) is outside dimension {dim} of size {_shape[dim]}.");
+        }
+
+        var (outer, size, inner) = Split(dim);
+        int[] shape = [.. _shape];
+        shape[dim] = length;
+        long t0 = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty(shape, Device);
+        Backend.Copy2D(Storage, start * inner, size * inner, y.Storage, 0, length * inner, outer, length * inner, accumulate: false);
+        if (WillRecord(this))
+        {
+            var x = this;
+            y.Record("narrow", g => x.Backend.Copy2D(g.Storage, 0, length * inner, x.GradStorage(), start * inner, size * inner, outer, length * inner, accumulate: true), x);
+        }
+
+        return Traced("narrow", y, t0);
+    }
+
+    /// <summary>Joins tensors along an existing dimension; all other dimensions must match.</summary>
+    public static Tensor Concat(IReadOnlyList<Tensor> tensors, int dim = 0)
+    {
+        if (tensors.Count == 0)
+        {
+            throw new ArgumentException("Concat needs at least one tensor.", nameof(tensors));
+        }
+
+        var first = tensors[0];
+        dim = first.NormalizeDim(dim);
+        int total = 0;
+        foreach (var t in tensors)
+        {
+            t.ThrowIfDisposed();
+            CheckSameDevice(first, t);
+            if (t.Rank != first.Rank || !t.Shape[..dim].SequenceEqual(first.Shape[..dim]) || !t.Shape[(dim + 1)..].SequenceEqual(first.Shape[(dim + 1)..]))
+            {
+                throw new ArgumentException($"Concat along {dim}: shape {FormatShape(t._shape)} does not match {FormatShape(first._shape)}.");
+            }
+
+            total += t._shape[dim];
+        }
+
+        var (outer, _, inner) = first.Split(dim);
+        int[] shape = [.. first._shape];
+        shape[dim] = total;
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty(shape, first.Device);
+        int offset = 0;
+        var offsets = new int[tensors.Count];
+        for (int i = 0; i < tensors.Count; i++)
+        {
+            var t = tensors[i];
+            offsets[i] = offset;
+            int width = t._shape[dim] * inner;
+            first.Backend.Copy2D(t.Storage, 0, width, y.Storage, offset * inner, total * inner, outer, width, accumulate: false);
+            offset += t._shape[dim];
+        }
+
+        if (Autograd.IsEnabled && tensors.Any(t => t.RequiresGrad))
+        {
+            var inputs = tensors.ToArray();
+            y.Record("concat", g =>
+            {
+                for (int i = 0; i < inputs.Length; i++)
+                {
+                    var t = inputs[i];
+                    if (t.RequiresGrad)
+                    {
+                        int width = t._shape[dim] * inner;
+                        t.Backend.Copy2D(g.Storage, offsets[i] * inner, total * inner, t.GradStorage(), 0, width, outer, width, accumulate: true);
+                    }
+                }
+            }, inputs);
+        }
+
+        return Traced("concat", y, start);
+    }
+
+    /// <summary>Stacks equally shaped tensors along a new dimension, e.g. T × [N, H] → [N, T, H] with dim 1.</summary>
+    public static Tensor Stack(IReadOnlyList<Tensor> tensors, int dim = 0)
+    {
+        if (tensors.Count == 0)
+        {
+            throw new ArgumentException("Stack needs at least one tensor.", nameof(tensors));
+        }
+
+        int rank = tensors[0].Rank + 1;
+        if (dim < 0)
+        {
+            dim += rank;
+        }
+
+        var expanded = tensors.Select(t => t.Reshape([.. t._shape[..dim], 1, .. t._shape[dim..]])).ToList();
+        return Concat(expanded, dim);
+    }
+
+    // ---------------------------------------------------------------- layer building blocks (internal)
+
+    /// <summary>
+    /// Standardizes each group of a [outer, groups, inner] view to zero mean and unit variance using batch
+    /// statistics, returning the batch mean and (biased) variance for running-statistics updates.
+    /// </summary>
+    internal Tensor Normalize(int outer, int groups, int inner, float eps, out Tensor mean, out Tensor variance)
+    {
+        ThrowIfDisposed();
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        mean = Empty([groups], Device);
+        variance = Empty([groups], Device);
+        var invStd = Empty([groups], Device);
+        Backend.NormStats(Storage, mean.Storage, variance.Storage, invStd.Storage, outer, groups, inner, eps);
+        var y = Empty(_shape, Device);
+        Backend.NormApply(Storage, mean.Storage, invStd.Storage, y.Storage, outer, groups, inner);
+        if (WillRecord(this))
+        {
+            var x = this;
+            y.Record("normalize", g =>
+            {
+                using var sum1 = Empty([groups], x.Device, zeroed: true, track: false);
+                using var sum2 = Empty([groups], x.Device, zeroed: true, track: false);
+                x.Backend.GroupReduce(g.Storage, y.Storage, sum1.Storage, sum2.Storage, outer, groups, inner);
+                x.Backend.NormBackward(g.Storage, y.Storage, sum1.Storage, sum2.Storage, invStd.Storage, x.GradStorage(), outer, groups, inner);
+            }, x);
+        }
+
+        return Traced("normalize", y, start);
+    }
+
+    /// <summary>Standardizes with fixed statistics (evaluation mode): (x - mean[g]) * invStd[g].</summary>
+    internal Tensor NormalizeWith(Tensor mean, Tensor invStd, int outer, int groups, int inner)
+    {
+        ThrowIfDisposed();
+        var y = Empty(_shape, Device);
+        Backend.NormApply(Storage, mean.Storage, invStd.Storage, y.Storage, outer, groups, inner);
+        if (WillRecord(this))
+        {
+            var x = this;
+            y.Record("normalize", g => x.Backend.GroupScaleShift(g.Storage, invStd.Storage, null, x.GradStorage(), x.Size, groups, inner, accumulate: true), x);
+        }
+
+        return y;
+    }
+
+    /// <summary>y = x * scale[g] + shift[g] with g = (i / inner) % groups (per-channel or per-feature affine).</summary>
+    internal Tensor GroupAffine(Tensor? scale, Tensor? shift, int groups, int inner)
+    {
+        ThrowIfDisposed();
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty(_shape, Device);
+        Backend.GroupScaleShift(Storage, scale?.Storage, shift?.Storage, y.Storage, Size, groups, inner, accumulate: false);
+        var x = this;
+        bool record = Autograd.IsEnabled && (x.RequiresGrad || scale?.RequiresGrad == true || shift?.RequiresGrad == true);
+        if (record)
+        {
+            int outer = Size / (groups * inner);
+            Tensor[] inputs = [x, .. new[] { scale, shift }.OfType<Tensor>()];
+            y.Record("group_affine", g =>
+            {
+                var backend = x.Backend;
+                if (x.RequiresGrad)
+                {
+                    backend.GroupScaleShift(g.Storage, scale?.Storage, null, x.GradStorage(), x.Size, groups, inner, accumulate: true);
+                }
+
+                bool needShift = shift?.RequiresGrad == true, needScale = scale?.RequiresGrad == true;
+                if (needShift || needScale)
+                {
+                    using var scratch = needShift ? null : Empty([groups], x.Device, zeroed: true, track: false);
+                    var sumG = needShift ? shift!.GradStorage() : scratch!.Storage;
+                    backend.GroupReduce(g.Storage, needScale ? x.Storage : null, sumG, needScale ? scale!.GradStorage() : null, outer, groups, inner);
+                }
+            }, inputs);
+        }
+
+        return Traced("group_affine", y, start);
+    }
+
+    /// <summary>Embedding lookup: rows of this [vocabulary, dim] table selected by integer-valued <paramref name="indices"/>.</summary>
+    internal Tensor EmbeddingLookup(Tensor indices)
+    {
+        ThrowIfDisposed();
+        indices.ThrowIfDisposed();
+        CheckSameDevice(this, indices);
+        int vocabulary = _shape[0], dim = _shape[1];
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty([.. indices._shape, dim], Device);
+        Backend.Gather(Storage, indices.Storage, y.Storage, indices.Size, dim, vocabulary);
+        if (WillRecord(this))
+        {
+            var table = this;
+            y.Record("embedding", g => table.Backend.ScatterAdd(g.Storage, indices.Storage, table.GradStorage(), indices.Size, dim, vocabulary), table);
+        }
+
+        return Traced("embedding", y, start);
+    }
+
+    /// <summary>Unfolds [N, C, H, W] into [N·OH·OW, C·KH·KW] patch rows for convolution as a matrix product.</summary>
+    internal Tensor Im2Col(in ConvGeometry geometry)
+    {
+        ThrowIfDisposed();
+        var g0 = geometry;
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty([g0.Positions, g0.PatchSize], Device);
+        Backend.Im2Col(Storage, y.Storage, g0);
+        if (WillRecord(this))
+        {
+            var x = this;
+            y.Record("im2col", g => x.Backend.Col2Im(g.Storage, x.GradStorage(), g0), x);
+        }
+
+        return Traced("im2col", y, start);
+    }
+
+    /// <summary>2-D max pooling of [N, C, H, W].</summary>
+    internal Tensor MaxPool(in ConvGeometry geometry)
+    {
+        ThrowIfDisposed();
+        var g0 = geometry;
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty([g0.N, g0.C, g0.OH, g0.OW], Device);
+        var argmax = Empty([y.Size], Device);
+        Backend.MaxPool(Storage, y.Storage, argmax.Storage, g0);
+        if (WillRecord(this))
+        {
+            var x = this;
+            y.Record("maxpool", g => x.Backend.MaxPoolBackward(g.Storage, argmax.Storage, x.GradStorage(), y.Size), x);
+        }
+
+        return Traced("maxpool", y, start);
+    }
+
+    // ---------------------------------------------------------------- helpers
+
+    internal int NormalizeDim(int dim)
+    {
+        int d = dim < 0 ? dim + Rank : dim;
+        if ((uint)d >= (uint)Rank)
+        {
+            throw new ArgumentOutOfRangeException(nameof(dim), dim, $"Dimension out of range for shape {FormatShape(_shape)}.");
+        }
+
+        return d;
+    }
+
+    /// <summary>Views the shape as [outer, shape[dim], inner].</summary>
+    internal (int Outer, int Size, int Inner) Split(int dim)
+    {
+        int outer = 1, inner = 1;
+        for (int i = 0; i < dim; i++)
+        {
+            outer *= _shape[i];
+        }
+
+        for (int i = dim + 1; i < Rank; i++)
+        {
+            inner *= _shape[i];
+        }
+
+        return (outer, _shape[dim], inner);
+    }
+
+    private static int[] Strides(ReadOnlySpan<int> shape)
+    {
+        var strides = new int[shape.Length];
+        int stride = 1;
+        for (int i = shape.Length - 1; i >= 0; i--)
+        {
+            strides[i] = stride;
+            stride *= shape[i];
+        }
+
+        return strides;
+    }
+
+    private void RequireRank(int minimum, string operation)
+    {
+        if (Rank < minimum)
+        {
+            throw new InvalidOperationException($"{operation} needs at least {minimum} dimension(s), got {FormatShape(_shape)}.");
+        }
+    }
+
+    // ---------------------------------------------------------------- other number types
+
+    /// <summary>
+    /// Creates a tensor from any numeric type (double, int, byte, Half, decimal, ...). Values are converted
+    /// to float32, the type every kernel computes in.
+    /// </summary>
+    public static Tensor From<T>(ReadOnlySpan<T> values, ReadOnlySpan<int> shape, Device? device = null, bool requiresGrad = false)
+        where T : INumberBase<T>
+    {
+        var converted = GC.AllocateUninitializedArray<float>(values.Length);
+        for (int i = 0; i < values.Length; i++)
+        {
+            converted[i] = float.CreateSaturating(values[i]);
+        }
+
+        return From(converted, shape, device, requiresGrad);
+    }
+
+    /// <summary>Creates a 2-D tensor from a rectangular array of any numeric type.</summary>
+    public static Tensor From<T>(T[,] values, Device? device = null, bool requiresGrad = false)
+        where T : INumberBase<T>
+    {
+        var flat = new T[values.Length];
+        int i = 0;
+        foreach (var v in values)
+        {
+            flat[i++] = v;
+        }
+
+        return From<T>(flat, [values.GetLength(0), values.GetLength(1)], device, requiresGrad);
+    }
+
+    /// <summary>Copies the elements into an array of any numeric type (saturating on overflow; truncating toward zero for integers).</summary>
+    public T[] ToArray<T>()
+        where T : INumberBase<T>
+    {
+        var values = ToArray();
+        var result = new T[values.Length];
+        for (int i = 0; i < values.Length; i++)
+        {
+            result[i] = T.CreateSaturating(values[i]);
+        }
+
+        return result;
+    }
+}

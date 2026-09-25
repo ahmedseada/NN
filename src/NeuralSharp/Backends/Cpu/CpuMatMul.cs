@@ -18,15 +18,20 @@ internal static class CpuMatMul
     /// <summary>m * n * k above which row blocks run in parallel.</summary>
     private const long ParallelWork = 1L << 17;
 
-    public static void Multiply(float[] a, float[] b, float[] c, int m, int n, int k, bool transA, bool transB, float beta)
+    public static void Multiply(float[] a, float[] b, float[] c, int m, int n, int k, bool transA, bool transB, float beta) =>
+        Multiply(a, 0, b, 0, c, 0, m, n, k, transA, transB, beta);
+
+    /// <summary>Multiplies the matrices starting at the given element offsets of each array.</summary>
+    public static void Multiply(float[] a, int aOffset, float[] b, int bOffset, float[] c, int cOffset, int m, int n, int k, bool transA, bool transB, float beta)
     {
         float[]? rented = null;
         if (transB)
         {
             // B is stored [n, k]; transpose it once into [k, n] so the kernel always streams contiguous B rows.
             rented = ArrayPool<float>.Shared.Rent(k * n);
-            Transpose(b, rented, n, k);
+            Transpose(b, bOffset, rented, n, k);
             b = rented;
+            bOffset = 0;
         }
 
         // Element (i, p) of op(A) lives at a[i * rowStride + p * colStride].
@@ -38,13 +43,14 @@ internal static class CpuMatMul
         {
             for (int block = 0; block < blocks; block++)
             {
-                RunBlock(a, b, c, block, m, n, k, rowStride, colStride, beta);
+                RunBlock(a, aOffset, b, bOffset, c, cOffset, block, m, n, k, rowStride, colStride, beta);
             }
         }
         else
         {
             float[] bb = b;
-            Parallel.For(0, blocks, ComputeResources.ParallelOptions, block => RunBlock(a, bb, c, block, m, n, k, rowStride, colStride, beta));
+            int bo = bOffset;
+            Parallel.For(0, blocks, ComputeResources.ParallelOptions, block => RunBlock(a, aOffset, bb, bo, c, cOffset, block, m, n, k, rowStride, colStride, beta));
         }
 
         if (rented is not null)
@@ -53,7 +59,7 @@ internal static class CpuMatMul
         }
     }
 
-    private static void Transpose(float[] src, float[] dst, int rows, int cols)
+    private static void Transpose(float[] src, int srcOffset, float[] dst, int rows, int cols)
     {
         const int Tile = 32;
         for (int r0 = 0; r0 < rows; r0 += Tile)
@@ -66,18 +72,18 @@ internal static class CpuMatMul
                 {
                     for (int col = c0; col < c1; col++)
                     {
-                        dst[col * rows + r] = src[r * cols + col];
+                        dst[col * rows + r] = src[srcOffset + r * cols + col];
                     }
                 }
             }
         }
     }
 
-    private static void RunBlock(float[] a, float[] b, float[] c, int block, int m, int n, int k, nint rowStride, nint colStride, float beta)
+    private static void RunBlock(float[] a, int aOffset, float[] b, int bOffset, float[] c, int cOffset, int block, int m, int n, int k, nint rowStride, nint colStride, float beta)
     {
-        ref float ra = ref MemoryMarshal.GetArrayDataReference(a);
-        ref float rb = ref MemoryMarshal.GetArrayDataReference(b);
-        ref float rc = ref MemoryMarshal.GetArrayDataReference(c);
+        ref float ra = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(a), aOffset);
+        ref float rb = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(b), bOffset);
+        ref float rc = ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(c), cOffset);
         int i0 = block * Mr;
         int rows = Math.Min(Mr, m - i0);
         int j = 0;

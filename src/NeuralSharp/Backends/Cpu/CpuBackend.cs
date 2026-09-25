@@ -14,7 +14,7 @@ internal sealed class CpuStorage(CpuBackend backend, float[] data, int length) :
 /// <see cref="Parallel"/> for large tensors. Small tensors stay on the calling thread so
 /// tiny networks are not dominated by scheduling overhead.
 /// </summary>
-internal sealed class CpuBackend : Backend
+internal sealed partial class CpuBackend : Backend
 {
     public static readonly CpuBackend Instance = new();
 
@@ -106,6 +106,9 @@ internal sealed class CpuBackend : Backend
             case UnaryOp.Relu: Run(new ReluKernel(D(x), D(y)), n); break;
             case UnaryOp.Square: Run(new SquareKernel(D(x), D(y)), n); break;
             case UnaryOp.Abs: Run(new AbsKernel(D(x), D(y)), n); break;
+            case UnaryOp.Exp: Run(new ExpKernel(D(x), D(y)), n); break;
+            case UnaryOp.Log: Run(new LogKernel(D(x), D(y)), n); break;
+            case UnaryOp.Gelu: Run(new GeluKernel(D(x), D(y)), n); break;
             default: throw new ArgumentOutOfRangeException(nameof(op));
         }
     }
@@ -119,6 +122,9 @@ internal sealed class CpuBackend : Backend
             case UnaryOp.Relu: Run(new ReluBackwardKernel(D(x), D(dy), D(dx)), n); break;
             case UnaryOp.Square: Run(new SquareBackwardKernel(D(x), D(dy), D(dx)), n); break;
             case UnaryOp.Abs: Run(new AbsBackwardKernel(D(x), D(dy), D(dx)), n); break;
+            case UnaryOp.Exp: Run(new MulAddKernel(D(dy), D(y), D(dx)), n); break;
+            case UnaryOp.Log: Run(new LogBackwardKernel(D(x), D(dy), D(dx)), n); break;
+            case UnaryOp.Gelu: Run(new GeluBackwardKernel(D(x), D(dy), D(dx)), n); break;
             default: throw new ArgumentOutOfRangeException(nameof(op));
         }
     }
@@ -193,8 +199,6 @@ internal sealed class CpuBackend : Backend
         Run(new AffineKernel(D(y), D(y), 1f, value), n);
     }
 
-    public override void MatMul(Storage a, Storage b, Storage c, int m, int n, int k, bool transA, bool transB, float beta) =>
-        CpuMatMul.Multiply(D(a), D(b), D(c), m, n, k, transA, transB, beta);
 
     public override void SgdStep(Storage p, Storage g, Storage? v, int n, float lr, float momentum)
     {
@@ -220,7 +224,7 @@ internal sealed class CpuBackend : Backend
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static float[] D(Storage s) => ((CpuStorage)s).Data;
+    internal static float[] D(Storage s) => ((CpuStorage)s).Data;
 
     private static double SumSpan(ReadOnlySpan<float> x)
     {
@@ -252,7 +256,7 @@ internal sealed class CpuBackend : Backend
     }
 
     /// <summary>Runs a range kernel inline for small inputs and in parallel chunks for large ones.</summary>
-    private static void Run<TKernel>(TKernel kernel, int n)
+    internal static void Run<TKernel>(TKernel kernel, int n)
         where TKernel : struct, IRangeKernel
     {
         if (n < ParallelThreshold || !ComputeResources.AllowParallel)
@@ -270,7 +274,7 @@ internal sealed class CpuBackend : Backend
         });
     }
 
-    private interface IRangeKernel
+    internal interface IRangeKernel
     {
         void Execute(int start, int end);
     }
@@ -604,7 +608,7 @@ internal sealed class CpuBackend : Backend
         }
     }
 
-    private readonly struct MulAddKernel(float[] a, float[] b, float[] c) : IRangeKernel
+    internal readonly struct MulAddKernel(float[] a, float[] b, float[] c) : IRangeKernel
     {
         public void Execute(int start, int end)
         {

@@ -30,13 +30,87 @@ public sealed class Dataset
     private readonly float[] _features;
     private readonly float[] _targets;
 
-    private Dataset(float[] features, float[] targets, int count, IReadOnlyList<string> featureNames, IReadOnlyList<string> targetNames)
+    private Dataset(float[] features, float[] targets, int count, IReadOnlyList<string> featureNames, IReadOnlyList<string> targetNames, int[]? featureShape = null)
     {
         _features = features;
         _targets = targets;
         Count = count;
         FeatureNames = featureNames;
         TargetNames = targetNames;
+        FeatureShape = featureShape ?? [featureNames.Count];
+    }
+
+    /// <summary>
+    /// The shape of one sample's features: [FeatureCount] for tabular data, [C, H, W] for images, [T] for
+    /// token sequences. Batches from a <see cref="DataLoader"/> have shape [batch, ..FeatureShape].
+    /// </summary>
+    public IReadOnlyList<int> FeatureShape { get; }
+
+    /// <summary>Returns the same data with each sample's features viewed as <paramref name="shape"/> (e.g. [1, 28, 28]).</summary>
+    public Dataset WithFeatureShape(params int[] shape)
+    {
+        if (shape.Aggregate(1, (a, b) => a * b) != FeatureCount)
+        {
+            throw new ArgumentException($"Feature shape [{string.Join(", ", shape)}] does not hold {FeatureCount} values.");
+        }
+
+        return new Dataset(_features, _targets, Count, FeatureNames, TargetNames, shape);
+    }
+
+    /// <summary>
+    /// Creates a classification dataset: <paramref name="labels"/> are class indices in [0, classes) and become
+    /// one-hot target rows, ready for <see cref="Losses.CrossEntropy"/> and <see cref="Training.Metric.Accuracy"/>.
+    /// </summary>
+    public static Dataset FromClassLabels(float[,] features, ReadOnlySpan<int> labels, int classes, IReadOnlyList<string>? classNames = null)
+    {
+        if (features.GetLength(0) != labels.Length)
+        {
+            throw new ArgumentException($"features has {features.GetLength(0)} rows but there are {labels.Length} labels.");
+        }
+
+        var targets = OneHot(labels, classes);
+        return FromFlat(MemoryMarshalHelpers.Flatten(features), targets, labels.Length,
+            DefaultNames("x", features.GetLength(1)), classNames ?? DefaultNames("class", classes));
+    }
+
+    /// <summary>
+    /// Converts a single target column of class indices (e.g. loaded from CSV) into one-hot targets.
+    /// </summary>
+    public Dataset ToOneHot(int classes, IReadOnlyList<string>? classNames = null)
+    {
+        if (TargetCount != 1)
+        {
+            throw new InvalidOperationException($"ToOneHot needs exactly one target column of class indices, found {TargetCount}.");
+        }
+
+        var labels = new int[Count];
+        for (int i = 0; i < Count; i++)
+        {
+            float v = _targets[i];
+            labels[i] = (int)v;
+            if (labels[i] != v)
+            {
+                throw new FormatException($"Target {v} of sample {i} is not a class index.");
+            }
+        }
+
+        return new Dataset(_features, OneHot(labels, classes), Count, FeatureNames, classNames ?? DefaultNames("class", classes), [.. FeatureShape]);
+    }
+
+    private static float[] OneHot(ReadOnlySpan<int> labels, int classes)
+    {
+        var targets = new float[labels.Length * classes];
+        for (int i = 0; i < labels.Length; i++)
+        {
+            if ((uint)labels[i] >= (uint)classes)
+            {
+                throw new ArgumentOutOfRangeException(nameof(labels), $"Label {labels[i]} of sample {i} is outside [0, {classes}).");
+            }
+
+            targets[i * classes + labels[i]] = 1f;
+        }
+
+        return targets;
     }
 
     /// <summary>Number of samples (rows).</summary>
@@ -226,7 +300,7 @@ public sealed class Dataset
             GetTargets(indices[i]).CopyTo(targets.AsSpan(i * t, t));
         }
 
-        return new Dataset(features, targets, indices.Length, FeatureNames, TargetNames);
+        return new Dataset(features, targets, indices.Length, FeatureNames, TargetNames, [.. FeatureShape]);
     }
 
     /// <summary>Shuffles the samples and splits them into a training and a test set.</summary>
@@ -252,7 +326,7 @@ public sealed class Dataset
         var t = (float[])_targets.Clone();
         features?.Transform(f, FeatureCount);
         targets?.Transform(t, TargetCount);
-        return new Dataset(f, t, Count, FeatureNames, TargetNames);
+        return new Dataset(f, t, Count, FeatureNames, TargetNames, [.. FeatureShape]);
     }
 
     /// <summary>The features as a [Count, FeatureCount] array.</summary>

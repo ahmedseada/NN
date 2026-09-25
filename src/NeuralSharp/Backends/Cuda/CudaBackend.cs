@@ -14,7 +14,7 @@ internal sealed class CudaStorage(CudaBackend backend, ulong pointer, int length
 /// and reused, so a training loop stops calling cuMemAlloc after its first iteration), and all
 /// kernels are the PTX from <see cref="PtxKernels"/>, launched on the default stream.
 /// </summary>
-internal sealed unsafe class CudaBackend : Backend
+internal sealed unsafe partial class CudaBackend : Backend
 {
     private static readonly Lazy<(int Count, string Reason)> Probe = new(ProbeDriver);
     private static readonly Lazy<CudaBackend>[] Instances = CreateInstances();
@@ -81,6 +81,7 @@ internal sealed unsafe class CudaBackend : Backend
         _sgdMomentum = Fn("sgd_momentum_f32");
         _adam = Fn("adam_f32");
         _matmul = Fn("matmul_f32");
+        _kernels = PtxKernels.AdvancedNames.ToDictionary(k => k, Fn);
     }
 
     public static int DeviceCount => Probe.Value.Count;
@@ -290,6 +291,9 @@ internal sealed unsafe class CudaBackend : Backend
             UnaryOp.Relu => _relu,
             UnaryOp.Square => _square,
             UnaryOp.Abs => _abs,
+            UnaryOp.Exp => _kernels["exp_f32"],
+            UnaryOp.Log => _kernels["log_f32"],
+            UnaryOp.Gelu => _kernels["gelu_f32"],
             _ => throw new ArgumentOutOfRangeException(nameof(op)),
         };
         Launch1D(fn, n, P(x), P(y), U(n));
@@ -304,6 +308,9 @@ internal sealed unsafe class CudaBackend : Backend
             UnaryOp.Relu => _reluBwd,
             UnaryOp.Square => _squareBwd,
             UnaryOp.Abs => _absBwd,
+            UnaryOp.Exp => _kernels["exp_bwd_f32"],
+            UnaryOp.Log => _kernels["log_bwd_f32"],
+            UnaryOp.Gelu => _kernels["gelu_bwd_f32"],
             _ => throw new ArgumentOutOfRangeException(nameof(op)),
         };
         Launch1D(fn, n, P(x), P(y), P(dy), P(dx), U(n));
@@ -354,16 +361,24 @@ internal sealed unsafe class CudaBackend : Backend
 
     public override void AddBroadcastScalar(Storage s, Storage y, int n, float scale) => Launch1D(_addScalar, n, P(s), P(y), F(scale), U(n));
 
-    public override void MatMul(Storage a, Storage b, Storage c, int m, int n, int k, bool transA, bool transB, float beta)
+    public override void BatchedMatMul(Storage a, Storage b, Storage c, int batch, int m, int n, int k, bool transA, bool transB, float beta)
     {
-        if (m == 0 || n == 0)
+        if (m == 0 || n == 0 || batch == 0)
         {
             return;
         }
 
         const int T = PtxKernels.Tile;
-        Launch(_matmul, (uint)((n + T - 1) / T), (uint)((m + T - 1) / T), T, T,
-            P(a), P(b), P(c), U(m), U(n), U(k), U(transA ? 1 : 0), U(transB ? 1 : 0), F(beta));
+        const int MaxGridZ = 65535;
+        ulong mk = (ulong)m * (ulong)k, kn = (ulong)k * (ulong)n, mn = (ulong)m * (ulong)n;
+        for (int first = 0; first < batch; first += MaxGridZ)
+        {
+            int count = Math.Min(MaxGridZ, batch - first);
+            ulong offset = (ulong)first * sizeof(float);
+            Launch(_matmul, (uint)((n + T - 1) / T), (uint)((m + T - 1) / T), (uint)count, T, T,
+                P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn, U(m), U(n), U(k), U(transA ? 1 : 0), U(transB ? 1 : 0), F(beta),
+                mk, kn, mn);
+        }
     }
 
     public override void SgdStep(Storage p, Storage g, Storage? v, int n, float lr, float momentum)
@@ -405,7 +420,10 @@ internal sealed unsafe class CudaBackend : Backend
     /// Launches a kernel. Every argument is widened to a 64-bit slot; the driver reads each
     /// parameter's actual size from the slot's start, which on little-endian hosts is the value itself.
     /// </summary>
-    private void Launch(IntPtr function, uint gridX, uint gridY, uint blockX, uint blockY, params ReadOnlySpan<ulong> args)
+    private void Launch(IntPtr function, uint gridX, uint gridY, uint blockX, uint blockY, params ReadOnlySpan<ulong> args) =>
+        Launch(function, gridX, gridY, 1, blockX, blockY, args);
+
+    private void Launch(IntPtr function, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, params ReadOnlySpan<ulong> args)
     {
         MakeCurrent();
         ulong* values = stackalloc ulong[args.Length];
@@ -416,7 +434,7 @@ internal sealed unsafe class CudaBackend : Backend
             pointers[i] = &values[i];
         }
 
-        Check(cuLaunchKernel(function, gridX, gridY, 1, blockX, blockY, 1, 0, IntPtr.Zero, pointers, null), nameof(cuLaunchKernel));
+        Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, 0, IntPtr.Zero, pointers, null), nameof(cuLaunchKernel));
     }
 
     private static ulong P(Storage s) => ((CudaStorage)s).Pointer;

@@ -1,15 +1,50 @@
 namespace NeuralSharp;
 
-/// <summary>Loss functions. Each returns a scalar tensor you can call <see cref="Tensor.Backward()"/> on.</summary>
+/// <summary>
+/// Loss functions. Each returns a scalar tensor you can call <see cref="Tensor.Backward()"/> on.
+/// The intermediate tensors belong to the autograd graph and must stay alive until
+/// <see cref="Tensor.Backward()"/> runs, so they are left to the caller's <see cref="TensorScope"/>.
+/// </summary>
 public static class Losses
 {
-    /// <summary>Mean squared error: mean((prediction - target)²).</summary>
-    /// <remarks>
-    /// The intermediate tensors belong to the autograd graph and must stay alive until
-    /// <see cref="Tensor.Backward()"/> runs, so they are left to the caller's <see cref="TensorScope"/>.
-    /// </remarks>
+    /// <summary>Mean squared error: mean((prediction - target)²). The standard regression loss.</summary>
     public static Tensor MeanSquaredError(Tensor prediction, Tensor target) => (prediction - target).Square().Mean();
 
     /// <summary>Mean absolute error: mean(|prediction - target|). Less sensitive to outliers than MSE.</summary>
     public static Tensor MeanAbsoluteError(Tensor prediction, Tensor target) => (prediction - target).Abs().Mean();
+
+    /// <summary>
+    /// Multi-class cross-entropy from raw scores (logits, no softmax layer needed):
+    /// mean over rows of -Σ target · log_softmax(logits). Targets are one-hot rows (or class probabilities)
+    /// with the same shape as the logits; see <see cref="Data.Dataset.FromClassLabels"/>.
+    /// </summary>
+    /// <param name="logits">[..., classes] unnormalized scores.</param>
+    /// <param name="targets">[..., classes] one-hot or probability targets.</param>
+    /// <param name="labelSmoothing">Mixes the targets with a uniform distribution (e.g. 0.1) to reduce over-confidence.</param>
+    public static Tensor CrossEntropy(Tensor logits, Tensor targets, float labelSmoothing = 0f)
+    {
+        int classes = logits.Shape[^1];
+        int rows = classes == 0 ? 0 : logits.Size / classes;
+        var smoothed = labelSmoothing > 0f ? targets * (1f - labelSmoothing) + labelSmoothing / classes : targets;
+        return (smoothed * logits.LogSoftmax()).Sum() * (-1f / Math.Max(rows, 1));
+    }
+
+    /// <summary>
+    /// Binary cross-entropy for probabilities in (0, 1), e.g. after a <see cref="Layers.Sigmoid"/> layer:
+    /// -mean(y·log p + (1 - y)·log(1 - p)). Prefer <see cref="BinaryCrossEntropyWithLogits"/> for stability.
+    /// </summary>
+    public static Tensor BinaryCrossEntropy(Tensor probabilities, Tensor targets)
+    {
+        const float Eps = 1e-7f;
+        var positive = targets * (probabilities + Eps).Log();
+        var negative = (1f - targets) * (1f - probabilities + Eps).Log();
+        return -(positive + negative).Mean();
+    }
+
+    /// <summary>
+    /// Binary cross-entropy from raw scores, computed stably as mean(max(x, 0) - x·y + log(1 + e^-|x|)).
+    /// Use it with a final layer that has no sigmoid.
+    /// </summary>
+    public static Tensor BinaryCrossEntropyWithLogits(Tensor logits, Tensor targets) =>
+        (logits.Relu() - logits * targets + ((-logits.Abs()).Exp() + 1f).Log()).Mean();
 }

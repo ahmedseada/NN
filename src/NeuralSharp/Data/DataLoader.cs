@@ -128,7 +128,7 @@ public sealed class DataLoader : IEnumerable<Batch>
                 pending = Task.Run(() => Gather(order, next, buffers[next & 1]));
             }
 
-            var x = Tensor.From(buffer.X.AsSpan(0, size * f), [size, f], Device);
+            var x = Tensor.From(buffer.X.AsSpan(0, size * f), [size, .. Dataset.FeatureShape], Device);
             var y = Tensor.From(buffer.Y.AsSpan(0, size * t), [size, t], Device);
             yield return new Batch(x, y, b);
         }

@@ -62,3 +62,38 @@ public sealed class Dropout : Module
     /// <inheritdoc />
     public override string ToString() => $"Dropout(p={Probability})";
 }
+
+/// <summary>Gaussian error linear unit, the standard activation in transformers.</summary>
+public sealed class GELU : Module
+{
+    /// <inheritdoc />
+    protected override Tensor ForwardCore(Tensor input) => input.Gelu();
+
+    /// <inheritdoc />
+    public override string ToString() => "GELU";
+}
+
+/// <summary>
+/// Softmax over the last dimension, turning scores into probabilities. Use it for inference output only:
+/// train with raw scores and <see cref="Losses.CrossEntropy"/>, which applies log-softmax itself.
+/// </summary>
+public sealed class Softmax : Module
+{
+    /// <inheritdoc />
+    protected override Tensor ForwardCore(Tensor input) => input.Softmax();
+
+    /// <inheritdoc />
+    public override string ToString() => "Softmax";
+}
+
+/// <summary>Wraps any tensor function as a layer, e.g. <c>new Lambda(x =&gt; x.Mean(1), "MeanOverTime")</c>.</summary>
+/// <param name="function">The computation; it may use any tensor operation and is differentiated automatically.</param>
+/// <param name="name">Display name for summaries.</param>
+public sealed class Lambda(Func<Tensor, Tensor> function, string name = "Lambda") : Module
+{
+    /// <inheritdoc />
+    protected override Tensor ForwardCore(Tensor input) => function(input);
+
+    /// <inheritdoc />
+    public override string ToString() => name;
+}

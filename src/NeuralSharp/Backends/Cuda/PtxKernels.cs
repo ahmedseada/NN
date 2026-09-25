@@ -8,7 +8,7 @@ namespace NeuralSharp.Backends.Cuda;
 /// The driver JIT-compiles this text for the installed GPU when the module is loaded, so the
 /// library needs neither nvcc nor NVRTC nor any precompiled GPU binaries.
 /// </summary>
-internal static class PtxKernels
+internal static partial class PtxKernels
 {
     /// <summary>Threads per block for 1-D kernels. The reduction in <c>sum_f32</c> is unrolled for exactly this size.</summary>
     public const int BlockSize = 256;
@@ -269,6 +269,7 @@ internal static class PtxKernels
         SumRows(sb);
         Sum(sb);
         MatMul(sb);
+        BuildAdvanced(sb);
         return sb.ToString();
     }
 
@@ -289,10 +290,10 @@ internal static class PtxKernels
         sb.AppendLine(string.Join(",\n", parameters));
         sb.AppendLine(")");
         sb.AppendLine("{");
-        sb.AppendLine("    .reg .pred %p<4>;");
-        sb.AppendLine("    .reg .f32 %f<16>;");
-        sb.AppendLine("    .reg .b32 %r<8>;");
-        sb.AppendLine("    .reg .b64 %rd<4>;");
+        sb.AppendLine("    .reg .pred %p<8>;");
+        sb.AppendLine("    .reg .f32 %f<32>;");
+        sb.AppendLine("    .reg .b32 %r<32>;");
+        sb.AppendLine("    .reg .b64 %rd<16>;");
         sb.AppendLine("    .reg .u32 %i, %n;");
         sb.AppendLine("    .reg .u64 %off;");
         foreach (var p in pointers)
@@ -480,7 +481,10 @@ internal static class PtxKernels
                 .param .u32 p_k,
                 .param .u32 p_ta,
                 .param .u32 p_tb,
-                .param .f32 p_beta
+                .param .f32 p_beta,
+                .param .u32 p_sa,
+                .param .u32 p_sb,
+                .param .u32 p_sc
             )
             {
                 .reg .pred %p<8>;
@@ -510,6 +514,17 @@ internal static class PtxKernels
                 cvta.to.global.u64 %rd1, %rd1;
                 ld.param.u64 %rd2, [p_b];
                 cvta.to.global.u64 %rd2, %rd2;
+
+                // Batched mode: blockIdx.z selects the matrix triple; strides are in elements.
+                mov.u32 %r19, %ctaid.z;
+                ld.param.u32 %r20, [p_sa];
+                mul.lo.u32 %r21, %r19, %r20;
+                mul.wide.u32 %rd10, %r21, 4;
+                add.u64 %rd1, %rd1, %rd10;
+                ld.param.u32 %r20, [p_sb];
+                mul.lo.u32 %r21, %r19, %r20;
+                mul.wide.u32 %rd10, %r21, 4;
+                add.u64 %rd2, %rd2, %rd10;
 
                 // Shared addresses: this thread's slot in As/Bs, the start of its As row and its Bs column.
                 mov.u32 %r5, As;
@@ -581,6 +596,10 @@ internal static class PtxKernels
                 mul.wide.u32 %rd7, %r18, 4;
                 ld.param.u64 %rd8, [p_c];
                 cvta.to.global.u64 %rd8, %rd8;
+                ld.param.u32 %r20, [p_sc];
+                mul.lo.u32 %r21, %r19, %r20;
+                mul.wide.u32 %rd10, %r21, 4;
+                add.u64 %rd8, %rd8, %rd10;
                 add.u64 %rd9, %rd8, %rd7;
                 ld.param.f32 %f5, [p_beta];
                 setp.eq.f32 %p5, %f5, {{Zero}};

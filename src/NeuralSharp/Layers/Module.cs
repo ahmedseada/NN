@@ -12,7 +12,7 @@ namespace NeuralSharp.Layers;
 /// </summary>
 public abstract class Module : IDisposable
 {
-    private const uint FileMagic = 0x3157_534E; // "NSW1"
+    private const uint FileMagic = 0x3257_534E; // "NSW2": parameters followed by buffers
 
     /// <summary>An optional name shown in summaries and telemetry.</summary>
     public string? Name { get; set; }
@@ -123,6 +123,45 @@ public abstract class Module : IDisposable
     /// <summary>The trainable tensors of this module and its children, in a stable order.</summary>
     public virtual IEnumerable<Tensor> Parameters() => Children().SelectMany(c => c.Parameters());
 
+    /// <summary>
+    /// Non-trainable state of this module and its children (e.g. BatchNorm running statistics).
+    /// Buffers are saved with <see cref="Save"/> and moved by <see cref="To"/>, but not optimized.
+    /// </summary>
+    public virtual IEnumerable<Tensor> Buffers() => Children().SelectMany(c => c.Buffers());
+
+    /// <summary>Creates a trainable parameter (outside any <see cref="TensorScope"/>).</summary>
+    protected static Tensor CreateParameter(float[] values, int[] shape, Device device) =>
+        Tensor.Persistent(values, shape, device, requiresGrad: true);
+
+    /// <summary>Creates a non-trainable buffer (outside any <see cref="TensorScope"/>).</summary>
+    protected static Tensor CreateBuffer(float[] values, int[] shape, Device device) =>
+        Tensor.Persistent(values, shape, device, requiresGrad: false);
+
+    /// <summary>Returns <paramref name="tensor"/> on <paramref name="device"/>, disposing the original when it had to be copied.</summary>
+    protected static Tensor MoveTensor(Tensor tensor, Device device)
+    {
+        if (tensor.Device == device)
+        {
+            return tensor;
+        }
+
+        var moved = Tensor.Persistent(tensor.ToArray(), tensor.Shape, device, tensor.RequiresGrad);
+        tensor.Dispose();
+        return moved;
+    }
+
+    /// <summary>Uniform values in [-bound, bound).</summary>
+    protected static float[] UniformValues(int count, float bound, Random random)
+    {
+        var values = new float[count];
+        for (int i = 0; i < count; i++)
+        {
+            values[i] = (random.NextSingle() * 2f - 1f) * bound;
+        }
+
+        return values;
+    }
+
     /// <summary>A table of layers and parameter counts.</summary>
     public string Summary()
     {
@@ -167,7 +206,7 @@ public abstract class Module : IDisposable
     {
         using var stream = File.Create(path);
         using var writer = new BinaryWriter(stream);
-        var parameters = Parameters().ToList();
+        var parameters = Parameters().Concat(Buffers()).ToList();
         writer.Write(FileMagic);
         writer.Write(parameters.Count);
         foreach (var p in parameters)
@@ -194,7 +233,7 @@ public abstract class Module : IDisposable
     {
         using var stream = File.OpenRead(path);
         using var reader = new BinaryReader(stream);
-        var parameters = Parameters().ToList();
+        var parameters = Parameters().Concat(Buffers()).ToList();
         if (reader.ReadUInt32() != FileMagic)
         {
             throw new InvalidDataException($"{path} is not a NeuralSharp weights file.");
@@ -234,7 +273,7 @@ public abstract class Module : IDisposable
     /// <summary>Releases the device memory held by the parameters.</summary>
     public virtual void Dispose()
     {
-        foreach (var p in Parameters())
+        foreach (var p in Parameters().Concat(Buffers()))
         {
             p.Dispose();
         }

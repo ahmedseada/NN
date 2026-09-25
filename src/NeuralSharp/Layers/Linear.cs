@@ -1,7 +1,8 @@
 namespace NeuralSharp.Layers;
 
 /// <summary>
-/// Fully connected layer: y = x · W + b, mapping [batch, inFeatures] to [batch, outFeatures].
+/// Fully connected layer: y = x · W + b, mapping [..., inFeatures] to [..., outFeatures]
+/// (any leading dimensions, e.g. [batch, time, features] for sequences).
 /// Weights start Xavier/Glorot-uniform and the bias starts at zero.
 /// </summary>
 public sealed class Linear : Module
@@ -22,14 +23,8 @@ public sealed class Linear : Module
         random ??= Random.Shared;
 
         float limit = MathF.Sqrt(6f / (inFeatures + outFeatures));
-        var w = new float[inFeatures * outFeatures];
-        for (int i = 0; i < w.Length; i++)
-        {
-            w[i] = (random.NextSingle() * 2f - 1f) * limit;
-        }
-
-        Weight = Tensor.Persistent(w, [inFeatures, outFeatures], device, requiresGrad: true);
-        Bias = bias ? Tensor.Persistent(new float[outFeatures], [outFeatures], device, requiresGrad: true) : null;
+        Weight = CreateParameter(UniformValues(inFeatures * outFeatures, limit, random), [inFeatures, outFeatures], device);
+        Bias = bias ? CreateParameter(new float[outFeatures], [outFeatures], device) : null;
     }
 
     /// <summary>Number of input features.</summary>
@@ -57,20 +52,8 @@ public sealed class Linear : Module
     /// <inheritdoc />
     protected internal override void MoveTo(Device device)
     {
-        Weight = Move(Weight, device);
-        Bias = Bias is null ? null : Move(Bias, device);
-    }
-
-    private static Tensor Move(Tensor t, Device device)
-    {
-        if (t.Device == device)
-        {
-            return t;
-        }
-
-        var moved = Tensor.Persistent(t.ToArray(), t.Shape, device, requiresGrad: true);
-        t.Dispose();
-        return moved;
+        Weight = MoveTensor(Weight, device);
+        Bias = Bias is null ? null : MoveTensor(Bias, device);
     }
 
     /// <inheritdoc />
