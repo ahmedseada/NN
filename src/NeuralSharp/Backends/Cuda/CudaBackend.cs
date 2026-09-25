@@ -37,6 +37,9 @@ internal sealed unsafe partial class CudaBackend : Backend
     private readonly MemoryAccountant _memory;
     private readonly int _multiprocessors;
 
+    // Kernel name and declared parameter count per loaded function: a launch with the wrong number of arguments
+    // would make the driver read past the argument array (CUDA_ERROR_INVALID_VALUE or silent garbage).
+    private readonly Dictionary<IntPtr, (string Name, int Parameters)> _signatures = [];
     private readonly IntPtr _fill, _affine, _axpy, _mulAdd, _add, _sub, _mul;
     private readonly IntPtr _sigmoid, _tanh, _relu, _square, _abs;
     private readonly IntPtr _sigmoidBwd, _tanhBwd, _reluBwd, _squareBwd, _absBwd, _dropout;
@@ -63,6 +66,7 @@ internal sealed unsafe partial class CudaBackend : Backend
             fixed (byte* p = bytes)
             {
                 Check(cuModuleGetFunction(out IntPtr function, module, p), $"cuModuleGetFunction({kernel})");
+                _signatures[function] = (kernel, PtxKernels.ParameterCounts[kernel]);
                 return function;
             }
         }
@@ -447,6 +451,12 @@ internal sealed unsafe partial class CudaBackend : Backend
 
     private void Launch(IntPtr function, uint gridX, uint gridY, uint gridZ, uint blockX, uint blockY, params ReadOnlySpan<ulong> args)
     {
+        if (_signatures.TryGetValue(function, out var signature) && signature.Parameters != args.Length)
+        {
+            throw new InvalidOperationException(
+                $"Kernel {signature.Name} declares {signature.Parameters} parameters but was launched with {args.Length} arguments.");
+        }
+
         MakeCurrent();
         ulong* values = stackalloc ulong[args.Length];
         void** pointers = stackalloc void*[args.Length];

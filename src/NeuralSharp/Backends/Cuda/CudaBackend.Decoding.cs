@@ -35,10 +35,10 @@ internal sealed unsafe partial class CudaBackend
     public override void PenalizeRows(Storage logits, Storage work, Storage history, Storage length, int rows, int vocabulary,
         int rowStride, int rowOffset, int capacity, int lastN, float repeat, float presence, float frequency) =>
         Launch1D(K("penalize_rows_f32"), rows, P(logits), P(work), P(history), P(length),
-            U(vocabulary), U(rowStride), U(rowOffset), U(capacity), U(Math.Min(lastN, capacity)), F(repeat), F(presence), F(frequency), U(rows));
+            U(vocabulary), U(rowStride), U(rowOffset), U(capacity), U(Math.Min(lastN, capacity)), F(repeat), F(presence), F(frequency), U(rows), U(rows));
 
     public override void HistoryPush(Storage ids, Storage history, Storage length, int rows, int capacity) =>
-        Launch1D(K("history_push_f32"), rows, P(ids), P(history), P(length), U(capacity), U(rows));
+        Launch1D(K("history_push_f32"), rows, P(ids), P(history), P(length), U(capacity), U(rows), U(rows));
 
     public override bool SupportsGraphs => true;
 

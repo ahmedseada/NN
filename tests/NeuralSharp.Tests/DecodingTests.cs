@@ -12,6 +12,7 @@ internal static partial class Tests
         ("graph replay gives the same tokens as direct execution", GraphReplay),
         ("sampler: distribution, top-k, temperature, determinism, CPU parity", SamplerBehaviour),
         ("sampler: top-p, min-p, repeat/presence/frequency penalties, history", SamplerFilters),
+        ("cuda: every kernel's declared parameter count is known (launch argument check)", KernelSignatures),
     ];
 
     private static Sequential TinyGpt(Device device, int vocabulary = 11, int dim = 16, int context = 12)
@@ -246,6 +247,19 @@ internal static partial class Tests
             int differences = cpuIds.Zip(deviceIds).Count(p => p.First != p.Second);
             Check(differences <= Rows / 200, $"{differences} of {Rows} samples differ between CPU and {device} (rounding only)");
         }
+    }
+
+    // Runs without a GPU: the PTX is generated on the host. CudaBackend.Launch compares every launch's argument count
+    // with these numbers, so a missing argument fails with a clear message instead of CUDA_ERROR_INVALID_VALUE.
+    private static void KernelSignatures(Device device)
+    {
+        _ = device;
+        var counts = NeuralSharp.Backends.Cuda.PtxKernels.ParameterCounts;
+        string[] all = [.. NeuralSharp.Backends.Cuda.PtxKernels.Names, .. NeuralSharp.Backends.Cuda.PtxKernels.AdvancedNames,
+            .. NeuralSharp.Backends.Cuda.PtxKernels.DecodingNames];
+        Check(counts.Count == all.Length && all.All(k => counts.TryGetValue(k, out int n) && n > 0), $"{counts.Count} kernels parsed, {all.Length} expected");
+        Check(counts["sample_rows_f32"] == 14 && counts["penalize_rows_f32"] == 14 && counts["history_push_f32"] == 6,
+            $"sampler kernels: {counts["sample_rows_f32"]}, {counts["penalize_rows_f32"]}, {counts["history_push_f32"]}");
     }
 
     private static void SamplerFilters(Device device)

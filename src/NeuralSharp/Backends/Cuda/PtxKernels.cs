@@ -35,6 +35,13 @@ internal static partial class PtxKernels
 
     public static string Source => LazySource.Value;
 
+    private static readonly Lazy<IReadOnlyDictionary<string, int>> LazyParameterCounts = new(() =>
+        System.Text.RegularExpressions.Regex.Matches(Source, @"\.entry\s+(\w+)\s*\(([^)]*)\)")
+            .ToDictionary(m => m.Groups[1].Value, m => System.Text.RegularExpressions.Regex.Count(m.Groups[2].Value, @"\.param\b")));
+
+    /// <summary>Number of parameters each kernel declares, read from <see cref="Source"/>; every launch must pass exactly this many.</summary>
+    public static IReadOnlyDictionary<string, int> ParameterCounts => LazyParameterCounts.Value;
+
     private static string Build()
     {
         var sb = new StringBuilder();
