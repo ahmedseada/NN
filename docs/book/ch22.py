@@ -119,6 +119,16 @@ def build():
              1024      28.3        94.6
              2048      18.2        72.2
             """),
+        cpugpu("one call, two implementations",
+               """
+               using var a = Tensor.Uniform([512, 512], -1, 1, device: Device.Cpu);
+               using var c = a.MatMul(a);      // CpuMatMul: 4x16 register tiles, Parallel.For over row blocks
+               """,
+               """
+               using var a = Tensor.Uniform([512, 512], -1, 1, device: Device.Cuda());
+               using var c = a.MatMul(a);      // matmul_f32 PTX kernel: 16x16 shared-memory tiles (Chapter 23)
+               """.replace("Chapter 23", ch("cuda")),
+               "The tensor's device selects the backend; results agree to float32 rounding."),
         honestbox("Where the CPU GEMM stops scaling",
                   "<p>Performance peaks around n = 256–512 and then falls, because the kernel blocks only for registers, "
                   "not for the CPU caches: for large matrices, rows of B are re-read from main memory. Adding cache "

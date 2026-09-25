@@ -99,6 +99,16 @@
   "hint": "−[y·log p + (1 − y)·log(1 − p)].",
   "see": "{ch:losses}; Pre-Calc volume, logarithms"
  },
+ "Blazor": {
+  "def": "Microsoft's framework for web user interfaces written in C#; Blazor Server runs components on the server, where they can use NeuralSharp directly.",
+  "hint": "",
+  "see": "{ch:projecttypes}"
+ },
+ "Body and head": {
+  "def": "The shared feature-extracting layers of a network (body) and the task-specific output layers on top (head).",
+  "hint": "",
+  "see": "{ch:finetune}"
+ },
  "Bottleneck": {
   "def": "The narrowest layer of an autoencoder, which forces a compact summary of the input.",
   "hint": "",
@@ -164,6 +174,11 @@
   "hint": "",
   "see": "{ch:metrics}, {ch:binary}"
  },
+ "Class library": {
+  "def": "A .NET project that produces a reusable DLL rather than an application; the right home for model code.",
+  "hint": "",
+  "see": "{ch:projecttypes}"
+ },
  "CNN": {
   "def": "Convolutional neural network: a network built mainly from convolution and pooling layers, used for images.",
   "hint": "",
@@ -193,6 +208,11 @@
   "def": "A table counting, for each actual class, how often each class was predicted.",
   "hint": "",
   "see": "{ch:multiclass}"
+ },
+ "Container": {
+  "def": "A packaged application image (e.g. Docker) that runs the same everywhere; GPU containers need the NVIDIA Container Toolkit on the host.",
+  "hint": "",
+  "see": "{ch:projecttypes}"
  },
  "Context length": {
   "def": "The maximum number of positions a sequence model looks at in one pass.",
@@ -268,6 +288,11 @@
   "def": "A layer in which every output depends on every input through its own weight; <code>Linear</code> in NeuralSharp.",
   "hint": "",
   "see": "{ch:dense}"
+ },
+ "Dependency injection": {
+  "def": "The ASP.NET Core mechanism that creates services (such as a loaded model) and hands them to endpoints and components.",
+  "hint": "",
+  "see": "{ch:webapi}, {ch:projecttypes}"
  },
  "Detach": {
   "def": "A tensor that shares data with another but has no history, so gradients stop there.",
@@ -389,6 +414,11 @@
   "hint": "",
   "see": "{ch:memory}"
  },
+ "Fine-tuning": {
+  "def": "Continuing to train an already trained model on new data, usually with a smaller learning rate.",
+  "hint": "",
+  "see": "{ch:finetune}"
+ },
  "Finite difference": {
   "def": "An estimate of a derivative from function values: (f(x + h) − f(x − h)) / 2h. Used to check gradients.",
   "hint": "The slope of a short chord approximates the slope of the tangent.",
@@ -488,6 +518,11 @@
   "def": "Gated recurrent unit: a recurrent layer with reset and update gates and a single state; lighter than an LSTM.",
   "hint": "",
   "see": "{ch:recurrent}"
+ },
+ "Health check": {
+  "def": "An endpoint that reports whether a service is ready, used by load balancers and orchestrators.",
+  "hint": "",
+  "see": "{ch:webapi}"
  },
  "Hidden state": {
   "def": "The vector a recurrent layer carries from one time step to the next and outputs.",
@@ -634,6 +669,11 @@
   "hint": "",
   "see": "{ch:losses}, {ch:metrics}"
  },
+ "Manifest": {
+  "def": "A small file describing a saved model: name, version, architecture, features, classes, threshold, training record.",
+  "hint": "",
+  "see": "{ch:inference}"
+ },
  "MAPE": {
   "def": "Mean absolute percentage error: the average error relative to the true value.",
   "hint": "",
@@ -679,10 +719,20 @@
   "hint": "",
   "see": "{ch:metrics}"
  },
+ "Micro-batching": {
+  "def": "Collecting requests that arrive within a few milliseconds and predicting them in one batch.",
+  "hint": "",
+  "see": "{ch:inference}, {ch:webapi}"
+ },
  "Mini-batch": {
   "def": "A small subset of the training data used for one optimizer step.",
   "hint": "",
   "see": "{ch:data}"
+ },
+ "Minimal API": {
+  "def": "ASP.NET Core's lightweight style of defining HTTP endpoints with <code>app.MapGet</code>/<code>MapPost</code>.",
+  "hint": "",
+  "see": "{ch:webapi}"
  },
  "MinMaxScaler": {
   "def": "Scales each column linearly into [0, 1] using its minimum and maximum.",
@@ -698,6 +748,11 @@
   "def": "Multilayer perceptron: a stack of dense layers with activations between them.",
   "hint": "",
   "see": "{ch:dense}"
+ },
+ "Model package": {
+  "def": "Everything needed to use a trained model: weights plus preprocessing (scalers, vocabularies, class names, thresholds, configuration).",
+  "hint": "",
+  "see": "{ch:inference}"
  },
  "Module": {
   "def": "Anything that maps input tensors to output tensors and may own parameters: a layer, an activation, or a <code>Sequential</code> of them.",
@@ -728,6 +783,16 @@
   "def": "Several attention computations in parallel on slices of the vectors, recombined by a linear layer.",
   "hint": "",
   "see": "{ch:attention}"
+ },
+ "Multi-output model": {
+  "def": "A model that predicts several quantities at once from a shared body.",
+  "hint": "",
+  "see": "{ch:finetune}"
+ },
+ "Multi-task loss": {
+  "def": "A weighted sum of the losses of several outputs.",
+  "hint": "",
+  "see": "{ch:finetune}"
  },
  "NaN": {
   "def": "\"Not a number\": the result of invalid arithmetic such as 0/0 or log of a negative number; one NaN spreads through everything computed from it.",
@@ -763,6 +828,11 @@
   "def": "A vector of zeros with a single 1 at the position of a class index.",
   "hint": "",
   "see": "{ch:tensors}, {ch:losses}"
+ },
+ "OpenAPI": {
+  "def": "A standard, machine-readable description of an HTTP API; ASP.NET Core generates it and Scalar renders it as a reference page.",
+  "hint": "",
+  "see": "{ch:webapi}"
  },
  "Optimizer": {
   "def": "The object that updates parameters from their gradients: <code>Sgd</code>, <code>Adam</code>, <code>AdamW</code>.",
@@ -1019,6 +1089,11 @@
   "hint": "",
   "see": "{ch:modules}"
  },
+ "Server-sent events": {
+  "def": "A simple HTTP streaming format in which the server pushes a sequence of named events to the client.",
+  "hint": "",
+  "see": "{ch:webapi}"
+ },
  "SGD": {
   "def": "Stochastic gradient descent: move each parameter by −learning rate × gradient, optionally with momentum.",
   "hint": "Step downhill in proportion to the slope.",
@@ -1043,6 +1118,11 @@
   "def": "Single instruction, multiple data: CPU instructions that process 4 to 16 floats at once. The CPU backend uses them through <code>Vector&lt;float&gt;</code>.",
   "hint": "",
   "see": "{ch:devices}, {ch:cpu}"
+ },
+ "Singleton": {
+  "def": "A service created once and shared by the whole application.",
+  "hint": "",
+  "see": "{ch:webapi}"
  },
  "Sliding window": {
   "def": "A fixed-length stretch of consecutive values, moved along a series to create training samples.",
@@ -1204,6 +1284,11 @@
   "hint": "",
   "see": "{ch:modules}"
  },
+ "Transfer learning": {
+  "def": "Reusing what a model learned on one task to learn a related task with less data.",
+  "hint": "",
+  "see": "{ch:finetune}"
+ },
  "Transformer": {
   "def": "An architecture of stacked blocks, each attention plus a feed-forward network with residual connections and normalization.",
   "hint": "",
@@ -1254,6 +1339,11 @@
   "hint": "",
   "see": "{ch:schedules}, {ch:performance}"
  },
+ "Web API": {
+  "def": "A service that exposes functionality (here: predictions) over HTTP, usually with JSON.",
+  "hint": "",
+  "see": "{ch:webapi}"
+ },
  "Weight": {
   "def": "A learned multiplier; a layer's weights form a matrix or filter bank.",
   "hint": "",
@@ -1268,6 +1358,21 @@
   "def": "The binary file written by <code>Save</code>: every parameter and buffer with its shape, but not the architecture.",
   "hint": "",
   "see": "{ch:modules}"
+ },
+ "Windows Forms": {
+  "def": "The classic .NET framework for Windows desktop applications.",
+  "hint": "",
+  "see": "{ch:projecttypes}"
+ },
+ "Worker service": {
+  "def": "A long-running .NET background process (a Windows service, a systemd unit, a container job).",
+  "hint": "",
+  "see": "{ch:projecttypes}"
+ },
+ "WPF": {
+  "def": "Windows Presentation Foundation: the XAML-based .NET framework for Windows desktop applications.",
+  "hint": "",
+  "see": "{ch:projecttypes}"
  },
  "XOR": {
   "def": "Exclusive or: the output is 1 when exactly one of two inputs is 1. The smallest problem a network without a hidden layer cannot solve.",

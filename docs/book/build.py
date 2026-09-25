@@ -1,7 +1,10 @@
 """One pipeline (Rule 3): chapters -> HTML -> WeasyPrint -> footer stamped once (Rule 4) -> checks once (Rule 6).
 Usage: python build.py [output.pdf]"""
+import html as html_lib
 import importlib
 import io
+import subprocess
+from datetime import date
 import pathlib
 import re
 import sys
@@ -19,12 +22,18 @@ import front
 import back
 
 HERE = pathlib.Path(__file__).parent
-CHAPTERS = [f"ch{i:02d}" for i in range(1, 35)]   # extended per Part as content groups are written
-PARTS = ["I", "II", "III", "IV", "V", "VI"]
+CHAPTERS = [f"ch{i:02d}" for i in range(1, 39)]   # extended per Part as content groups are written
+PARTS = ["I", "II", "III", "IV", "V", "VI", "VII"]
 
 
-def assemble():
-    """Builds every page in reading order; Contents is generated last (it needs the TOC) and inserted after the cover."""
+VERSION = "1.0"
+
+
+def assemble(index_entries=None):
+    """Builds every page in reading order; Contents is generated last (it needs the TOC) and inserted after the cover.
+    The Index (last) is built from a previous render's page texts; None leaves a placeholder of the same structure."""
+    gen.TOC.clear()
+    gen.ANSWERS.clear()
     body = [esc_check(front.how_to_use(), "how to use")]
     for part in PARTS:
         body.append(gen.partpage(part))
@@ -36,10 +45,53 @@ def assemble():
     files = [HERE / f"{n}.py" for n in CHAPTERS]
     body += [esc_check(back.answer_key(p), f"answer key {p}") for p in PARTS]
     body.append(esc_check(back.glossary(files), "glossary"))
+    body.append(esc_check(back.outro(VERSION, commit(), date.today().isoformat()), "outro"))
+    body.append(esc_check(back.index_pages(index_entries or []), "index"))
     body = [esc_check(front.cover(), "cover"), esc_check(front.contents(), "contents")] + body
     esc_check("".join(body), "full document body")
     css = (HERE / "style.css").read_text(encoding="utf-8")
     return f'<!doctype html><html lang="en"><head><meta charset="utf-8"><style>{css}</style></head><body>{"".join(body)}</body></html>'
+
+
+def commit():
+    try:
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=HERE, capture_output=True, text=True).stdout.strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def index_terms():
+    """Glossary terms used in chapters, with the search string (parentheticals stripped, entities decoded)."""
+    terms = back.footer_terms([HERE / f"{n}.py" for n in CHAPTERS])
+    out = []
+    for t in terms:
+        search = html_lib.unescape(re.sub(r"\s*\(.*?\)", "", t)).strip()
+        if search:
+            out.append((t, search))
+    return out
+
+
+def compute_index(pdf_bytes):
+    """Per-page search of chapter body text: first Part page to the first Answer Key page; at most 10 pages per term."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    texts = [p.get_text() for p in doc]
+    start = next(i for i, t in enumerate(texts) if "PART I" in t and "Foundations" in t and "Getting Started" in t and i > 2)
+    end = next(i for i, t in enumerate(texts) if "ANSWER KEY" in t and i > start)
+    entries = []
+    for term, search in index_terms():
+        short = len(search) <= 3
+        flags = 0 if short else re.IGNORECASE
+        # word boundaries; plural s/es allowed for longer terms; "e.g."-style lookahead: not followed by ".letter"
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(search) + (r"(?:e?s)?" if not short else "") + r"(?![A-Za-z0-9])(?!\.[A-Za-z])"
+        rx = re.compile(pattern, flags)
+        pages = [i + 1 for i in range(start, end) if rx.search(texts[i].replace("\n", " "))]
+        if pages:
+            entries.append((term, pages[:10]))
+    return sorted(entries, key=lambda e: e[0].lower())
+
+
+def render(html):
+    return HTML(string=html, base_url=str(HERE)).write_pdf()
 
 
 def stamp(pdf_bytes, out_path):
@@ -92,10 +144,17 @@ def checks(path):
 
 
 if __name__ == "__main__":
-    out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else HERE / "out" / "NeuralSharp_sample.pdf")
+    out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else HERE / "out" / "NeuralSharp.pdf")
     out.parent.mkdir(exist_ok=True)
-    html = assemble()
-    stamp(HTML(string=html, base_url=str(HERE)).write_pdf(), out)
+    index, pdf, passes = None, None, 0
+    while passes < 5:                                     # iterate until Contents/Index page numbers are stable
+        passes += 1
+        pdf = render(assemble(index))
+        new_index = compute_index(pdf)
+        if new_index == index:
+            break
+        index = new_index
+    stamp(pdf, out)
     pages, body, fails = checks(out)
-    print(f"{out.name}: {pages} pages, body {body}pt")
+    print(f"{out.name}: {pages} pages, body {body}pt, {passes} layout passes, {len(index)} index terms")
     print("CHECKS: PASS" if not fails else "CHECKS: FAIL\n  " + "\n  ".join(fails[:40]))

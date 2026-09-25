@@ -138,3 +138,10 @@ code, .f, pre, .mono { font-variant-ligatures: none; font-feature-settings: "lig
 sup, sub { font-size: 7.8pt; line-height: 0; }
 /* practice + key-terms travel together at a chapter's end */
 .chapter-end { break-inside: avoid; }
+
+/* index: two columns */
+.index { columns: 2; column-gap: 8mm; font-size: 8.2pt; }
+.ixg { margin-bottom: 4pt; }
+.ixk { font-weight: 700; color: var(--teal); font-size: 9.6pt; break-after: avoid; margin-top: 3pt; }
+.ix { break-inside: avoid; padding-left: 8pt; text-indent: -8pt; line-height: 1.35; }
+.ixp { color: var(--muted); }

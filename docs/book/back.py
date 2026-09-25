@@ -45,3 +45,56 @@ def glossary(chapter_files):
                 brief("Math is only hinted at here. For the full treatment see the Pre-Calc volume "
                       "<i>Numbers, Shapes, and Functions</i> and the <i>Activation Functions</i> volume of this series."),
                 f'<dl class="gloss">{"".join(entries)}</dl>', new=True)
+
+
+def outro(version, commit, date):
+    return page(
+        topbar("BACK MATTER", "OUTRO"),
+        h1("OUTRO", "Where to Go from Here"),
+        brief("You have now seen every part of NeuralSharp, from a single tensor to a GPT served over HTTP, and "
+              "built a dozen kinds of project with it, each on the CPU and on the GPU."),
+        h2("What you can build now", toc=False),
+        reftable(["If your data is…", "Start from"], [
+            ["rows of numbers → a number", ch("regression")],
+            ["rows of numbers → yes/no", ch("binary")],
+            ["rows of numbers → one of K classes", ch("multiclass")],
+            ["a series over time → its future", ch("timeseries")],
+            ["normal records → alerts on unusual ones", ch("anomaly")],
+            ["users, items, categories", ch("recommender")],
+            ["images", ch("cnn") + ", " + ch("ocr")],
+            ["sentences or event sequences", ch("sentiment")],
+            ["text to continue", ch("gpt")],
+            ["a trained model to ship", ch("inference") + "–" + ch("projecttypes")],
+        ], caption="Table O.1 — Choosing a starting point"),
+        h2("Going deeper", toc=False),
+        para("The mathematics that this book only hints at is developed in the other volumes of the series: the "
+             "Pre-Calc volume <i>Numbers, Shapes, and Functions</i> for functions, exponentials, logarithms, "
+             "trigonometry and rates of change, and the <i>Activation Functions</i> volume for every activation, its "
+             "derivative and its effect on gradients. Inside the library, " + ch("cpu") + " and " + ch("cuda") +
+             " show where to add your own operations, and the test project shows how to verify them."),
+        h2("Colophon", toc=False),
+        reftable(["", ""], [
+            ["Book", f"NeuralSharp · The Library and Its Projects, version {version}, {date}"],
+            ["Library", f"NeuralSharp for .NET 10, repository commit {commit}"],
+            ["Examples", "Every printed output comes from a real run on a 4-core cloud CPU (AVX-512, 8-wide Vector&lt;float&gt;) "
+                         "unless marked otherwise; GPU figures quoted from runs on a laptop GeForce RTX 5050"],
+            ["Typesetting", "Generated from Python sources with WeasyPrint; Noto Sans, Noto Sans Math and JetBrains Mono"],
+        ], caption="Table O.2 — About this edition"),
+        new=True,
+    )
+
+
+def index_pages(entries):
+    """entries: list of (term, [pages]) sorted by term."""
+    groups = {}
+    for term, pages in entries:
+        key = term[0].upper() if term[0].isalpha() else "#"
+        groups.setdefault(key, []).append((term, pages))
+    blocks = []
+    for key in sorted(groups):
+        rows = "".join(f'<div class="ix"><span class="ixt">{t}</span> <span class="ixp">{", ".join(map(str, p))}</span></div>'
+                       for t, p in groups[key])
+        blocks.append(f'<div class="ixg"><div class="ixk">{key}</div>{rows}</div>')
+    return page(topbar("BACK MATTER", "INDEX"), h1("INDEX", "Index"),
+                para("Page numbers refer to the chapters (at most ten per term). Definitions are in the Glossary."),
+                f'<div class="index">{"".join(blocks)}</div>', new=True)
