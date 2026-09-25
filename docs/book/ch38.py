@@ -1,369 +1,153 @@
-"""Chapter 38 — NeuralSharp in Every .NET Project Type."""
+"""Chapter 38 — Inference Modes and Model Files in Practice."""
 from gen import *
 
 PART = "VII"
-
-LIBRARY = """
-    using NeuralSharp;
-    using NeuralSharp.Data;
-    using NeuralSharp.Layers;
-
-    namespace Pricing;
-
-    public sealed record House(float Area, float Bedrooms, float Bathrooms, float Age, float DistanceKm,
-                               float Quality, float Garage, float Pool, float Lot);
-
-    /// The house-price model as a reusable component, referenced by every application below.
-    public sealed class HousePriceModel : IDisposable
-    {
-        public const int Features = 9;
-        private readonly Sequential _model;
-        private readonly StandardScaler _features, _price;
-
-        private HousePriceModel(Sequential model, StandardScaler features, StandardScaler price, Device device)
-        {
-            _model = model; _features = features; _price = price; Device = device;
-        }
-
-        public Device Device { get; }
-
-        /// The architecture, identical in training and inference.
-        public static Sequential CreateNetwork(Device? device = null, Random? random = null) => new()
-        {
-            new Linear(Features, 64, device: device, random: random), new ReLU(), new Dropout(0.05f, random),
-            new Linear(64, 32, device: device, random: random), new ReLU(),
-            new Linear(32, 1, device: device, random: random),
-        };
-
-        public static HousePriceModel Load(string directory, Device? device = null)
-        {
-            device ??= Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu;
-            var model = CreateNetwork(device);
-            model.Load(Path.Combine(directory, "house-price.weights"));
-            model.Eval();
-            return new HousePriceModel(model,
-                StandardScaler.Load(Path.Combine(directory, "house-price.features.txt")),
-                StandardScaler.Load(Path.Combine(directory, "house-price.price.txt")), device);
-        }
-
-        public float Predict(House house) => Predict([house])[0];
-
-        public float[] Predict(IReadOnlyList<House> houses)
-        {
-            var x = new float[houses.Count * Features];
-            for (int i = 0; i < houses.Count; i++)
-            {
-                var h = houses[i];
-                float[] row = [h.Area, h.Bedrooms, h.Bathrooms, h.Age, h.DistanceKm, h.Quality, h.Garage, h.Pool, h.Lot];
-                row.CopyTo(x, i * Features);
-            }
-            _features.Transform(x, Features);
-            using var input = Tensor.From(x, [houses.Count, Features], Device);
-            using var output = _model.Predict(input);
-            var prices = output.ToArray();
-            _price.InverseTransform(prices, 1);
-            return prices;
-        }
-
-        public void Dispose() => _model.Dispose();
-    }
-"""
-
-WORKER = """
-    using Pricing;
-
-    namespace PriceWorker;
-
-    /// Watches a folder for CSV files of houses (9 columns, no header) and writes a priced copy of each.
-    public sealed class Worker(ILogger<Worker> logger, IConfiguration config) : BackgroundService
-    {
-        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-        {
-            string inbox = config["Inbox"] ?? "inbox", outbox = config["Outbox"] ?? "outbox";
-            Directory.CreateDirectory(inbox);
-            Directory.CreateDirectory(outbox);
-            using var model = HousePriceModel.Load(config["ModelDirectory"] ?? "models");
-            logger.LogInformation("Model loaded on {Device}", model.Device);
-
-            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
-            do
-            {
-                foreach (var file in Directory.GetFiles(inbox, "*.csv"))
-                {
-                    var houses = File.ReadLines(file)
-                        .Select(line => line.Split(',').Select(v => float.Parse(v, CultureInfo.InvariantCulture)).ToArray())
-                        .Select(v => new House(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]))
-                        .ToList();
-                    var prices = model.Predict(houses);                           // one batch per file
-                    await File.WriteAllLinesAsync(Path.Combine(outbox, Path.GetFileName(file)),
-                        File.ReadLines(file).Zip(prices, (line, p) => $"{line},{p:F0}"), stoppingToken);
-                    File.Delete(file);
-                    logger.LogInformation("Priced {Count} houses from {File}", houses.Count, Path.GetFileName(file));
-                }
-            }
-            while (await timer.WaitForNextTickAsync(stoppingToken));
-        }
-    }
-"""
-
-BLAZOR = """
-    @page "/price"
-    @rendermode InteractiveServer
-    @inject Pricing.HousePriceModel Model
-
-    <h3>House price</h3>
-    <label>Area (sq ft) <input type="number" @bind="area" /></label>
-    <label>Bedrooms <input type="number" @bind="bedrooms" /></label>
-    <label>Age (years) <input type="number" @bind="age" /></label>
-    <label>Quality (1-10) <input type="number" @bind="quality" /></label>
-    <button @onclick="Estimate">Estimate</button>
-    @if (price is not null)
-    {
-        <p>Estimated price: <b>@price.Value.ToString("C0")</b></p>
-    }
-
-    @code {
-        float area = 2100, bedrooms = 4, age = 15, quality = 7;
-        float? price;
-
-        void Estimate() =>
-            price = Model.Predict(new Pricing.House(area, bedrooms, 2, age, 9.5f, quality, 2, 0, 6500));
-    }
-
-    // Program.cs, after CreateBuilder:
-    builder.Services.AddSingleton(_ => Pricing.HousePriceModel.Load(builder.Configuration["ModelDirectory"] ?? "models"));
-"""
-
-TESTS = """
-    using NeuralSharp;
-    using Pricing;
-
-    public sealed class HousePriceModelTests : IDisposable
-    {
-        private static readonly string ModelDirectory = Environment.GetEnvironmentVariable("HOUSE_MODEL_DIR") ?? "models";
-        private readonly HousePriceModel _model = HousePriceModel.Load(ModelDirectory, Device.Cpu);
-
-        [Fact]
-        public void Family_house_is_priced_in_a_plausible_range()
-        {
-            float price = _model.Predict(new House(2100, 4, 2, 15, 9.5f, 7, 2, 0, 6500));
-            Assert.InRange(price, 300_000f, 500_000f);
-        }
-
-        [Fact]
-        public void Bigger_house_costs_more_all_else_equal()
-        {
-            float small = _model.Predict(new House(1200, 3, 2, 15, 9.5f, 7, 2, 0, 6500));
-            float large = _model.Predict(new House(2400, 3, 2, 15, 9.5f, 7, 2, 0, 6500));
-            Assert.True(large > small);
-        }
-
-        [Fact]
-        public void Batch_and_single_predictions_agree()
-        {
-            var houses = new[] { new House(950, 2, 1, 45, 30, 4, 0, 0, 2900), new House(4200, 5, 4, 2, 2, 10, 3, 1, 12000) };
-            float[] batch = _model.Predict(houses);
-            Assert.Equal(batch[0], _model.Predict(houses[0]), 1e-3f);
-            Assert.Equal(batch[1], _model.Predict(houses[1]), 1e-3f);
-        }
-
-        [Fact]
-        public void Gpu_matches_cpu_when_available()
-        {
-            if (!Device.IsCudaAvailable) return;                     // passes trivially without a GPU
-            using var gpu = HousePriceModel.Load(ModelDirectory, Device.Cuda());
-            var house = new House(2100, 4, 2, 15, 9.5f, 7, 2, 0, 6500);
-            Assert.Equal(_model.Predict(house), gpu.Predict(house), 1f);   // within $1
-        }
-
-        public void Dispose() => _model.Dispose();
-    }
-"""
-
-WINFORMS = """
-    using Pricing;
-
-    public partial class Form1 : Form
-    {
-        private readonly HousePriceModel _model = HousePriceModel.Load("models");
-        private readonly NumericUpDown _area = new() { Maximum = 10_000, Value = 2100, Dock = DockStyle.Top };
-        private readonly NumericUpDown _quality = new() { Minimum = 1, Maximum = 10, Value = 7, Dock = DockStyle.Top };
-        private readonly Label _result = new() { Dock = DockStyle.Top, Height = 40 };
-
-        public Form1()
-        {
-            InitializeComponent();
-            Text = $"House price ({_model.Device})";
-            var button = new Button { Text = "Estimate", Dock = DockStyle.Top };
-            button.Click += async (_, _) =>
-            {
-                var house = new House((float)_area.Value, 4, 2, 15, 9.5f, (float)_quality.Value, 2, 0, 6500);
-                float price = await Task.Run(() => _model.Predict(house));        // keep the UI thread free
-                _result.Text = $"Estimated price: {price:C0}";
-            };
-            Controls.AddRange([_result, button, _quality, _area]);
-            FormClosed += (_, _) => _model.Dispose();
-        }
-    }
-"""
-
-WPF = """
-    // MainWindow.xaml: two TextBoxes (Area, Quality), a Button (Click="Estimate_Click") and a TextBlock (Result)
-    public partial class MainWindow : Window
-    {
-        private readonly HousePriceModel _model = HousePriceModel.Load("models");
-
-        public MainWindow()
-        {
-            InitializeComponent();
-            Closed += (_, _) => _model.Dispose();
-        }
-
-        private async void Estimate_Click(object sender, RoutedEventArgs e)
-        {
-            var house = new House(float.Parse(Area.Text), 4, 2, 15, 9.5f, float.Parse(Quality.Text), 2, 0, 6500);
-            float price = await Task.Run(() => _model.Predict(house));
-            Result.Text = $"Estimated price: {price:C0}";
-        }
-    }
-"""
 
 
 def build():
     return page(
         chapter_open(
-            "projecttypes",
-            "NeuralSharp is an ordinary .NET library: any project that can reference a class library can train or "
-            "run models. This chapter packages the house-price model once as a class library and uses it from a "
-            "worker service, a web API, a Blazor app, a unit-test project, a Windows Forms app and a WPF app, all "
-            "built from the standard <code>dotnet new</code> templates and compiled for this book. It closes with "
-            "notes on containers, cloud functions, mobile and the browser.",
-            "Put the model code (factory, loading, preprocessing, prediction) in a <b>class library</b>; every application references it.",
-            "Services (web, worker, Blazor): load once as a singleton or in <code>ExecuteAsync</code>; <code>Eval()</code> once.",
-            "Desktop apps: predict on a background thread (<code>Task.Run</code>) to keep the UI responsive.",
-            "Tests: plausibility, monotonicity, batch/single agreement and CPU/GPU parity.",
-            "GPU use needs only the NVIDIA driver on the machine (or in the container); everything else is managed code.",
+            "inference",
+            "Training happens once; inference happens every time the model is used. This chapter collects what every "
+            "project in Parts V and VI did to use a trained model: which files make up a model, how the samples switch "
+            "between training and prediction with <code>--mode predict</code>, how to load on either device, and what "
+            "inference really costs: a cold first call, then microseconds per row, especially in batches.",
+            "A deployable model is a <b>package</b>: weights, plus whatever turns raw input into tensors and outputs into answers (scalers, vocabularies, class names, configuration).",
+            "Build the architecture from one factory (or from a saved configuration), then <code>Load</code>, then <code>Eval()</code> once.",
+            "<code>Predict</code> = evaluation mode + no gradients + freed intermediates.",
+            "Measured: 13.6 ms cold first call, 20.6 µs per single-row call, 1.57 µs per row in batches of 1,000.",
+            "Every sample project has an inference mode: <code>--predict</code> (or <code>--mode predict</code>) with <code>--model</code> and <code>--input</code>.",
         ),
-        h2("38.1 The pattern: one library, many front ends"),
-        reftable(["Project", "Template", "Built here", "Ran here"], [
-            ["Class library", "<code>dotnet new classlib</code>", "yes", "(used by all)"],
-            ["Console app", "<code>dotnet new console</code>", "yes (every sample)", "yes"],
-            ["Web API", "<code>dotnet new web</code>", "yes", "yes: 200 concurrent requests (" + ch("webapi") + ")"],
-            ["Worker service", "<code>dotnet new worker</code>", "yes", "yes: priced a CSV from an inbox folder"],
-            ["Blazor web app", "<code>dotnet new blazor --interactivity Server</code>", "yes", "yes: page served (HTTP 200)"],
-            ["xUnit tests", "<code>dotnet new xunit</code>", "yes", "yes: 4 passed"],
-            ["Windows Forms", "<code>dotnet new winforms</code>", "yes (EnableWindowsTargeting)", "no (Windows only)"],
-            ["WPF", "<code>dotnet new wpf</code>", "yes (EnableWindowsTargeting)", "no (Windows only)"],
-        ], caption="Table 38.1 — Project types covered, and what was verified for this book (Linux container)"),
-        deriv("Setting up the solution", [
-            "<code>dotnet new classlib -n Pricing</code>; <code>dotnet add Pricing reference path/to/NeuralSharp.csproj</code>.",
-            "Create each application with its template and <code>dotnet add &lt;App&gt; reference Pricing/Pricing.csproj</code>.",
-            "Copy the model folder (weights + scalers) next to each application, or configure its path "
-            "(<code>ModelDirectory</code> in <code>appsettings.json</code> or an environment variable).",
-            "Optionally <code>dotnet new sln</code> and <code>dotnet sln add</code> every project.",
-        ]),
-        h2("38.2 The class library"),
-        snippet(LIBRARY, caption="Pricing/HousePriceModel.cs"),
-        para("This is the house-price model of " + ch("regression") + " behind a small API: <code>CreateNetwork</code> "
-             "for training code, <code>Load</code> for applications (GPU when available, CPU otherwise, unless a device "
-             "is passed), and <code>Predict</code> for one house or a batch. It is safe to share between threads "
-             "(" + ch("inference") + ")."),
-        cpugpu("choosing the device for any application",
-               """
-               using var model = HousePriceModel.Load("models", Device.Cpu);        // always the CPU
-               """,
-               """
-               using var model = HousePriceModel.Load("models", Device.Cuda());     // a specific GPU
-               using var auto = HousePriceModel.Load("models");                     // GPU if present, else CPU
-               """,
-               "Expose the choice as a setting (" + ch("devices") + ", Section 2.3) so operators can switch without a rebuild."),
-        h2("38.3 Worker service"),
-        para("A worker service is a long-running background process (a Windows service, a Linux systemd unit, a "
-             "container). Here it watches a folder and prices every CSV file dropped into it."),
-        snippet(WORKER, caption="PriceWorker/Worker.cs (with <code>using System.Globalization;</code>)"),
-        output("""
-            $ cat inbox/batch1.csv
-            2100,4,2,15,9.5,7,2,0,6500
-            1200,3,1,30,12,5,1,0,4000
-            950,2,1,45,30,4,0,0,2900
-            $ dotnet PriceWorker.dll --ModelDirectory models --Inbox inbox --Outbox outbox
-            $ cat outbox/batch1.csv
-            2100,4,2,15,9.5,7,2,0,6500,390612
-            1200,3,1,30,12,5,1,0,4000,192873
-            950,2,1,45,30,4,0,0,2900,87454
-            """, caption="The worker at work"),
-        h2("38.4 Web API and Blazor"),
-        para("The web API is the one of " + ch("webapi") + ", with <code>PricePredictor</code> replaced by the library "
-             "class. A Blazor Server app runs its components on the server, so it can inject the model directly:"),
-        snippet(BLAZOR, caption="PriceWeb/Components/Pages/Price.razor and the registration in Program.cs"),
-        honestbox("Blazor WebAssembly and the browser",
-                  "<p>In Blazor WebAssembly the code runs inside the browser: there is no CUDA driver, and threads are limited, "
-                  "so only the CPU backend could run, single-threaded and slowly. This was not tested for this book. For "
-                  "browser front ends, keep the model on the server (Blazor Server, or a Web API called from the page), as "
-                  "the GPT sample's <code>index.html</code> does.</p>"),
-        h2("38.5 Unit tests"),
-        snippet(TESTS, caption="Pricing.Tests/HousePriceModelTests.cs"),
-        output("""
-            $ HOUSE_MODEL_DIR=/path/to/models dotnet test Pricing.Tests -c Release
-            Passed!  - Failed:     0, Passed:     4, Skipped:     0, Total:     4, Duration: 57 ms - Pricing.Tests.dll (net10.0)
-            """),
-        para("Tests of a model check behaviour, not exact numbers: plausible ranges, directions that must hold (a bigger "
-             "house is not cheaper), consistency between code paths, and parity between devices. " + ch("testing") +
-             " covers testing the library itself."),
-        h2("38.6 Desktop: Windows Forms and WPF"),
-        snippet(WINFORMS, caption="PriceDesk/Form1.cs (Windows Forms)"),
-        snippet(WPF, caption="PriceWpf/MainWindow.xaml.cs (WPF)"),
-        para("Both compile on any OS with <code>&lt;EnableWindowsTargeting&gt;true&lt;/EnableWindowsTargeting&gt;</code> in the "
-             "project file and run on Windows. Loading the model in a field initializer is fine for a small model; for large "
-             "ones, load asynchronously after the window appears. A desktop GPU is used automatically when present."),
-        honestbox(".NET MAUI (Android, iOS, Mac, Windows)",
-                  "<p>NeuralSharp is plain .NET, so the CPU backend should work in MAUI apps; the CUDA backend applies only on "
-                  "Windows desktops with NVIDIA GPUs. MAUI was not built or tested for this book. On phones, prefer small models "
-                  "and ship the weights as app resources.</p>"),
-        h2("38.7 Containers and the cloud"),
+        h2("38.1 What a model package contains"),
+        reftable(["Project", "Files", "Why each is needed"], [
+            ["House prices (" + ch("regression", None) + ")", "<code>house-price.weights</code>, <code>.features.txt</code>, <code>.price.txt</code>", "Weights; input scaling; output unscaling"],
+            ["Churn (" + ch("binary", None) + ")", "<code>churn.weights</code>, <code>churn.scaler</code> (+ chosen threshold)", "The threshold is a business decision made after training"],
+            ["Anomaly detector (" + ch("anomaly", None) + ")", "weights, scaler, threshold", "The detector is model + threshold"],
+            ["Recommender (" + ch("recommender", None) + ")", "weights, user and item id maps", "Ids must map to the same embedding rows"],
+            ["Sentiment (" + ch("sentiment", None) + ")", "weights, vocabulary", "Words must map to the same ids"],
+            ["OCR (" + ch("ocr", None) + ")", "weights, alphabet", "Class index → character"],
+            ["GPT (" + ch("gpt", None) + ")", "weights, config JSON (vocabulary, sizes, training record)", "The config rebuilds the architecture"],
+        ], caption="Table 38.1 — Model packages from this book"),
         snippet("""
-            # Dockerfile for the web API (CPU)
-            FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-            WORKDIR /src
-            COPY . .
-            RUN dotnet publish PriceApi -c Release -o /app
+            // A small manifest saved next to the weights; loading reads it first.
+            public sealed record ModelManifest(
+                string Name, int Version, string Architecture,      // e.g. "mlp-9-64-32-1"
+                string[] FeatureNames, string? TargetName,
+                string[]? ClassNames, float? Threshold,
+                DateTimeOffset TrainedAt, double ValidationScore)
+            {
+                public void Save(string path) => File.WriteAllText(path, JsonSerializer.Serialize(this));
+                public static ModelManifest Load(string path) => JsonSerializer.Deserialize<ModelManifest>(File.ReadAllText(path))!;
+            }
 
-            FROM mcr.microsoft.com/dotnet/aspnet:10.0
-            WORKDIR /app
-            COPY --from=build /app .
-            COPY models ./models
-            ENTRYPOINT ["dotnet", "PriceApi.dll"]
+            // models/house-price/v3/ : model.weights, features.scaler, price.scaler, manifest.json
+            """, caption="A pattern for versioned model folders"),
+        trap("weights without their preprocessing",
+             "<p>Weights alone are not a model. A missing scaler, vocabulary or class list produces confident nonsense rather "
+             "than an error. Save everything the prediction path needs, in one folder, and load it together.</p>"),
+        h2("38.2 Inference modes in the samples"),
+        para("Every sample project trains, saves and demonstrates the model by default, and runs inference only with "
+             "<code>--predict</code>. The shared <code>SampleOptions</code> class (samples/Shared) parses the options, "
+             "so each <code>Program.cs</code> starts with the same few lines; reuse the pattern in your own tools."),
+        reftable(["Option", "Meaning"], [
+            ["<code>--mode train|predict</code>, <code>--predict</code>", "Train and save (default), or load and predict only"],
+            ["<code>--model &lt;path&gt;</code>", "Model file to save or load (default <code>models/&lt;sample&gt;.weights</code> next to the executable)"],
+            ["<code>--input &lt;value&gt;</code>", "Sample-specific input: features, sentences, shapes, a text line, a prompt"],
+            ["<code>--data &lt;file.csv&gt;</code>", "Predict every row of a file (house prices)"],
+            ["<code>--cpu</code>, <code>--cuda</code>, <code>--device cuda:N</code>", "Where inference runs"],
+            ["<code>--threads</code>, <code>--gpu-memory</code>, <code>--cpu-memory</code>", "Resource limits (" + ch("devices") + ")"],
+            ["<code>--log inference</code>, <code>--log-file run.jsonl</code>", "Latency telemetry (" + ch("telemetry") + ")"],
+        ], caption="Table 38.2 — Sample command-line options"),
+        snippet("""
+            if (SampleOptions.Parse(args) is not { } options) return 0;      // prints help on --help or errors
+            var device = options.Device;
+            string modelPath = options.ModelPath("house-price.weights");
 
-            # For the GPU: run on a host with the NVIDIA driver and the NVIDIA Container Toolkit:
-            #   docker run --gpus all -p 8080:8080 price-api
-            # The container needs no CUDA libraries: the driver's libcuda.so.1 is mounted by the toolkit.
-            """, caption="A container image (not built for this book: no Docker in the book's environment)"),
-        reftable(["Host", "Notes"], [
-            ["Linux or Windows VM", "Any; install the NVIDIA driver on GPU VMs"],
-            ["Kubernetes", "GPU nodes with the NVIDIA device plugin; request <code>nvidia.com/gpu: 1</code>"],
-            ["Azure Functions / AWS Lambda", "CPU only; keep models small and load them once per instance (static field) to limit cold starts"],
-            ["Azure App Service / AWS App Runner", "CPU; as the web API above"],
-        ], caption="Table 38.2 — Where the applications can run"),
-        honestbox("What \"verified\" means in this chapter",
-                  "<p>The class library, worker, web API, Blazor app and tests were built and run in this book's Linux container "
-                  "on the CPU. The Windows Forms and WPF projects were compiled but, being Windows-only, not run. The Docker, "
-                  "Kubernetes, serverless and MAUI notes describe standard .NET deployment and were not exercised.</p>"),
+            if (options.PredictOnly)
+            {
+                if (!options.RequireModel(modelPath)) return 1;               // helpful message if not trained yet
+                using var model = BuildModel(FeatureCount);
+                model.Load(modelPath);
+                // ... parse options.Input, predict, print ...
+                return 0;
+            }
+            // ... otherwise train, evaluate, save ...
+            """, caption="The skeleton every sample follows"),
+        cpugpu("the same model file on either device",
+               """
+               using var model = BuildModel(device: Device.Cpu);
+               model.Load("models/house-price.weights");
+               model.Eval();
+               """,
+               """
+               using var model = BuildModel(device: Device.Cuda());
+               model.Load("models/house-price.weights");              // the file does not know about devices
+               model.Eval();
+               """),
+        h2("38.3 What inference costs"),
+        mex("cold start, single rows and batches (house-price model, CPU)", None,
+            """
+            model.Eval();
+            var one = new float[1, 9];
+            var many = new float[1000, 9];
+
+            var cold = Stopwatch.StartNew();
+            model.Predict(one);
+            Console.WriteLine($"first call (cold): {cold.Elapsed.TotalMilliseconds:F2} ms");
+
+            for (int i = 0; i < 200; i++) model.Predict(one);               // warm-up
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < 1000; i++) model.Predict(one);
+            Console.WriteLine($"1 row per call:     {sw.Elapsed.TotalMilliseconds:F1} µs per call");  // 1000 calls: ms = µs each
+
+            for (int i = 0; i < 20; i++) model.Predict(many);
+            sw.Restart();
+            for (int i = 0; i < 100; i++) model.Predict(many);
+            double ms = sw.Elapsed.TotalMilliseconds / 100;
+            Console.WriteLine($"1,000 rows per call: {ms:F3} ms per call = {ms:F2} µs per row");
+            """,
+            out="""
+            first call (cold): 13.60 ms
+            1 row per call:     20.6 µs per call
+            1,000 rows per call: 1.574 ms per call = 1.57 µs per row
+            """,
+            after="The cold call pays for JIT compilation and first allocations; do one warm-up prediction at startup. "
+                  "Batching makes each row about 13× cheaper, because per-call costs are shared. On the GPU the difference "
+                  "is larger still: a single-row call is dominated by launches and the copy back."),
+        reftable(["Situation", "Recommendation"], [
+            ["Interactive, one request at a time", "CPU; warm up at startup; <code>Predict(float[,])</code>"],
+            ["Many requests per second", "Batch requests arriving within a few milliseconds into one <code>Predict</code> (micro-batching)"],
+            ["Nightly scoring of millions of rows", "Large batches (10,000+); the GPU for big models; <code>Trainer.Predict(dataset)</code> batches for you"],
+            ["Latency budget below 1 ms", "Small model on the CPU; avoid per-request allocations of large arrays"],
+        ], caption="Table 38.3 — Inference setups"),
+        h2("38.4 Concurrency"),
+        para("A loaded model can serve many threads at once if it is put in evaluation mode once after loading: "
+             "<code>Predict</code> then never changes the model's state, each call works on its own tensors, and memory "
+             "pools are thread-safe. The house-price Web API of " + ch("webapi") + " served 200 concurrent requests this "
+             "way. Two cases still need a lock (for example a <code>SemaphoreSlim</code>): moving the model between devices "
+             "while serving, and stateful generation with a KV cache, where one generation owns the caches (the GPT API "
+             "serializes requests for this reason)."),
+        trap("calling Eval() per request",
+             "<p><code>Predict</code> switches to evaluation mode and restores the previous mode afterwards. If the model was "
+             "left in training mode, two concurrent calls can interleave these switches so one runs with dropout active. "
+             "Call <code>Eval()</code> once after loading and leave it.</p>"),
         practice([
-            (1, "Which project should contain the model's architecture, and why?",
-             "The class library: training and every application must build the identical network for the saved weights to "
-             "fit, so the factory lives in one place."),
-            (1, "Why does the WinForms handler call <code>Predict</code> inside <code>Task.Run</code>?",
-             "So the UI thread stays free to repaint and respond; a large model or a cold first call could otherwise freeze the window."),
-            (2, "Add a CSV upload to the Blazor page that prices every row.",
-             "Use <code>InputFile</code>, read the stream line by line into <code>House</code> records, call "
-             "<code>Model.Predict(houses)</code> once, and show the results in a table."),
-            (2, "Make the worker use the GPU when the machine has one.",
-             "Nothing to change: <code>HousePriceModel.Load</code> picks <code>Device.Cuda()</code> when available; set "
-             "<code>NEURALSHARP_DISABLE_CUDA=1</code> to force the CPU."),
-            (3, "Turn the worker into a training service that retrains the model every night on new data.",
-             "Add a second loop (or a scheduled job) that loads the accumulated CSV data, trains with <code>CreateNetwork</code> "
-             "and the Trainer, evaluates on recent data, writes a new versioned model folder only if it beats the current "
-             "model, and signals the scoring loop to reload."),
+            (1, "List the files needed to serve the churn model and explain each.",
+             "Weights (the network), the feature scaler (to scale inputs like training data), and the chosen threshold "
+             "(to turn probabilities into decisions)."),
+            (1, "Why warm up a model at startup?",
+             "The first call includes one-off JIT compilation and allocation (13.6 ms here, far more for GPU kernel "
+             "compilation); a warm-up moves that cost out of the first user's request."),
+            (2, "Write a <code>ModelPackage.Load(folder)</code> that reads a manifest, builds the right architecture and loads weights and scaler.",
+             "Read <code>manifest.json</code>; switch on <code>Architecture</code> to call the matching factory; <code>Load</code> the "
+             "weights; <code>StandardScaler.Load</code> the scaler files; <code>Eval()</code>; return an object exposing <code>Predict</code>."),
+            (2, "Score a CSV of 2 million rows as fast as possible.",
+             "Stream the file in chunks of e.g. 50,000 rows, scale each chunk, call <code>Predict</code> on the chunk (or several "
+             "chunks in parallel on the CPU), write results as you go; on a GPU use chunks of 100,000+."),
+            (3, "Implement micro-batching for a web API: collect requests for up to 5 ms or 256 rows, predict once, and complete each request.",
+             "Use a <code>Channel</code> of (input, <code>TaskCompletionSource</code>) pairs; a background loop reads the first item, "
+             "keeps reading until 5 ms have passed or 256 rows are collected, stacks the rows, calls <code>Predict</code>, and sets each "
+             "request's result from its row of the output."),
         ], PART),
-        footer("Class library", "Worker service", "Blazor", "Unit test", "Windows Forms", "WPF", "Container", "Dependency injection"),
+        footer("Inference mode", "Model package", "Manifest", "Warm-up", "Latency", "Micro-batching", "Evaluation mode"),
     )

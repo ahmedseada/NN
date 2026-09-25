@@ -1,144 +1,170 @@
-"""Chapter 37 — Fine-Tuning, Freezing and Multi-Output Models."""
+"""Chapter 37 — Text Summarization: Extractive and Abstractive."""
 from gen import *
 
-PART = "VII"
+PART = "VI"
 
-TRANSFER = """
-    // Body: the part of the network that learns features; heads: task-specific last layers.
-    static Sequential Body(Random r) => new()
-    {
-        new Linear(8, 64, random: r), new Tanh(),
-        new Linear(64, 64, random: r), new Tanh(),
-    };
+# Measured by: dotnet run -c Release --project samples/NeuralSharp.Samples.Summarizer -- --cpu  (see RESULTS)
+M = {k: "…" for k in ("params", "r1", "lead_r1", "exact", "numbers", "train_s", "ms", "vocab")}   # filled after the full run
+RESULTS = ""
+EXAMPLES = ""
 
-    // 1. pretrain body + head A on task A (5,000 samples), then keep the body
-    using var body = Body(new Random(1));
-    using var headA = new Linear(64, 1, random: new Random(2));
-    using (var modelA = new Sequential { body, headA })
-    {
-        using var opt = new Adam(modelA.Parameters(), 3e-3f);
-        new Trainer(modelA, opt, Losses.MeanSquaredError).Fit(new DataLoader(taskA, 64, shuffle: true, seed: 1), 40);
-        body.Save("body.weights");                       // a Sequential saves on its own
-    }
-
-    // 2a. frozen body + new head on the small task (40 samples)
-    using var frozenBody = Body(new Random(5));
-    frozenBody.Load("body.weights");
-    foreach (var p in frozenBody.Parameters()) p.RequiresGrad = false;     // no gradients for the body
-    using var headB = new Linear(64, 1, random: new Random(6));
-    using var modelB = new Sequential { frozenBody, headB };
-    using var optB = new Adam(headB.Parameters(), 3e-3f);                    // only the head is optimized
-    new Trainer(modelB, optB, Losses.MeanSquaredError).Fit(new DataLoader(smallB, 32, shuffle: true, seed: 1), 200);
-
-    // 2b. fine-tune everything: load the body, keep RequiresGrad, optimize all at a 10x smaller rate
-    //     using var opt = new Adam(model.Parameters(), 3e-4f);
+LAYOUT = """
+    Training sequence (96 token ids):
+      the tigers played the foxes in elgin on friday . ... <sum> the tigers beat the foxes 4 to 0 in elgin . <end> <pad> ...
+    Targets (next token), · = ignored:
+      ·   ·      ·      ·   ·     ·  ·     ·  ·      ·  ...  the   tigers beat the foxes 4 to 0 in elgin . <end>  ·    ·     ·
 """
 
-MULTI = """
-    // Targets per row: [value, value > 0 ? 1 : 0]; the model has one shared body and a 2-output head.
-    using var multi = new Sequential { Body(new Random(7)), new Linear(64, 2, random: new Random(8)) };
+DATASET = """
+    // Inputs are "<report> <sum> <summary> <end> <pad>..."; the target of each position is the next token, but only
+    // where that next token belongs to the summary. Every other position gets the id `vocabulary` (one past the end).
+    int ignore = words.VocabularySize;
+    var features = new float[reports.Count * Context];
+    var targets = new float[reports.Count * Context];
+    Array.Fill(targets, ignore);
+    for (int i = 0; i < reports.Count; i++)
+    {
+        var prompt = words.Encode(reports[i].Document + " <sum>");
+        var ids = prompt.Concat(words.Encode(reports[i].Summary + " <end>")).Take(Context + 1).ToList();
+        for (int t = 0; t < Context; t++)
+        {
+            features[i * Context + t] = t < ids.Count ? ids[t] : words["<pad>"];
+            if (t + 1 < ids.Count && t + 1 >= prompt.Count)
+                targets[i * Context + t] = ids[t + 1];
+        }
+    }
+"""
 
-    static Tensor TwoTaskLoss(Tensor output, Tensor target) =>
-        Losses.MeanSquaredError(output.Narrow(1, 0, 1), target.Narrow(1, 0, 1))                    // regression head
-        + 0.5f * Losses.BinaryCrossEntropyWithLogits(output.Narrow(1, 1, 1), target.Narrow(1, 1, 1));   // yes/no head
+LOSS = """
+    // Cross-entropy over summary tokens only, averaged per summary token.
+    static Tensor SummaryLoss(Tensor logits, Tensor next, double summaryTokensPerRow)
+    {
+        int vocabulary = logits.Shape[^1];
+        // One-hot with one extra class, then cut it off: the "ignore" id becomes an all-zero row that adds nothing.
+        var targets = Tensor.OneHot(next, vocabulary + 1).Narrow(2, 0, vocabulary);
+        return (targets * logits.LogSoftmax()).Sum() * (float)(-1.0 / (next.Shape[0] * summaryTokensPerRow));
+    }
+"""
 
-    var valueMae = new Metric("value_mae", (p, t) => Losses.MeanAbsoluteError(p.Narrow(1, 0, 1), t.Narrow(1, 0, 1)));
-    var signAcc = new Metric("sign_acc", (p, t) => Metric.BinaryAccuracy(0f).BatchMean(p.Narrow(1, 1, 1), t.Narrow(1, 1, 1)));
-
-    using var opt = new Adam(multi.Parameters(), 3e-3f);
-    var trainer = new Trainer(multi, opt, TwoTaskLoss) { Metrics = { valueMae, signAcc } };
-    trainer.Fit(new DataLoader(train, 64, shuffle: true, seed: 1), 30);
-    var result = trainer.Evaluate(new DataLoader(test, 1000));
-    Console.WriteLine($"two heads: value MAE {result.Metrics["value_mae"]:F4}, sign accuracy {result.Metrics["sign_acc"]:P1}");
+GENERATE = """
+    var greedy = new GenerationOptions
+    {
+        Temperature = 0f, TopK = 1, RepeatPenalty = 1f,       // deterministic: always the most likely word
+        NumPredict = 30, Stop = ["<end>"], NumCtx = Context,
+    };
+    model.Eval();
+    var generator = new TextGenerator(model, tokenizer, Context);          // tokenizer: a WordTokenizer
+    var (summary, reason, stats) = generator.Generate(report + " <sum>", greedy);
 """
 
 
 def build():
     return page(
         chapter_open(
-            "finetune",
-            "Models rarely start from nothing in practice. A network trained on a large task learns features that "
-            "help related tasks with little data (transfer learning); a model can be adjusted to new data without "
-            "retraining it from scratch (fine-tuning); and one network can predict several things at once "
-            "(multi-output). All three come down to three tools you already have: saving and loading parts of a "
-            "model, choosing which parameters the optimizer updates, and building a loss from several pieces.",
-            "Save and load any sub-module: a <code>Sequential</code> body is a module with its own weights file.",
-            "Freeze: <code>p.RequiresGrad = false</code> on the body's parameters and give only the head to the optimizer.",
-            "Fine-tune: train everything with a learning rate about 10× smaller than the original.",
-            "Measured: with 40 samples of a related task, a frozen pretrained body cut the test error 4× (0.060 → 0.016).",
-            "Multi-output: one head with several outputs, split with <code>Narrow</code>, and a weighted sum of losses.",
+            "summarizer",
+            "A summary keeps what matters and drops the rest. <b>Extractive</b> summarizers select sentences from the "
+            "text; <b>abstractive</b> ones write new sentences, which lets them combine facts that are spread over the "
+            "text, compare numbers and rephrase. This project, <code>NeuralSharp.Samples.Summarizer</code>, compares two "
+            "extractive baselines with a word-level transformer that writes the summary token by token through the "
+            "Generation layer of " + ch("textgen") + ", and scores all three with ROUGE and with checks of the facts.",
+            "Data: short reports of four kinds (sports matches, weather, company results, fires) with one-sentence reference summaries.",
+            f"Model: a decoder-only transformer over words ({M['params']} parameters), trained on \"report &lt;sum&gt; summary &lt;end&gt;\" with the loss masked to the summary.",
+            "Generation: <code>WordTokenizer</code> + <code>TextGenerator</code>, greedy, stopping at <code>&lt;end&gt;</code>.",
+            f"Result: ROUGE-1 {M['r1']} against {M['lead_r1']} for the best extractive baseline; {M['exact']} of summaries exactly right, {M['numbers']} with every number right.",
+            f"Cost: training {M['train_s']} s on the CPU; {M['ms']} ms per summary.",
         ),
-        h2("37.1 Transfer learning, measured"),
-        para("The experiment uses 8 inputs that drive 4 hidden features. Task A (5,000 samples) is one combination "
-             "of those features. Task B, with only 40 samples, uses the same features with different weights; task C "
-             "needs a product of two features that task A never required. Each small task is trained three ways."),
-        snippet(TRANSFER, caption="Pretraining, freezing and fine-tuning (data generation omitted)"),
-        output("""
-            task B (shares features)      test MSE: scratch 0.0601   frozen body 0.0156   fine-tuned 0.0389
-            task C (needs new features)   test MSE: scratch 0.2073   frozen body 0.1681   fine-tuned 0.1697
-            """, caption="Test error on 2,000 unseen samples (targets have a variance of about 0.9)"),
-        para("When the new task uses the features the body already learned (B), freezing the body and fitting only a "
-             "65-parameter head is four times better than training all 4,801 parameters from 40 samples. When it needs new "
-             "features (C), the pretrained body helps less; with more data for task C, training from scratch or "
-             "fine-tuning would overtake it. In an earlier run with 100 samples of a task like C, training from scratch "
-             "won outright (0.049 against 0.151 frozen): transfer pays when data is scarce and the tasks are related."),
-        reftable(["Situation", "Strategy"], [
-            ["Very little data, closely related task", "Freeze the body, train a new head"],
-            ["Moderate data, related task", "Train the head first (frozen body), then unfreeze and fine-tune all with lr/10"],
-            ["Plenty of data or an unrelated task", "Train from scratch (or fine-tune everything)"],
-            ["Same task, new data arriving (drift)", "Fine-tune the existing model on recent data at a low rate; validate on recent data"],
-        ], caption="Table 37.1 — Choosing a strategy"),
-        cpugpu("pretrain on the GPU, adapt on the CPU",
+        h2("37.1 Reports that need more than copying"),
+        para("<code>Reports.cs</code> generates the data. Each report starts with a scene-setting sentence, followed by "
+             "two sentences with the key facts and two or three filler sentences, in random order. The reference "
+             "summaries are designed so that no sentence of the report contains them: the winner of a match must be found "
+             "by comparing two scores, \"rose\" or \"fell\" by comparing two revenues, and \"rain likely\" by checking "
+             "whether a percentage is at least 50."),
+        reftable(["Kind", "Key facts in the report", "Reference summary"], [
+            ["match", "the tigers scored 4 goals . … the foxes scored 0 goals .", "the tigers beat the foxes 4 to 0 in elgin ."],
+            ["weather", "the high will be 22 degrees … there is a 0 percent chance of rain .", "granton will reach 22 degrees on tuesday with little chance of rain ."],
+            ["company", "revenue was 21 million dollars . … a year earlier revenue was 15 million dollars .", "ionix revenue rose from 15 to 21 million dollars in the third quarter ."],
+            ["fire", "firefighters rescued 30 people from the building .", "30 people were rescued from a factory fire in elgin ."],
+        ], caption="Table 37.1 — The four kinds of report"),
+        para(f"8,000 reports are used for training (5 % of them for validation) and 400 new ones for testing. The "
+             f"<code>WordTokenizer</code> built from the training texts has {M['vocab']} words, numbers 0–99 included, so "
+             "a number is one token that the model can copy."),
+        h2("37.2 Two extractive baselines"),
+        snippet("""
+            static List<string> Sentences(string document) =>
+                [.. document.Split(" . ", StringSplitOptions.RemoveEmptyEntries).Select(s => s.TrimEnd(' ', '.') + " .")];
+
+            // 1. The first sentence (news articles often put the gist first).
+            string First(string doc) => Sentences(doc)[0];
+
+            // 2. The sentence whose words occur most often in the whole report.
+            static string Central(string document)
+            {
+                var counts = WordTokenizer.Split(document).GroupBy(w => w).ToDictionary(g => g.Key, g => g.Count());
+                return Sentences(document).MaxBy(s => WordTokenizer.Split(s).Average(w => (double)counts.GetValueOrDefault(w)))!;
+            }
+            """, caption="Extractive summaries: choose one sentence"),
+        para("Both are instant and can never state something false, but here neither can be right: the summary sentence "
+             "is not in the report. They set the floor that a learned model must beat."),
+        h2("37.3 Training only on the summary"),
+        para("The abstractive model is a GPT like the one in " + ch("gpt") + ", over words instead of characters: "
+             "embedding, positional encoding, three causal transformer layers of width 96, and a linear layer to the "
+             "vocabulary. It learns from sequences \"report &lt;sum&gt; summary &lt;end&gt;\". Predicting the report "
+             "itself would be wasted effort (its sentences are random), so only the summary positions have targets "
+             "(<b>loss masking</b>)."),
+        output(LAYOUT, caption="What the model reads and what it is trained to predict"),
+        snippet(DATASET, caption="Building masked training sequences"),
+        snippet(LOSS, caption="The masked loss, from ordinary tensor operations"),
+        trap("averaging over positions that do not count",
+             "<p>Dividing the masked loss by all 96 positions would make it about eight times smaller than the true loss "
+             "per summary token, and hide how well the model really does. Divide by the number of summary tokens (here "
+             "their average per row, a constant computed from the data).</p>"),
+        h2("37.4 Writing the summary"),
+        para("At inference time the report plus <code>&lt;sum&gt;</code> is the prompt, and the Generation layer does the "
+             "rest: the KV cache processes the prompt once, the sampler picks the most likely word, and generation stops "
+             "when the text contains <code>&lt;end&gt;</code>, which is not returned."),
+        snippet(GENERATE, caption="Summarizing with TextGenerator"),
+        h2("37.5 Results"),
+        output(RESULTS, caption="dotnet run -c Release --project samples/NeuralSharp.Samples.Summarizer -- --cpu"),
+        para("ROUGE compares a summary with the reference by overlapping words (ROUGE-1), word pairs (ROUGE-2) and the "
+             "longest common word sequence (ROUGE-L), each as the F1 of precision and recall (glossary <b>ROUGE</b>). "
+             "It rewards the right words, not the right facts: \"the tigers beat the tigers 4 to 0\" still scores well. "
+             "That is why the sample also counts exact summaries and summaries with every number right and in order."),
+        output(EXAMPLES, caption="Summaries of new reports"),
+        honestbox("What these numbers do and do not show",
+                  "<p>The reports are synthetic and follow four templates, so a small model can learn them almost "
+                  "perfectly; on real news the same model would need far more data and a larger vocabulary (sub-word "
+                  "tokens). What transfers is the method: masked training on \"input &lt;sep&gt; output\" sequences, "
+                  "generation with a stop token, and evaluation that checks facts, not only word overlap.</p>"),
+        cpugpu("training and inference commands",
                """
-               // on a laptop: adapt the pretrained body to a small local dataset
-               using var body = Body(new Random(5));                  // Device.Default = Cpu
-               body.Load("body.weights");
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Summarizer -- --cpu
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Summarizer -- --cpu --predict \\
+                   --input "the lions played the owls in kelso on friday . the owls scored 2 goals . the lions scored 4 goals ."
                """,
                """
-               // on a GPU server: pretrain on the large dataset
-               Device.Default = Device.Cuda();
-               // ... train body + head A ...
-               body.Save("body.weights");                             // device-independent file
-               """),
-        trap("forgetting that frozen BatchNorm still updates",
-             "<p>Setting <code>RequiresGrad = false</code> stops gradient updates, but a <code>BatchNorm</code> layer in "
-             "training mode still updates its running statistics from the new data. To freeze it completely, put the "
-             "body in evaluation mode (<code>body.Eval()</code>) while training the head.</p>"),
-        h2("37.2 One model, several outputs"),
-        para("Related predictions can share a body: a price and whether the house sells within a month, a class and a "
-             "bounding box, tomorrow's demand for five products. The last layer outputs all values side by side; the loss "
-             "splits them with <code>Narrow</code> and adds the parts, weighted so that none dominates."),
-        snippet(MULTI, caption="A regression head and a yes/no head sharing one body"),
-        output("""
-            two heads: value MAE 0.0308, sign accuracy 98.8 %
-            """),
-        reftable(["Outputs", "Head", "Loss"], [
-            ["Several numbers", "<code>Linear(h, K)</code>", "<code>MeanSquaredError</code> on all K at once (scale the targets alike)"],
-            ["Number + yes/no", "<code>Linear(h, 2)</code>", "MSE on column 0 + w · BCE-with-logits on column 1"],
-            ["Class + number", "<code>Linear(h, K + 1)</code>", "<code>CrossEntropy</code> on columns 0…K−1 + w · MSE on column K"],
-            ["Several yes/no labels", "<code>Linear(h, K)</code>", "<code>BinaryCrossEntropyWithLogits</code> on all K"],
-        ], caption="Table 37.2 — Multi-output recipes"),
-        honestbox("Weighting the parts",
-                  "<p>The loss weights (0.5 above) balance how much each task pulls on the shared body. Start by making "
-                  "each part contribute similar amounts at the beginning of training (compare their initial values), "
-                  "then adjust the weight of the task you care about most. Report each task's own metric, as the "
-                  "custom metrics above do.</p>"),
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Summarizer -- --cuda
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Summarizer -- --cuda --predict
+               """,
+               note="Without <code>--input</code>, prediction mode summarizes a freshly generated report. On the GPU the "
+                    "decoding step is recorded once as a CUDA graph and replayed for every word."),
         practice([
-            (1, "How do you freeze all but the last layer of a <code>Sequential</code> named <code>model</code>?",
-             "<code>foreach (var p in model.Parameters().Except(model[model.Count - 1].Parameters())) p.RequiresGrad = false;</code> "
-             "and create the optimizer with <code>model[model.Count - 1].Parameters()</code>."),
-            (1, "Why fine-tune with a smaller learning rate than the original training?",
-             "The weights are already good; large steps would destroy the learned features before the new data can refine them."),
-            (2, "Save only the head of a model and load it onto a different body of the same shape.",
-             "Call <code>head.Save(path)</code> on the <code>Linear</code> (any module can be saved) and <code>newHead.Load(path)</code>; "
-             "combine with <code>new Sequential { body, newHead }</code>."),
-            (2, "Build a model that predicts a class (3 classes) and a confidence score in [0, 1] from the same features.",
-             "Head <code>Linear(h, 4)</code>; loss = <code>CrossEntropy(output.Narrow(1, 0, 3), oneHot)</code> + w · "
-             "<code>BinaryCrossEntropyWithLogits(output.Narrow(1, 3, 1), score)</code>, with targets packed as 4 columns."),
-            (3, "Fine-tune the house-price model on 200 new sales from a different city.",
-             "Load the model and scalers; keep the scalers (the input distribution may shift, so check it); train all layers "
-             "with Adam at 2e-4 for a few epochs with early stopping on a held-out part of the new sales; compare MAE on "
-             "the new city before and after, and on the old test set to check nothing important was forgotten."),
+            (1, "Why can neither extractive baseline produce the reference summary here?",
+             "The reference sentence does not occur in the report: it combines facts from several sentences and states a "
+             "comparison (winner, rose/fell) that no sentence contains."),
+            (1, "What does the model receive as the target at a position inside the report?",
+             "The ignore id (the vocabulary size), which becomes an all-zero one-hot row, so the position adds nothing to the loss."),
+            (2, "Add a fifth report kind (for example election results) and check that the model learns it.",
+             "Add a generator in <code>Reports.cs</code> with a lead, two fact sentences, fillers and a summary that needs a "
+             "comparison (the winner); include it in the <code>switch</code> with <code>i % 5</code>; retrain and look at "
+             "the per-kind exact-match lines."),
+            (2, "Why does greedy decoding suit this task better than sampling with temperature 0.8?",
+             "A summary should state the facts; sampling can pick a less likely word, such as a wrong number or \"fell\" "
+             "instead of \"rose\", with no benefit from variety."),
+            (3, "Adapt the sample to real text: what must change?",
+             "A much larger corpus of (document, summary) pairs; a sub-word tokenizer so rare words and numbers are not "
+             "&lt;unk&gt;; a longer context (reports longer than 96 tokens); a bigger model trained on the GPU; and "
+             "evaluation by people or by fact checks, since ROUGE alone rewards fluent but wrong summaries."),
         ], PART),
-        footer("Transfer learning", "Fine-tuning", "Freezing", "Body and head", "Multi-output model", "Multi-task loss"),
+        footer("Summarization", "Extractive summarization", "Abstractive summarization", "ROUGE", "Loss masking",
+               "Greedy decoding", "Tokenizer", "Unknown token"),
     )

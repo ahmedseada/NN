@@ -1,162 +1,200 @@
-"""Chapter 27 — Multi-Class Classification."""
+"""Chapter 27 — Binary Classification."""
 from gen import *
 
 PART = "V"
+
+PROGRAM = """
+    using NeuralSharp;
+    using NeuralSharp.Data;
+    using NeuralSharp.Diagnostics;
+    using NeuralSharp.Layers;
+    using NeuralSharp.Optimizers;
+    using NeuralSharp.Training;
+
+    Device.Default = args.Contains("--cuda") ? Device.Cuda() : Device.Cpu;
+
+    // ---- data: 5,000 synthetic customers, about 1 in 6 churns (replace with Dataset.LoadCsv)
+    string[] columns = ["tenure_months", "monthly_fee", "support_calls", "contract_years", "usage_hours"];
+    var rng = new Random(11);
+    var x = new float[5000, 5];
+    var y = new float[5000, 1];
+    for (int i = 0; i < 5000; i++)
+    {
+        float tenure = rng.Next(1, 73), fee = 20 + 100 * rng.NextSingle(), calls = rng.Next(0, 8);
+        float contract = rng.Next(0, 3), usage = 5 + 60 * rng.NextSingle();
+        double score = -1.9 - 0.04 * tenure + 0.02 * fee + 0.45 * calls - 0.9 * contract - 0.03 * usage
+                     + 0.8 * (rng.NextDouble() - 0.5);
+        x[i, 0] = tenure; x[i, 1] = fee; x[i, 2] = calls; x[i, 3] = contract; x[i, 4] = usage;
+        y[i, 0] = rng.NextDouble() < 1 / (1 + Math.Exp(-score)) ? 1 : 0;
+    }
+    var data = Dataset.FromArrays(x, y, columns, ["churn"]);
+    Console.WriteLine($"{data.Count} customers, churn rate {data.Targets.ToArray().Average():P1}");
+    var (train, test) = data.Split(0.8, seed: 3);
+    var scaler = StandardScaler.FitFeatures(train);
+    train = train.Scale(scaler);                  // targets are 0/1: only features are scaled
+    test = test.Scale(scaler);
+
+    // ---- model: one raw score out, no Sigmoid layer
+    static Sequential Build(Random? r = null) => new()
+    {
+        new Linear(5, 32, random: r), new ReLU(), new Dropout(0.1f, r),
+        new Linear(32, 32, random: r), new ReLU(),
+        new Linear(32, 1, random: r),
+    };
+    using var model = Build(new Random(1));
+    using var optimizer = new AdamW(model.Parameters(), 3e-3f, weightDecay: 1e-4f);
+    var trainer = new Trainer(model, optimizer, Losses.BinaryCrossEntropyWithLogits)
+    {
+        Metrics = { Metric.BinaryAccuracy(threshold: 0f) },     // score 0 <=> probability 0.5
+        EarlyStoppingPatience = 10,
+    };
+    using (Telemetry.Subscribe(new ConsoleLogger(TelemetryLevel.Training, epochInterval: 10)))
+        trainer.Fit(new DataLoader(train, 64, shuffle: true, seed: 1), epochs: 100,
+                    validation: new DataLoader(test, 512));
+"""
+
+EVAL = """
+    // ---- probabilities, then precision/recall at three thresholds
+    float[,] logits = trainer.Predict(test);
+    var p = new float[test.Count];
+    var t = new float[test.Count];
+    for (int i = 0; i < test.Count; i++)
+    {
+        p[i] = 1f / (1f + MathF.Exp(-logits[i, 0]));          // sigmoid
+        t[i] = test.GetTargets(i)[0];
+    }
+    Console.WriteLine("threshold  accuracy  precision  recall    F1");
+    foreach (float threshold in new[] { 0.3f, 0.5f, 0.7f })
+    {
+        int tp = 0, fp = 0, fn = 0, tn = 0;
+        for (int i = 0; i < p.Length; i++)
+        {
+            bool predicted = p[i] >= threshold, actual = t[i] == 1;
+            if (predicted && actual) tp++; else if (predicted) fp++; else if (actual) fn++; else tn++;
+        }
+        double precision = tp / (double)Math.Max(tp + fp, 1), recall = tp / (double)Math.Max(tp + fn, 1);
+        double f1 = 2 * precision * recall / Math.Max(precision + recall, 1e-9);
+        Console.WriteLine($"  {threshold,7:F1}  {(tp + tn) / (double)p.Length,8:P1}  {precision,9:P1}  {recall,6:P1}  {f1,5:F3}");
+    }
+
+    // ROC AUC: the chance that a random churner gets a higher score than a random non-churner
+    var pos = p.Where((_, i) => t[i] == 1).ToArray();
+    var neg = p.Where((_, i) => t[i] == 0).ToArray();
+    double auc = pos.Sum(a => neg.Count(b => a > b) + 0.5 * neg.Count(b => a == b)) / ((double)pos.Length * neg.Length);
+    Console.WriteLine($"ROC AUC {auc:F3}   (always 'no churn' would be {1 - t.Average():P1} accurate)");
+"""
+
+SERVE = """
+    model.Save("churn.weights");
+    scaler.Save("churn.scaler");
+
+    // ---- later / elsewhere: score new customers
+    using var served = Build();
+    served.Load("churn.weights");
+    served.Eval();
+    var fx = StandardScaler.Load("churn.scaler");
+    float[] customers = [3, 95, 5, 0, 10,   60, 40, 0, 2, 45];
+    fx.Transform(customers, 5);
+    using var input = Tensor.From(customers, [2, 5]);
+    using var output = served.Predict(input);
+    using var probability = output.Sigmoid();
+    var risk = probability.ToArray();
+    Console.WriteLine($"new customer A (3 months, $95, 5 calls, monthly): churn risk {risk[0]:P0}");
+    Console.WriteLine($"new customer B (60 months, $40, 0 calls, 2-year):  churn risk {risk[1]:P0}");
+"""
 
 
 def build():
     return page(
         chapter_open(
-            "multiclass",
-            "When the answer is one of several categories (which product line, which species, which digit), the model "
-            "outputs one score per class and the loss is cross-entropy. This project classifies points of three "
-            "interleaved spirals, a problem no straight line can solve, and shows the full workflow including "
-            "one-hot targets, label smoothing, a cosine schedule, a confusion matrix, class probabilities at "
-            "inference and a decision map. The code is the repository's <code>NeuralSharp.Samples.Classification</code>.",
-            "Task type: <b>multi-class classification</b>. Last layer <code>Linear(h, K)</code>; loss <code>CrossEntropy</code> (one-hot) or <code>SparseCrossEntropy</code> (ids).",
-            "Targets: <code>Dataset.FromClassLabels(features, labels, K, names)</code> creates one-hot rows.",
-            "Predictions: <code>ArgMax</code> for the class, <code>Softmax()</code> for probabilities.",
-            "Result: 97.8% test accuracy on 3 spiral classes; the confusion matrix shows which classes are confused.",
-            "The same code classifies any table of numbers into K classes.",
+            "binary",
+            "Many business questions have a yes/no answer: will this customer leave, is this transaction fraud, will "
+            "this machine fail, is this email spam. This project predicts customer churn from five account features. "
+            "Beyond training, it shows what makes binary classification different: turning scores into "
+            "probabilities, choosing a decision threshold, and judging a model with precision, recall and ROC AUC "
+            "when one answer is much rarer than the other.",
+            "Task type: <b>binary classification</b>. Last layer <code>Linear(h, 1)</code>, loss <code>BinaryCrossEntropyWithLogits</code>.",
+            "Probability = <code>Sigmoid()</code> of the output; the decision threshold is a business choice, not always 0.5.",
+            "With 17.5% churners, \"nobody churns\" is already about 83% accurate: report precision, recall and AUC.",
+            "Result: ROC AUC 0.829; at threshold 0.3 the model catches 60% of churners.",
+            "Save the weights and the feature scaler; serve probabilities.",
         ),
-        h2("27.1 Data and model"),
-        snippet("""
-            const int Classes = 3, PerClass = 300;
-            string[] classNames = ["red", "green", "blue"];
-
-            var random = new Random(1);
-            var features = new float[Classes * PerClass, 2];
-            var labels = new int[Classes * PerClass];
-            for (int c = 0; c < Classes; c++)
-                for (int i = 0; i < PerClass; i++)
-                {
-                    int row = c * PerClass + i;
-                    double radius = i / (double)PerClass;
-                    double angle = c * 2 * Math.PI / Classes + radius * 5 + random.NextDouble() * 0.25;
-                    features[row, 0] = (float)(radius * Math.Cos(angle));
-                    features[row, 1] = (float)(radius * Math.Sin(angle));
-                    labels[row] = c;
-                }
-            var data = Dataset.FromClassLabels(features, labels, Classes, classNames);   // one-hot targets
-            var (train, test) = data.Split(0.8, seed: 2);
-
-            var init = new Random(3);
-            using var model = new Sequential
-            {
-                new Linear(2, 128, device: device, random: init), new BatchNorm(128, device: device), new ReLU(),
-                new Linear(128, 64, device: device, random: init), new BatchNorm(64, device: device), new ReLU(),
-                new Linear(64, Classes, device: device, random: init),                // raw scores
-            };
-            """, caption="Spiral data and a 9,219-parameter classifier"),
-        h2("27.2 Training"),
-        snippet("""
-            int epochs = 200;
-            using var optimizer = new AdamW(model.Parameters(), learningRate: 0.01f, weightDecay: 1e-4f);
-            var trainer = new Trainer(model, optimizer,
-                (logits, targets) => Losses.CrossEntropy(logits, targets, labelSmoothing: 0.05f))
-            {
-                Metrics = { Metric.Accuracy },
-                Scheduler = new CosineAnnealing(optimizer, totalEpochs: epochs, warmupEpochs: 5),
-            };
-            trainer.Fit(new DataLoader(train, 64, shuffle: true, device: device, seed: 4), epochs,
-                        validation: new DataLoader(test, 512, device: device));
-            """, caption="Cross-entropy with label smoothing, AdamW and a cosine schedule"),
+        h2("27.1 The program"),
+        para("The whole project is one <code>Program.cs</code>. Synthetic data keeps it self-contained; for real data "
+             "replace the generator with <code>Dataset.LoadCsv(\"customers.csv\", new CsvOptions { TargetColumns = "
+             "[\"churn\"], IgnoreColumns = [\"customer_id\"] })</code>, where the churn column holds 0 or 1."),
+        snippet(PROGRAM, caption="Program.cs, part 1: data, model, training"),
         output("""
-            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 720 samples, 180 validation | batch 64, 12 steps/epoch | AdamW lr=0.001667 | 9,219 parameters | 4 CPU threads
-            Epoch   1/200  loss 0.886633  accuracy 0.5694  val_loss 1.077530  val_accuracy 0.4667  86.3 ms  8,344 samples/s  *
-            Epoch  20/200  loss 0.317225  accuracy 0.9347  val_loss 0.247562  val_accuracy 0.9722  19.5 ms  36,992 samples/s  *
-            Epoch  60/200  loss 0.244288  accuracy 0.9750  val_loss 0.224612  val_accuracy 0.9833  16.2 ms  44,349 samples/s
-            Epoch 100/200  loss 0.239780  accuracy 0.9722  val_loss 0.216285  val_accuracy 0.9944  5.0 ms  144,401 samples/s
-            Epoch 200/200  loss 0.229764  accuracy 0.9778  val_loss 0.218855  val_accuracy 0.9778  9.0 ms  80,380 samples/s
-            Finished 200 epochs in 1.87 s | best epoch 182 loss 0.209481
-            """, caption="Training output (every 20th epoch printed; some lines omitted here)"),
-        para("The loss levels off near 0.2 rather than 0: with label smoothing the target itself is not a pure one-hot "
-             "row, so a perfect model still has a positive loss (" + ch("losses") + "). The first epoch starts close to "
-             "ln 3 ≈ 1.10, as expected for 3 classes."),
-        h2("27.3 Where the errors are"),
-        snippet("""
-            var result = trainer.Evaluate(new DataLoader(test, 512, device: device));
-            Console.WriteLine($"Test accuracy: {result.Metrics["accuracy"]:P1}  (cross-entropy {result.Loss:F4})");
-
-            var scores = trainer.Predict(test);                        // [180, 3] raw scores
-            var confusion = new int[Classes, Classes];
-            for (int i = 0; i < test.Count; i++)
-            {
-                int actual = test.GetTargets(i).IndexOf(1f);           // position of the 1 in the one-hot row
-                int predicted = Enumerable.Range(0, Classes).MaxBy(c => scores[i, c]);
-                confusion[actual, predicted]++;
-            }
-            """, caption="Accuracy and a confusion matrix"),
+            5000 customers, churn rate 17.5 %
+            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 4,000 samples, 1,000 validation | batch 64, 63 steps/epoch | AdamW lr=0.003 | 1,281 parameters | 4 CPU threads
+            Epoch   1/100  loss 0.416125  accuracy 0.8233  val_loss 0.354400  val_accuracy 0.8560  97.6 ms  40,990 samples/s  *
+            Epoch  10/100  loss 0.343585  accuracy 0.8468  val_loss 0.349250  val_accuracy 0.8520  20.8 ms  191,870 samples/s  *
+            Epoch  20/100  loss 0.337062  accuracy 0.8545  val_loss 0.358105  val_accuracy 0.8540  24.3 ms  164,784 samples/s
+            Finished 28 epochs in 0.80 s (early stop) | best epoch 18 loss 0.348009
+            """, caption="Training output (model summary omitted)"),
+        h2("27.2 Thresholds, precision and recall"),
+        snippet(EVAL, caption="Program.cs, part 2: evaluation"),
         output("""
-            Test accuracy: 97.8 %  (cross-entropy 0.2189)
-
-            Confusion matrix (rows = actual, columns = predicted):
-                        red  green   blue
-              red        67      0      0
-              green       1     48      0
-              blue        3      0     61
+            threshold  accuracy  precision  recall    F1
+                  0.3    81.1 %     46.2 %  59.9 %  0.522
+                  0.5    85.2 %     63.6 %  32.6 %  0.431
+                  0.7    84.7 %     88.0 %  12.8 %  0.223
+            ROC AUC 0.829   (always 'no churn' would be 82.8 % accurate)
+            """, caption="Evaluation output"),
+        reftable(["Measure", "Question it answers", "Here, at 0.3"], [
+            ["Precision", "Of the customers we flag, how many really churn?", "46%"],
+            ["Recall", "Of the customers who churn, how many do we flag?", "60%"],
+            ["F1", "One number balancing both (harmonic mean)", "0.522"],
+            ["ROC AUC", "How well are churners ranked above non-churners, over all thresholds? (0.5 = random, 1 = perfect)", "0.829"],
+        ], caption="Table 27.1 — Scores for imbalanced yes/no problems (glossary <b>Precision</b>, <b>Recall</b>, <b>ROC AUC</b>)"),
+        para("Accuracy barely moves across thresholds and never clearly beats the 82.8% of always answering \"no\", "
+             "yet the model is useful: at 0.3 it finds six in ten churners, at 0.7 it is right 88% of the time it "
+             "raises an alarm. Which threshold is best depends on costs: if a retention offer is cheap and losing a "
+             "customer expensive, favour recall (a low threshold); if every flag triggers a costly phone call, favour "
+             "precision (a high threshold)."),
+        h2("27.3 Serving probabilities"),
+        snippet(SERVE, caption="Program.cs, part 3: save, load, score"),
+        output("""
+            new customer A (3 months, $95, 5 calls, monthly): churn risk 88 %
+            new customer B (60 months, $40, 0 calls, 2-year):  churn risk 0 %
             """),
-        para("Of 180 test points 4 are wrong, and 3 of those are blue points taken for red, which is where the two "
-             "spirals meet near the centre. A confusion matrix (glossary <b>Confusion matrix</b>) shows such patterns "
-             "that a single accuracy figure hides."),
-        h2("27.4 Probabilities at inference"),
-        snippet("""
-            model.Load(modelPath);
-            using var points = Tensor.From(new float[,] { { 0.5f, 0.2f }, { -0.3f, -0.6f }, { 0f, 0.9f } }, device);
-            using var logits = model.Predict(points);
-            using var probabilities = logits.Softmax();                // rows sum to 1
-            """, caption="--predict mode"),
-        output("""
-                 x      y  | class  |    red   green    blue
-               0.50   0.20 | blue   |    1 %     3 %    96 %
-              -0.30  -0.60 | red    |   79 %    19 %     2 %
-               0.00   0.90 | blue   |    0 %     4 %    95 %
-            """),
-        output("""
-            BBBBBBBBBBBBBBBBbbbbbbbbbbbbbbbbbbbbgggggGGGGGGGGGGGGGGGGGGG
-            BBBBBBBBBBBBBbbbbbrrrrrrrrrrrrrbbbbBBBBBBBbbbggggGGGGGGGGGGG
-            BBBBBBBbbbbrrrRRRRRRRRrrrrrrRRRRRRRrrbbBBBBBBbbgggGGGGGGGGGG
-            BBBBBbbbrrrRRRRRRrrgggGGGGGgggrrRRrrbbBBBBBBbbgggGGGGGGGGGGG
-            BBbbbrrrRRRRRRRRrrggGGGGGggbbBBBBBBBBBBBBBbbgggGGGGGGGGGGGGG
-            bbbrrrrRRRRRRRRRRrrrggGGGGGGGggggggggggGGGGGGGGGGGGGGGGGGggg
-            bbbrrrrrRRRRRRRRRRRRRRrrrrrrgggggggggggggggggggggggggggrrrrr
-            bbrrrrrrrrRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
-            """, caption="Part of the decision map the sample prints (upper case: at least 90% confident)"),
-        cpugpu("running the sample",
+        cpugpu("running the project",
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Classification -- --cpu
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Classification -- --cpu --predict --input "0.5,0.2;-0.3,-0.6"
+               dotnet run -c Release
                """,
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Classification -- --cuda
-               """),
-        h2("27.5 From spirals to your data"),
-        reftable(["Your data", "Change"], [
-            ["CSV with a class-id column", "<code>Dataset.LoadCsv(…, new CsvOptions { TargetColumns = [\"species\"] }).ToOneHot(K)</code>, scale the features"],
-            ["Many classes (100+)", "Wider last hidden layer; <code>SparseCrossEntropy</code> with id targets saves memory"],
-            ["Unequal class sizes", "Report per-class accuracy or the confusion matrix; oversample small classes"],
-            ["Images", "A CNN front end (" + ch("cnn") + ")"],
-            ["Text", "Embeddings + LSTM/transformer (" + ch("sentiment") + ")"],
-            ["\"None of the above\" matters", "Add an explicit \"other\" class, or reject predictions whose top probability is below a threshold"],
-        ], caption="Table 27.1 — Adapting the classifier"),
-        trap("reading scores as probabilities",
-             "<p><code>Predict</code> returns raw scores; they can be negative and do not sum to 1. Apply "
-             "<code>Softmax()</code> for probabilities; the class (<code>ArgMax</code>) is the same either way.</p>"),
+               dotnet run -c Release -- --cuda
+               // at 1,281 parameters the CPU is faster; the GPU pays off for wide models
+               // or hundreds of thousands of rows (Chapter 20)
+               """.replace("Chapter 20", ch("performance"))),
+        h2("27.4 Variations"),
+        reftable(["Situation", "Do this"], [
+            ["Very rare positives (fraud: 0.5%)", "Oversample positives in the training set with <code>Subset</code> (repeat their indices), or weight the loss; judge by recall at a fixed precision"],
+            ["Several independent yes/no labels (multi-label)", "<code>Linear(h, K)</code> with <code>BinaryCrossEntropyWithLogits</code>; each output has its own sigmoid and threshold"],
+            ["Probabilities must be well calibrated", "Keep the logits loss; avoid heavy oversampling (it inflates probabilities) or rescale afterwards"],
+            ["Categorical features (plan type, region)", "Embeddings (" + ch("recommender") + ")"],
+            ["Sequences (click streams)", "An LSTM/GRU front end (" + ch("recurrent") + ", " + ch("sentiment") + ")"],
+        ], caption="Table 27.2 — Adapting the churn model"),
+        trap("tuning the threshold on the test set",
+             "<p>Choosing the threshold that maximizes F1 on the test set and then reporting that F1 is optimistic. Pick the "
+             "threshold on a validation split and report on a separate test split.</p>"),
         practice([
-            (1, "What is the expected loss of an untrained 10-class classifier?",
-             "About ln 10 ≈ 2.30 (slightly more with label smoothing)."),
-            (1, "Train with ids instead of one-hot targets: what changes?",
-             "Build the dataset with <code>FromArrays(features, ids)</code> (one column of class ids), use "
-             "<code>Losses.SparseCrossEntropy</code> and <code>Metric.SparseAccuracy</code>."),
-            (2, "Compute per-class recall from the confusion matrix above.",
-             "red 67/67 = 100%, green 48/49 = 98%, blue 61/64 = 95%."),
-            (2, "Reject uncertain predictions: output \"unsure\" when the top probability is below 0.6. How many test points would be rejected?",
-             "Apply <code>Softmax</code> to <code>trainer.Predict(test)</code> scores (row by row on the host) and count rows "
-             "whose maximum is below 0.6; those are near the class boundaries, where most errors are."),
-            (3, "Classify the classic Iris flowers (4 measurements, 3 species) from a CSV.",
-             "<code>LoadCsv</code> with the species id column as target, <code>ToOneHot(3)</code>, split 80/20, standardize, "
-             "a 4 → 16 → 3 MLP, <code>CrossEntropy</code>, <code>Metric.Accuracy</code>, early stopping; expect over 90% test accuracy."),
+            (1, "Why does the model end with <code>Linear(32, 1)</code> and no <code>Sigmoid</code>?",
+             "<code>BinaryCrossEntropyWithLogits</code> applies the sigmoid internally in a numerically stable way (" + ch("losses") + "). "
+             "Apply <code>Sigmoid()</code> only when reading probabilities."),
+            (1, "Why does <code>Metric.BinaryAccuracy</code> use threshold 0 here?",
+             "The model outputs logits; a logit of 0 corresponds to a probability of 0.5."),
+            (2, "Oversample churners so they make up about 40% of the training set, retrain, and compare recall at 0.5.",
+             "Collect the indices of positive rows, repeat them three times, append to all indices, and train on "
+             "<code>train.Subset(indices)</code>. Recall at 0.5 rises sharply, precision falls, and probabilities shift "
+             "upwards; AUC changes little."),
+            (2, "Write a function that returns the threshold with the best F1 on a validation set.",
+             "Try thresholds 0.05, 0.10, …, 0.95, compute precision and recall at each as in part 2, and return the "
+             "threshold with the largest F1."),
+            (3, "Turn the project into a fraud detector for a CSV of transactions with a 0/1 <code>fraud</code> column.",
+             "<code>LoadCsv</code> with <code>TargetColumns = [\"fraud\"]</code>; scale features; the same model and loss; "
+             "oversample fraud rows; choose the threshold for the recall the business needs; report precision, recall and AUC."),
         ], PART),
-        footer("Multi-class classification", "Cross-entropy", "One-hot", "Softmax", "ArgMax", "Confusion matrix",
-               "Label smoothing", "Decision boundary"),
+        footer("Binary classification", "Logits", "Sigmoid", "Threshold", "Precision", "Recall", "F1 score",
+               "ROC AUC", "Class imbalance", "Oversampling"),
     )

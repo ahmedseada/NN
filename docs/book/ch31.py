@@ -1,142 +1,190 @@
-"""Chapter 31 — Image Classification with CNNs."""
+"""Chapter 31 — Recommenders and Categorical Embeddings."""
 from gen import *
 
-PART = "VI"
+PART = "V"
+
+MF = """
+    /// rating = mean + userBias + itemBias + userVector · itemVector;  input [N, 2] = (user id, item id)
+    sealed class MatrixFactorization : Module
+    {
+        private readonly Embedding _users, _items, _userBias, _itemBias;
+        private readonly float _mean;
+
+        public MatrixFactorization(int users, int items, int dim, float mean, Random? random = null, Device? device = null)
+        {
+            _users = new Embedding(users, dim, device, random);
+            _items = new Embedding(items, dim, device, random);
+            _userBias = new Embedding(users, 1, device, random);
+            _itemBias = new Embedding(items, 1, device, random);
+            _mean = mean;
+        }
+
+        protected override Tensor ForwardCore(Tensor x)
+        {
+            var user = x.Narrow(1, 0, 1).Flatten(0);                       // [N] user ids
+            var item = x.Narrow(1, 1, 1).Flatten(0);                       // [N] item ids
+            var dot = (_users.Forward(user) * _items.Forward(item)).Sum(1, keepDim: true) * 0.1f;   // [N, 1]
+            return dot + _userBias.Forward(user) * 0.1f + _itemBias.Forward(item) * 0.1f + _mean;
+        }
+
+        public override IEnumerable<Module> Children() => [_users, _items, _userBias, _itemBias];
+    }
+"""
+
+TRAIN = """
+    // ratings: (user, item) -> stars, e.g. loaded from a CSV with columns user,item,rating
+    var (train, test) = Dataset.FromArrays(ids, ratings, ["user", "item"], ["rating"]).Split(0.9, seed: 1);
+    float mean = train.Targets.ToArray().Average();
+
+    using var model = new MatrixFactorization(Users, Items, dim: 16, mean, new Random(1));
+    using var optimizer = new AdamW(model.Parameters(), 5e-3f, weightDecay: 1e-2f);
+    var trainer = new Trainer(model, optimizer, Losses.MeanSquaredError)
+    {
+        Metrics = { Metric.RootMeanSquaredError },
+        EarlyStoppingPatience = 5,
+    };
+    var history = trainer.Fit(new DataLoader(train, 256, shuffle: true, seed: 1), epochs: 100,
+                              validation: new DataLoader(test, 2048));
+    var best = history.Epochs[history.BestEpoch - 1];
+    double baseline = Math.Sqrt(test.Targets.ToArray().Average(r => (r - mean) * (r - mean)));
+    Console.WriteLine($"{history.Epochs.Count} epochs; test RMSE {best.ValidationMetrics!["rmse"]:F3} stars " +
+                      $"(predicting the average: {baseline:F3})");
+
+    // top 5 recommendations for user 7 among the movies they have not rated
+    int user = 7;
+    var unseen = Enumerable.Range(0, Items).Where(i => !rated.Contains((user, i))).ToArray();
+    var query = new float[unseen.Length, 2];
+    for (int k = 0; k < unseen.Length; k++) { query[k, 0] = user; query[k, 1] = unseen[k]; }
+    float[,] scores = model.Predict(query);
+    Console.WriteLine($"user {user}: top 5 of {unseen.Length} unseen movies");
+    foreach (int k in Enumerable.Range(0, unseen.Length).OrderByDescending(k => scores[k, 0]).Take(5))
+        Console.WriteLine($"  movie {unseen[k],3}: predicted {scores[k, 0]:F2}, " +
+                          $"true taste {TrueRating(user, unseen[k]):F2}");   // TrueRating: from the synthetic generator
+"""
+
+TABULAR = """
+    /// Numeric columns [promo, temperature] + embedded weekday (dim 3) and store (dim 8), then an MLP.
+    /// Input rows: [promo, temperature, weekday id, store id].
+    sealed class SalesModel : Module
+    {
+        private readonly Embedding _weekday, _store;
+        private readonly Sequential _mlp;
+
+        public SalesModel(int stores, Random? random = null, Device? device = null)
+        {
+            _weekday = new Embedding(7, 3, device, random);
+            _store = new Embedding(stores, 8, device, random);
+            _mlp = new Sequential
+            {
+                new Linear(2 + 3 + 8, 64, device: device, random: random), new ReLU(),
+                new Linear(64, 64, device: device, random: random), new ReLU(),
+                new Linear(64, 1, device: device, random: random),
+            };
+        }
+
+        protected override Tensor ForwardCore(Tensor x)
+        {
+            var numeric = x.Narrow(1, 0, 2);                                   // [N, 2]
+            var weekday = _weekday.Forward(x.Narrow(1, 2, 1).Flatten(0));     // [N, 3]
+            var store = _store.Forward(x.Narrow(1, 3, 1).Flatten(0));         // [N, 8]
+            return _mlp.Forward(Tensor.Concat([numeric, weekday, store], dim: 1));
+        }
+
+        public override IEnumerable<Module> Children() => [_weekday, _store, _mlp];
+    }
+"""
 
 
 def build():
     return page(
         chapter_open(
-            "cnn",
-            "This project teaches a convolutional network to recognize four shapes (circle, square, triangle, cross) "
-            "in small noisy grey images, drawn at random positions and sizes. It is the template for any image "
-            "classifier: product photos, defects on a production line, medical scans, handwritten digits. The code is "
-            "the repository's <code>NeuralSharp.Samples.Images</code>; this chapter explains each part and how to "
-            "feed it real image files.",
-            "Task type: <b>image classification</b>. Input <code>[N, C, H, W]</code>; model Conv2d/BatchNorm/ReLU/MaxPool blocks + dense head.",
-            "Data: <code>Dataset.FromClassLabels(pixels, labels, K).WithFeatureShape(1, 16, 16)</code>.",
-            "Result: 100% test accuracy after 12 epochs (8 s on the book's 4-core CPU).",
-            "Convolutions are where the GPU shines; use <code>--cuda</code> and larger batches for real image sizes.",
-            "Scale pixels to [0, 1]; keep images the same size; use NCHW order.",
+            "recommender",
+            "Ids are everywhere in business data: users, products, stores, countries, weekdays. Treating an id as a "
+            "number (store 17 is \"more\" than store 3) is meaningless, and one-hot columns get huge. Embeddings "
+            "(" + ch("embedding") + ") give each id a learned vector instead. This chapter builds two projects on that "
+            "idea: a movie recommender that learns user and item vectors from ratings, and a sales model that mixes "
+            "numeric columns with embedded categories. Both are custom composite modules.",
+            "Recommender (matrix factorization): rating ≈ mean + user bias + item bias + user vector · item vector.",
+            "Input rows hold ids as floats; <code>Narrow</code> + <code>Flatten(0)</code> extracts an id column for an <code>Embedding</code>.",
+            "Result: test RMSE 0.431 stars against 0.946 for always predicting the average.",
+            "Tabular data: embedding the store id cut the error from 27.3 to 1.5 units compared with feeding the id as a number.",
+            "Recommending = scoring every unseen item for a user and taking the best.",
         ),
-        h2("31.1 The model"),
-        snippet("""
-            const int Size = 16;
-            string[] shapes = ["circle", "square", "triangle", "cross"];
-            var init = new Random(3);
-            using var model = new Sequential
-            {
-                new Conv2d(1, 16, kernelSize: 3, padding: 1, device: device, random: init), new BatchNorm(16, device: device), new ReLU(),
-                new MaxPool2d(2),                                                      // 16x16 -> 8x8
-                new Conv2d(16, 32, kernelSize: 3, padding: 1, device: device, random: init), new BatchNorm(32, device: device), new ReLU(),
-                new MaxPool2d(2),                                                      // 8x8 -> 4x4
-                new Flatten(),
-                new Linear(32 * 4 * 4, 64, device: device, random: init), new ReLU(), new Dropout(0.2f, init),
-                new Linear(64, shapes.Length, device: device, random: init),
-            };
-            """, caption="A two-block CNN (37,988 parameters)"),
-        para("Two convolution blocks detect strokes and then corners and curves; each pooling halves the image. "
-             "The dense head combines the 32 feature maps of 4×4 into a decision. " + ch("conv") + " explains every "
-             "layer and the shape arithmetic."),
-        h2("31.2 Data"),
-        snippet("""
-            // pixels: float[count, 16 * 16] in [0, 1], labels: int[count] in 0..3
-            var data = Dataset.FromClassLabels(pixels, labels, shapes.Length, shapes)
-                              .WithFeatureShape(1, Size, Size);          // batches come out as [N, 1, 16, 16]
-            """, caption="Turning pixel rows into an image dataset"),
-        para("The sample draws its images procedurally (outline shapes with random size, position, brightness and noise), "
-             "4,000 for training and 800 for testing, so it needs no downloads. The same two lines take any set of "
-             "equally sized images."),
-        h2("31.3 Training and results"),
-        snippet("""
-            int epochs = 12;
-            using var optimizer = new AdamW(model.Parameters(), learningRate: 0.003f);
-            var trainer = new Trainer(model, optimizer, (logits, targets) => Losses.CrossEntropy(logits, targets))
-            {
-                Metrics = { Metric.Accuracy },
-                Scheduler = new CosineAnnealing(optimizer, epochs),
-            };
-            trainer.Fit(new DataLoader(train, 64, shuffle: true, device: device, seed: 4), epochs,
-                        validation: new DataLoader(test, 400, device: device));
-            """),
+        h2("31.1 A recommender from ratings"),
+        para("The data are (user, movie, stars) triples; most pairs are unrated. Matrix factorization "
+             "(glossary <b>Matrix factorization</b>) gives every user and every movie a vector of 16 numbers, trained "
+             "so that their dot product, plus a per-user and per-movie bias, reproduces the known ratings. Users with "
+             "similar tastes end up with similar vectors, and a user's predicted rating for an unseen movie follows. "
+             "The factor 0.1 scales down the embeddings' N(0, 1) starting values so the initial predictions are close "
+             "to the mean rating."),
+        snippet(MF, caption="The model: four embeddings and a dot product"),
+        snippet(TRAIN, caption="Training and recommending (the synthetic ratings generator is omitted: 500 users, 300 movies, 30,000 ratings)"),
         output("""
-            4000 training and 800 test images of 16x16 pixels, 4 classes
-
-            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 4,000 samples, 800 validation | batch 64, 63 steps/epoch | AdamW lr=0.003 | 37,988 parameters | 4 CPU threads
-            Epoch  1/12  loss 0.438070  accuracy 0.8375  val_loss 0.053383  val_accuracy 0.9900  1498.1 ms  2,670 samples/s  *
-            Epoch  2/12  loss 0.051849  accuracy 0.9835  val_loss 0.016776  val_accuracy 0.9962  676.3 ms  5,914 samples/s  *
-            Epoch  4/12  loss 0.009389  accuracy 0.9990  val_loss 0.005124  val_accuracy 1.0000  586.3 ms  6,822 samples/s  *
-            Epoch  8/12  loss 0.003615  accuracy 0.9992  val_loss 0.002073  val_accuracy 0.9988  618.7 ms  6,465 samples/s  *
-            Epoch 12/12  loss 0.001750  accuracy 1.0000  val_loss 0.000860  val_accuracy 1.0000  644.6 ms  6,205 samples/s  *
-            Finished 12 epochs in 8.25 s | best epoch 12 loss 0.000860
-
-            Test accuracy: 100.0 %
-            """, caption="Training output (selected epochs)"),
-        output("""
-            Image 1: predicted circle (100 %), actually circle
-                    ++###++
-                  +#+     +##
-                 +#         ##
-                 ##          #
-                 +#+        ##
-                  +#++   ++#+
-                     ++++++
-            """, caption="The sample prints a few test images as ASCII art with the model's verdict"),
-        cpugpu("training and predicting",
+            49 epochs; test RMSE 0.431 stars (predicting the average: 0.946)
+            user 7: top 5 of 246 unseen movies
+              movie  76: predicted 4.65, true taste 4.27
+              movie 258: predicted 4.48, true taste 4.11
+              movie  44: predicted 4.44, true taste 4.44
+              movie 286: predicted 4.35, true taste 3.93
+              movie  61: predicted 4.34, true taste 3.70
+            """, caption="Output (\"true taste\" is available only because the data are synthetic)"),
+        cpugpu("scale",
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Images -- --cpu
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Images -- --cpu --predict --input "circle,cross"
+               // 500 users x 300 movies trains in seconds on the CPU
+               Device.Default = Device.Cpu;
                """,
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Images -- --cuda --batch-size 256
-               // convolutions are large regular matrix products: the GPU's best case
+               // millions of ratings, 100k+ users: the GPU and large batches (4,096+)
+               Device.Default = Device.Cuda();
+               var loader = new DataLoader(train, 4096, shuffle: true);
+               // scoring all items for a user is one Predict call on [items, 2]
                """),
-        h2("31.4 Using your own image files"),
-        para("NeuralSharp has no image decoder, so reading PNG or JPEG files needs a small helper. Two dependency-free "
-             "routes: convert images to PGM (a trivial format) with any image tool and read them as the OCR sample does "
-             "(" + ch("ocr") + "), or use an imaging library you already have. On Windows, "
-             "<code>System.Drawing</code> works; cross-platform libraries such as ImageSharp or SkiaSharp do too. "
-             "Whatever reads the file, the steps into NeuralSharp are the same:"),
-        deriv("From files to a dataset", [
-            "Resize every image to the same size (e.g. 64×64) and convert to grey (C = 1) or keep RGB (C = 3).",
-            "Write pixels in <b>NCHW</b> order: all red values row by row, then all green, then all blue, each divided by 255.",
-            "Collect the rows into <code>float[count, C·H·W]</code> and the labels (e.g. from folder names) into <code>int[]</code>.",
-            "<code>Dataset.FromClassLabels(pixels, labels, K, classNames).WithFeatureShape(C, H, W)</code>; split; train as above.",
-            "Save the class names with the weights so predictions can be turned back into labels.",
+        reftable(["Extension", "How"], [
+            ["Implicit feedback (clicks, purchases, no stars)", "Targets 1 for interactions and 0 for sampled non-interactions; <code>BinaryCrossEntropyWithLogits</code>"],
+            ["New users with no history (cold start)", "Add user features (age group, country) as extra embeddings/columns; recommend popular items until history exists"],
+            ["Item side information (genre, price)", "Add item-feature embeddings to the item vector"],
+            ["\"Customers who bought X also bought\"", "Nearest item vectors by cosine similarity (" + ch("embedding") + ")"],
+            ["Serving", "Precompute all item vectors; a user's scores are one matrix product"],
+        ], caption="Table 31.1 — Recommender extensions"),
+        h2("31.2 Categorical columns in tabular models"),
+        para("The second project predicts daily sales of 50 stores from a promotion flag, the temperature, the "
+             "weekday and the store. Weekday and store are categories. The same data trains two models: an MLP that "
+             "reads the four columns as numbers, and a model that embeds weekday and store."),
+        snippet(TABULAR, caption="Mixing numeric columns and embeddings"),
+        output("""
+            ids as numbers  test MAE 27.27 units  (4,545 parameters)
+            embeddings      test MAE 1.46 units  (5,542 parameters)
+            """, caption="Both models trained with Adam, early stopping, 16,000 training rows"),
+        para("With ids as numbers, the MLP would have to carve 50 arbitrary store levels out of one numeric input; "
+             "with an embedding, each store simply gets its own learned vector. The same pattern handles any number of "
+             "categorical columns: one <code>Embedding</code> per column, sized by Table 9.2 (" + ch("embedding") + "), "
+             "concatenated with the scaled numeric columns."),
+        deriv("Preparing categorical columns", [
+            "Collect the distinct values of each categorical column in the training data and number them 0…K−1 "
+            "(reserve one id for values not seen in training).",
+            "Replace each value by its id when building the feature rows; keep the numeric columns scaled.",
+            "Save the value-to-id maps (e.g. as JSON) together with the weights and the scaler: they are part of the model.",
         ]),
-        snippet("""
-            // pixel buffer in HWC order (as most decoders return it) -> NCHW row for NeuralSharp
-            static void ToChw(ReadOnlySpan<byte> hwc, int height, int width, Span<float> chw)
-            {
-                for (int y = 0; y < height; y++)
-                    for (int x = 0; x < width; x++)
-                        for (int c = 0; c < 3; c++)
-                            chw[c * height * width + y * width + x] = hwc[(y * width + x) * 3 + c] / 255f;
-            }
-            """, caption="The one conversion every image pipeline needs"),
-        reftable(["Image size / data", "Suggested model"], [
-            ["16–32 px, a few classes", "2 blocks (16, 32 channels), dense head: this chapter"],
-            ["28×28 digits or characters", "2 blocks (32, 64), dense head: " + ch("ocr")],
-            ["64×64 photos, 10+ classes", "4 blocks (32, 64, 128, 128), <code>GlobalAveragePool2d</code>, <code>Linear(128, K)</code>"],
-            ["Few images per class (under ~100)", "Augment (flips, small shifts, brightness), heavy dropout; consider fine-tuning (" + ch("finetune") + ")"],
-        ], caption="Table 31.1 — Sizing a CNN"),
-        trap("images of different sizes in one batch",
-             "<p>A batch is one tensor, so every image must have the same C, H and W. Resize (or crop and pad) when loading.</p>"),
+        trap("scaling the id columns",
+             "<p>A <code>StandardScaler</code> fitted on all columns would turn ids into fractional numbers that no longer "
+             "select embedding rows. Scale only the numeric columns (fit the scaler on them alone), and leave id columns "
+             "as integers.</p>"),
         practice([
-            (1, "What input shape does the model expect for a batch of 32 of the sample's images?",
-             "<code>[32, 1, 16, 16]</code>."),
-            (1, "Add a fifth shape class (for example a diamond). What changes in the model?",
-             "Only the last layer: <code>Linear(64, 5)</code> (and the class name list)."),
-            (2, "Double the image size to 32×32. Which layer's size must change and to what?",
-             "After two poolings the maps are 8×8, so the first dense layer becomes <code>Linear(32 * 8 * 8, 64)</code>; or add a "
-             "third block to return to 4×4."),
-            (2, "Add simple data augmentation: horizontally flip half of the training images each epoch.",
-             "Build a flipped copy of each training image (reverse each pixel row) and add both versions to the dataset, or "
-             "generate a new randomly flipped dataset per epoch and call <code>Fit</code> one epoch at a time."),
-            (3, "Build a folder-per-class image classifier for 64×64 RGB photos.",
-             "Enumerate subfolders as classes; load, resize to 64×64 and convert each file to CHW floats with a helper like "
-             "<code>ToChw</code>; <code>FromClassLabels(...).WithFeatureShape(3, 64, 64)</code>; a 4-block CNN with global average "
-             "pooling; train on the GPU with batch 128; save weights plus class names."),
+            (1, "How many parameters do the four embeddings of the recommender have for 500 users, 300 movies and dim 16?",
+             "(500 + 300)·16 + (500 + 300)·1 = 12,800 + 800 = 13,600."),
+            (1, "Why does the recommender add the mean rating as a constant?",
+             "So the model starts near the right level and the embeddings only have to learn deviations from it."),
+            (2, "Find the 3 movies most similar to movie 44 from the learned vectors.",
+             "Read the item embedding table (<code>Weight.ToArray2D()</code>; expose the embedding from the module), compute the "
+             "cosine similarity of row 44 with every other row, and take the three largest."),
+            (2, "Add a country column (40 countries) to the sales model.",
+             "Add <code>new Embedding(40, 4)</code>, a fifth input column with the country id, extract it with "
+             "<code>x.Narrow(1, 4, 1).Flatten(0)</code>, and widen the first Linear to 2 + 3 + 8 + 4 inputs."),
+            (3, "Turn the recommender into an implicit-feedback model for purchase data.",
+             "Use purchased (user, item) pairs as positives with target 1, sample random unpurchased pairs as negatives "
+             "with target 0 (e.g. 4 per positive), drop the mean term, train with <code>BinaryCrossEntropyWithLogits</code>, "
+             "and rank unseen items by score; evaluate with the share of held-out purchases that appear in each user's top 10."),
         ], PART),
-        footer("CNN", "Convolution", "Feature map", "NCHW", "Data augmentation", "Pooling", "Image classification"),
+        footer("Recommender system", "Matrix factorization", "Embedding", "Categorical feature", "Cold start",
+               "Implicit feedback", "Dot product"),
     )

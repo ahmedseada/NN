@@ -1,4 +1,4 @@
-"""Chapter 34 — GPT Text Generation."""
+"""Chapter 34 — Sequence Classification and Sentiment."""
 from gen import *
 
 PART = "VI"
@@ -7,168 +7,176 @@ PART = "VI"
 def build():
     return page(
         chapter_open(
-            "gpt",
-            "A GPT is a decoder-only transformer trained to predict the next token of text; generating means "
-            "predicting, sampling and repeating. This project, the repository's <code>NeuralSharp.Samples.Transformer</code> "
-            "with the shared <code>CharGpt</code> class, trains a character-level GPT on 333,000 characters of simple "
-            "English from a small grammar (or any text file you give it), saves it with its configuration, and "
-            "generates text with a KV cache, on-device sampling, CUDA graphs and batched samples.",
-            "Model: <code>Embedding</code> → <code>PositionalEncoding</code> → 3 causal <code>TransformerEncoderLayer</code>s → <code>LayerNorm</code> → <code>Linear</code> to the vocabulary (341,309 parameters).",
-            "Training data: windows of 64 characters; the target is the same window shifted by one character; <code>SparseCrossEntropy</code> per position.",
-            "Result: 89.4% next-character accuracy; every generated word is a real word of the grammar.",
-            "Training: 136 s on the book's 4-core CPU; about 16 s on a laptop GeForce RTX 5050.",
-            "Generation on the CPU: 230 characters/s by full recompute, 3,429 with the KV cache, 10,081 with 32 samples at once.",
+            "sentiment",
+            "Is this review positive or negative? The answer depends on word order: \"not good\" is negative, \"not bad\" "
+            "positive. This project, the repository's <code>NeuralSharp.Samples.Sequences</code>, trains four models on "
+            "the same sentences, a bag of words that ignores order, an LSTM, a GRU and a transformer, and measures "
+            "exactly where order matters. It is the template for any text or event-sequence classifier: support "
+            "tickets, intents, log lines, click streams.",
+            "Task type: <b>sequence classification</b>. Input: token ids <code>[N, T]</code>; output: class scores <code>[N, K]</code>.",
+            "Every model starts with <code>Embedding</code>; they differ in how they combine the T word vectors.",
+            "Result: bag of words 70.1% (57.3% on sentences with \"not\"); LSTM 100%, GRU 99.9%, transformer 99.5%.",
+            "The transformer needed 40 epochs against 15 for the recurrent models, a typical pattern on small data.",
+            "The <code>--predict</code> mode compares all saved models on your sentences.",
         ),
-        h2("34.1 The model and its configuration"),
+        h2("34.1 Vocabulary and data"),
         snippet("""
-            public sealed record GptConfig(string Vocabulary, int Context = 64, int Dim = 96, int Heads = 4, int Layers = 3)
-            {
-                public int TrainedEpochs { get; init; }
-                public double? ValidationLoss { get; init; }
-                public double? ValidationAccuracy { get; init; }
-                public DateTimeOffset? TrainedAt { get; init; }
-                public string? Corpus { get; init; }
-                // Save(weightsPath) / Load(weightsPath): JSON next to the weights file
-            }
-
-            public static CharGpt Create(GptConfig config, Device device, Random? random = null)
-            {
-                random ??= new Random(2);
-                var model = new Sequential
-                {
-                    new Embedding(config.Vocabulary.Length, config.Dim, device, random),
-                    new PositionalEncoding(config.Context, config.Dim, device),
-                };
-                for (int layer = 0; layer < config.Layers; layer++)
-                    model.Add(new TransformerEncoderLayer(config.Dim, config.Heads, ffDim: 4 * config.Dim,
-                                                          dropout: 0.1f, causal: true, device: device, random: random));
-                model.Add(new LayerNorm(config.Dim, device: device));
-                model.Add(new Linear(config.Dim, config.Vocabulary.Length, device: device, random: random));
-                return new CharGpt(config, model, device);
-            }
-            """, caption="samples/Shared/Gpt/CharGpt.cs (abridged)"),
-        para("<code>CharGpt</code>, <code>GptConfig</code>, <code>GptTraining</code> and <code>GenerationSettings</code> are "
-             "sample code in <code>samples/Shared/Gpt/CharGpt.cs</code>, built only on the public library API; copy the "
-             "file into your own project (or link it) to reuse them. The configuration (vocabulary, sizes, training "
-             "record) is saved as JSON next to the weights. Loading "
-             "reads the JSON first and builds the matching model, so an inference program never has to repeat the "
-             "architecture by hand: a pattern worth copying for any model whose shape is chosen at training time."),
-        h2("34.2 Training windows"),
+            string[] positive = ["good", "great", "excellent", "love", "wonderful", "fun"];
+            string[] negative = ["bad", "awful", "terrible", "hate", "boring", "dull"];
+            string[] neutral = ["the", "movie", "was", "a", "plot", "acting", "really", "very", "it", "this", "i", "at", "all", "and"];
+            string[] vocabulary = ["<pad>", "<unk>", "not", .. positive, .. negative, .. neutral];
+            var ids = vocabulary.Select((word, id) => (word, id)).ToDictionary(p => p.word, p => p.id);
+            const int MaxLength = 12;                                      // sentences padded/cut to 12 tokens
+            """, caption="A 29-word vocabulary with padding and unknown-word ids"),
+        para("The sample generates 6,000 training and 1,500 test sentences of 5–12 words mixing sentiment words, "
+             "neutral words and \"not\", which flips the word after it; the label follows from the words. Real text "
+             "uses the <code>Vocabulary</code> helper of " + ch("embedding") + " to build ids from a corpus."),
+        h2("34.2 Four models"),
         snippet("""
-            public static Dataset Windows(string corpus, GptConfig config, int maxWindows, int seed)
+            const int Dim = 32;
+            var models = new (string Name, int Epochs, Func<Random, Module> Create)[]
             {
-                var index = config.Vocabulary.Select((c, i) => (c, i)).ToDictionary(p => p.c, p => p.i);
-                var random = new Random(seed);
-                int context = config.Context;
-                int windows = Math.Min(maxWindows, Math.Max(1, corpus.Length / 4));
-                var features = new float[windows * context];
-                var targets = new float[windows * context];
-                for (int w = 0; w < windows; w++)
+                ("Bag of words (order-blind baseline)", 15, r => new Sequential
                 {
-                    int start = random.Next(corpus.Length - context - 1);
-                    for (int t = 0; t < context; t++)
-                    {
-                        features[w * context + t] = index[corpus[start + t]];       // characters t
-                        targets[w * context + t] = index[corpus[start + t + 1]];    // the character after each
-                    }
-                }
-                string[] positions = [.. Enumerable.Range(0, context).Select(t => $"t{t}")];
-                return Dataset.FromFlat(features, targets, windows, positions, positions);
-            }
-
-            // training: AdamW, cosine schedule, clipping; SparseCrossEntropy over [N, 64, V] logits and [N, 64] targets
-            var trainer = new Trainer(gpt.Model, optimizer, (logits, next) => Losses.SparseCrossEntropy(logits, next))
-            {
-                Metrics = { Metric.SparseAccuracy },
-                Scheduler = new CosineAnnealing(optimizer, epochs, minLearningRate: 2e-4f),
-                MaxGradientNorm = 1f,
+                    new Embedding(vocabulary.Length, Dim, device, r),
+                    new Lambda(x => x.Mean(1), "MeanOverWords"),
+                    new Linear(Dim, 2, device: device, random: r),
+                }),
+                ("LSTM", 15, r => new Sequential
+                {
+                    new Embedding(vocabulary.Length, Dim, device, r),
+                    new LSTM(Dim, 64, device: device, random: r),
+                    new Linear(64, 2, device: device, random: r),
+                }),
+                ("GRU", 15, r => new Sequential
+                {
+                    new Embedding(vocabulary.Length, Dim, device, r),
+                    new GRU(Dim, 64, device: device, random: r),
+                    new Linear(64, 2, device: device, random: r),
+                }),
+                ("Transformer", 40, r => new Sequential
+                {
+                    new Embedding(vocabulary.Length, Dim, device, r),
+                    new PositionalEncoding(MaxLength, Dim, device),
+                    new TransformerEncoderLayer(Dim, heads: 4, ffDim: 64, dropout: 0f, device: device, random: r),
+                    new TransformerEncoderLayer(Dim, heads: 4, ffDim: 64, dropout: 0f, device: device, random: r),
+                    new LayerNorm(Dim, device: device),
+                    new Lambda(x => x.Mean(1), "MeanOverWords"),
+                    new Linear(Dim, 2, device: device, random: r),
+                }),
             };
-            """, caption="Every window teaches 64 predictions at once, thanks to the causal mask"),
-        output("""
-            Corpus: 333,267 characters, vocabulary of 29: "\\n ,.abcdefghiklmnopqrstuvwxyz"
-            Sample: "every morning, my neighbor forgot a wooden boat. the old wizard borrowed a shiny key and then opened a shiny key. last night, our teacher opened a wooden boat. ..."
-
-            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 19,000 samples, 1,000 validation | batch 32, 594 steps/epoch | AdamW lr=0.002 | 341,309 parameters | 4 CPU threads
-            Epoch 1/2  loss 0.573884  accuracy 0.7999  val_loss 0.262710  val_accuracy 0.8926  70053.7 ms  271 samples/s  *
-            Epoch 2/2  loss 0.266744  accuracy 0.8895  val_loss 0.250425  val_accuracy 0.8938  65444.2 ms  290 samples/s  *
-            Finished 2 epochs in 135.51 s | best epoch 2 loss 0.250425
-            """, caption="Training output on the CPU"),
-        para("A validation loss of 0.25 is far below ln 29 ≈ 3.37, the loss of guessing. The remaining uncertainty "
-             "is real: after \"the old \" several nouns are equally valid in this grammar, so no model can reach 100%."),
-        h2("34.3 Generating"),
-        output("""
-            Prompt "the little robot " (temperature 0.7, KV cache):
-              the little robot built a tiny garden and then carried the heavy box.
-              a quiet student opened the heavy box on the hill. the old wizard sold a shiny key and then watched a shiny key. before dawn, the young pilot sold a tiny garden. ...
-              -> 400 characters in 112 ms (3585/s, 0.25 ms per step), first token 12.1 ms, average confidence 91 %, perplexity 1.20
-              -> 76/76 generated words are real vocabulary words (100 %)
-            """, caption="Generation after training (text shortened)"),
-        para("Perplexity 1.20 means the model is, on average, choosing between about 1.2 equally likely characters: "
-             "very sure of itself, as a simple grammar allows (glossary <b>Perplexity</b>). The generation loop in "
-             "<code>CharGpt.Generate</code> is the one explained in " + ch("generation") + ": prefill the prompt, "
-             "then one cached step per character, sampling on the device, reading tokens back in chunks, and "
-             "re-reading the last half of the window when the 64-character context is full."),
+            """, caption="Same embedding, four ways to read the sentence"),
         snippet("""
-            using var gpt = CharGpt.Load("models/transformer.weights", Device.Default);
-            var settings = new GenerationSettings(
-                Length: 400, Temperature: 0.7f, TopK: 0, Seed: 6,
-                Samples: 1, UseCache: true, UseGraph: true);
-            var result = gpt.Generate("the little robot ", settings,
-                onToken: token => Console.Write(token.Token));            // streams characters as they arrive
-            Console.WriteLine($"\\n{result.Metrics.TokensPerSecond:F0} chars/s, perplexity {result.Metrics.Perplexity:F2}");
-            """, caption="Using a trained model from your own code"),
-        h2("34.4 How fast, and why"),
+            foreach (var (name, epochs, create) in models)
+            {
+                var model = create(new Random(2));
+                var optimizer = new AdamW(model.Parameters(), learningRate: 0.003f, weightDecay: 1e-4f);
+                var trainer = new Trainer(model, optimizer, (logits, targets) => Losses.CrossEntropy(logits, targets))
+                {
+                    Metrics = { Metric.Accuracy },
+                    Scheduler = new CosineAnnealing(optimizer, epochs, warmupEpochs: 1),
+                    MaxGradientNorm = 1f,                                  // recurrent layers: clip
+                };
+                trainer.Fit(new DataLoader(train, 64, shuffle: true, device: device, seed: 3), epochs);
+                double accuracy = trainer.Evaluate(new DataLoader(test, 500, device: device)).Metrics["accuracy"];
+                double negated = trainer.Evaluate(new DataLoader(testNegated, 500, device: device)).Metrics["accuracy"];
+                model.Save(ModelFile(name));
+            }
+            """, caption="One training loop for all four"),
         output("""
-            Benchmark on cpu (CPU (4 threads, 8-wide SIMD)), 400 characters per sample
+            === Bag of words (order-blind baseline)
+            Epoch 15/15  loss 0.566507  accuracy 0.7072  14.1 ms  424,680 samples/s  *
+            === LSTM
+            Epoch 15/15  loss 0.000262  accuracy 1.0000  400.9 ms  14,966 samples/s  *
+            === GRU
+            Epoch 15/15  loss 0.000185  accuracy 1.0000  308.2 ms  19,471 samples/s  *
+            === Transformer
+            Epoch 20/40  loss 0.005096  accuracy 0.9987  620.7 ms  9,667 samples/s  *
+            Epoch 40/40  loss 0.000065  accuracy 1.0000  562.8 ms  10,661 samples/s  *
 
-              mode                            chars/s   ms/step   first token   note
-              full recompute, 1 sample            230      4.36        4.1 ms   1.0x
-              KV cache, 1 sample                 3429      0.29        2.4 ms   14.9x
-              KV cache + graph, 1 sample         4260      0.23        1.8 ms   18.6x  graphs are GPU-only; CPU runs the step directly
-              KV cache + graph, 8 samples        6271      1.26        8.7 ms   27.3x  graphs are GPU-only; CPU runs the step directly
-              KV cache + graph, 32 samples      10081      3.13       20.4 ms   43.9x  graphs are GPU-only; CPU runs the step directly
-            """, caption="--predict --benchmark true on the CPU"),
-        para("The cache removes the repeated work (15×); batching samples shares each step's fixed costs (up to 44× in "
-             "total characters per second). On the CPU the graph rows differ from the plain cache only by timing noise "
-             "and warm-up; on a GPU, recording the step as a CUDA graph removes the launch overhead of the step's "
-             "several hundred kernels, which is where most of a small model's GPU time goes."),
+            Model                                   test accuracy   sentences with "not"
+              Bag of words (order-blind baseline)        70.1 %               57.3 %
+              LSTM                                      100.0 %              100.0 %
+              GRU                                        99.9 %               99.9 %
+              Transformer                                99.5 %               99.3 %
+            """, caption="Selected training lines and the comparison (CPU)"),
+        reftable(["Model", "Parameters", "Training time (CPU)", "Reads order by"], [
+            ["Bag of words", "994", "0.6 s", "— (averages word vectors)"],
+            ["LSTM", "25,890", "7.2 s", "carrying a state through the words"],
+            ["GRU", "19,682", "4.7 s", "carrying a state (fewer gates)"],
+            ["Transformer", "18,146", "24.1 s (40 epochs)", "positional encodings + attention"],
+        ], caption="Table 34.1 — The four models compared"),
+        para("The bag of words gets the easy sentences right but is little better than a coin toss (57%) when \"not\" "
+             "decides the answer: averaging throws away which word \"not\" was next to. All order-aware models solve "
+             "the task. On such a small dataset the recurrent models learn fastest; transformers overtake them on "
+             "longer texts and larger datasets (" + ch("recurrent") + ", Table 11.3)."),
+        h2("34.3 Using the models"),
+        snippet("""
+            float[] PositiveProbabilities(Module model, string[] texts)
+            {
+                var encoded = new float[texts.Length, MaxLength];                // zeros = <pad>
+                for (int s = 0; s < texts.Length; s++)
+                {
+                    var words = texts[s].ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                    for (int t = 0; t < Math.Min(words.Length, MaxLength); t++)
+                        encoded[s, t] = ids.GetValueOrDefault(words[t], ids["<unk>"]);
+                }
+                using var input = Tensor.From(encoded, device);
+                using var logits = model.Predict(input);
+                using var probabilities = logits.Softmax();
+                var p = probabilities.ToArray();
+                return [.. Enumerable.Range(0, texts.Length).Select(s => p[s * 2 + 1])];   // column 1 = positive
+            }
+            """, caption="Tokenize, pad, predict, softmax"),
+        output("""
+            "the movie was not good"
+                Bag of words (order-blind baseline)  positive (67 %)
+                LSTM                                 negative (100 %)
+                GRU                                  negative (100 %)
+                Transformer                          negative (100 %)
+            "not bad at all"
+                Bag of words (order-blind baseline)  negative (60 %)
+                LSTM                                 positive (100 %)
+                GRU                                  positive (100 %)
+                Transformer                          positive (100 %)
+            """, caption="--predict --input \"the movie was not good;not bad at all\""),
         cpugpu("commands",
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cpu
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cpu --predict --input "the old wizard" --temperature 0.8
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cpu --corpus mybook.txt --epochs 5
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences -- --cpu
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences -- --cpu --predict --input "i hate it;not boring"
                """,
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cuda
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cuda --predict --benchmark true
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cuda --predict --samples 8 --top-k 10
-               """,
-               "The Web API of " + ch("webapi") + " serves the same model with a browser interface and live metrics."),
-        h2("34.5 Training on your own text"),
-        reftable(["Corpus size", "Suggested configuration", "Notes"], [
-            ["~100 KB (a short story)", "Dim 64, 2 layers, context 64, 5–10 epochs", "Learns spelling and common words; expect memorized phrases"],
-            ["1–5 MB (a few books)", "Dim 128–192, 4 layers, context 128, GPU", "Plausible sentences in the author's style"],
-            ["Larger", "Dim 256+, 6+ layers, context 256; a GPU is essential", "Consider word pieces instead of characters"],
-        ], caption="Table 34.1 — Sizing a character GPT"),
-        trap("expecting knowledge from a small GPT",
-             "<p>A model of a few hundred thousand parameters learns the surface of its corpus (spelling, grammar, style), "
-             "not facts or reasoning. It is excellent for text in a fixed format (logs, product names, code-like strings, "
-             "templated reports) and for learning how language models work.</p>"),
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences -- --cuda --batch-size 256
+               """),
+        h2("34.4 Real text"),
+        reftable(["Need", "How"], [
+            ["Build the vocabulary", "Count words in the training texts; keep those seen at least 2–5 times; reserve pad and unknown ids"],
+            ["Longer documents", "Raise <code>MaxLength</code> (and <code>PositionalEncoding</code>'s length); consider truncating from the start"],
+            ["More classes (topics, intents)", "<code>Linear(h, K)</code> and K-class labels"],
+            ["Several labels per text", "Sigmoid outputs with <code>BinaryCrossEntropyWithLogits</code> (" + ch("binary") + ")"],
+            ["Tag each word (names, dates)", "<code>returnSequences: true</code> and a per-step <code>Linear</code> (" + ch("recurrent") + ")"],
+            ["Misspellings and rare words", "Character-level input (as in " + ch("gpt") + ") or sub-word pieces"],
+        ], caption="Table 34.2 — From the sample to real text"),
+        trap("unknown words in production",
+             "<p>Words not in the training vocabulary map to <code>&lt;unk&gt;</code>. If many important words are unknown, "
+             "predictions degrade silently. Log the share of unknown tokens per request and retrain with a larger "
+             "vocabulary when it grows.</p>"),
         practice([
-            (1, "Why does one training window give 64 training examples?",
-             "The causal mask lets position t see only characters 0…t, so each of the 64 positions is an independent "
-             "next-character prediction, all computed in one forward pass."),
-            (1, "What does temperature 0.7 do compared with 1.0?",
-             "It sharpens the distribution, favouring likely characters: more conservative, more repetitive text (" + ch("generation") + ")."),
-            (2, "Train on your own text file and generate with three temperatures (0.5, 0.8, 1.2). Describe the differences.",
-             "<code>--corpus file.txt</code>, then <code>--predict --temperature …</code>. Low temperatures repeat frequent phrases; high "
-             "temperatures invent words and break grammar; around 0.7–0.9 is usually most readable."),
-            (2, "Generate 8 different continuations of the same prompt in one call.",
-             "<code>--samples 8</code>, or <code>GenerationSettings(Samples: 8, …)</code>; the result holds 8 sequences, generated as one batch."),
-            (3, "Double the model (Dim 192, 6 layers, context 128) and train it on the GPU. What changes in the code?",
-             "Only the <code>GptConfig</code> passed to <code>CharGpt.Create</code>; the saved JSON records the new sizes, so "
-             "<code>CharGpt.Load</code> and the Web API pick them up without changes."),
+            (1, "Why can the bag-of-words model not tell \"not good\" from \"good not\"?",
+             "The mean of the word vectors is the same for both orders."),
+            (1, "What is the input shape for a batch of 64 sentences?",
+             "<code>[64, 12]</code> token ids; the embedding turns it into <code>[64, 12, 32]</code>."),
+            (2, "Add a third class \"neutral\" for sentences without sentiment words.",
+             "Generate or label neutral sentences, make the targets 3-class, and change every model's last layer to "
+             "<code>Linear(…, 3)</code>; the probability code then reads three columns."),
+            (2, "Make the transformer train faster on this data.",
+             "Try a higher learning rate with warm-up, one block instead of two, or a smaller <code>ffDim</code>; measure epochs to "
+             "99% accuracy rather than time per epoch."),
+            (3, "Classify real support tickets into 8 categories from a CSV with <code>text</code> and <code>category</code> columns.",
+             "Read the file with your own CSV code (text columns), build a <code>Vocabulary</code> from the training texts, encode to "
+             "<code>[N, T]</code> ids, build the dataset with <code>FromClassLabels(ids, labels, 8)</code> and <code>WithFeatureShape(T)</code>, "
+             "use the GRU model with <code>Linear(64, 8)</code>, and report per-class accuracy."),
         ], PART),
-        footer("GPT", "Language model", "Character-level model", "Next-token prediction", "Causal mask",
-               "Perplexity", "Temperature", "KV cache", "Context length"),
+        footer("Sequence classification", "Sentiment analysis", "Token", "Vocabulary", "Bag of words", "LSTM",
+               "GRU", "Transformer", "Padding"),
     )

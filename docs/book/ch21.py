@@ -50,7 +50,7 @@ def build():
         reftable(["Type", "Members"], [
             ["<code>DecodingContext(device, batch, capacity)</code>", "<code>Length</code>, <code>Capacity</code>, <code>Batch</code>, <code>Reset()</code>, <code>CaptureStep(action)</code>, <code>ReplayStep(graph)</code>, <code>Dispose()</code>"],
             ["<code>Sequential.ForwardCached(input, context)</code>", "Runs new positions <code>[batch, newSteps]</code> through the model using and extending the caches"],
-            ["<code>TokenSampler(device, rows, vocabulary, maxSteps)</code>", "<code>Temperature</code>, <code>TopK</code>, <code>Seed</code>, <code>Sample(logits)</code>, <code>Ids</code>, <code>Read(from, to)</code>, <code>Reset()</code>"],
+            ["<code>TokenSampler(device, rows, vocabulary, maxSteps, historyCapacity)</code>", "<code>Temperature</code>, <code>TopK</code>, <code>TopP</code>, <code>MinP</code>, penalties (" + ch("textgen") + "), <code>Seed</code>, <code>SetHistory</code>, <code>Sample(logits)</code>, <code>Ids</code>, <code>Read(from, to)</code>, <code>Reset()</code>"],
             ["<code>SampledToken</code>", "<code>Id</code>, <code>Probability</code>, <code>Entropy</code> (bits), <code>Alternatives</code> (top 5)"],
             ["<code>ComputeGraph</code>", "<code>Capture(device, action)</code>, <code>Replay()</code>, <code>IsRecorded</code>, <code>FailureReason</code>"],
         ], caption="Table 21.1 — The generation API"),

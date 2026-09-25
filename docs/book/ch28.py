@@ -1,210 +1,162 @@
-"""Chapter 28 — Time-Series Forecasting."""
+"""Chapter 28 — Multi-Class Classification."""
 from gen import *
 
 PART = "V"
 
 
-def windows_svg():
-    w, h = 470, 110
-    p = [f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
-    for i in range(22):
-        x = 12 + i * 20
-        fill = "#fff4e2" if i < 16 else "#e6f2ef"
-        p.append(f'<rect x="{x}" y="20" width="18" height="18" rx="2" fill="{fill}" stroke="#b7c3c8"/>')
-    for k, y in enumerate((50, 72)):
-        x0 = 12 + k * 20
-        p.append(f'<rect x="{x0}" y="{y}" width="{7 * 20 - 2}" height="14" rx="2" fill="#0f6b5c" opacity="0.85"/>')
-        p.append(f'<rect x="{x0 + 7 * 20}" y="{y}" width="18" height="14" rx="2" fill="#a15c00"/>')
-        p.append(svg_text(x0 + 7 * 20 + 32, y + 11, "target", 7.4, "#a15c00", "start"))
-    p.append(svg_text(12 + 3.5 * 20, 104, "window of T past values", 7.4, "#0f6b5c"))
-    p.append(svg_text(12 + 8 * 20, 14, "training period", 7.6, "#a15c00"))
-    p.append(svg_text(12 + 19 * 20, 14, "test period", 7.6, "#0f6b5c"))
-    p.append("</svg>")
-    return "".join(p)
-
-
-PROGRAM = """
-    using NeuralSharp;
-    using NeuralSharp.Data;
-    using NeuralSharp.Diagnostics;
-    using NeuralSharp.Layers;
-    using NeuralSharp.Optimizers;
-    using NeuralSharp.Training;
-
-    Device.Default = args.Contains("--cuda") ? Device.Cuda() : Device.Cpu;
-
-    // ---- a daily series: trend + weekly pattern + yearly season + noise (e.g. store visitors)
-    var rng = new Random(5);
-    float[] series = new float[1200];
-    for (int d = 0; d < series.Length; d++)
-        series[d] = 200 + 0.05f * d + 30 * MathF.Sin(2 * MathF.PI * d / 7)
-                  + 50 * MathF.Sin(2 * MathF.PI * d / 365) + 8 * (rng.NextSingle() - 0.5f) * 2;
-
-    // ---- split BY TIME: the first 1000 days train, the last 200 test
-    const int T = 28;                                            // look back four weeks
-    int split = 1000;
-    var scale = StandardScaler.Fit(series.AsSpan(0, split), 1);   // training period only
-    float[] scaled = (float[])series.Clone();
-    scale.Transform(scaled, 1);
-
-    Dataset Windows(int from, int to)                             // windows whose TARGET day is in [from, to)
-    {
-        int count = to - Math.Max(from, T);
-        var x = new float[count, T];
-        var y = new float[count, 1];
-        for (int i = 0; i < count; i++)
-        {
-            int target = Math.Max(from, T) + i;
-            for (int k = 0; k < T; k++) x[i, k] = scaled[target - T + k];
-            y[i, 0] = scaled[target];
-        }
-        return Dataset.FromArrays(x, y).WithFeatureShape(T, 1);  // batches: [N, T, 1]
-    }
-    var train = Windows(0, split);
-    var test = Windows(split, series.Length);
-    Console.WriteLine($"{train.Count} training windows, {test.Count} test windows");
-
-    static Sequential Build(Random? r = null) => new()
-    {
-        new GRU(1, 32, random: r),                                // reads the window step by step
-        new Linear(32, 1, random: r),                             // next value
-    };
-    using var model = Build(new Random(1));
-    using var optimizer = new Adam(model.Parameters(), 3e-3f);
-    var trainer = new Trainer(model, optimizer, Losses.MeanSquaredError)
-    {
-        EarlyStoppingPatience = 8,
-        MaxGradientNorm = 1f,                                     // recurrent nets: clip
-    };
-    using (Telemetry.Subscribe(new ConsoleLogger(TelemetryLevel.Training, epochInterval: 10)))
-        trainer.Fit(new DataLoader(train, 32, shuffle: true, seed: 1), epochs: 60,
-                    validation: new DataLoader(test, 256));
-"""
-
-EVAL = """
-    // ---- one-step-ahead error in real units, against two simple baselines
-    float[,] pred = trainer.Predict(test);
-    float[] p = [.. Enumerable.Range(0, test.Count).Select(i => pred[i, 0])];
-    scale.InverseTransform(p, 1);
-    double mae = 0, naive = 0, seasonal = 0;
-    for (int i = 0; i < test.Count; i++)
-    {
-        int day = split + i;
-        mae += Math.Abs(p[i] - series[day]);
-        naive += Math.Abs(series[day - 1] - series[day]);         // tomorrow = today
-        seasonal += Math.Abs(series[day - 7] - series[day]);      // tomorrow = same weekday last week
-    }
-    Console.WriteLine($"MAE next day: GRU {mae / test.Count:F1}   'same as yesterday' {naive / test.Count:F1}" +
-                      $"   'same as last week' {seasonal / test.Count:F1}");
-
-    // ---- 14-day forecast: feed each prediction back in as the newest value
-    var window = scaled[(split - T)..split].ToList();
-    var forecast = new List<float>();
-    model.Eval();
-    for (int step = 0; step < 14; step++)
-    {
-        using var input = Tensor.From([.. window.TakeLast(T)], [1, T, 1]);
-        using var next = model.Predict(input);
-        float value = next.Item();
-        window.Add(value);
-        forecast.Add(value);
-    }
-    float[] f = [.. forecast];
-    scale.InverseTransform(f, 1);
-    Console.WriteLine("day   forecast   actual");
-    for (int d = 0; d < 14; d += 2) Console.WriteLine($"{split + d,4} {f[d],9:F1} {series[split + d],8:F1}");
-    Console.WriteLine($"14-day MAE {Enumerable.Range(0, 14).Average(d => Math.Abs(f[d] - series[split + d])):F1}");
-"""
-
-
 def build():
     return page(
         chapter_open(
-            "timeseries",
-            "Forecasting predicts future values of a series from its past: sales, energy load, sensor readings, "
-            "visitors. The network sees a window of recent values and predicts the next one; forecasting further "
-            "ahead feeds predictions back in. This project forecasts a daily series with trend and weekly and yearly "
-            "patterns using a GRU, and, most importantly, compares it with simple baselines, which every forecasting "
-            "project must beat.",
-            "Task type: <b>regression on windows</b>. Features <code>[N, T, 1]</code> (T past values), target the next value.",
-            "Split by time, never randomly: the test period comes after the training period.",
-            "Fit the scaler on the training period only.",
-            "Result: next-day MAE 5.7, against 6.6 for \"same weekday last week\" and 17.1 for \"same as yesterday\".",
-            "Multi-step forecasts feed each prediction back; errors grow with the horizon (14-day MAE 6.3).",
+            "multiclass",
+            "When the answer is one of several categories (which product line, which species, which digit), the model "
+            "outputs one score per class and the loss is cross-entropy. This project classifies points of three "
+            "interleaved spirals, a problem no straight line can solve, and shows the full workflow including "
+            "one-hot targets, label smoothing, a cosine schedule, a confusion matrix, class probabilities at "
+            "inference and a decision map. The code is the repository's <code>NeuralSharp.Samples.Classification</code>.",
+            "Task type: <b>multi-class classification</b>. Last layer <code>Linear(h, K)</code>; loss <code>CrossEntropy</code> (one-hot) or <code>SparseCrossEntropy</code> (ids).",
+            "Targets: <code>Dataset.FromClassLabels(features, labels, K, names)</code> creates one-hot rows.",
+            "Predictions: <code>ArgMax</code> for the class, <code>Softmax()</code> for probabilities.",
+            "Result: 97.8% test accuracy on 3 spiral classes; the confusion matrix shows which classes are confused.",
+            "The same code classifies any table of numbers into K classes.",
         ),
-        h2("28.1 Windows"),
-        diagram("Figure 28.1 — Sliding windows over a series", windows_svg(),
-                "Each training sample is T consecutive values and the value that follows; windows are built separately for the training and test periods."),
-        snippet(PROGRAM, caption="Program.cs, part 1: series, windows, GRU, training"),
+        h2("28.1 Data and model"),
+        snippet("""
+            const int Classes = 3, PerClass = 300;
+            string[] classNames = ["red", "green", "blue"];
+
+            var random = new Random(1);
+            var features = new float[Classes * PerClass, 2];
+            var labels = new int[Classes * PerClass];
+            for (int c = 0; c < Classes; c++)
+                for (int i = 0; i < PerClass; i++)
+                {
+                    int row = c * PerClass + i;
+                    double radius = i / (double)PerClass;
+                    double angle = c * 2 * Math.PI / Classes + radius * 5 + random.NextDouble() * 0.25;
+                    features[row, 0] = (float)(radius * Math.Cos(angle));
+                    features[row, 1] = (float)(radius * Math.Sin(angle));
+                    labels[row] = c;
+                }
+            var data = Dataset.FromClassLabels(features, labels, Classes, classNames);   // one-hot targets
+            var (train, test) = data.Split(0.8, seed: 2);
+
+            var init = new Random(3);
+            using var model = new Sequential
+            {
+                new Linear(2, 128, device: device, random: init), new BatchNorm(128, device: device), new ReLU(),
+                new Linear(128, 64, device: device, random: init), new BatchNorm(64, device: device), new ReLU(),
+                new Linear(64, Classes, device: device, random: init),                // raw scores
+            };
+            """, caption="Spiral data and a 9,219-parameter classifier"),
+        h2("28.2 Training"),
+        snippet("""
+            int epochs = 200;
+            using var optimizer = new AdamW(model.Parameters(), learningRate: 0.01f, weightDecay: 1e-4f);
+            var trainer = new Trainer(model, optimizer,
+                (logits, targets) => Losses.CrossEntropy(logits, targets, labelSmoothing: 0.05f))
+            {
+                Metrics = { Metric.Accuracy },
+                Scheduler = new CosineAnnealing(optimizer, totalEpochs: epochs, warmupEpochs: 5),
+            };
+            trainer.Fit(new DataLoader(train, 64, shuffle: true, device: device, seed: 4), epochs,
+                        validation: new DataLoader(test, 512, device: device));
+            """, caption="Cross-entropy with label smoothing, AdamW and a cosine schedule"),
         output("""
-            972 training windows, 200 test windows
-            Sequential(2 layers)
-              GRU(1 -> 32)  [3,264 params]
-              Linear(32 -> 1)  [33 params]
-            Total trainable parameters: 3,297
-            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 972 samples, 200 validation | batch 32, 31 steps/epoch | Adam lr=0.003 | 3,297 parameters | 4 CPU threads
-            Epoch  1/60  loss 0.490665  val_loss 0.379358  422.2 ms  2,302 samples/s  *
-            Epoch 10/60  loss 0.021693  val_loss 0.029009  59.4 ms  16,365 samples/s
-            Finished 14 epochs in 1.77 s (early stop) | best epoch 6 loss 0.026781
-            """),
-        h2("28.2 Beating the baselines"),
-        snippet(EVAL, caption="Program.cs, part 2: evaluation and a 14-day forecast"),
+            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 720 samples, 180 validation | batch 64, 12 steps/epoch | AdamW lr=0.001667 | 9,219 parameters | 4 CPU threads
+            Epoch   1/200  loss 0.886633  accuracy 0.5694  val_loss 1.077530  val_accuracy 0.4667  86.3 ms  8,344 samples/s  *
+            Epoch  20/200  loss 0.317225  accuracy 0.9347  val_loss 0.247562  val_accuracy 0.9722  19.5 ms  36,992 samples/s  *
+            Epoch  60/200  loss 0.244288  accuracy 0.9750  val_loss 0.224612  val_accuracy 0.9833  16.2 ms  44,349 samples/s
+            Epoch 100/200  loss 0.239780  accuracy 0.9722  val_loss 0.216285  val_accuracy 0.9944  5.0 ms  144,401 samples/s
+            Epoch 200/200  loss 0.229764  accuracy 0.9778  val_loss 0.218855  val_accuracy 0.9778  9.0 ms  80,380 samples/s
+            Finished 200 epochs in 1.87 s | best epoch 182 loss 0.209481
+            """, caption="Training output (every 20th epoch printed; some lines omitted here)"),
+        para("The loss levels off near 0.2 rather than 0: with label smoothing the target itself is not a pure one-hot "
+             "row, so a perfect model still has a positive loss (" + ch("losses") + "). The first epoch starts close to "
+             "ln 3 ≈ 1.10, as expected for 3 classes."),
+        h2("28.3 Where the errors are"),
+        snippet("""
+            var result = trainer.Evaluate(new DataLoader(test, 512, device: device));
+            Console.WriteLine($"Test accuracy: {result.Metrics["accuracy"]:P1}  (cross-entropy {result.Loss:F4})");
+
+            var scores = trainer.Predict(test);                        // [180, 3] raw scores
+            var confusion = new int[Classes, Classes];
+            for (int i = 0; i < test.Count; i++)
+            {
+                int actual = test.GetTargets(i).IndexOf(1f);           // position of the 1 in the one-hot row
+                int predicted = Enumerable.Range(0, Classes).MaxBy(c => scores[i, c]);
+                confusion[actual, predicted]++;
+            }
+            """, caption="Accuracy and a confusion matrix"),
         output("""
-            MAE next day: GRU 5.7   'same as yesterday' 17.1   'same as last week' 6.6
-            day   forecast   actual
-            1000     176.0    179.9
-            1002     219.2    215.7
-            1004     214.9    216.0
-            1006     171.7    166.0
-            1008     191.7    205.7
-            1010     224.4    235.2
-            1012     189.4    193.1
-            14-day MAE 6.3
+            Test accuracy: 97.8 %  (cross-entropy 0.2189)
+
+            Confusion matrix (rows = actual, columns = predicted):
+                        red  green   blue
+              red        67      0      0
+              green       1     48      0
+              blue        3      0     61
             """),
-        para("\"Same weekday last week\" is a strong baseline for a series with a weekly rhythm: it already captures "
-             "most of the pattern. The GRU improves on it by also using the trend and the latest level. The added "
-             "noise has an average size of 4, so an MAE near 5–6 is close to the best possible. Always report a "
-             "baseline: a network that cannot beat \"same as last week\" is not worth deploying."),
-        honestbox("Why time must not be shuffled",
-                  "<p>A random split puts days from the future into the training set and windows that overlap test windows "
-                  "into both sets, so the test error measures memory, not forecasting. The same applies to the scaler: "
-                  "statistics that include the future leak information (glossary <b>Data leakage</b>).</p>"),
-        cpugpu("running the project",
+        para("Of 180 test points 4 are wrong, and 3 of those are blue points taken for red, which is where the two "
+             "spirals meet near the centre. A confusion matrix (glossary <b>Confusion matrix</b>) shows such patterns "
+             "that a single accuracy figure hides."),
+        h2("28.4 Probabilities at inference"),
+        snippet("""
+            model.Load(modelPath);
+            using var points = Tensor.From(new float[,] { { 0.5f, 0.2f }, { -0.3f, -0.6f }, { 0f, 0.9f } }, device);
+            using var logits = model.Predict(points);
+            using var probabilities = logits.Softmax();                // rows sum to 1
+            """, caption="--predict mode"),
+        output("""
+                 x      y  | class  |    red   green    blue
+               0.50   0.20 | blue   |    1 %     3 %    96 %
+              -0.30  -0.60 | red    |   79 %    19 %     2 %
+               0.00   0.90 | blue   |    0 %     4 %    95 %
+            """),
+        output("""
+            BBBBBBBBBBBBBBBBbbbbbbbbbbbbbbbbbbbbgggggGGGGGGGGGGGGGGGGGGG
+            BBBBBBBBBBBBBbbbbbrrrrrrrrrrrrrbbbbBBBBBBBbbbggggGGGGGGGGGGG
+            BBBBBBBbbbbrrrRRRRRRRRrrrrrrRRRRRRRrrbbBBBBBBbbgggGGGGGGGGGG
+            BBBBBbbbrrrRRRRRRrrgggGGGGGgggrrRRrrbbBBBBBBbbgggGGGGGGGGGGG
+            BBbbbrrrRRRRRRRRrrggGGGGGggbbBBBBBBBBBBBBBbbgggGGGGGGGGGGGGG
+            bbbrrrrRRRRRRRRRRrrrggGGGGGGGggggggggggGGGGGGGGGGGGGGGGGGggg
+            bbbrrrrrRRRRRRRRRRRRRRrrrrrrgggggggggggggggggggggggggggrrrrr
+            bbrrrrrrrrRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
+            """, caption="Part of the decision map the sample prints (upper case: at least 90% confident)"),
+        cpugpu("running the sample",
                """
-               dotnet run -c Release
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Classification -- --cpu
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Classification -- --cpu --predict --input "0.5,0.2;-0.3,-0.6"
                """,
                """
-               dotnet run -c Release -- --cuda
-               // a GRU over 28 steps with 32 units is small: expect the CPU to be as fast.
-               // With many series (batch 512+) or hidden sizes of 128+, the GPU wins.
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Classification -- --cuda
                """),
-        h2("28.3 Extensions"),
-        reftable(["Need", "How"], [
-            ["Several input series (weather, price, promotions)", "Windows of shape <code>[T, F]</code>: <code>WithFeatureShape(T, F)</code> and <code>GRU(F, h)</code>"],
-            ["Calendar effects (weekday, holiday)", "Add them as extra input columns per step (one-hot or embedded)"],
-            ["Predict H days at once", "Targets of H values and <code>Linear(h, H)</code>: no feedback, errors do not compound"],
-            ["Many related series (all stores)", "Train one model on windows from every series; add a series embedding (" + ch("recommender") + ")"],
-            ["Uncertainty", "Train two outputs (value and spread) or use Monte-Carlo dropout (" + ch("norm") + ")"],
-            ["Long histories", "A causal transformer (" + ch("attention") + ", Practice 12.5) or a longer window"],
-        ], caption="Table 28.1 — Forecasting extensions"),
-        trap("forecasting with the training-period scaler forgotten",
-             "<p>The model predicts scaled values; apply <code>InverseTransform</code> with the same scaler, and when feeding "
-             "predictions back, keep them scaled (as the loop above does) and unscale only for output.</p>"),
+        h2("28.5 From spirals to your data"),
+        reftable(["Your data", "Change"], [
+            ["CSV with a class-id column", "<code>Dataset.LoadCsv(…, new CsvOptions { TargetColumns = [\"species\"] }).ToOneHot(K)</code>, scale the features"],
+            ["Many classes (100+)", "Wider last hidden layer; <code>SparseCrossEntropy</code> with id targets saves memory"],
+            ["Unequal class sizes", "Report per-class accuracy or the confusion matrix; oversample small classes"],
+            ["Images", "A CNN front end (" + ch("cnn") + ")"],
+            ["Text", "Embeddings + LSTM/transformer (" + ch("sentiment") + ")"],
+            ["\"None of the above\" matters", "Add an explicit \"other\" class, or reject predictions whose top probability is below a threshold"],
+        ], caption="Table 28.1 — Adapting the classifier"),
+        trap("reading scores as probabilities",
+             "<p><code>Predict</code> returns raw scores; they can be negative and do not sum to 1. Apply "
+             "<code>Softmax()</code> for probabilities; the class (<code>ArgMax</code>) is the same either way.</p>"),
         practice([
-            (1, "Why is the test set built with <code>Windows(split, series.Length)</code> rather than from a random 20% of all windows?",
-             "Forecasts must be evaluated on a period after the training data; random windows would overlap training windows and leak the future."),
-            (1, "What does a next-day MAE of 5.7 mean for this series?",
-             "Tomorrow's predicted value is on average 5.7 units (visitors) away from the actual value."),
-            (2, "Replace the GRU with an LSTM. Compare MAE and training time.",
-             "Swap <code>new GRU(1, 32, …)</code> for <code>new LSTM(1, 32, …)</code>; expect similar accuracy with about a third more "
-             "parameters and slightly longer epochs (" + ch("recurrent") + ")."),
-            (2, "Change the model to predict the next 7 days in one shot.",
-             "Make each target the 7 values after the window (<code>float[count, 7]</code>), end with <code>Linear(32, 7)</code>, and "
-             "stop windows 7 days before the end of each period."),
-            (3, "Add the weekday as a second input feature per step and compare against the univariate model.",
-             "Build windows <code>[T, 2]</code> with the scaled value and weekday/6 at each step, use <code>WithFeatureShape(T, 2)</code> and "
-             "<code>GRU(2, 32)</code>. With an explicit weekday the model needs less effort to learn the weekly rhythm."),
+            (1, "What is the expected loss of an untrained 10-class classifier?",
+             "About ln 10 ≈ 2.30 (slightly more with label smoothing)."),
+            (1, "Train with ids instead of one-hot targets: what changes?",
+             "Build the dataset with <code>FromArrays(features, ids)</code> (one column of class ids), use "
+             "<code>Losses.SparseCrossEntropy</code> and <code>Metric.SparseAccuracy</code>."),
+            (2, "Compute per-class recall from the confusion matrix above.",
+             "red 67/67 = 100%, green 48/49 = 98%, blue 61/64 = 95%."),
+            (2, "Reject uncertain predictions: output \"unsure\" when the top probability is below 0.6. How many test points would be rejected?",
+             "Apply <code>Softmax</code> to <code>trainer.Predict(test)</code> scores (row by row on the host) and count rows "
+             "whose maximum is below 0.6; those are near the class boundaries, where most errors are."),
+            (3, "Classify the classic Iris flowers (4 measurements, 3 species) from a CSV.",
+             "<code>LoadCsv</code> with the species id column as target, <code>ToOneHot(3)</code>, split 80/20, standardize, "
+             "a 4 → 16 → 3 MLP, <code>CrossEntropy</code>, <code>Metric.Accuracy</code>, early stopping; expect over 90% test accuracy."),
         ], PART),
-        footer("Time series", "Forecasting", "Sliding window", "Baseline", "Horizon", "Recursive forecasting",
-               "Data leakage", "GRU"),
+        footer("Multi-class classification", "Cross-entropy", "One-hot", "Softmax", "ArgMax", "Confusion matrix",
+               "Label smoothing", "Decision boundary"),
     )

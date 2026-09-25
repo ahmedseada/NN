@@ -1,184 +1,142 @@
-"""Chapter 32 — OCR: Reading Characters."""
+"""Chapter 32 — Image Classification with CNNs."""
 from gen import *
 
 PART = "VI"
 
 
-def pipeline_svg():
-    w, h = 470, 90
-    steps = [("page image", "PGM / pixels"), ("segment", "lines → characters"), ("normalize", "each to 20×20"),
-             ("CNN", "one batch"), ("text", "ArgMax → letters")]
-    p = [f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
-    for i, (a, b) in enumerate(steps):
-        x = 6 + i * 93
-        p.append(f'<rect x="{x}" y="18" width="80" height="44" rx="5" fill="{"#0f6b5c" if a == "CNN" else "#e6f2ef"}" stroke="#0f6b5c"/>')
-        color = "#ffffff" if a == "CNN" else "#0f6b5c"
-        p.append(svg_text(x + 40, 37, a, 8.4, color))
-        p.append(svg_text(x + 40, 51, b, 7.2, color))
-        if i < 4:
-            p.append(f'<line x1="{x + 80}" y1="40" x2="{x + 93}" y2="40" stroke="#56606a"/>')
-    p.append(svg_text(235, 82, "only the CNN is learned; segmentation is classic image processing", 7.4, "#56606a"))
-    p.append("</svg>")
-    return "".join(p)
-
-
 def build():
     return page(
         chapter_open(
-            "ocr",
-            "Optical character recognition turns an image of printed text into a string. This project, the "
-            "repository's <code>NeuralSharp.Samples.Ocr</code>, trains a CNN on randomly distorted renderings of the "
-            "36 characters 0–9 and A–Z, then reads whole lines: it cuts the image into characters, classifies all of "
-            "them in one batch, and reassembles the text with spaces and line breaks. It also reads your own images "
-            "in PGM format.",
-            "Two parts: <b>segmentation</b> (plain C#: find lines, characters and word gaps) and <b>recognition</b> (a CNN classifier with 36 classes).",
-            "Training data is generated: every character rendered with random size, slant, position, stroke weight, brightness and noise.",
-            "Result: 100% on unseen character renderings; 99.85% character accuracy on 40 random text lines (39 exactly right).",
-            "Inference batches all characters of a page into one <code>Predict</code> call.",
-            "The recipe transfers to any \"cut into pieces, classify each piece\" problem.",
+            "cnn",
+            "This project teaches a convolutional network to recognize four shapes (circle, square, triangle, cross) "
+            "in small noisy grey images, drawn at random positions and sizes. It is the template for any image "
+            "classifier: product photos, defects on a production line, medical scans, handwritten digits. The code is "
+            "the repository's <code>NeuralSharp.Samples.Images</code>; this chapter explains each part and how to "
+            "feed it real image files.",
+            "Task type: <b>image classification</b>. Input <code>[N, C, H, W]</code>; model Conv2d/BatchNorm/ReLU/MaxPool blocks + dense head.",
+            "Data: <code>Dataset.FromClassLabels(pixels, labels, K).WithFeatureShape(1, 16, 16)</code>.",
+            "Result: 100% test accuracy after 12 epochs (8 s on the book's 4-core CPU).",
+            "Convolutions are where the GPU shines; use <code>--cuda</code> and larger batches for real image sizes.",
+            "Scale pixels to [0, 1]; keep images the same size; use NCHW order.",
         ),
-        diagram("Figure 32.1 — Reading a line", pipeline_svg(), "Segmentation finds the characters; the CNN names them."),
-        h2("32.1 The recognizer"),
+        h2("32.1 The model"),
         snippet("""
-            const int Cell = Renderer.Cell;                  // 20: characters are normalized to 20x20
-            string alphabet = Font.Characters;               // "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            var init = new Random(1);
+            const int Size = 16;
+            string[] shapes = ["circle", "square", "triangle", "cross"];
+            var init = new Random(3);
             using var model = new Sequential
             {
-                new Conv2d(1, 32, kernelSize: 3, padding: 1, device: device, random: init), new BatchNorm(32, device: device), new ReLU(),
-                new MaxPool2d(2),                                                      // 20x20 -> 10x10
-                new Conv2d(32, 64, kernelSize: 3, padding: 1, device: device, random: init), new BatchNorm(64, device: device), new ReLU(),
-                new MaxPool2d(2),                                                      // 10x10 -> 5x5
+                new Conv2d(1, 16, kernelSize: 3, padding: 1, device: device, random: init), new BatchNorm(16, device: device), new ReLU(),
+                new MaxPool2d(2),                                                      // 16x16 -> 8x8
+                new Conv2d(16, 32, kernelSize: 3, padding: 1, device: device, random: init), new BatchNorm(32, device: device), new ReLU(),
+                new MaxPool2d(2),                                                      // 8x8 -> 4x4
                 new Flatten(),
-                new Linear(64 * 5 * 5, 128, device: device, random: init), new ReLU(), new Dropout(0.3f, init),
-                new Linear(128, alphabet.Length, device: device, random: init),
+                new Linear(32 * 4 * 4, 64, device: device, random: init), new ReLU(), new Dropout(0.2f, init),
+                new Linear(64, shapes.Length, device: device, random: init),
             };
-            """, caption="CNN over 20×20 character images (228,580 parameters)"),
+            """, caption="A two-block CNN (37,988 parameters)"),
+        para("Two convolution blocks detect strokes and then corners and curves; each pooling halves the image. "
+             "The dense head combines the 32 feature maps of 4×4 into a decision. " + ch("conv") + " explains every "
+             "layer and the shape arithmetic."),
+        h2("32.2 Data"),
         snippet("""
-            Dataset Characters(int perClass, int seed)
-            {
-                var rng = new Random(seed);
-                int count = perClass * alphabet.Length;
-                var pixels = new float[count, Cell * Cell];
-                var labels = new int[count];
-                var image = new float[Cell * Cell];
-                for (int s = 0; s < count; s++)
-                {
-                    labels[s] = s % alphabet.Length;
-                    Array.Clear(image);
-                    Renderer.RenderCharacter(labels[s], image, rng);         // random distortions
-                    for (int i = 0; i < image.Length; i++) pixels[s, i] = image[i];
-                }
-                return Dataset.FromClassLabels(pixels, labels, alphabet.Length, [.. alphabet.Select(c => c.ToString())])
-                              .WithFeatureShape(1, Cell, Cell);
-            }
-
-            var train = Characters(perClass: 300, seed: 2);                   // 10,800 images
-            var test = Characters(perClass: 60, seed: 3);                     // 2,160 unseen renderings
-            """, caption="Generated training data"),
-        h2("32.2 Training"),
+            // pixels: float[count, 16 * 16] in [0, 1], labels: int[count] in 0..3
+            var data = Dataset.FromClassLabels(pixels, labels, shapes.Length, shapes)
+                              .WithFeatureShape(1, Size, Size);          // batches come out as [N, 1, 16, 16]
+            """, caption="Turning pixel rows into an image dataset"),
+        para("The sample draws its images procedurally (outline shapes with random size, position, brightness and noise), "
+             "4,000 for training and 800 for testing, so it needs no downloads. The same two lines take any set of "
+             "equally sized images."),
+        h2("32.3 Training and results"),
         snippet("""
-            int epochs = 10;
-            using var optimizer = new AdamW(model.Parameters(), learningRate: 0.003f, weightDecay: 1e-4f);
-            var trainer = new Trainer(model, optimizer,
-                (logits, targets) => Losses.CrossEntropy(logits, targets, labelSmoothing: 0.05f))
+            int epochs = 12;
+            using var optimizer = new AdamW(model.Parameters(), learningRate: 0.003f);
+            var trainer = new Trainer(model, optimizer, (logits, targets) => Losses.CrossEntropy(logits, targets))
             {
                 Metrics = { Metric.Accuracy },
-                Scheduler = new CosineAnnealing(optimizer, epochs, warmupEpochs: 1),
+                Scheduler = new CosineAnnealing(optimizer, epochs),
             };
             trainer.Fit(new DataLoader(train, 64, shuffle: true, device: device, seed: 4), epochs,
-                        validation: new DataLoader(test, 500, device: device));
+                        validation: new DataLoader(test, 400, device: device));
             """),
         output("""
-            Rendered 10,800 training and 2,160 test characters in 1796 ms
+            4000 training and 800 test images of 16x16 pixels, 4 classes
 
-            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 10,800 samples, 2,160 validation | batch 64, 169 steps/epoch | AdamW lr=0.0015 | 228,580 parameters | 4 CPU threads
-            Epoch  1/10  loss 1.688845  accuracy 0.6114  val_loss 0.570783  val_accuracy 0.9880  7915.9 ms  1,364 samples/s  *
-            Epoch  2/10  loss 0.721386  accuracy 0.9500  val_loss 0.486671  val_accuracy 0.9977  6256.4 ms  1,726 samples/s  *
-            Epoch  3/10  loss 0.621004  accuracy 0.9807  val_loss 0.464879  val_accuracy 1.0000  6015.5 ms  1,795 samples/s  *
-            Epoch 10/10  loss 0.522551  accuracy 0.9961  val_loss 0.416508  val_accuracy 1.0000  6070.1 ms  1,779 samples/s  *
-            Finished 10 epochs in 62.83 s | best epoch 10 loss 0.416508
+            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 4,000 samples, 800 validation | batch 64, 63 steps/epoch | AdamW lr=0.003 | 37,988 parameters | 4 CPU threads
+            Epoch  1/12  loss 0.438070  accuracy 0.8375  val_loss 0.053383  val_accuracy 0.9900  1498.1 ms  2,670 samples/s  *
+            Epoch  2/12  loss 0.051849  accuracy 0.9835  val_loss 0.016776  val_accuracy 0.9962  676.3 ms  5,914 samples/s  *
+            Epoch  4/12  loss 0.009389  accuracy 0.9990  val_loss 0.005124  val_accuracy 1.0000  586.3 ms  6,822 samples/s  *
+            Epoch  8/12  loss 0.003615  accuracy 0.9992  val_loss 0.002073  val_accuracy 0.9988  618.7 ms  6,465 samples/s  *
+            Epoch 12/12  loss 0.001750  accuracy 1.0000  val_loss 0.000860  val_accuracy 1.0000  644.6 ms  6,205 samples/s  *
+            Finished 12 epochs in 8.25 s | best epoch 12 loss 0.000860
 
-            Character accuracy on unseen renderings: 100.00 %
-            Read 40 random text lines: 99.85 % character accuracy, 39/40 lines exactly right
-            """, caption="Training output on the CPU (selected epochs)"),
-        para("Training accuracy stays below validation accuracy because dropout and the random distortions make the "
-             "training images harder than the clean test renderings; the loss stays above 0 because of label smoothing. "
-             "At 63 s on 4 CPU cores this is the first project in the book where the GPU makes a real difference: "
-             "convolutions over 10,800 images per epoch."),
-        h2("32.3 Reading a line"),
-        snippet("""
-            string Read(float[] pixels, int width, int height)
-            {
-                var glyphs = Segmenter.Segment(pixels, width, height);           // characters, with space/newline flags
-                if (glyphs.Count == 0) return "";
-
-                var batch = new float[glyphs.Count * Cell * Cell];
-                for (int i = 0; i < glyphs.Count; i++)
-                    glyphs[i].Pixels.CopyTo(batch, i * Cell * Cell);
-
-                using var input = Tensor.From(batch, [glyphs.Count, 1, Cell, Cell], device);   // the whole page at once
-                using var logits = model.Predict(input);
-                using var best = logits.ArgMax();
-                var classes = best.ToArray();
-
-                var text = new System.Text.StringBuilder();
-                for (int i = 0; i < glyphs.Count; i++)
-                {
-                    text.Append(glyphs[i].NewLineBefore ? "\\n" : glyphs[i].SpaceBefore ? " " : "");
-                    text.Append(alphabet[(int)classes[i]]);
-                }
-                return text.ToString();
-            }
-            """, caption="Segmentation + batched recognition"),
+            Test accuracy: 100.0 %
+            """, caption="Training output (selected epochs)"),
         output("""
-            Rendered line "HELLO WORLD 2026":
-
-                  ##      +##   ###########   ##+           ##+             #######
-                  ##+      ##   ###+##+###+   ##+           ##+           ###########
-                  ##      +##   ##+           ##            ##+           ##      +##
-                  ###########   #########     ##+           ##+           ##+      ##
-                  ###########   #########     ##            ##+           ##      +##
-                  ##+      ##   ##            ##+           ##            ##      +##
-                  ##      +##   #####++#++#   ##+           ##+    + +    ##+  ++ ###
-                  ##+     +##   ###########   ###########   ###########     #######
-            Recognized: HELLO WORLD 2026
-            """, caption="--predict --input \"HELLO WORLD 2026\" (preview cropped to the first five letters)"),
-        cpugpu("commands",
+            Image 1: predicted circle (100 %), actually circle
+                    ++###++
+                  +#+     +##
+                 +#         ##
+                 ##          #
+                 +#+        ##
+                  +#++   ++#+
+                     ++++++
+            """, caption="The sample prints a few test images as ASCII art with the model's verdict"),
+        cpugpu("training and predicting",
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cpu
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cpu --predict --input "HELLO WORLD 2026"
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cpu --predict --image page.pgm
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Images -- --cpu
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Images -- --cpu --predict --input "circle,cross"
                """,
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cuda
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cuda --predict --save-image line.pgm
-               """,
-               "Convert a PNG or JPEG to PGM with any image tool, e.g. <code>magick scan.png scan.pgm</code> (ImageMagick)."),
-        h2("32.4 From the sample to real documents"),
-        reftable(["Real-world issue", "Approach"], [
-            ["Other fonts, lower case, punctuation", "Render training data from those fonts and characters (or collect labelled crops); enlarge the alphabet"],
-            ["Touching or broken characters", "Improve segmentation, or recognize whole words with a sequence model reading the line left to right (" + ch("recurrent") + ")"],
-            ["Skewed or noisy scans", "Deskew and threshold before segmenting; add rotation and noise to the training renderings"],
-            ["Handwriting", "Collect labelled samples; larger CNN; heavy augmentation"],
-            ["Confidence per character", "<code>Softmax()</code> of the logits; flag characters below e.g. 0.9 for review"],
-        ], caption="Table 32.1 — Going further"),
-        trap("recognizing characters one Predict call at a time",
-             "<p>A page may contain thousands of characters. One call per character pays the call overhead (and on the GPU "
-             "a synchronization) thousands of times; batch all glyphs into one tensor, as <code>Read</code> does.</p>"),
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Images -- --cuda --batch-size 256
+               // convolutions are large regular matrix products: the GPU's best case
+               """),
+        h2("32.4 Using your own image files"),
+        para("NeuralSharp has no image decoder, so reading PNG or JPEG files needs a small helper. Two dependency-free "
+             "routes: convert images to PGM (a trivial format) with any image tool and read them as the OCR sample does "
+             "(" + ch("ocr") + "), or use an imaging library you already have. On Windows, "
+             "<code>System.Drawing</code> works; cross-platform libraries such as ImageSharp or SkiaSharp do too. "
+             "Whatever reads the file, the steps into NeuralSharp are the same:"),
+        deriv("From files to a dataset", [
+            "Resize every image to the same size (e.g. 64×64) and convert to grey (C = 1) or keep RGB (C = 3).",
+            "Write pixels in <b>NCHW</b> order: all red values row by row, then all green, then all blue, each divided by 255.",
+            "Collect the rows into <code>float[count, C·H·W]</code> and the labels (e.g. from folder names) into <code>int[]</code>.",
+            "<code>Dataset.FromClassLabels(pixels, labels, K, classNames).WithFeatureShape(C, H, W)</code>; split; train as above.",
+            "Save the class names with the weights so predictions can be turned back into labels.",
+        ]),
+        snippet("""
+            // pixel buffer in HWC order (as most decoders return it) -> NCHW row for NeuralSharp
+            static void ToChw(ReadOnlySpan<byte> hwc, int height, int width, Span<float> chw)
+            {
+                for (int y = 0; y < height; y++)
+                    for (int x = 0; x < width; x++)
+                        for (int c = 0; c < 3; c++)
+                            chw[c * height * width + y * width + x] = hwc[(y * width + x) * 3 + c] / 255f;
+            }
+            """, caption="The one conversion every image pipeline needs"),
+        reftable(["Image size / data", "Suggested model"], [
+            ["16–32 px, a few classes", "2 blocks (16, 32 channels), dense head: this chapter"],
+            ["28×28 digits or characters", "2 blocks (32, 64), dense head: " + ch("ocr")],
+            ["64×64 photos, 10+ classes", "4 blocks (32, 64, 128, 128), <code>GlobalAveragePool2d</code>, <code>Linear(128, K)</code>"],
+            ["Few images per class (under ~100)", "Augment (flips, small shifts, brightness), heavy dropout; consider fine-tuning (" + ch("finetune") + ")"],
+        ], caption="Table 32.1 — Sizing a CNN"),
+        trap("images of different sizes in one batch",
+             "<p>A batch is one tensor, so every image must have the same C, H and W. Resize (or crop and pad) when loading.</p>"),
         practice([
-            (1, "Why does validation accuracy exceed training accuracy in the log?",
-             "Dropout is active and distortions are random during training; evaluation runs without dropout on clean test renderings."),
-            (1, "How many classes does the recognizer have, and what would change to add lower-case letters?",
-             "36. Adding a–z makes 62: extend the alphabet (and the renderer's font), and the last layer becomes <code>Linear(128, 62)</code>."),
-            (2, "Report the three least confident characters of a recognized line.",
-             "Apply <code>Softmax()</code> to the logits, take each row's maximum as confidence, and list the three glyphs with the lowest values."),
-            (2, "Read a multi-line PGM page and print the lines separately.",
-             "<code>Segmenter</code> already marks <code>NewLineBefore</code>; <code>Read</code> inserts line breaks, so split the result on newlines."),
-            (3, "Recognize license plates from photos.",
-             "Locate the plate (a separate detector or a fixed camera region), threshold and segment it like a text line, train the CNN on "
-             "renderings of the plate font with perspective and blur augmentations, and batch-recognize the characters; validate on "
-             "real labelled photos."),
+            (1, "What input shape does the model expect for a batch of 32 of the sample's images?",
+             "<code>[32, 1, 16, 16]</code>."),
+            (1, "Add a fifth shape class (for example a diamond). What changes in the model?",
+             "Only the last layer: <code>Linear(64, 5)</code> (and the class name list)."),
+            (2, "Double the image size to 32×32. Which layer's size must change and to what?",
+             "After two poolings the maps are 8×8, so the first dense layer becomes <code>Linear(32 * 8 * 8, 64)</code>; or add a "
+             "third block to return to 4×4."),
+            (2, "Add simple data augmentation: horizontally flip half of the training images each epoch.",
+             "Build a flipped copy of each training image (reverse each pixel row) and add both versions to the dataset, or "
+             "generate a new randomly flipped dataset per epoch and call <code>Fit</code> one epoch at a time."),
+            (3, "Build a folder-per-class image classifier for 64×64 RGB photos.",
+             "Enumerate subfolders as classes; load, resize to 64×64 and convert each file to CHW floats with a helper like "
+             "<code>ToChw</code>; <code>FromClassLabels(...).WithFeatureShape(3, 64, 64)</code>; a 4-block CNN with global average "
+             "pooling; train on the GPU with batch 128; save weights plus class names."),
         ], PART),
-        footer("OCR", "Segmentation", "Glyph", "Data augmentation", "Synthetic data", "PGM"),
+        footer("CNN", "Convolution", "Feature map", "NCHW", "Data augmentation", "Pooling", "Image classification"),
     )

@@ -1,190 +1,201 @@
-"""Chapter 30 — Recommenders and Categorical Embeddings."""
+"""Chapter 30 — Anomaly Detection with Autoencoders."""
 from gen import *
 
 PART = "V"
 
-MF = """
-    /// rating = mean + userBias + itemBias + userVector · itemVector;  input [N, 2] = (user id, item id)
-    sealed class MatrixFactorization : Module
+
+def ae_svg():
+    w, h = 470, 120
+    p = [f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
+    layers = [(8, 40), (16, 130), (2, 235), (16, 340), (8, 430)]
+    for n, x in layers:
+        hgt = 6 + n * 5.5
+        p.append(f'<rect x="{x - 14}" y="{60 - hgt / 2}" width="28" height="{hgt}" rx="4" fill="{"#a15c00" if n == 2 else "#e6f2ef"}" stroke="#0f6b5c"/>')
+        p.append(svg_text(x, 60 + hgt / 2 + 12, str(n), 8, "#56606a"))
+    for (_, x1), (_, x2) in zip(layers, layers[1:]):
+        p.append(f'<line x1="{x1 + 14}" y1="60" x2="{x2 - 14}" y2="60" stroke="#56606a"/>')
+    p.append(svg_text(40, 14, "readings", 7.8, "#0f6b5c"))
+    p.append(svg_text(235, 14, "bottleneck", 7.8, "#a15c00"))
+    p.append(svg_text(430, 14, "rebuilt readings", 7.8, "#0f6b5c"))
+    p.append(svg_text(235, 116, "anomaly score = mean squared difference between input and output", 7.4, "#56606a"))
+    p.append("</svg>")
+    return "".join(p)
+
+
+PROGRAM = """
+    using NeuralSharp;
+    using NeuralSharp.Data;
+    using NeuralSharp.Layers;
+    using NeuralSharp.Optimizers;
+    using NeuralSharp.Training;
+
+    Device.Default = args.Contains("--cuda") ? Device.Cuda() : Device.Cpu;
+
+    // ---- machine sensors: 8 readings driven by 2 hidden factors (load, temperature) + noise
+    var rng = new Random(9);
+    float[] Reading(bool faulty)
     {
-        private readonly Embedding _users, _items, _userBias, _itemBias;
-        private readonly float _mean;
-
-        public MatrixFactorization(int users, int items, int dim, float mean, Random? random = null, Device? device = null)
+        float load = rng.NextSingle() * 2 - 1, temp = rng.NextSingle() * 2 - 1;
+        float[] r =
+        [
+            load, 0.8f * load + 0.2f * temp, temp, 0.5f * load - 0.5f * temp,
+            load * temp, 0.3f * load + 0.7f * temp, -load, 0.6f * temp,
+        ];
+        for (int k = 0; k < 8; k++) r[k] += 0.05f * (rng.NextSingle() - 0.5f);
+        if (faulty)                                             // one sensor goes wrong
         {
-            _users = new Embedding(users, dim, device, random);
-            _items = new Embedding(items, dim, device, random);
-            _userBias = new Embedding(users, 1, device, random);
-            _itemBias = new Embedding(items, 1, device, random);
-            _mean = mean;
+            int k = rng.Next(8);
+            r[k] += (rng.Next(2) == 0 ? -1 : 1) * (0.6f + rng.NextSingle());
         }
-
-        protected override Tensor ForwardCore(Tensor x)
-        {
-            var user = x.Narrow(1, 0, 1).Flatten(0);                       // [N] user ids
-            var item = x.Narrow(1, 1, 1).Flatten(0);                       // [N] item ids
-            var dot = (_users.Forward(user) * _items.Forward(item)).Sum(1, keepDim: true) * 0.1f;   // [N, 1]
-            return dot + _userBias.Forward(user) * 0.1f + _itemBias.Forward(item) * 0.1f + _mean;
-        }
-
-        public override IEnumerable<Module> Children() => [_users, _items, _userBias, _itemBias];
+        return r;
     }
-"""
-
-TRAIN = """
-    // ratings: (user, item) -> stars, e.g. loaded from a CSV with columns user,item,rating
-    var (train, test) = Dataset.FromArrays(ids, ratings, ["user", "item"], ["rating"]).Split(0.9, seed: 1);
-    float mean = train.Targets.ToArray().Average();
-
-    using var model = new MatrixFactorization(Users, Items, dim: 16, mean, new Random(1));
-    using var optimizer = new AdamW(model.Parameters(), 5e-3f, weightDecay: 1e-2f);
-    var trainer = new Trainer(model, optimizer, Losses.MeanSquaredError)
+    float[,] Rows(int n, Func<int, bool> faulty, out bool[] labels)
     {
-        Metrics = { Metric.RootMeanSquaredError },
-        EarlyStoppingPatience = 5,
+        var m = new float[n, 8];
+        labels = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            labels[i] = faulty(i);
+            var r = Reading(labels[i]);
+            for (int k = 0; k < 8; k++) m[i, k] = r[k];
+        }
+        return m;
+    }
+
+    // Train on NORMAL data only; the targets are the inputs themselves.
+    var normal = Rows(4000, _ => false, out _);
+    var (train, validation) = Dataset.FromArrays(normal, normal).Split(0.9, seed: 1);
+    var testRows = Rows(2000, i => i % 50 == 0, out bool[] isFaulty);          // 2% faulty
+
+    static Sequential Build(Random? r = null) => new()
+    {
+        new Linear(8, 16, random: r), new Tanh(),
+        new Linear(16, 2, random: r),                            // the bottleneck
+        new Linear(2, 16, random: r), new Tanh(),
+        new Linear(16, 8, random: r),
     };
-    var history = trainer.Fit(new DataLoader(train, 256, shuffle: true, seed: 1), epochs: 100,
-                              validation: new DataLoader(test, 2048));
-    var best = history.Epochs[history.BestEpoch - 1];
-    double baseline = Math.Sqrt(test.Targets.ToArray().Average(r => (r - mean) * (r - mean)));
-    Console.WriteLine($"{history.Epochs.Count} epochs; test RMSE {best.ValidationMetrics!["rmse"]:F3} stars " +
-                      $"(predicting the average: {baseline:F3})");
-
-    // top 5 recommendations for user 7 among the movies they have not rated
-    int user = 7;
-    var unseen = Enumerable.Range(0, Items).Where(i => !rated.Contains((user, i))).ToArray();
-    var query = new float[unseen.Length, 2];
-    for (int k = 0; k < unseen.Length; k++) { query[k, 0] = user; query[k, 1] = unseen[k]; }
-    float[,] scores = model.Predict(query);
-    Console.WriteLine($"user {user}: top 5 of {unseen.Length} unseen movies");
-    foreach (int k in Enumerable.Range(0, unseen.Length).OrderByDescending(k => scores[k, 0]).Take(5))
-        Console.WriteLine($"  movie {unseen[k],3}: predicted {scores[k, 0]:F2}, " +
-                          $"true taste {TrueRating(user, unseen[k]):F2}");   // TrueRating: from the synthetic generator
+    using var model = Build(new Random(2));
+    using var optimizer = new Adam(model.Parameters(), 3e-3f);
+    var trainer = new Trainer(model, optimizer, Losses.MeanSquaredError) { EarlyStoppingPatience = 10 };
+    var history = trainer.Fit(new DataLoader(train, 64, shuffle: true, seed: 1), epochs: 200,
+                              validation: new DataLoader(validation, 512));
+    Console.WriteLine($"trained {history.Epochs.Count} epochs, best validation reconstruction MSE {history.BestLoss:F5}");
 """
 
-TABULAR = """
-    /// Numeric columns [promo, temperature] + embedded weekday (dim 3) and store (dim 8), then an MLP.
-    /// Input rows: [promo, temperature, weekday id, store id].
-    sealed class SalesModel : Module
+SCORE = """
+    // ---- anomaly score: reconstruction error per row
+    float[] Errors(float[,] rows)
     {
-        private readonly Embedding _weekday, _store;
-        private readonly Sequential _mlp;
-
-        public SalesModel(int stores, Random? random = null, Device? device = null)
-        {
-            _weekday = new Embedding(7, 3, device, random);
-            _store = new Embedding(stores, 8, device, random);
-            _mlp = new Sequential
-            {
-                new Linear(2 + 3 + 8, 64, device: device, random: random), new ReLU(),
-                new Linear(64, 64, device: device, random: random), new ReLU(),
-                new Linear(64, 1, device: device, random: random),
-            };
-        }
-
-        protected override Tensor ForwardCore(Tensor x)
-        {
-            var numeric = x.Narrow(1, 0, 2);                                   // [N, 2]
-            var weekday = _weekday.Forward(x.Narrow(1, 2, 1).Flatten(0));     // [N, 3]
-            var store = _store.Forward(x.Narrow(1, 3, 1).Flatten(0));         // [N, 8]
-            return _mlp.Forward(Tensor.Concat([numeric, weekday, store], dim: 1));
-        }
-
-        public override IEnumerable<Module> Children() => [_weekday, _store, _mlp];
+        using var input = Tensor.From(rows);
+        using var output = model.Predict(input);
+        var o = output.ToArray2D();
+        var e = new float[rows.GetLength(0)];
+        for (int i = 0; i < e.Length; i++)
+            for (int k = 0; k < 8; k++)
+                e[i] += (o[i, k] - rows[i, k]) * (o[i, k] - rows[i, k]) / 8;
+        return e;
     }
+
+    // Threshold: the 99th percentile of the errors on normal validation data.
+    var validationErrors = Errors(validation.FeaturesToArray()).Order().ToArray();
+    float threshold = validationErrors[(int)(0.99 * validationErrors.Length)];
+    Console.WriteLine($"threshold (99th percentile of normal errors) {threshold:F5}");
+
+    var errors = Errors(testRows);
+    int tp = 0, fp = 0, fn = 0;
+    for (int i = 0; i < errors.Length; i++)
+    {
+        bool flagged = errors[i] > threshold;
+        if (flagged && isFaulty[i]) tp++; else if (flagged) fp++; else if (isFaulty[i]) fn++;
+    }
+    Console.WriteLine($"test: {isFaulty.Count(f => f)} faulty of {errors.Length}; caught {tp}, missed {fn}, false alarms {fp}");
 """
 
 
 def build():
     return page(
         chapter_open(
-            "recommender",
-            "Ids are everywhere in business data: users, products, stores, countries, weekdays. Treating an id as a "
-            "number (store 17 is \"more\" than store 3) is meaningless, and one-hot columns get huge. Embeddings "
-            "(" + ch("embedding") + ") give each id a learned vector instead. This chapter builds two projects on that "
-            "idea: a movie recommender that learns user and item vectors from ratings, and a sales model that mixes "
-            "numeric columns with embedded categories. Both are custom composite modules.",
-            "Recommender (matrix factorization): rating ≈ mean + user bias + item bias + user vector · item vector.",
-            "Input rows hold ids as floats; <code>Narrow</code> + <code>Flatten(0)</code> extracts an id column for an <code>Embedding</code>.",
-            "Result: test RMSE 0.431 stars against 0.946 for always predicting the average.",
-            "Tabular data: embedding the store id cut the error from 27.3 to 1.5 units compared with feeding the id as a number.",
-            "Recommending = scoring every unseen item for a user and taking the best.",
+            "anomaly",
+            "Often you have plenty of normal data and almost no examples of failures, fraud or defects, and the next "
+            "anomaly may look like nothing seen before. An autoencoder learns to compress and rebuild normal data; "
+            "anything it rebuilds badly is unusual. This project detects faulty sensor readings that way, without a "
+            "single faulty example during training.",
+            "Task type: <b>unsupervised anomaly detection</b>. Train with the inputs as targets (<code>FromArrays(x, x)</code>) and MSE.",
+            "A narrow bottleneck forces the model to learn the structure of normal data.",
+            "Score = reconstruction error; threshold = a high percentile (e.g. 99th) of scores on normal validation data.",
+            "Result: all 40 faulty readings caught; 37 false alarms among 1,960 normal readings (1.9%).",
+            "Works for sensors, transactions, network traffic, log statistics: any fixed-length numeric record.",
         ),
-        h2("30.1 A recommender from ratings"),
-        para("The data are (user, movie, stars) triples; most pairs are unrated. Matrix factorization "
-             "(glossary <b>Matrix factorization</b>) gives every user and every movie a vector of 16 numbers, trained "
-             "so that their dot product, plus a per-user and per-movie bias, reproduces the known ratings. Users with "
-             "similar tastes end up with similar vectors, and a user's predicted rating for an unseen movie follows. "
-             "The factor 0.1 scales down the embeddings' N(0, 1) starting values so the initial predictions are close "
-             "to the mean rating."),
-        snippet(MF, caption="The model: four embeddings and a dot product"),
-        snippet(TRAIN, caption="Training and recommending (the synthetic ratings generator is omitted: 500 users, 300 movies, 30,000 ratings)"),
+        diagram("Figure 30.1 — The autoencoder", ae_svg(),
+                "Eight readings are squeezed through two numbers. Normal readings, which really depend on two factors, pass almost unchanged."),
+        h2("30.1 Training on normal data"),
+        snippet(PROGRAM, caption="Program.cs, part 1: data and training"),
         output("""
-            49 epochs; test RMSE 0.431 stars (predicting the average: 0.946)
-            user 7: top 5 of 246 unseen movies
-              movie  76: predicted 4.65, true taste 4.27
-              movie 258: predicted 4.48, true taste 4.11
-              movie  44: predicted 4.44, true taste 4.44
-              movie 286: predicted 4.35, true taste 3.93
-              movie  61: predicted 4.34, true taste 3.70
-            """, caption="Output (\"true taste\" is available only because the data are synthetic)"),
-        cpugpu("scale",
+            trained 72 epochs, best validation reconstruction MSE 0.00023
+            """),
+        h2("30.2 Scoring and the threshold"),
+        snippet(SCORE, caption="Program.cs, part 2: reconstruction errors and detection"),
+        output("""
+            threshold (99th percentile of normal errors) 0.00063
+            test: 40 faulty of 2000; caught 40, missed 0, false alarms 37
+            """),
+        para("The typical (median) error is 0.00021 for normal readings and 0.10 for faulty ones: faults stand out by "
+             "a factor of about 500. The 99th-percentile threshold accepts that about 1% of normal readings are flagged; "
+             "here 37 of 1,960 (1.9%). Raise the percentile (99.9th) for fewer false alarms at the risk of missing "
+             "subtle faults."),
+        cpugpu("scoring a stream of readings in a service",
                """
-               // 500 users x 300 movies trains in seconds on the CPU
-               Device.Default = Device.Cpu;
+               using var detector = Build();
+               detector.Load("sensors.weights");
+               detector.Eval();
+               float threshold = float.Parse(File.ReadAllText("sensors.threshold"));
+               float Score(float[] reading)
+               {
+                   using var input = Tensor.From(reading, [1, 8]);
+                   using var output = detector.Predict(input);
+                   var o = output.ToArray();
+                   return o.Select((v, k) => (v - reading[k]) * (v - reading[k])).Sum() / 8;
+               }
+               bool IsAnomaly(float[] reading) => Score(reading) > threshold;
                """,
                """
-               // millions of ratings, 100k+ users: the GPU and large batches (4,096+)
-               Device.Default = Device.Cuda();
-               var loader = new DataLoader(train, 4096, shuffle: true);
-               // scoring all items for a user is one Predict call on [items, 2]
-               """),
-        reftable(["Extension", "How"], [
-            ["Implicit feedback (clicks, purchases, no stars)", "Targets 1 for interactions and 0 for sampled non-interactions; <code>BinaryCrossEntropyWithLogits</code>"],
-            ["New users with no history (cold start)", "Add user features (age group, country) as extra embeddings/columns; recommend popular items until history exists"],
-            ["Item side information (genre, price)", "Add item-feature embeddings to the item vector"],
-            ["\"Customers who bought X also bought\"", "Nearest item vectors by cosine similarity (" + ch("embedding") + ")"],
-            ["Serving", "Precompute all item vectors; a user's scores are one matrix product"],
-        ], caption="Table 30.1 — Recommender extensions"),
-        h2("30.2 Categorical columns in tabular models"),
-        para("The second project predicts daily sales of 50 stores from a promotion flag, the temperature, the "
-             "weekday and the store. Weekday and store are categories. The same data trains two models: an MLP that "
-             "reads the four columns as numbers, and a model that embeds weekday and store."),
-        snippet(TABULAR, caption="Mixing numeric columns and embeddings"),
-        output("""
-            ids as numbers  test MAE 27.27 units  (4,545 parameters)
-            embeddings      test MAE 1.46 units  (5,542 parameters)
-            """, caption="Both models trained with Adam, early stopping, 16,000 training rows"),
-        para("With ids as numbers, the MLP would have to carve 50 arbitrary store levels out of one numeric input; "
-             "with an embedding, each store simply gets its own learned vector. The same pattern handles any number of "
-             "categorical columns: one <code>Embedding</code> per column, sized by Table 9.2 (" + ch("embedding") + "), "
-             "concatenated with the scaled numeric columns."),
-        deriv("Preparing categorical columns", [
-            "Collect the distinct values of each categorical column in the training data and number them 0…K−1 "
-            "(reserve one id for values not seen in training).",
-            "Replace each value by its id when building the feature rows; keep the numeric columns scaled.",
-            "Save the value-to-id maps (e.g. as JSON) together with the weights and the scaler: they are part of the model.",
-        ]),
-        trap("scaling the id columns",
-             "<p>A <code>StandardScaler</code> fitted on all columns would turn ids into fractional numbers that no longer "
-             "select embedding rows. Scale only the numeric columns (fit the scaler on them alone), and leave id columns "
-             "as integers.</p>"),
+               using var detector = Build();
+               detector.To(Device.Cuda());
+               detector.Load("sensors.weights");
+               // score readings in batches of thousands per Predict call for throughput
+               """,
+               "Save the threshold with the model: it is part of the detector. If the readings need scaling, save the scaler too."),
+        h2("30.3 Making it work on real data"),
+        reftable(["Issue", "Remedy"], [
+            ["Features on different scales", "Standardize with a scaler fitted on normal training data"],
+            ["Some training data is already anomalous", "Usually fine if rare; or train, remove the top 1% of scores, and retrain"],
+            ["Too many false alarms", "Higher percentile; a larger bottleneck; more training data covering all normal operating modes"],
+            ["Anomalies slip through", "A narrower bottleneck; per-feature errors (which sensor is off?)"],
+            ["Normal behaviour drifts (seasons, wear)", "Retrain regularly on recent normal data; monitor the score distribution"],
+            ["Sequences rather than single readings", "Autoencode windows (flattened, or with LSTM encoder/decoder)"],
+            ["A few labelled anomalies exist", "Use them to choose the threshold (maximize recall at acceptable precision, " + ch("binary") + ")"],
+        ], caption="Table 30.1 — Practical issues"),
+        trap("a bottleneck that is too wide",
+             "<p>A bottleneck as wide as the input lets the network learn to copy any input, faults included, so errors "
+             "shrink for everything and the gap between normal and faulty data narrows (Practice 4 measures it). Start "
+             "with a bottleneck close to the number of factors that really drive the data and widen only until normal "
+             "data is rebuilt well.</p>"),
         practice([
-            (1, "How many parameters do the four embeddings of the recommender have for 500 users, 300 movies and dim 16?",
-             "(500 + 300)·16 + (500 + 300)·1 = 12,800 + 800 = 13,600."),
-            (1, "Why does the recommender add the mean rating as a constant?",
-             "So the model starts near the right level and the embeddings only have to learn deviations from it."),
-            (2, "Find the 3 movies most similar to movie 44 from the learned vectors.",
-             "Read the item embedding table (<code>Weight.ToArray2D()</code>; expose the embedding from the module), compute the "
-             "cosine similarity of row 44 with every other row, and take the three largest."),
-            (2, "Add a country column (40 countries) to the sales model.",
-             "Add <code>new Embedding(40, 4)</code>, a fifth input column with the country id, extract it with "
-             "<code>x.Narrow(1, 4, 1).Flatten(0)</code>, and widen the first Linear to 2 + 3 + 8 + 4 inputs."),
-            (3, "Turn the recommender into an implicit-feedback model for purchase data.",
-             "Use purchased (user, item) pairs as positives with target 1, sample random unpurchased pairs as negatives "
-             "with target 0 (e.g. 4 per positive), drop the mean term, train with <code>BinaryCrossEntropyWithLogits</code>, "
-             "and rank unseen items by score; evaluate with the share of held-out purchases that appear in each user's top 10."),
+            (1, "Why does the dataset use the features as targets?",
+             "An autoencoder learns to reproduce its input; the reconstruction error then measures how typical an input is."),
+            (1, "What fraction of normal readings should a 99.5th-percentile threshold flag?",
+             "About 0.5%."),
+            (2, "Report which sensor caused each alarm.",
+             "Keep the per-feature squared errors instead of averaging them; the sensor with the largest error is the likely culprit."),
+            (2, "Widen the bottleneck to 8 units and rerun. What happens?",
+             "Measured: normal readings are rebuilt better (median error 0.00003), but faults are rebuilt better too "
+             "(median 0.010 instead of 0.10). The detector caught 38 of 40 faults with 44 false alarms, against 40 and 37 "
+             "with the 2-unit bottleneck: a wider bottleneck starts to copy faults as well."),
+            (3, "Adapt the detector to credit-card transactions (amount, hour, merchant category, distance from home, …).",
+             "Scale numeric columns, embed or one-hot the merchant category (" + ch("recommender") + "), train on transactions "
+             "believed legitimate, choose the threshold with the few known fraud cases, and review flagged transactions "
+             "by hand before acting."),
         ], PART),
-        footer("Recommender system", "Matrix factorization", "Embedding", "Categorical feature", "Cold start",
-               "Implicit feedback", "Dot product"),
+        footer("Anomaly detection", "Autoencoder", "Bottleneck", "Reconstruction error", "Percentile",
+               "Unsupervised learning", "False alarm"),
     )

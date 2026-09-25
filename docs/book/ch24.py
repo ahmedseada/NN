@@ -1,172 +1,184 @@
-"""Chapter 24 — Testing, Gradient Checking and Debugging."""
+"""Chapter 24 — Inside the CUDA Backend."""
 from gen import *
 
 PART = "IV"
+
+RELU_PTX = """
+    .visible .entry relu_f32(
+        .param .u64 p_x,
+        .param .u64 p_y,
+        .param .u32 p_n
+    )
+    {
+        ...                                   // register declarations
+        mov.u32 %r1, %ctaid.x;                // block index
+        mov.u32 %r2, %ntid.x;                 // threads per block (256)
+        mov.u32 %r3, %tid.x;                  // thread index in the block
+        mad.lo.u32 %i, %r1, %r2, %r3;         // i = block * 256 + thread
+        ld.param.u32 %n, [p_n];
+        setp.ge.u32 %p0, %i, %n;              // past the end? skip
+        @%p0 bra DONE;
+        mul.wide.u32 %off, %i, 4;             // byte offset of element i
+        ld.param.u64 %b_x, [p_x];
+        cvta.to.global.u64 %b_x, %b_x;
+        add.u64 %a_x, %b_x, %off;
+        ld.param.u64 %b_y, [p_y];
+        cvta.to.global.u64 %b_y, %b_y;
+        add.u64 %a_y, %b_y, %off;
+        ld.global.f32 %f1, [%a_x];            // x[i]
+        max.f32 %f2, %f1, 0f00000000;         // max(x[i], 0)
+        st.global.f32 [%a_y], %f2;            // y[i] = ...
+    DONE:
+        ret;
+    }
+"""
+
+
+def flow_svg():
+    w, h = 470, 120
+    p = [f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
+    boxes = [("C# builds PTX text", 10), ("driver JIT → GPU code", 130), ("cuLaunchKernel on stream", 250), ("GPU runs 1000s of threads", 370)]
+    for label, x in boxes:
+        p.append(f'<rect x="{x}" y="30" width="100" height="40" rx="5" fill="#e6f2ef" stroke="#0f6b5c"/>')
+        words = label.split(" ")
+        mid = len(words) // 2
+        p.append(svg_text(x + 50, 47, " ".join(words[:mid]), 7.8, "#0f6b5c"))
+        p.append(svg_text(x + 50, 60, " ".join(words[mid:]), 7.8, "#0f6b5c"))
+    for x in (110, 230, 350):
+        p.append(f'<line x1="{x}" y1="50" x2="{x + 20}" y2="50" stroke="#56606a"/>')
+        p.append(f'<polygon points="{x + 20},50 {x + 14},47 {x + 14},53" fill="#56606a"/>')
+    p.append(svg_text(60, 90, "once per process", 7.4, "#56606a"))
+    p.append(svg_text(180, 90, "once per GPU (cached", 7.4, "#56606a"))
+    p.append(svg_text(180, 101, "by the driver)", 7.4, "#56606a"))
+    p.append(svg_text(300, 90, "every operation", 7.4, "#56606a"))
+    p.append(svg_text(420, 90, "asynchronously", 7.4, "#56606a"))
+    p.append("</svg>")
+    return "".join(p)
 
 
 def build():
     return page(
         chapter_open(
-            "testing",
-            "A neural network that is wrong usually still runs: it just learns badly. This chapter shows how the "
-            "library tests itself on every device, how to test your own layers and models the same way, and a "
-            "systematic procedure for the classic failures: loss not falling, NaN, shape errors, memory growth, and "
-            "CPU and GPU disagreeing.",
-            "The test project runs every test on every available device: <code>dotnet run -c Release --project tests/NeuralSharp.Tests</code>.",
-            "Three kinds of test: compare with a reference implementation, check gradients with finite differences, and check that a model can learn.",
-            "Overfit one tiny batch first: a model that cannot memorize 8 samples has a bug.",
-            "Most silent bugs are data bugs: unscaled inputs, wrong labels, leakage between train and validation.",
-            "Compare CPU and GPU with a relative tolerance, never bit for bit.",
+            "cuda",
+            "The CUDA backend runs every operation on an NVIDIA GPU using only what the display driver provides. It "
+            "writes its GPU programs as PTX text in C#, has the driver compile them for the installed card, manages "
+            "GPU memory with a caching allocator, queues work on its own stream and can record whole sequences of work "
+            "as CUDA graphs. This chapter walks through each piece, so the GPU behaviour described in earlier "
+            "chapters has no mystery left.",
+            "P/Invoke into the driver API (<code>nvcuda.dll</code> / <code>libcuda.so.1</code>): no CUDA Toolkit, no cuBLAS, no cuDNN, no native code of our own.",
+            "57 kernels are generated as PTX for <code>sm_50</code> and JIT-compiled by the driver for any GPU from Maxwell to Blackwell.",
+            "One context and one stream per GPU; operations return after queuing; reads synchronize.",
+            "Memory: a caching allocator keyed by size; cached blocks are reused, released on demand or when a limit is reached.",
+            "CUDA graphs: stream capture records a step; one <code>cuGraphLaunch</code> replays it.",
         ),
-        h2("24.1 The library's own tests"),
-        para("The test project is a self-contained console program (no test framework needed). It runs each test once on "
-             "the CPU and once on every GPU, inside a <code>TensorScope</code>, and prints a line per test:"),
+        diagram("Figure 24.1 — From C# to GPU threads", flow_svg(),
+                "The PTX text is built once per process; compiled code is cached by the driver on disk between runs."),
+        h2("24.1 Talking to the driver"),
+        reftable(["Driver call", "Used for"], [
+            ["<code>cuInit</code>, <code>cuDeviceGetCount</code>, <code>cuDeviceGet</code>, <code>cuDeviceGetName</code>, <code>cuDeviceTotalMem</code>", "Detection and <code>Device.Name</code> (" + ch("devices") + ")"],
+            ["<code>cuDevicePrimaryCtxRetain</code>, <code>cuCtxSetCurrent</code>", "One context per GPU, made current on whichever thread calls"],
+            ["<code>cuStreamCreate</code>", "The backend's own stream: all kernels and async copies go there"],
+            ["<code>cuModuleLoadDataEx</code>, <code>cuModuleGetFunction</code>", "JIT-compiling the PTX and finding each kernel"],
+            ["<code>cuMemAlloc</code>, <code>cuMemFree</code>, <code>cuMemsetD32Async</code>", "Device memory"],
+            ["<code>cuMemcpyHtoD</code>, <code>cuMemcpyDtoH</code>, <code>cuMemcpyDtoDAsync</code>", "Uploads, downloads (synchronizing) and device copies"],
+            ["<code>cuLaunchKernel</code>", "Every operation"],
+            ["<code>cuCtxSynchronize</code>", "<code>Device.Synchronize()</code>"],
+            ["<code>cuStreamBeginCapture</code>, <code>cuStreamEndCapture</code>, <code>cuGraphInstantiateWithFlags</code>, <code>cuGraphLaunch</code>", "Compute graphs (" + ch("generation") + ")"],
+        ], caption="Table 24.1 — The driver API calls the library makes"),
+        para("The calls are declared with .NET's <code>LibraryImport</code> source generator and resolved against the "
+             "driver library at run time, so the same NeuralSharp build runs with or without a GPU: without one, "
+             "detection reports the reason and everything uses the CPU."),
+        h2("24.2 Kernels written as PTX"),
+        para("PTX is NVIDIA's portable GPU assembly language (glossary <b>PTX</b>). The class <code>PtxKernels</code> "
+             "generates the text for all kernels with C# string templates; most element-wise kernels differ only in "
+             "a few instructions, so one template (<code>Elementwise</code>) produces them. The test program can dump "
+             "the whole module:"),
         output("""
-            CUDA not available (the NVIDIA driver library (libcuda.so.1 / libcuda.so) was not found); testing the CPU only.
-            == cpu: CPU (4 threads, 8-wide SIMD)
-              PASS matmul matches reference (all transposes, beta 0 and 1) (87 ms)
-              PASS element-wise ops match reference (25 ms)
-              PASS large tensors (parallel / multi-block paths) (235 ms)
-              PASS gradient: sigmoid, sum (7 ms)
-              ...
-              PASS batched cached decoding matches sequences decoded one by one (5 ms)
-              PASS graph replay gives the same tokens as direct execution (12 ms)
-              PASS sampler: distribution, top-k, temperature, determinism, CPU parity (19 ms)
-            56 passed, 0 failed
-            """, caption="The test run in this book's container (CPU only); on a machine with one GPU, 112 tests run"),
-        reftable(["Test kind", "Examples in the suite", "Catches"], [
-            ["Reference comparison", "matmul (all transposes), element-wise ops, softmax, convolution, pooling against simple loops", "Wrong kernels, indexing errors"],
-            ["Gradient checks", "every operation and every layer, including dropout with a fixed mask", "Wrong backward formulas"],
-            ["Learning tests", "optimizers minimize a quadratic; XOR and small tasks train", "Wiring errors that pass the other tests"],
-            ["Property tests", "save/load round-trip, scopes free memory, cached decoding equals full decoding, graph replay equals direct execution", "Lifetime and consistency errors"],
-            ["Device parity", "the same tests on CPU and GPU; the sampler picks the same tokens", "Backend-specific bugs"],
-        ], caption="Table 24.1 — What the suite tests"),
-        h2("24.2 Testing your own layers"),
-        snippet("""
-            static void GradCheck(Device device, int[] shape, Func<Tensor, Tensor> f, float tolerance = 2e-2f)
-            {
-                var random = new Random(1);
-                var x0 = new float[shape.Aggregate(1, (a, b) => a * b)];
-                for (int i = 0; i < x0.Length; i++) x0[i] = random.NextSingle() * 2 - 1;
-
-                using var scope = new TensorScope();
-                var x = Tensor.From(x0, shape, device, requiresGrad: true);
-                f(x).Backward();
-                float[] analytic = x.Grad!.ToArray();
-
-                const float h = 1e-2f;
-                using var noGrad = Autograd.NoGrad();
-                for (int i = 0; i < x0.Length; i++)
-                {
-                    var plus = (float[])x0.Clone();  plus[i] += h;
-                    var minus = (float[])x0.Clone(); minus[i] -= h;
-                    float numeric = (f(Tensor.From(plus, shape, device)).Item()
-                                   - f(Tensor.From(minus, shape, device)).Item()) / (2 * h);
-                    if (MathF.Abs(numeric - analytic[i]) > tolerance * Math.Max(1f, MathF.Abs(numeric)))
-                        throw new Exception($"element {i}: autograd {analytic[i]}, numeric {numeric}");
-                }
-            }
-
-            // a layer's input gradient, on every device
-            foreach (var device in new[] { Device.Cpu }.Concat(Device.IsCudaAvailable ? [Device.Cuda()] : []))
-            {
-                using var layer = new FeatureGate(4, device, new Random(3));        // your custom layer (Chapter 6)
-                GradCheck(device, [3, 4], x => layer.Forward(x).Tanh().Sum());
-                Console.WriteLine($"{device}: gradient OK");
-            }
-            """.replace("(Chapter 6)", f"({ch('modules')})"), caption="A reusable gradient check (adapted from the test suite)"),
-        para("For a layer's <i>parameter</i> gradients, perturb each parameter value instead of the input: read "
-             "the parameter with <code>ToArray()</code>, change one value, write it back by loading a file or by "
-             "building the layer from known values, and compare the change in loss with the parameter's "
-             "<code>Grad</code>. Checking the input gradient, as above, already exercises the whole backward pass "
-             "of the layer."),
-        cpugpu("comparing devices",
+            dotnet run -c Release --project tests/NeuralSharp.Tests -- --dump-ptx kernels.ptx
+            Wrote 104879 characters of PTX to kernels.ptx
+            """, caption="Dumping the generated GPU code (57 kernels, 4,087 lines)"),
+        code(RELU_PTX, "One generated kernel: ReLU (from kernels.ptx, comments added)", lang="text"),
+        reftable(["Kernel family", "Examples"], [
+            ["Element-wise (one thread per element, blocks of 256)", "fill, affine, axpy, add/sub/mul, sigmoid, tanh, relu, gelu, exp, log and their backward kernels, dropout"],
+            ["Reductions (shared memory and atomic additions)", "sum_f32, sum_rows_f32, sum_axis_f32, norm_stats_f32, group_reduce_f32"],
+            ["Matrix product (16×16 shared-memory tiles, batched over grid z)", "matmul_f32"],
+            ["Row-wise (one thread per row)", "softmax, log-softmax, argmax, class_match, layernorm_fused, scale_mask_softmax"],
+            ["Data movement", "permute, copy2d, gather (embeddings), scatter_add, im2col/col2im, maxpool"],
+            ["Optimizers", "sgd_momentum_f32, adam_f32"],
+            ["Decoding", "decoder_mask, kv_write, bias_gelu, sample_rows"],
+        ], caption="Table 24.2 — The 57 kernels by family"),
+        honestbox("Why PTX and not CUDA C",
+                  "<p>Compiling CUDA C needs nvcc or NVRTC from the CUDA Toolkit, a multi-gigabyte install the library "
+                  "deliberately avoids. PTX is accepted directly by every NVIDIA driver, which compiles it for the card "
+                  "in use. The price is that kernels are written at assembly level; the generator keeps that manageable, "
+                  "and every kernel is validated with NVIDIA's <code>ptxas</code> for architectures sm_50 to sm_120 "
+                  "during development.</p>"),
+        h2("24.3 Launching and the stream"),
+        para("An operation computes its grid (for element-wise kernels: n / 256 blocks of 256 threads), packs its "
+             "arguments (pointers, sizes, scalars as 64-bit slots) and calls <code>cuLaunchKernel</code> on the backend's "
+             "stream. The call returns immediately; the GPU runs kernels in stream order. That is why operations look "
+             "instantaneous from C#, why a read (<code>Item()</code>, <code>ToArray()</code>) waits, and why telemetry "
+             "timings on the GPU measure launch time unless <code>SynchronizeForTiming</code> is set (" + ch("telemetry") + ")."),
+        reftable(["Cost", "Typical size", "Consequence"], [
+            ["Kernel launch (CPU side)", "a few µs", "Thousands of tiny operations per step are launch-bound; batch them (" + ch("performance") + ") or use a graph"],
+            ["Host ↔ device copy", "~10 GB/s + fixed latency", "Upload data once per batch, read results rarely"],
+            ["Synchronization", "waits for all queued work", "Avoid in inner loops"],
+        ], caption="Table 24.3 — Where GPU time goes besides arithmetic"),
+        h2("24.4 Memory"),
+        para("<code>cuMemAlloc</code> is slow and synchronizing, so it must not happen in every step. The backend "
+             "keeps freed blocks in a dictionary from element count to a stack of device pointers. An allocation of the "
+             "same size pops a cached block; only otherwise is the driver asked. Freed blocks are returned under a lock "
+             "and never touch the driver, because the finalizer thread may be the one freeing. If the driver reports "
+             "out-of-memory, the backend forces a garbage collection, frees the cache and retries once. Limits from "
+             "<code>ComputeResources.GpuMemoryLimit</code> are enforced before any allocation (" + ch("devices") + ")."),
+        cpugpu("watching the GPU allocator settle",
                """
-               using var cpuModel = Factory.Create(Device.Cpu);
-               cpuModel.Save("tmp.weights");
-               float[,] cpuOut = cpuModel.Predict(batch);
+               // on the CPU the same pattern applies to pooled float[] arrays
+               Console.WriteLine(ComputeResources.GetMemoryUsage(Device.Cpu));
                """,
                """
-               using var gpuModel = Factory.Create(Device.Cuda());
-               gpuModel.Load("tmp.weights");                        // identical weights
-               float[,] gpuOut = gpuModel.Predict(batch);
-               // compare element by element: |a - b| <= 1e-4 * max(1, |a|)
+               var gpu = Device.Cuda();
+               for (int epoch = 0; epoch < 3; epoch++)
+               {
+                   trainer.Fit(loader, epochs: 1);
+                   Console.WriteLine(ComputeResources.GetMemoryUsage(gpu));   // InUse + Cached stay flat
+               }
+               ComputeResources.ReleaseCachedMemory(gpu);                    // give cached blocks back
                """),
-        h2("24.3 When training goes wrong"),
-        deriv("A procedure that finds most bugs", [
-            "<b>Look at the data.</b> Print a few rows of features and targets after scaling. Check shapes, ranges, "
-            "NaN values and that labels match inputs.",
-            "<b>Check the starting loss.</b> Cross-entropy should start near ln K (" + ch("losses") + "); MSE on standardized "
-            "targets near 1.",
-            "<b>Overfit a tiny batch.</b> Train on 8 samples for a few hundred steps without dropout or weight decay. The loss "
-            "must go almost to zero. If not, the model, loss or optimizer wiring is wrong.",
-            "<b>Check gradients</b> of any custom layer or loss (Section 24.2).",
-            "<b>Scale up</b> to the full data; then tune the learning rate (" + ch("optimizers") + ") and capacity.",
-            "<b>Watch validation</b> for overfitting and use early stopping (" + ch("trainer") + ").",
-        ]),
-        reftable(["Symptom", "Likely causes", "Where to look"], [
-            ["Loss does not fall at all", "Learning rate far too low or too high; <code>ZeroGrad</code>/<code>Step</code> missing; parameters not given to the optimizer; frozen by mistake", ch("optimizers") + ", " + ch("autograd")],
-            ["Loss becomes NaN", "Rate too high; unscaled inputs; <code>Log</code> of 0 or negative numbers in a custom loss; NaN in the data", ch("schedules") + " (clipping), " + ch("data")],
-            ["Loss stuck at ln K (classification)", "Labels shuffled relative to inputs; wrong target format; Softmax before cross-entropy", ch("losses")],
-            ["Training good, validation bad", "Overfitting; leakage-free split? scaler fitted on training data only?", ch("norm") + ", " + ch("data")],
-            ["Validation suspiciously good", "Leakage: duplicates or overlapping windows in both sets", ch("trainer")],
-            ["Predictions all the same value", "Dead ReLUs; too high a rate; targets not scaled; model in the wrong mode", ch("dense")],
-            ["Different result on every <code>Predict</code>", "Model in training mode (dropout on)", ch("modules")],
-            ["Shape exception", "Read the message: it names both shapes; trace shapes layer by layer", ch("conv") + " (Section 10.3)"],
-            ["Memory grows every step", "Missing <code>TensorScope</code>; tensors stored across steps", ch("memory")],
-            ["CPU and GPU differ slightly", "Normal float32 rounding differences", ch("cuda")],
-            ["CPU and GPU differ a lot", "Different weights (seed, loading), or a device bug: report it with a minimal repro", "Section 24.2"],
-        ], caption="Table 24.2 — Symptoms and causes"),
-        mex("overfitting one tiny batch as a smoke test", None,
-            """
-            // 8 random samples, random targets: a working model must memorize them.
-            var r = new Random(0);
-            using var x = Tensor.Uniform([8, 10], -1, 1, r);
-            using var y = Tensor.Uniform([8, 1], -1, 1, r);
-            using var model = new Sequential { new Linear(10, 64, random: r), new ReLU(), new Linear(64, 1, random: r) };
-            using var opt = new Adam(model.Parameters(), 1e-2f);
-            float loss = 0;
-            for (int step = 0; step < 500; step++)
-            {
-                using var scope = new TensorScope();
-                var l = Losses.MeanSquaredError(model.Forward(x), y);
-                opt.ZeroGrad(); l.Backward(); opt.Step();
-                loss = l.Item();
-            }
-            Console.WriteLine(loss < 1e-4 ? $"OK: memorized ({loss:E1})" : $"PROBLEM: loss {loss}");
-            """,
-            out="""
-            OK: memorized (6.9E-018)
-            """),
-        h2("24.4 Tools for looking inside"),
-        reftable(["Tool", "Shows"], [
-            ["<code>model.Summary()</code>", "Structure and parameter counts (" + ch("modules") + ")"],
-            ["Shape trace (<code>foreach (var layer in model)</code>)", "Every intermediate shape (" + ch("conv") + ")"],
-            ["<code>ConsoleLogger(TelemetryLevel.Layers)</code>", "Each layer's input/output shapes and time"],
-            ["<code>ConsoleLogger(TelemetryLevel.Operations)</code>", "Every operation, forward and backward (" + ch("telemetry") + ")"],
-            ["<code>TelemetryLevel.Gradients</code>", "Gradient norm per batch: exploding or vanishing gradients"],
-            ["<code>tensor.ToString()</code>", "Values of small tensors"],
-            ["<code>ComputeResources.GetMemoryUsage(device)</code>", "Leaks (" + ch("memory") + ")"],
-            ["<code>NEURALSHARP_DISABLE_CUDA=1</code>", "Run a GPU program on the CPU to compare behaviour"],
-        ], caption="Table 24.3 — Debugging tools"),
+        h2("24.5 Graphs"),
+        para("For a compute graph the backend switches its stream into capture mode (<code>cuStreamBeginCapture</code>, "
+             "relaxed mode), runs the step, and ends the capture, which yields a graph of every recorded kernel; "
+             "<code>cuGraphInstantiateWithFlags</code> turns it into an executable graph that <code>cuGraphLaunch</code> "
+             "replays. Memory freed during recording is kept aside for the graph's exclusive use, since the graph writes to "
+             "those addresses on every replay; it returns to the pool only when the graph is disposed. The requirements for "
+             "a replayable step are in " + ch("generation") + "."),
+        h2("24.6 Numerical differences between CPU and GPU"),
+        para("Both devices compute in float32, but not in the same order: GPU reductions sum in parallel trees, some "
+             "GPU functions use fast approximate instructions (e.g. <code>ex2.approx</code> for sigmoid and tanh), and "
+             "fused multiply-adds round differently from separate operations. Results therefore agree to about 5–6 "
+             "significant digits, not bit for bit. The test suite compares the devices with a relative tolerance, and "
+             "sampling is designed so that the same seed still picks the same tokens (" + ch("generation") + ")."),
+        trap("expecting identical GPU runs",
+             "<p>Parallel reductions that use atomic additions finish in a different order from run to run, so two GPU "
+             "trainings with the same seeds can differ in the last digits and drift apart over many epochs. For exact "
+             "reproducibility, train on the CPU.</p>"),
         practice([
-            (1, "A new 5-class classifier starts with a loss of 12.4. What do you check first?",
-             "The starting loss should be near ln 5 ≈ 1.61. Check input scaling (huge activations give huge logits), the "
-             "target format, and that there is no Softmax before the loss."),
-            (1, "Why overfit a tiny batch before training on everything?",
-             "It separates bugs from tuning: any correctly wired model can memorize 8 samples. If it cannot, something is "
-             "structurally wrong, and no amount of tuning on the full data will fix it."),
-            (2, "Write a test that a model gives the same output before saving and after loading into a fresh instance.",
-             "Build with a factory, predict a fixed batch, <code>Save</code>, create a second instance, <code>Load</code>, "
-             "predict again, and compare with a tolerance of about 1e-6 (the same device gives identical values)."),
-            (2, "Run the gradient check of Section 24.2 on <code>Losses.BinaryCrossEntropyWithLogits</code> with fixed targets.",
-             "<code>GradCheck(device, [6, 1], z =&gt; Losses.BinaryCrossEntropyWithLogits(z, targets))</code> with "
-             "<code>targets</code> a fixed tensor of 0s and 1s created on the same device; it passes."),
-            (3, "Design a regression test for a trained production model.",
-             "Keep a small fixed input set with the expected outputs saved at release time; the test loads the model and "
-             "scalers, predicts, and checks every output within a tolerance, and also checks a metric (e.g. MAE on a held-out "
-             "set) against a threshold. Run it on both devices in CI where a GPU is available."),
+            (1, "Which files must be installed on a machine to use the GPU backend?",
+             "Only the NVIDIA display driver (which provides nvcuda.dll or libcuda.so.1). No CUDA Toolkit, cuBLAS or cuDNN."),
+            (1, "Why does <code>loss.Item()</code> take longer on the GPU than the whole forward pass seemed to?",
+             "The forward pass only queued kernels; <code>Item()</code> waits for all of them to finish and then copies the value."),
+            (2, "Dump the PTX and find the kernel used by <code>Tensor.Softmax()</code>. How is one row processed?",
+             "<code>softmax_f32</code>, launched with one thread per row: the thread scans its row for the maximum, sums "
+             "exp(x − max) and writes each element divided by that sum (subtracting the maximum keeps the exponentials "
+             "from overflowing)."),
+            (2, "A model uses 2 GB on the GPU after training although only 500 MB is in use. Explain and fix.",
+             "The rest is cached blocks kept for reuse (<code>Cached</code> in <code>GetMemoryUsage</code>). Call "
+             "<code>ComputeResources.ReleaseCachedMemory(gpu)</code>, or set a <code>GpuMemoryLimit</code>."),
+            (3, "Outline the steps to add a new GPU kernel, e.g. a fused bias + ReLU.",
+             "Write the PTX with the element-wise template (load x and bias[i % cols], add, max with 0, store), add its name "
+             "to the kernel list, get the function handle when the module loads, implement the backend method with "
+             "<code>Launch1D</code>, provide the CPU equivalent, and add CPU/GPU comparison and gradient tests (" + ch("testing") + ")."),
         ], PART),
-        footer("Unit test", "Reference implementation", "Finite difference", "Smoke test", "Overfitting a batch",
-               "NaN", "Device parity", "Data leakage"),
+        footer("CUDA", "Driver API", "PTX", "JIT compilation", "Kernel", "Thread block", "Grid", "Stream",
+               "Caching allocator", "CUDA graph", "Stream capture"),
     )

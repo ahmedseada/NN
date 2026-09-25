@@ -1,220 +1,236 @@
-"""Chapter 36 — Serving Models over HTTP."""
+"""Chapter 36 — Search Re-Ranking with a Cross-Encoder."""
 from gen import *
 
-PART = "VII"
+PART = "VI"
 
-PRICE_API = """
-    using NeuralSharp;
-    using NeuralSharp.Data;
-    using NeuralSharp.Layers;
 
-    var builder = WebApplication.CreateBuilder(args);
-    builder.Services.AddSingleton<PricePredictor>();          // loaded once, shared by all requests
-    var app = builder.Build();
+def stages_svg():
+    w, h = 470, 120
+    p = [f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
+    items = [(10, "question", "#56606a", "#f2f4f5"), (120, "BM25 over 1,600", "#56606a", "#f2f4f5"),
+             (240, "cross-encoder", "#0f6b5c", "#e6f2ef"), (360, "ranked answers", "#0f6b5c", "#e6f2ef")]
+    for x, t, stroke, fill in items:
+        p.append(f'<rect x="{x}" y="34" width="100" height="36" rx="4" fill="{fill}" stroke="{stroke}" stroke-width="0.8"/>')
+        p.append(svg_text(x + 50, 56, t, 8.2, stroke))
+    for x, label in ((110, ""), (230, "20 candidates"), (350, "20 scores")):
+        p.append(f'<path d="M{x} 52 L{x + 6} 52" stroke="#1a1f23" stroke-width="1"/><path d="M{x + 6} 49 L{x + 9} 52 L{x + 6} 55 Z" fill="#1a1f23"/>')
+        if label:
+            p.append(svg_text(x + 4, 26, label, 7.2, "#56606a"))
+    p.append(svg_text(170, 88, "fast: word matching, whole collection", 7.4, "#56606a"))
+    p.append(svg_text(290, 100, "slow but accurate: reads question and passage together", 7.4, "#0f6b5c"))
+    p.append("</svg>")
+    return "".join(p)
 
-    app.MapPost("/predict", (House[] houses, PricePredictor predictor) =>
-        houses.Length is 0 or > 1000
-            ? Results.BadRequest("send 1-1000 houses")
-            : Results.Ok(predictor.Predict(houses)));
-    app.MapGet("/health", (PricePredictor p) => Results.Ok(new { device = p.Device.ToString(), parameters = p.ParameterCount }));
-    app.Run();
 
-    public sealed record House(float Area, float Bedrooms, float Bathrooms, float Age, float DistanceKm,
-                               float Quality, float Garage, float Pool, float Lot);
-
-    public sealed class PricePredictor : IDisposable
+SCORER = """
+    // "<cls> question <sep> passage <pad>..." (28 ids) → one relevance score, read at the <cls> position.
+    Sequential Scorer(int vocabulary, Random r) => new()
     {
-        private const int Features = 9;
-        private readonly Sequential _model;
-        private readonly StandardScaler _features, _price;
+        new Embedding(vocabulary, Dim, device, r),                     // Dim = 64
+        new PositionalEncoding(Length, Dim, device),                   // Length = 28
+        new TransformerEncoderLayer(Dim, heads: 4, ffDim: 2 * Dim, dropout: 0.1f, device: device, random: r),
+        new TransformerEncoderLayer(Dim, heads: 4, ffDim: 2 * Dim, dropout: 0.1f, device: device, random: r),
+        new LayerNorm(Dim, device: device),
+        new Lambda(x => x.Narrow(1, 0, 1).Reshape(-1, Dim), "ClsToken"),   // [N, 28, 64] → [N, 64]
+        new Linear(Dim, 1, device: device, random: r),
+    };
+"""
 
-        public PricePredictor(IConfiguration config)
-        {
-            string dir = config["Model:Directory"] ?? "models";
-            Device = config["Model:Device"] == "cuda" && NeuralSharp.Device.IsCudaAvailable
-                ? NeuralSharp.Device.Cuda() : NeuralSharp.Device.Cpu;
-            _model = new Sequential
-            {
-                new Linear(Features, 64, device: Device), new ReLU(), new Dropout(0.05f),
-                new Linear(64, 32, device: Device), new ReLU(),
-                new Linear(32, 1, device: Device),
-            };
-            _model.Load(Path.Combine(dir, "house-price.weights"));
-            _model.Eval();                                      // once: requests never switch modes
-            _features = StandardScaler.Load(Path.Combine(dir, "house-price.features.txt"));
-            _price = StandardScaler.Load(Path.Combine(dir, "house-price.price.txt"));
-        }
+GROUPS = """
+    // One training row = one question with 8 passages (answer at a random position + 7 BM25 hard negatives),
+    // flattened to 8 × 28 ids; the label is the answer's position (a class out of 8).
+    var scorer = Scorer(tokenizer.VocabularySize, new Random(2));
+    using var groupModel = new Sequential
+    {
+        new Lambda(x => x.Reshape(-1, Length), "PairsOfGroup"),       // [B, 8·28] → [B·8, 28]
+        scorer,                                                        // → [B·8, 1]
+        new Lambda(x => x.Reshape(-1, Group), "ScoresOfGroup"),       // → [B, 8]: logits over the group
+    };
+    using var optimizer = new AdamW(groupModel.Parameters(), learningRate: 0.002f, weightDecay: 0.01f);
+    var trainer = new Trainer(groupModel, optimizer, (logits, targets) => Losses.CrossEntropy(logits, targets))
+    {
+        Metrics = { Metric.Accuracy },                                 // = answer ranked first within its group
+        Scheduler = new CosineAnnealing(optimizer, epochs, minLearningRate: 1e-4f, warmupEpochs: 1),
+        MaxGradientNorm = 1f,
+    };
+    trainer.Fit(new DataLoader(trainSet, 32, shuffle: true, device: device, seed: 5), epochs,
+        validation: new DataLoader(validation, 200, device: device));
+    scorer.Save(modelPath);                                            // only the pair scorer is needed later
+"""
 
-        public Device Device { get; }
-        public long ParameterCount => _model.ParameterCount;
+PLACEHOLDERS = """
+    // Vocabulary: words used for at least two training towns; a town's own name is not in it.
+    // Unknown words become <w0>, <w1>, ... numbered by first appearance in each (question, passage) pair.
+    var placeholders = new Dictionary<string, int>();
+    int Id(string word) => words[word] != words["<unk>"] ? words[word]
+        : placeholders.Count < Placeholders || placeholders.ContainsKey(word)
+            ? words[$"<w{(placeholders.TryGetValue(word, out int k) ? k : placeholders[word] = placeholders.Count)}>"]
+            : words["<unk>"];
+    var ids = new List<int> { words["<cls>"] };
+    ids.AddRange(WordTokenizer.Split(question).Select(Id));
+    ids.Add(words["<sep>"]);
+    ids.AddRange(WordTokenizer.Split(passage).Select(Id));
+"""
 
-        public float[] Predict(IReadOnlyList<House> houses)
-        {
-            var x = new float[houses.Count * Features];
-            for (int i = 0; i < houses.Count; i++)
-            {
-                var h = houses[i];
-                float[] row = [h.Area, h.Bedrooms, h.Bathrooms, h.Age, h.DistanceKm, h.Quality, h.Garage, h.Pool, h.Lot];
-                row.CopyTo(x, i * Features);
-            }
-            _features.Transform(x, Features);
-            using var input = Tensor.From(x, [houses.Count, Features], Device);
-            using var output = _model.Predict(input);
-            var prices = output.ToArray();
-            _price.InverseTransform(prices, 1);
-            return prices;
-        }
+RESULTS = """
+    1600 passages about 160 towns; 2880 training questions (120 towns), 960 test questions (40 unseen towns); vocabulary 222 (+ placeholders for town names)
+    Example: "how many people live in tormor" -> "roughly 37 thousand inhabitants call tormor home ."
 
-        public void Dispose() => _model.Dispose();
-    }
+    BM25 alone:            Hit@1 27.1 %   MRR@10 0.429   Recall@20 94.9 %
+
+    Cross-encoder: 2 layers, dim 64, 81,345 parameters; groups of 8 (1 answer + 7 hard negatives), 12 epochs
+    Epoch 12/12  loss 0.000171  accuracy 1.0000  val_loss 0.000006  val_accuracy 1.0000  15422.9 ms  177 samples/s  *
+    Trained in 188 s
+
+    BM25 + cross-encoder:  Hit@1 86.6 %   MRR@10 0.895   Recall@20 94.9 %
+    The re-ranker can only order what the first stage found: of the 94.9 % of questions whose answer is among the 20 candidates, it puts 91.3 % first.
+    Re-ranking cost: 7.36 ms per question (20 pairs in one batch, cpu)
+
+    Hit@1 per aspect (unseen towns)      BM25   re-ranked
+      population                          0 %      67 %
+      founded                            48 %     100 %
+      food                               26 %      72 %
+      river                              34 %      79 %
+      climate                            17 %      95 %
+      sport                              37 %      80 %
+      mayor                              40 %     100 %
+      transport                          14 %     100 %
+
+    "how many people live in tormor"
+      BM25 top:      many people visit tormor to see the old town .
+      re-ranked top: roughly 37 thousand inhabitants call tormor home .
+    "which river runs through tormor"
+      BM25 top:      the ash river flows through pelby .
+      re-ranked top: the stone river flows through lorwick .
+    "is there public transport in tormor"
+      BM25 top:      summers in tormor are mild and winters are wet .
+      re-ranked top: tormor has a metro service across the city .
 """
 
 
 def build():
     return page(
         chapter_open(
-            "webapi",
-            "Most trained models end up behind an HTTP endpoint that other programs call. This chapter builds two "
-            "services with ASP.NET Core minimal APIs: a small, complete prediction API for the house-price model, and "
-            "a tour of the repository's GPT Web API (<code>NeuralSharp.Samples.GptApi</code>), which adds an OpenAPI "
-            "description with a Scalar reference page, a browser UI, streaming with server-sent events, background "
-            "training, device switching and live metrics.",
-            "Register the model as a <b>singleton</b> service: load once at startup, <code>Eval()</code> once, share across requests.",
-            "A stateless predictor serves concurrent requests without locks (200 concurrent requests, all succeeded).",
-            "Stateful work (text generation with a KV cache) is serialized with a <code>SemaphoreSlim</code>.",
-            "Stream long outputs with <code>TypedResults.ServerSentEvents</code>.",
-            "Expose health, model info and device endpoints for operations.",
+            "reranker",
+            "Search usually runs in two stages. A fast first stage matches words over the whole collection and returns a "
+            "few dozen candidates; a slower, more accurate model then reads the question together with each candidate "
+            "and re-orders them. This project, <code>NeuralSharp.Samples.ReRanker</code>, builds both: BM25 as the first "
+            "stage and a small transformer <b>cross-encoder</b> as the re-ranker, trained listwise on hard negatives and "
+            "tested on towns it never saw during training.",
+            "First stage: BM25 word matching; the answer is among its top 20 for 94.9 % of the questions, but first for only 27.1 %.",
+            "Re-ranker: 2 transformer layers read \"&lt;cls&gt; question &lt;sep&gt; passage\" and output one score (81,345 parameters).",
+            "Training: one answer + 7 hard negatives per question, softmax cross-entropy over the 8 scores, with the ordinary <code>Trainer</code>.",
+            "Rare words (town names) become placeholders <code>&lt;w0&gt;</code>, <code>&lt;w1&gt;</code>…: without them 57.5 % first on unseen towns, with them 86.6 %.",
+            "Cost: 7.4 ms per question to score 20 candidates on the CPU; training 188 s.",
         ),
-        h2("36.1 A prediction API in one file"),
-        deriv("Creating it", [
-            "<code>dotnet new web -n PriceApi</code> and <code>dotnet add reference …/NeuralSharp.csproj</code>.",
-            "Replace <code>Program.cs</code> with the code below.",
-            "Copy the three model files of " + ch("regression") + " into <code>models/</code> (or pass <code>--Model:Directory</code>).",
-            "<code>dotnet run -c Release --urls http://localhost:5090</code> (add <code>--Model:Device cuda</code> for the GPU).",
-        ]),
-        snippet(PRICE_API, caption="Program.cs of a complete house-price API"),
-        output("""
-            $ curl localhost:5090/health
-            {"device":"cpu","parameters":2753}
-
-            $ curl -X POST localhost:5090/predict -H 'Content-Type: application/json' -d '[
-                {"area":2100,"bedrooms":4,"bathrooms":2,"age":15,"distanceKm":9.5,"quality":7,"garage":2,"pool":0,"lot":6500},
-                {"area":1200,"bedrooms":3,"bathrooms":1,"age":30,"distanceKm":12,"quality":5,"garage":1,"pool":0,"lot":4000}]'
-            [390611.53,192872.94]
-
-            $ seq 200 | xargs -P 32 -I{} curl -s -o /dev/null -w "%{http_code}\\n" -X POST localhost:5090/predict ... | sort | uniq -c
-                200 200
-
-            $ curl -X POST localhost:5090/predict -H 'Content-Type: application/json' -d '[]'
-            "send 1-1000 houses"
-            """, caption="Calling the API (the concurrent test sends 200 requests, 32 at a time)"),
-        para("The predictions match the console sample's (<code>$390,612</code> and <code>$192,873</code>, " + ch("regression") + "). "
-             "Because the model is in evaluation mode from the start and each request creates its own tensors, "
-             "concurrent requests need no lock (" + ch("inference") + ", Section 35.4)."),
-        cpugpu("configuring the device",
+        h2("36.1 The task and the data"),
+        diagram("Figure 36.1 — Two-stage search", stages_svg(),
+                "The first stage must be fast because it looks at every passage; the second may be slow because it looks at 20."),
+        para("The collection (<code>Collection.cs</code>) describes 160 invented towns. Each town has one passage for each of "
+             "eight aspects (population, founding, food, river, climate, sport, mayor, transport) and two general passages. "
+             "Each aspect has three question wordings. The data is built to be hard for word matching: questions and "
+             "answers use different words, while the general passages share the questions' words without answering them."),
+        reftable(["Question", "Answer passage", "Tempting wrong passage"], [
+            ["how many people live in tormor", "roughly 37 thousand <b>inhabitants</b> call tormor home .", "many <b>people</b> visit tormor to see the old town ."],
+            ["which <b>river</b> runs through tormor", "tormor sits on the banks of the reed .", "the ash <b>river</b> flows through pelby ."],
+            ["is there public transport in tormor", "tormor has a metro service across the city .", "summers <b>in</b> tormor are mild ... (shares \"in\", \"tormor\")"],
+        ], caption="Table 36.1 — Why word matching struggles"),
+        para("The towns are split: questions about the first 120 are used for training, questions about the other 40 "
+             "(960 questions) only for testing. A re-ranker that merely memorized towns would fail the test."),
+        trap("testing on what was trained",
+             "<p>Splitting the <i>questions</i> randomly would put questions about the same town in both sets; the model "
+             "could then score well by remembering which passages belong to which town. Split by the unit you will meet "
+             "new in production (here the town; in real search, new documents and new users).</p>"),
+        h2("36.2 The first stage: BM25"),
+        para("BM25 (<code>Bm25</code> in the sample) scores a passage by the question words it contains. Rare words count "
+             "more than common ones (a logarithm of how few passages contain the word, the inverse document frequency), "
+             "repeated words count with diminishing returns, and long passages are penalized slightly (glossary <b>BM25</b>; "
+             "logarithms are in the Pre-Calc volume). It needs no training and scans 1,600 passages in well under a "
+             "millisecond."),
+        snippet("""
+            // score(passage) = Σ over question words w in the passage of
+            //     idf(w) · tf · (k1 + 1) / (tf + k1 · (1 − b + b · length / averageLength))
+            //   idf(w) = log(1 + (N − n + 0.5) / (n + 0.5)),  n = passages containing w,  k1 = 1.2,  b = 0.75
+            var bm25 = new Bm25(collection.Passages.Select(p => p.Text));
+            int[] candidates = bm25.Search("how many people live in tormor", k: 20);   // passage ids, best first
+            """, caption="The first stage"),
+        para("BM25 finds the right passage somewhere in its top 20 for 94.9 % of the test questions (Recall@20) but "
+             "ranks it first for only 27.1 % (Hit@1), and never for the population questions: \"people\" and \"live\" "
+             "point to the general passages, not to \"inhabitants\" and \"residents\"."),
+        h2("36.3 The cross-encoder and listwise training"),
+        para("A cross-encoder reads the question and the passage as one sequence, so attention can relate every question "
+             "word to every passage word (\"live\" ↔ \"inhabitants\", the town in the question ↔ the town in the passage). "
+             "It is the same kind of transformer as the sentiment model of " + ch("sentiment") + ", with a single score "
+             "as output."),
+        snippet(SCORER, caption="The pair scorer"),
+        para("Training shows the model one question with eight passages: the answer and seven <b>hard negatives</b>, the "
+             "passages BM25 ranks highest that are not the answer. The eight scores are treated as the logits of an "
+             "8-class problem whose correct class is the answer's position, so the ordinary cross-entropy loss teaches the "
+             "model to score the answer above its closest competitors (a <b>listwise loss</b>). Two <code>Lambda</code> "
+             "layers reshape a batch of groups into pairs and the scores back into groups, so <code>Trainer</code>, "
+             "<code>DataLoader</code> and <code>Metric.Accuracy</code> work unchanged."),
+        snippet(GROUPS, caption="Training on groups with the standard Trainer"),
+        trap("easy negatives",
+             "<p>With random passages as negatives, the model only needs to check that the town matches, and it reaches "
+             "high training accuracy without learning the aspect words. Negatives must be the mistakes the first stage "
+             "actually makes: take them from its top results.</p>"),
+        h2("36.4 Words the model has never seen"),
+        para("The first version of this project put every word, town names included, in the vocabulary. It reached 99.3 % "
+             "within-group accuracy on training towns, but only 57.5 % Hit@1 on unseen towns: an unseen name is an "
+             "untrained embedding, so the model could not tell whether the town in a passage was the town in the question, "
+             "and river passages of other towns won. The fix is a standard one for rare words: words that occur for only "
+             "one town (their names) are left out of the vocabulary and encoded, per pair, as placeholders numbered by "
+             "first appearance."),
+        snippet(PLACEHOLDERS, caption="Placeholder encoding of rare words"),
+        para("\"how many people live in tormor\" paired with \"roughly 37 thousand inhabitants call tormor home .\" becomes "
+             "<code>&lt;cls&gt; how many people live in &lt;w0&gt; &lt;sep&gt; roughly 37 thousand inhabitants call &lt;w0&gt; home .</code>, "
+             "while a passage about lorwick gets <code>&lt;w1&gt;</code>. The model learns \"same placeholder = same "
+             "entity\", which holds for any name. Hit@1 on unseen towns rose from 57.5 % to 86.6 %, with a smaller "
+             "vocabulary (222 words instead of 550)."),
+        h2("36.5 Results"),
+        output(RESULTS, caption="dotnet run -c Release --project samples/NeuralSharp.Samples.ReRanker -- --cpu"),
+        para("Re-ranking lifts Hit@1 from 27.1 % to 86.6 % and MRR@10 from 0.43 to 0.90 (glossary <b>MRR</b>). The "
+             "re-ranker cannot recover an answer the first stage missed, so 94.9 % is its ceiling; of the reachable "
+             "answers it ranks 91.3 % first. The remaining errors are mostly questions whose answer is missing from the 20 "
+             "candidates (the river question above: its answer, \"tormor sits on the banks of the reed .\", has no "
+             "\"river\", and BM25 leaves it out of its top 20), so the next improvement is a larger candidate list or a better first stage, "
+             "not a bigger re-ranker."),
+        reftable(["Candidates re-ranked", "Effect"], [
+            ["More (50–100)", "Higher ceiling (recall); cost grows linearly (7.4 ms per 20 here)"],
+            ["Fewer (5–10)", "Cheaper; the re-ranker can only fix small ordering mistakes"],
+            ["Batch all candidates in one call", "One <code>Predict</code> of [20, 28] ids instead of 20 calls"],
+        ], caption="Table 36.2 — Tuning the second stage"),
+        cpugpu("training and inference commands",
                """
-               // appsettings.json
-               { "Model": { "Directory": "models", "Device": "cpu" } }
+               dotnet run -c Release --project samples/NeuralSharp.Samples.ReRanker -- --cpu
+               dotnet run -c Release --project samples/NeuralSharp.Samples.ReRanker -- --cpu --predict \\
+                   --input "how many people live in armor"
                """,
                """
-               // appsettings.Production.json on a GPU server
-               { "Model": { "Directory": "/srv/models/house-price/v3", "Device": "cuda" } }
-               // or on the command line: --Model:Device cuda
-               """),
-        h2("36.2 The GPT Web API"),
-        reftable(["Endpoint", "Returns"], [
-            ["<code>GET /api/status</code>", "Loading, Training (with live progress), Ready or Failed"],
-            ["<code>GET /api/model</code>", "Parameters, layers, heads, width, context, vocabulary, training record, layer summary"],
-            ["<code>GET /api/devices</code>", "CPU and every GPU, with memory usage and which one holds the model"],
-            ["<code>POST /api/generate</code>", "Generated samples, every character with probability, entropy and top-5 alternatives, and metrics"],
-            ["<code>POST /api/generate/stream</code>", "The same as server-sent events: <code>token</code> events, then a <code>metrics</code> event"],
-            ["<code>GET /</code>, <code>GET /scalar</code>", "The browser UI (output and metrics left, inputs and model parameters right) and the API reference"],
-        ], caption="Table 36.1 — NeuralSharp.Samples.GptApi"),
-        snippet("""
-            var builder = WebApplication.CreateBuilder(args);
-            builder.Services.AddOpenApi();
-            builder.Services.AddSingleton<GptService>();
-            builder.Services.AddHostedService(services => services.GetRequiredService<GptService>());   // loads or trains in the background
-
-            var app = builder.Build();
-            app.UseDefaultFiles();
-            app.UseStaticFiles();                                     // wwwroot/index.html
-            app.MapOpenApi();
-            app.MapScalarApiReference();                              // /scalar
-
-            var api = app.MapGroup("/api");
-            api.MapGet("/status", (GptService gpt) => gpt.Status);
-            api.MapPost("/generate", async (GenerateRequest request, GptService gpt, CancellationToken ct) =>
-                TypedResults.Ok(await gpt.GenerateAsync(request, ct)));
-            api.MapPost("/generate/stream", (GenerateRequest request, GptService gpt, CancellationToken ct) =>
-                TypedResults.ServerSentEvents(gpt.StreamAsync(request, ct)));
-            app.Run();
-            """, caption="Program.cs of the GPT API (abridged: error handling and OpenAPI descriptions removed)"),
-        output("""
-            $ curl localhost:5080/api/status
-            {"status":"Ready","message":"Ready on cpu","training":null}
-
-            $ curl localhost:5080/api/devices
-            [{"id":"cpu","name":"CPU (4 threads, 8-wide SIMD)","type":"Cpu","available":true,"active":true,
-              "memory":{"inUse":1389812,"cached":15204792,"limit":null,"reserved":16594604}},
-             {"id":"cuda","name":"No NVIDIA GPU detected","type":"Cuda","available":false,"active":false,"memory":null}]
-
-            $ curl localhost:5080/api/model
-            {"name":"char-gpt","parameters":341309,"layers":3,"heads":4,"dim":96,"context":64,"vocabularySize":29,
-             "trainedEpochs":2,"validationLoss":0.2504,"validationAccuracy":0.8938,"corpus":"built-in grammar", ...}
-            """, caption="Status, devices and model (long values shortened)"),
-        output("""
-            $ curl -X POST localhost:5080/api/generate -H 'Content-Type: application/json' \\
-                   -d '{"prompt":"the little robot ","length":60,"seed":6}'
-            "text": "built a tiny garden and then carried the heavy box.\\na quiet ",
-            first token: {"token":"b","probability":0.394,"entropy":2.55,
-                          "alternatives":[b 0.394, f 0.205, r 0.093, s 0.086, w 0.067]}
-            "metrics": {"mode":"KV cache","generatedTokens":60,"totalMs":28.98,"firstTokenMs":6.81,
-                        "tokensPerSecond":2070.8,"averageProbability":0.882,"perplexity":1.226,
-                        "contextResets":1,"graphNote":"graphs are GPU-only; CPU runs the step directly", ...}
-
-            $ curl -N -X POST localhost:5080/api/generate/stream -d '{"prompt":"a curious cat ","length":20,"seed":3,"chunkSize":8}' ...
-            event: token
-            data: {"sample":0,"index":0,"token":"f","probability":0.2556171,"entropy":2.7526093,...}
-
-            event: token
-            data: {"sample":0,"index":1,"token":"o","probability":0.99999976,"entropy":8.111985E-06,...}
-            """, caption="Generating and streaming (JSON condensed for print)"),
-        para("The first character is genuinely uncertain (entropy 2.55 bits: several verbs could follow \"the little "
-             "robot\"), while the next ones are nearly certain once the word has started. The API also accepts "
-             "<code>\"device\": \"cuda\"</code> to move the model to the GPU between requests, <code>samples</code> for "
-             "batched continuations, and <code>useCache</code>/<code>useGraph</code> to compare decoding modes (" + ch("generation") + ")."),
-        honestbox("Why the GPT service uses a lock",
-                  "<p>Generation owns stateful resources for its duration: the KV caches, the sampler, and on the GPU a "
-                  "recorded graph. The service therefore lets one generation run at a time "
-                  "(<code>SemaphoreSlim(1, 1)</code>) and queues the others; with a small model each takes milliseconds. "
-                  "For higher throughput, batch several prompts' samples into one generation, or run several model "
-                  "copies.</p>"),
-        h2("36.3 Production checklist"),
-        reftable(["Concern", "Practice"], [
-            ["Startup", "Load, <code>Eval()</code>, warm up with one prediction, then report ready (health endpoint)"],
-            ["Input validation", "Check sizes and ranges; reject NaN; cap batch sizes"],
-            ["Throughput", "Accept batches; micro-batch single requests (" + ch("inference") + ")"],
-            ["Resources", "<code>ComputeResources.MaxCpuThreads</code> below the core count, and memory limits, so the web server keeps capacity"],
-            ["Monitoring", "<code>JsonLinesLogger</code> at <code>TelemetryLevel.Inference</code> for latency; log input distributions to catch drift"],
-            ["Model updates", "Versioned folders; load the new version into a new singleton and swap references"],
-            ["GPU servers", "One process per GPU, or <code>Device.Cuda(n)</code> per model copy"],
-        ], caption="Table 36.2 — Serving in production"),
+               dotnet run -c Release --project samples/NeuralSharp.Samples.ReRanker -- --cuda
+               dotnet run -c Release --project samples/NeuralSharp.Samples.ReRanker -- --cuda --predict \\
+                   --input "is it cold?|winters are icy and long .|the shop opens at nine ."
+               """,
+               note="With <code>|</code> the input is a question followed by your own passages to re-rank. On the GPU, "
+                    "all 20 pairs are one batch of small kernels; the gain over the CPU grows with the number of "
+                    "candidates and the size of the model."),
         practice([
-            (1, "Why is the predictor registered as a singleton rather than per request?",
-             "Loading weights and scalers is expensive (file reads, allocation, warm-up); a singleton loads once and shares the model."),
-            (1, "Which endpoint would a load balancer's health check call?",
-             "<code>/health</code> (or <code>/api/status</code> for the GPT API), returning success only when the model is loaded."),
-            (2, "Add an endpoint that returns the churn probability for a customer.",
-             "Load the churn weights and scaler in a singleton like <code>PricePredictor</code>; in the handler scale the features, "
-             "<code>Predict</code>, apply <code>Sigmoid()</code>, and return <code>{ probability, churn = probability &gt;= threshold }</code>."),
-            (2, "Log each request's latency to a JSON Lines file without writing timing code.",
-             "Subscribe a <code>JsonLinesLogger(\"inference.jsonl\", TelemetryLevel.Inference)</code> at startup; every "
-             "<code>Predict</code> call then writes an <code>inference</code> event with latency and throughput (" + ch("telemetry") + ")."),
-            (3, "Serve two versions of the house-price model side by side for an A/B test.",
-             "Register two predictors (keyed services, or a dictionary keyed by version), route a share of requests to each "
-             "(e.g. by a hash of the client id), return the version in the response, and compare their errors on later "
-             "observed prices."),
+            (1, "Why is BM25 run over the whole collection but the cross-encoder only over 20 passages?",
+             "BM25 costs microseconds per passage and needs no model; the cross-encoder runs a transformer per pair "
+             "(7.4 ms per 20 here), far too slow for every passage of a large collection."),
+            (1, "What does Recall@20 of 94.9 % limit?",
+             "The best possible Hit@1 of the two-stage system: the re-ranker only orders the 20 candidates."),
+            (2, "Change the sample to re-rank 50 candidates. What do you expect for Recall, Hit@1 and cost?",
+             "Set <code>Candidates = 50</code>: Recall rises (the ceiling), Hit@1 rises if the re-ranker keeps its accuracy on "
+             "the extra, mostly easy candidates, and the cost per question rises about 2.5×."),
+            (2, "Why must the group model's output be [B, 8] and not [B·8, 1] for the loss?",
+             "Cross-entropy normalizes over the last dimension; the softmax must run over the 8 passages of one question, "
+             "so the scores of a group have to be one row."),
+            (3, "Replace the cross-encoder by a bi-encoder: encode questions and passages separately into vectors and score by dot product. What do you gain and lose?",
+             "Passage vectors can be computed once and searched quickly (it can even replace BM25), but question and "
+             "passage words no longer attend to each other, so fine distinctions (which town, which aspect) are usually "
+             "less accurate; bi-encoders are typical first stages, cross-encoders re-rankers."),
         ], PART),
-        footer("Web API", "Minimal API", "Singleton", "Server-sent events", "OpenAPI", "Health check", "Micro-batching"),
+        footer("Re-ranking", "Two-stage retrieval", "BM25", "Cross-encoder", "Hard negative", "Listwise loss",
+               "MRR", "Recall@k", "Placeholder token"),
     )

@@ -1,200 +1,193 @@
-"""Chapter 26 — Binary Classification."""
+"""Chapter 26 — Regression: Predicting House Prices."""
 from gen import *
 
 PART = "V"
-
-PROGRAM = """
-    using NeuralSharp;
-    using NeuralSharp.Data;
-    using NeuralSharp.Diagnostics;
-    using NeuralSharp.Layers;
-    using NeuralSharp.Optimizers;
-    using NeuralSharp.Training;
-
-    Device.Default = args.Contains("--cuda") ? Device.Cuda() : Device.Cpu;
-
-    // ---- data: 5,000 synthetic customers, about 1 in 6 churns (replace with Dataset.LoadCsv)
-    string[] columns = ["tenure_months", "monthly_fee", "support_calls", "contract_years", "usage_hours"];
-    var rng = new Random(11);
-    var x = new float[5000, 5];
-    var y = new float[5000, 1];
-    for (int i = 0; i < 5000; i++)
-    {
-        float tenure = rng.Next(1, 73), fee = 20 + 100 * rng.NextSingle(), calls = rng.Next(0, 8);
-        float contract = rng.Next(0, 3), usage = 5 + 60 * rng.NextSingle();
-        double score = -1.9 - 0.04 * tenure + 0.02 * fee + 0.45 * calls - 0.9 * contract - 0.03 * usage
-                     + 0.8 * (rng.NextDouble() - 0.5);
-        x[i, 0] = tenure; x[i, 1] = fee; x[i, 2] = calls; x[i, 3] = contract; x[i, 4] = usage;
-        y[i, 0] = rng.NextDouble() < 1 / (1 + Math.Exp(-score)) ? 1 : 0;
-    }
-    var data = Dataset.FromArrays(x, y, columns, ["churn"]);
-    Console.WriteLine($"{data.Count} customers, churn rate {data.Targets.ToArray().Average():P1}");
-    var (train, test) = data.Split(0.8, seed: 3);
-    var scaler = StandardScaler.FitFeatures(train);
-    train = train.Scale(scaler);                  // targets are 0/1: only features are scaled
-    test = test.Scale(scaler);
-
-    // ---- model: one raw score out, no Sigmoid layer
-    static Sequential Build(Random? r = null) => new()
-    {
-        new Linear(5, 32, random: r), new ReLU(), new Dropout(0.1f, r),
-        new Linear(32, 32, random: r), new ReLU(),
-        new Linear(32, 1, random: r),
-    };
-    using var model = Build(new Random(1));
-    using var optimizer = new AdamW(model.Parameters(), 3e-3f, weightDecay: 1e-4f);
-    var trainer = new Trainer(model, optimizer, Losses.BinaryCrossEntropyWithLogits)
-    {
-        Metrics = { Metric.BinaryAccuracy(threshold: 0f) },     // score 0 <=> probability 0.5
-        EarlyStoppingPatience = 10,
-    };
-    using (Telemetry.Subscribe(new ConsoleLogger(TelemetryLevel.Training, epochInterval: 10)))
-        trainer.Fit(new DataLoader(train, 64, shuffle: true, seed: 1), epochs: 100,
-                    validation: new DataLoader(test, 512));
-"""
-
-EVAL = """
-    // ---- probabilities, then precision/recall at three thresholds
-    float[,] logits = trainer.Predict(test);
-    var p = new float[test.Count];
-    var t = new float[test.Count];
-    for (int i = 0; i < test.Count; i++)
-    {
-        p[i] = 1f / (1f + MathF.Exp(-logits[i, 0]));          // sigmoid
-        t[i] = test.GetTargets(i)[0];
-    }
-    Console.WriteLine("threshold  accuracy  precision  recall    F1");
-    foreach (float threshold in new[] { 0.3f, 0.5f, 0.7f })
-    {
-        int tp = 0, fp = 0, fn = 0, tn = 0;
-        for (int i = 0; i < p.Length; i++)
-        {
-            bool predicted = p[i] >= threshold, actual = t[i] == 1;
-            if (predicted && actual) tp++; else if (predicted) fp++; else if (actual) fn++; else tn++;
-        }
-        double precision = tp / (double)Math.Max(tp + fp, 1), recall = tp / (double)Math.Max(tp + fn, 1);
-        double f1 = 2 * precision * recall / Math.Max(precision + recall, 1e-9);
-        Console.WriteLine($"  {threshold,7:F1}  {(tp + tn) / (double)p.Length,8:P1}  {precision,9:P1}  {recall,6:P1}  {f1,5:F3}");
-    }
-
-    // ROC AUC: the chance that a random churner gets a higher score than a random non-churner
-    var pos = p.Where((_, i) => t[i] == 1).ToArray();
-    var neg = p.Where((_, i) => t[i] == 0).ToArray();
-    double auc = pos.Sum(a => neg.Count(b => a > b) + 0.5 * neg.Count(b => a == b)) / ((double)pos.Length * neg.Length);
-    Console.WriteLine($"ROC AUC {auc:F3}   (always 'no churn' would be {1 - t.Average():P1} accurate)");
-"""
-
-SERVE = """
-    model.Save("churn.weights");
-    scaler.Save("churn.scaler");
-
-    // ---- later / elsewhere: score new customers
-    using var served = Build();
-    served.Load("churn.weights");
-    served.Eval();
-    var fx = StandardScaler.Load("churn.scaler");
-    float[] customers = [3, 95, 5, 0, 10,   60, 40, 0, 2, 45];
-    fx.Transform(customers, 5);
-    using var input = Tensor.From(customers, [2, 5]);
-    using var output = served.Predict(input);
-    using var probability = output.Sigmoid();
-    var risk = probability.ToArray();
-    Console.WriteLine($"new customer A (3 months, $95, 5 calls, monthly): churn risk {risk[0]:P0}");
-    Console.WriteLine($"new customer B (60 months, $40, 0 calls, 2-year):  churn risk {risk[1]:P0}");
-"""
 
 
 def build():
     return page(
         chapter_open(
-            "binary",
-            "Many business questions have a yes/no answer: will this customer leave, is this transaction fraud, will "
-            "this machine fail, is this email spam. This project predicts customer churn from five account features. "
-            "Beyond training, it shows what makes binary classification different: turning scores into "
-            "probabilities, choosing a decision threshold, and judging a model with precision, recall and ROC AUC "
-            "when one answer is much rarer than the other.",
-            "Task type: <b>binary classification</b>. Last layer <code>Linear(h, 1)</code>, loss <code>BinaryCrossEntropyWithLogits</code>.",
-            "Probability = <code>Sigmoid()</code> of the output; the decision threshold is a business choice, not always 0.5.",
-            "With 17.5% churners, \"nobody churns\" is already about 83% accurate: report precision, recall and AUC.",
-            "Result: ROC AUC 0.829; at threshold 0.3 the model catches 60% of churners.",
-            "Save the weights and the feature scaler; serve probabilities.",
+            "regression",
+            "The first complete project: predict a house's sale price from nine numbers describing it. It uses every "
+            "piece of Parts I–III in the order a real project needs them: load a CSV, split, scale, build a model, "
+            "train with validation and early stopping, report errors in dollars, save the model with its scalers, and "
+            "serve predictions from a separate inference mode. The code is the repository's "
+            "<code>NeuralSharp.Samples.HousePrices</code> project; this chapter walks through it and shows how to "
+            "adapt it to any numeric prediction task.",
+            "Task type: <b>regression</b> (predict a number). Loss MSE, metric MAE, report MAE/RMSE/MAPE/R² in real units.",
+            "Data: <code>houses.csv</code>, 2,500 rows, 9 numeric features and a <code>price</code> column.",
+            "Model: 9 → 64 → 32 → 1 MLP with ReLU and light dropout (2,753 parameters).",
+            "Result on the CPU: MAE $15,570 (5.3%), R² 0.975, in under a second of training.",
+            "Three files make the model: weights, feature scaler, price scaler.",
         ),
-        h2("26.1 The program"),
-        para("The whole project is one <code>Program.cs</code>. Synthetic data keeps it self-contained; for real data "
-             "replace the generator with <code>Dataset.LoadCsv(\"customers.csv\", new CsvOptions { TargetColumns = "
-             "[\"churn\"], IgnoreColumns = [\"customer_id\"] })</code>, where the churn column holds 0 or 1."),
-        snippet(PROGRAM, caption="Program.cs, part 1: data, model, training"),
+        h2("26.1 The project at a glance"),
+        reftable(["Step", "API", "Chapter"], [
+            ["Load CSV", "<code>Dataset.LoadCsv(path, new CsvOptions { TargetColumns = [\"price\"], IgnoreColumns = [\"id\"] })</code>", ch("data", None)],
+            ["Split", "<code>houses.Split(0.8, seed: 1)</code>", ch("data", None)],
+            ["Scale", "<code>StandardScaler.FitFeatures(train)</code>, <code>FitTargets(train)</code>, <code>Scale</code>", ch("data", None)],
+            ["Model", "<code>Sequential</code> of <code>Linear</code>, <code>ReLU</code>, <code>Dropout</code>", ch("dense", None)],
+            ["Train", "<code>Trainer</code> with <code>Adam</code>, MSE, MAE metric, early stopping", ch("trainer", None)],
+            ["Evaluate", "<code>trainer.Predict</code>, <code>InverseTransform</code>, <code>RegressionReport</code>", ch("metrics", None)],
+            ["Save / serve", "<code>model.Save</code>, <code>scaler.Save</code>; <code>--predict</code> mode loads them", ch("modules", None) + ", " + ch("inference", None)],
+        ], caption="Table 26.1 — The pipeline and where each part is explained"),
+        deriv("Creating the project yourself", [
+            "<code>dotnet new console -n HousePrices</code>, then <code>cd HousePrices</code>.",
+            "<code>dotnet add reference ../NN/src/NeuralSharp/NeuralSharp.csproj</code>.",
+            "Copy your CSV to <code>data/houses.csv</code> and mark it to copy to the output folder "
+            "(<code>&lt;None Update=\"data\\**\" CopyToOutputDirectory=\"PreserveNewest\" /&gt;</code> in the .csproj).",
+            "Write <code>Program.cs</code> as in the sections below; run with <code>dotnet run -c Release</code>.",
+            "Or run the finished sample: <code>dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --cpu</code> (or <code>--cuda</code>).",
+        ]),
+        h2("26.2 The data"),
         output("""
-            5000 customers, churn rate 17.5 %
-            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 4,000 samples, 1,000 validation | batch 64, 63 steps/epoch | AdamW lr=0.003 | 1,281 parameters | 4 CPU threads
-            Epoch   1/100  loss 0.416125  accuracy 0.8233  val_loss 0.354400  val_accuracy 0.8560  97.6 ms  40,990 samples/s  *
-            Epoch  10/100  loss 0.343585  accuracy 0.8468  val_loss 0.349250  val_accuracy 0.8520  20.8 ms  191,870 samples/s  *
-            Epoch  20/100  loss 0.337062  accuracy 0.8545  val_loss 0.358105  val_accuracy 0.8540  24.3 ms  164,784 samples/s
-            Finished 28 epochs in 0.80 s (early stop) | best epoch 18 loss 0.348009
-            """, caption="Training output (model summary omitted)"),
-        h2("26.2 Thresholds, precision and recall"),
-        snippet(EVAL, caption="Program.cs, part 2: evaluation"),
+            id,area_sqft,bedrooms,bathrooms,age_years,distance_km,quality,garage_spaces,has_pool,lot_sqft,price
+            1,2291,5,3,4,35.7,8,1,0,11952,313600
+            2,2073,4,3,48,2.8,5,0,0,3328,420300
+            """, caption="The first lines of houses.csv (generated by the sample if missing)"),
+        snippet("""
+            var houses = Dataset.LoadCsv(dataPath, new CsvOptions
+            {
+                TargetColumns = ["price"],
+                IgnoreColumns = ["id"],
+            });
+            var (train, test) = houses.Split(trainFraction: 0.8, seed: 1);
+
+            // Fit on the training set only, so nothing about the test set leaks into training.
+            var featureScaler = StandardScaler.FitFeatures(train);
+            var priceScaler = StandardScaler.FitTargets(train);
+            var trainScaled = train.Scale(featureScaler, priceScaler);
+            var testScaled = test.Scale(featureScaler, priceScaler);
+
+            var trainLoader = new DataLoader(trainScaled, batchSize: 64, shuffle: true, device: device, seed: 1);
+            var testLoader = new DataLoader(testScaled, batchSize: 512, device: device);
+            """, caption="Loading, splitting and scaling"),
+        h2("26.3 The model and training"),
+        snippet("""
+            // One factory for training AND inference, so saved weights always fit.
+            Sequential BuildModel(int features, Random? random = null)
+            {
+                var model = new Sequential
+                {
+                    new Linear(features, 64, device: device, random: random), new ReLU(), new Dropout(0.05f, random),
+                    new Linear(64, 32, device: device, random: random), new ReLU(),
+                    new Linear(32, 1, device: device, random: random),        // plain Linear: any price
+                };
+                model.Name = "house-price-mlp";
+                return model;
+            }
+
+            using var model = BuildModel(houses.FeatureCount, new Random(1));
+            using var optimizer = new Adam(model.Parameters(), learningRate: 0.002f);
+            var trainer = new Trainer(model, optimizer, Losses.MeanSquaredError)
+            {
+                Metrics = { Metric.MeanAbsoluteError },
+                EarlyStoppingPatience = 30,
+            };
+            var history = trainer.Fit(trainLoader, epochs: 400, validation: testLoader);
+            """, caption="Model factory and Trainer"),
         output("""
-            threshold  accuracy  precision  recall    F1
-                  0.3    81.1 %     46.2 %  59.9 %  0.522
-                  0.5    85.2 %     63.6 %  32.6 %  0.431
-                  0.7    84.7 %     88.0 %  12.8 %  0.223
-            ROC AUC 0.829   (always 'no churn' would be 82.8 % accurate)
+            Loaded Dataset(2,500 samples, features [area_sqft, bedrooms, bathrooms, age_years, distance_km, quality, garage_spaces, has_pool, lot_sqft] -> targets [price]) in 49 ms
+            Split: 2000 training / 500 test samples
+
+            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 2,000 samples, 500 validation | batch 64, 32 steps/epoch | Adam lr=0.002 | 2,753 parameters | 4 CPU threads
+            Epoch   1/400  loss 0.314442  mae 0.3958  val_loss 0.100076  val_mae 0.2459  60.5 ms  33,053 samples/s  *
+            Epoch  10/400  loss 0.036492  mae 0.1423  val_loss 0.026273  val_mae 0.1227  12.3 ms  162,621 samples/s  *
+            Epoch  20/400  loss 0.030439  mae 0.1295  val_loss 0.023986  val_mae 0.1134  16.4 ms  122,096 samples/s
+            Epoch  30/400  loss 0.028837  mae 0.1260  val_loss 0.025198  val_mae 0.1153  18.9 ms  105,895 samples/s
+            Epoch  40/400  loss 0.024654  mae 0.1203  val_loss 0.024709  val_mae 0.1185  12.6 ms  158,650 samples/s
+            Epoch  50/400  loss 0.024179  mae 0.1159  val_loss 0.025291  val_mae 0.1158  6.0 ms  331,614 samples/s
+            Epoch  60/400  loss 0.022677  mae 0.1126  val_loss 0.026736  val_mae 0.1201  8.6 ms  232,758 samples/s
+            Finished 63 epochs in 0.88 s (early stop) | best epoch 33 loss 0.023277
+            Best epoch: 33 (validation loss 0.02328), stopped early and restored its weights
+            """, caption="Training output (CPU)"),
+        h2("26.4 Errors in dollars"),
+        snippet("""
+            var scaledPredictions = trainer.Predict(testScaled);
+            float[] predicted = [.. scaledPredictions.Cast<float>()];
+            priceScaler.InverseTransform(predicted, 1);                      // back to dollars
+            var report = RegressionReport.Compute(predicted, test.Targets);   // test.Targets: unscaled prices
+            """, caption="Unscale, then score"),
+        output("""
+            Test set:
+              Mean absolute error:     $15,570
+              Root mean squared error: $21,387
+              Mean absolute % error:   5.3 %
+              R²:                      0.9750
+
+               area  beds baths  age  dist qual |     actual |  predicted |  error
+            -----------------------------------+------------+------------+-------
+               1875     3     2   38  36.6    6 |   $214,600 |   $221,552 |  3.2 %
+               1907     3     2   40   6.4    5 |   $414,900 |   $355,627 | -14.3 %
+               1623     3     2    5  23.0    9 |   $256,600 |   $274,063 |  6.8 %
+               2096     3     3   61  12.7    4 |   $279,600 |   $289,097 |  3.4 %
+               1239     2     2   57   2.2    5 |   $276,300 |   $259,323 | -6.1 %
+                908     2     1   19  13.0    6 |   $175,200 |   $177,453 |  1.3 %
+                450     1     1   68   1.5    5 |   $112,100 |   $138,612 | 23.7 %
+               1728     3     2   68  16.2   10 |   $291,800 |   $312,154 |  7.0 %
             """, caption="Evaluation output"),
-        reftable(["Measure", "Question it answers", "Here, at 0.3"], [
-            ["Precision", "Of the customers we flag, how many really churn?", "46%"],
-            ["Recall", "Of the customers who churn, how many do we flag?", "60%"],
-            ["F1", "One number balancing both (harmonic mean)", "0.522"],
-            ["ROC AUC", "How well are churners ranked above non-churners, over all thresholds? (0.5 = random, 1 = perfect)", "0.829"],
-        ], caption="Table 26.1 — Scores for imbalanced yes/no problems (glossary <b>Precision</b>, <b>Recall</b>, <b>ROC AUC</b>)"),
-        para("Accuracy barely moves across thresholds and never clearly beats the 82.8% of always answering \"no\", "
-             "yet the model is useful: at 0.3 it finds six in ten churners, at 0.7 it is right 88% of the time it "
-             "raises an alarm. Which threshold is best depends on costs: if a retention offer is cheap and losing a "
-             "customer expensive, favour recall (a low threshold); if every flag triggers a costly phone call, favour "
-             "precision (a high threshold)."),
-        h2("26.3 Serving probabilities"),
-        snippet(SERVE, caption="Program.cs, part 3: save, load, score"),
-        output("""
-            new customer A (3 months, $95, 5 calls, monthly): churn risk 88 %
-            new customer B (60 months, $40, 0 calls, 2-year):  churn risk 0 %
-            """),
-        cpugpu("running the project",
+        h2("26.5 Saving and serving"),
+        snippet("""
+            model.Save(modelPath);                            // house-price.weights
+            featureScaler.Save(featureScalerPath);            // house-price.features.txt
+            priceScaler.Save(priceScalerPath);                // house-price.price.txt
+
+            // --- inference mode (a separate run, or a separate program) ---
+            using var served = BuildModel(FeatureCount);
+            served.Load(modelPath);
+            var fx = StandardScaler.Load(featureScalerPath);
+            var fy = StandardScaler.Load(priceScalerPath);
+
+            float[] features = [2100, 4, 2, 15, 9.5f, 7, 2, 0, 6500,   1200, 3, 1, 30, 12, 5, 1, 0, 4000];
+            fx.Transform(features, FeatureCount);
+            using var input = Tensor.From(features, [2, FeatureCount], device);
+            using var output = served.Predict(input);
+            float[] prices = output.ToArray();
+            fy.InverseTransform(prices, 1);
+            """, caption="Save three files; load them to predict"),
+        cpugpu("training and serving from the command line",
                """
-               dotnet run -c Release
+               dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --cpu
+               dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --cpu --predict --input "2100,4,2,15,9.5,7,2,0,6500;1200,3,1,30,12,5,1,0,4000"
                """,
                """
-               dotnet run -c Release -- --cuda
-               // at 1,281 parameters the CPU is faster; the GPU pays off for wide models
-               // or hundreds of thousands of rows (Chapter 20)
-               """.replace("Chapter 20", ch("performance"))),
-        h2("26.4 Variations"),
-        reftable(["Situation", "Do this"], [
-            ["Very rare positives (fraud: 0.5%)", "Oversample positives in the training set with <code>Subset</code> (repeat their indices), or weight the loss; judge by recall at a fixed precision"],
-            ["Several independent yes/no labels (multi-label)", "<code>Linear(h, K)</code> with <code>BinaryCrossEntropyWithLogits</code>; each output has its own sigmoid and threshold"],
-            ["Probabilities must be well calibrated", "Keep the logits loss; avoid heavy oversampling (it inflates probabilities) or rescale afterwards"],
-            ["Categorical features (plan type, region)", "Embeddings (" + ch("recommender") + ")"],
-            ["Sequences (click streams)", "An LSTM/GRU front end (" + ch("recurrent") + ", " + ch("sentiment") + ")"],
-        ], caption="Table 26.2 — Adapting the churn model"),
-        trap("tuning the threshold on the test set",
-             "<p>Choosing the threshold that maximizes F1 on the test set and then reporting that F1 is optimistic. Pick the "
-             "threshold on a validation split and report on a separate test split.</p>"),
+               dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --cuda
+               dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --cuda --predict --data new-listings.csv
+               """,
+               "A model trained on either device is served on either device; <code>--data file.csv</code> prices every row "
+               "and, if the file has a price column, reports the error."),
+        output("""
+            Loaded .../models/house-price.weights
+
+              2100,4,2,15,9.5,7,2,0,6500             $390,612
+              1200,3,1,30,12,5,1,0,4000              $192,873
+            """, caption="--predict output"),
+        h2("26.6 Adapting it to your data"),
+        reftable(["Your situation", "Change"], [
+            ["Different columns", "Only <code>TargetColumns</code>/<code>IgnoreColumns</code>; the model reads <code>FeatureCount</code>"],
+            ["Several numbers to predict (price and rent)", "<code>TargetColumns = [\"price\", \"rent\"]</code>, last layer <code>Linear(32, 2)</code>"],
+            ["Targets from 10 to 10,000,000", "Train on log(target), predict exp(output); or MAE loss"],
+            ["Outliers in the targets", "<code>Losses.MeanAbsoluteError</code> or the Huber loss of " + ch("losses")],
+            ["Text or category columns", "Map them to ids and use embeddings (" + ch("recommender") + ")"],
+            ["Fewer than a few hundred rows", "Smaller model (16 units), more dropout/weight decay, k-fold validation (" + ch("data") + ")"],
+            ["Hundreds of thousands of rows", "Wider model (128–256), batch 256+, consider the GPU"],
+        ], caption="Table 26.2 — Common adaptations"),
+        trap("serving without the scalers",
+             "<p>The model was trained on standardized inputs and predicts standardized prices. Feeding raw square feet "
+             "and reading the raw output gives numbers near zero. Always load and apply both scalers.</p>"),
         practice([
-            (1, "Why does the model end with <code>Linear(32, 1)</code> and no <code>Sigmoid</code>?",
-             "<code>BinaryCrossEntropyWithLogits</code> applies the sigmoid internally in a numerically stable way (" + ch("losses") + "). "
-             "Apply <code>Sigmoid()</code> only when reading probabilities."),
-            (1, "Why does <code>Metric.BinaryAccuracy</code> use threshold 0 here?",
-             "The model outputs logits; a logit of 0 corresponds to a probability of 0.5."),
-            (2, "Oversample churners so they make up about 40% of the training set, retrain, and compare recall at 0.5.",
-             "Collect the indices of positive rows, repeat them three times, append to all indices, and train on "
-             "<code>train.Subset(indices)</code>. Recall at 0.5 rises sharply, precision falls, and probabilities shift "
-             "upwards; AUC changes little."),
-            (2, "Write a function that returns the threshold with the best F1 on a validation set.",
-             "Try thresholds 0.05, 0.10, …, 0.95, compute precision and recall at each as in part 2, and return the "
-             "threshold with the largest F1."),
-            (3, "Turn the project into a fraud detector for a CSV of transactions with a 0/1 <code>fraud</code> column.",
-             "<code>LoadCsv</code> with <code>TargetColumns = [\"fraud\"]</code>; scale features; the same model and loss; "
-             "oversample fraud rows; choose the threshold for the recall the business needs; report precision, recall and AUC."),
+            (1, "Which three files must a web service load to price houses, and in which order are they used?",
+             "The feature scaler (applied to the input), the weights (the model), and the price scaler (applied to the output)."),
+            (1, "The MAE is $15,570 but the RMSE $21,387. What does the gap tell you?",
+             "Errors vary: a few larger misses (like the −14% and +24% rows) raise RMSE more than MAE."),
+            (2, "Predict both price and yearly property tax from the same features.",
+             "Add the tax column to <code>TargetColumns</code>, set the last layer to <code>Linear(32, 2)</code>, and fit the target "
+             "scaler on both columns; <code>RegressionReport</code> can then be computed per column on the unscaled outputs."),
+            (2, "Make the model train on the GPU but serve on a CPU-only server.",
+             "Run training with <code>--cuda</code>; copy the three files to the server and run <code>--predict --cpu</code> (or build "
+             "the model with <code>device: Device.Cpu</code>). Weight files are device-independent."),
+            (3, "Replace MSE on prices with MSE on log-prices and compare MAPE.",
+             "Transform targets with <code>MathF.Log</code> before fitting the price scaler, and apply <code>MathF.Exp</code> after "
+             "<code>InverseTransform</code>. Log-targets make the loss relative, which usually lowers MAPE on cheap houses."),
         ], PART),
-        footer("Binary classification", "Logits", "Sigmoid", "Threshold", "Precision", "Recall", "F1 score",
-               "ROC AUC", "Class imbalance", "Oversampling"),
+        footer("Regression", "Feature", "Target", "MAE", "RMSE", "R²", "StandardScaler", "Early stopping", "Inference mode"),
     )

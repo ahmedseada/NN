@@ -22,7 +22,7 @@ import front
 import back
 
 HERE = pathlib.Path(__file__).parent
-CHAPTERS = [f"ch{i:02d}" for i in range(1, 39)]   # extended per Part as content groups are written
+CHAPTERS = [f"ch{i:02d}" for i in range(1, 42)]   # extended per Part as content groups are written
 PARTS = ["I", "II", "III", "IV", "V", "VI", "VII"]
 
 

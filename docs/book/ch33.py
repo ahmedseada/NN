@@ -1,182 +1,184 @@
-"""Chapter 33 — Sequence Classification and Sentiment."""
+"""Chapter 33 — OCR: Reading Characters."""
 from gen import *
 
 PART = "VI"
 
 
+def pipeline_svg():
+    w, h = 470, 90
+    steps = [("page image", "PGM / pixels"), ("segment", "lines → characters"), ("normalize", "each to 20×20"),
+             ("CNN", "one batch"), ("text", "ArgMax → letters")]
+    p = [f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
+    for i, (a, b) in enumerate(steps):
+        x = 6 + i * 93
+        p.append(f'<rect x="{x}" y="18" width="80" height="44" rx="5" fill="{"#0f6b5c" if a == "CNN" else "#e6f2ef"}" stroke="#0f6b5c"/>')
+        color = "#ffffff" if a == "CNN" else "#0f6b5c"
+        p.append(svg_text(x + 40, 37, a, 8.4, color))
+        p.append(svg_text(x + 40, 51, b, 7.2, color))
+        if i < 4:
+            p.append(f'<line x1="{x + 80}" y1="40" x2="{x + 93}" y2="40" stroke="#56606a"/>')
+    p.append(svg_text(235, 82, "only the CNN is learned; segmentation is classic image processing", 7.4, "#56606a"))
+    p.append("</svg>")
+    return "".join(p)
+
+
 def build():
     return page(
         chapter_open(
-            "sentiment",
-            "Is this review positive or negative? The answer depends on word order: \"not good\" is negative, \"not bad\" "
-            "positive. This project, the repository's <code>NeuralSharp.Samples.Sequences</code>, trains four models on "
-            "the same sentences, a bag of words that ignores order, an LSTM, a GRU and a transformer, and measures "
-            "exactly where order matters. It is the template for any text or event-sequence classifier: support "
-            "tickets, intents, log lines, click streams.",
-            "Task type: <b>sequence classification</b>. Input: token ids <code>[N, T]</code>; output: class scores <code>[N, K]</code>.",
-            "Every model starts with <code>Embedding</code>; they differ in how they combine the T word vectors.",
-            "Result: bag of words 70.1% (57.3% on sentences with \"not\"); LSTM 100%, GRU 99.9%, transformer 99.5%.",
-            "The transformer needed 40 epochs against 15 for the recurrent models, a typical pattern on small data.",
-            "The <code>--predict</code> mode compares all saved models on your sentences.",
+            "ocr",
+            "Optical character recognition turns an image of printed text into a string. This project, the "
+            "repository's <code>NeuralSharp.Samples.Ocr</code>, trains a CNN on randomly distorted renderings of the "
+            "36 characters 0–9 and A–Z, then reads whole lines: it cuts the image into characters, classifies all of "
+            "them in one batch, and reassembles the text with spaces and line breaks. It also reads your own images "
+            "in PGM format.",
+            "Two parts: <b>segmentation</b> (plain C#: find lines, characters and word gaps) and <b>recognition</b> (a CNN classifier with 36 classes).",
+            "Training data is generated: every character rendered with random size, slant, position, stroke weight, brightness and noise.",
+            "Result: 100% on unseen character renderings; 99.85% character accuracy on 40 random text lines (39 exactly right).",
+            "Inference batches all characters of a page into one <code>Predict</code> call.",
+            "The recipe transfers to any \"cut into pieces, classify each piece\" problem.",
         ),
-        h2("33.1 Vocabulary and data"),
+        diagram("Figure 33.1 — Reading a line", pipeline_svg(), "Segmentation finds the characters; the CNN names them."),
+        h2("33.1 The recognizer"),
         snippet("""
-            string[] positive = ["good", "great", "excellent", "love", "wonderful", "fun"];
-            string[] negative = ["bad", "awful", "terrible", "hate", "boring", "dull"];
-            string[] neutral = ["the", "movie", "was", "a", "plot", "acting", "really", "very", "it", "this", "i", "at", "all", "and"];
-            string[] vocabulary = ["<pad>", "<unk>", "not", .. positive, .. negative, .. neutral];
-            var ids = vocabulary.Select((word, id) => (word, id)).ToDictionary(p => p.word, p => p.id);
-            const int MaxLength = 12;                                      // sentences padded/cut to 12 tokens
-            """, caption="A 29-word vocabulary with padding and unknown-word ids"),
-        para("The sample generates 6,000 training and 1,500 test sentences of 5–12 words mixing sentiment words, "
-             "neutral words and \"not\", which flips the word after it; the label follows from the words. Real text "
-             "uses the <code>Vocabulary</code> helper of " + ch("embedding") + " to build ids from a corpus."),
-        h2("33.2 Four models"),
-        snippet("""
-            const int Dim = 32;
-            var models = new (string Name, int Epochs, Func<Random, Module> Create)[]
+            const int Cell = Renderer.Cell;                  // 20: characters are normalized to 20x20
+            string alphabet = Font.Characters;               // "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            var init = new Random(1);
+            using var model = new Sequential
             {
-                ("Bag of words (order-blind baseline)", 15, r => new Sequential
-                {
-                    new Embedding(vocabulary.Length, Dim, device, r),
-                    new Lambda(x => x.Mean(1), "MeanOverWords"),
-                    new Linear(Dim, 2, device: device, random: r),
-                }),
-                ("LSTM", 15, r => new Sequential
-                {
-                    new Embedding(vocabulary.Length, Dim, device, r),
-                    new LSTM(Dim, 64, device: device, random: r),
-                    new Linear(64, 2, device: device, random: r),
-                }),
-                ("GRU", 15, r => new Sequential
-                {
-                    new Embedding(vocabulary.Length, Dim, device, r),
-                    new GRU(Dim, 64, device: device, random: r),
-                    new Linear(64, 2, device: device, random: r),
-                }),
-                ("Transformer", 40, r => new Sequential
-                {
-                    new Embedding(vocabulary.Length, Dim, device, r),
-                    new PositionalEncoding(MaxLength, Dim, device),
-                    new TransformerEncoderLayer(Dim, heads: 4, ffDim: 64, dropout: 0f, device: device, random: r),
-                    new TransformerEncoderLayer(Dim, heads: 4, ffDim: 64, dropout: 0f, device: device, random: r),
-                    new LayerNorm(Dim, device: device),
-                    new Lambda(x => x.Mean(1), "MeanOverWords"),
-                    new Linear(Dim, 2, device: device, random: r),
-                }),
+                new Conv2d(1, 32, kernelSize: 3, padding: 1, device: device, random: init), new BatchNorm(32, device: device), new ReLU(),
+                new MaxPool2d(2),                                                      // 20x20 -> 10x10
+                new Conv2d(32, 64, kernelSize: 3, padding: 1, device: device, random: init), new BatchNorm(64, device: device), new ReLU(),
+                new MaxPool2d(2),                                                      // 10x10 -> 5x5
+                new Flatten(),
+                new Linear(64 * 5 * 5, 128, device: device, random: init), new ReLU(), new Dropout(0.3f, init),
+                new Linear(128, alphabet.Length, device: device, random: init),
             };
-            """, caption="Same embedding, four ways to read the sentence"),
+            """, caption="CNN over 20×20 character images (228,580 parameters)"),
         snippet("""
-            foreach (var (name, epochs, create) in models)
+            Dataset Characters(int perClass, int seed)
             {
-                var model = create(new Random(2));
-                var optimizer = new AdamW(model.Parameters(), learningRate: 0.003f, weightDecay: 1e-4f);
-                var trainer = new Trainer(model, optimizer, (logits, targets) => Losses.CrossEntropy(logits, targets))
+                var rng = new Random(seed);
+                int count = perClass * alphabet.Length;
+                var pixels = new float[count, Cell * Cell];
+                var labels = new int[count];
+                var image = new float[Cell * Cell];
+                for (int s = 0; s < count; s++)
                 {
-                    Metrics = { Metric.Accuracy },
-                    Scheduler = new CosineAnnealing(optimizer, epochs, warmupEpochs: 1),
-                    MaxGradientNorm = 1f,                                  // recurrent layers: clip
-                };
-                trainer.Fit(new DataLoader(train, 64, shuffle: true, device: device, seed: 3), epochs);
-                double accuracy = trainer.Evaluate(new DataLoader(test, 500, device: device)).Metrics["accuracy"];
-                double negated = trainer.Evaluate(new DataLoader(testNegated, 500, device: device)).Metrics["accuracy"];
-                model.Save(ModelFile(name));
-            }
-            """, caption="One training loop for all four"),
-        output("""
-            === Bag of words (order-blind baseline)
-            Epoch 15/15  loss 0.566507  accuracy 0.7072  14.1 ms  424,680 samples/s  *
-            === LSTM
-            Epoch 15/15  loss 0.000262  accuracy 1.0000  400.9 ms  14,966 samples/s  *
-            === GRU
-            Epoch 15/15  loss 0.000185  accuracy 1.0000  308.2 ms  19,471 samples/s  *
-            === Transformer
-            Epoch 20/40  loss 0.005096  accuracy 0.9987  620.7 ms  9,667 samples/s  *
-            Epoch 40/40  loss 0.000065  accuracy 1.0000  562.8 ms  10,661 samples/s  *
-
-            Model                                   test accuracy   sentences with "not"
-              Bag of words (order-blind baseline)        70.1 %               57.3 %
-              LSTM                                      100.0 %              100.0 %
-              GRU                                        99.9 %               99.9 %
-              Transformer                                99.5 %               99.3 %
-            """, caption="Selected training lines and the comparison (CPU)"),
-        reftable(["Model", "Parameters", "Training time (CPU)", "Reads order by"], [
-            ["Bag of words", "994", "0.6 s", "— (averages word vectors)"],
-            ["LSTM", "25,890", "7.2 s", "carrying a state through the words"],
-            ["GRU", "19,682", "4.7 s", "carrying a state (fewer gates)"],
-            ["Transformer", "18,146", "24.1 s (40 epochs)", "positional encodings + attention"],
-        ], caption="Table 33.1 — The four models compared"),
-        para("The bag of words gets the easy sentences right but is little better than a coin toss (57%) when \"not\" "
-             "decides the answer: averaging throws away which word \"not\" was next to. All order-aware models solve "
-             "the task. On such a small dataset the recurrent models learn fastest; transformers overtake them on "
-             "longer texts and larger datasets (" + ch("recurrent") + ", Table 11.3)."),
-        h2("33.3 Using the models"),
-        snippet("""
-            float[] PositiveProbabilities(Module model, string[] texts)
-            {
-                var encoded = new float[texts.Length, MaxLength];                // zeros = <pad>
-                for (int s = 0; s < texts.Length; s++)
-                {
-                    var words = texts[s].ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                    for (int t = 0; t < Math.Min(words.Length, MaxLength); t++)
-                        encoded[s, t] = ids.GetValueOrDefault(words[t], ids["<unk>"]);
+                    labels[s] = s % alphabet.Length;
+                    Array.Clear(image);
+                    Renderer.RenderCharacter(labels[s], image, rng);         // random distortions
+                    for (int i = 0; i < image.Length; i++) pixels[s, i] = image[i];
                 }
-                using var input = Tensor.From(encoded, device);
-                using var logits = model.Predict(input);
-                using var probabilities = logits.Softmax();
-                var p = probabilities.ToArray();
-                return [.. Enumerable.Range(0, texts.Length).Select(s => p[s * 2 + 1])];   // column 1 = positive
+                return Dataset.FromClassLabels(pixels, labels, alphabet.Length, [.. alphabet.Select(c => c.ToString())])
+                              .WithFeatureShape(1, Cell, Cell);
             }
-            """, caption="Tokenize, pad, predict, softmax"),
+
+            var train = Characters(perClass: 300, seed: 2);                   // 10,800 images
+            var test = Characters(perClass: 60, seed: 3);                     // 2,160 unseen renderings
+            """, caption="Generated training data"),
+        h2("33.2 Training"),
+        snippet("""
+            int epochs = 10;
+            using var optimizer = new AdamW(model.Parameters(), learningRate: 0.003f, weightDecay: 1e-4f);
+            var trainer = new Trainer(model, optimizer,
+                (logits, targets) => Losses.CrossEntropy(logits, targets, labelSmoothing: 0.05f))
+            {
+                Metrics = { Metric.Accuracy },
+                Scheduler = new CosineAnnealing(optimizer, epochs, warmupEpochs: 1),
+            };
+            trainer.Fit(new DataLoader(train, 64, shuffle: true, device: device, seed: 4), epochs,
+                        validation: new DataLoader(test, 500, device: device));
+            """),
         output("""
-            "the movie was not good"
-                Bag of words (order-blind baseline)  positive (67 %)
-                LSTM                                 negative (100 %)
-                GRU                                  negative (100 %)
-                Transformer                          negative (100 %)
-            "not bad at all"
-                Bag of words (order-blind baseline)  negative (60 %)
-                LSTM                                 positive (100 %)
-                GRU                                  positive (100 %)
-                Transformer                          positive (100 %)
-            """, caption="--predict --input \"the movie was not good;not bad at all\""),
+            Rendered 10,800 training and 2,160 test characters in 1796 ms
+
+            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 10,800 samples, 2,160 validation | batch 64, 169 steps/epoch | AdamW lr=0.0015 | 228,580 parameters | 4 CPU threads
+            Epoch  1/10  loss 1.688845  accuracy 0.6114  val_loss 0.570783  val_accuracy 0.9880  7915.9 ms  1,364 samples/s  *
+            Epoch  2/10  loss 0.721386  accuracy 0.9500  val_loss 0.486671  val_accuracy 0.9977  6256.4 ms  1,726 samples/s  *
+            Epoch  3/10  loss 0.621004  accuracy 0.9807  val_loss 0.464879  val_accuracy 1.0000  6015.5 ms  1,795 samples/s  *
+            Epoch 10/10  loss 0.522551  accuracy 0.9961  val_loss 0.416508  val_accuracy 1.0000  6070.1 ms  1,779 samples/s  *
+            Finished 10 epochs in 62.83 s | best epoch 10 loss 0.416508
+
+            Character accuracy on unseen renderings: 100.00 %
+            Read 40 random text lines: 99.85 % character accuracy, 39/40 lines exactly right
+            """, caption="Training output on the CPU (selected epochs)"),
+        para("Training accuracy stays below validation accuracy because dropout and the random distortions make the "
+             "training images harder than the clean test renderings; the loss stays above 0 because of label smoothing. "
+             "At 63 s on 4 CPU cores this is the first project in the book where the GPU makes a real difference: "
+             "convolutions over 10,800 images per epoch."),
+        h2("33.3 Reading a line"),
+        snippet("""
+            string Read(float[] pixels, int width, int height)
+            {
+                var glyphs = Segmenter.Segment(pixels, width, height);           // characters, with space/newline flags
+                if (glyphs.Count == 0) return "";
+
+                var batch = new float[glyphs.Count * Cell * Cell];
+                for (int i = 0; i < glyphs.Count; i++)
+                    glyphs[i].Pixels.CopyTo(batch, i * Cell * Cell);
+
+                using var input = Tensor.From(batch, [glyphs.Count, 1, Cell, Cell], device);   // the whole page at once
+                using var logits = model.Predict(input);
+                using var best = logits.ArgMax();
+                var classes = best.ToArray();
+
+                var text = new System.Text.StringBuilder();
+                for (int i = 0; i < glyphs.Count; i++)
+                {
+                    text.Append(glyphs[i].NewLineBefore ? "\\n" : glyphs[i].SpaceBefore ? " " : "");
+                    text.Append(alphabet[(int)classes[i]]);
+                }
+                return text.ToString();
+            }
+            """, caption="Segmentation + batched recognition"),
+        output("""
+            Rendered line "HELLO WORLD 2026":
+
+                  ##      +##   ###########   ##+           ##+             #######
+                  ##+      ##   ###+##+###+   ##+           ##+           ###########
+                  ##      +##   ##+           ##            ##+           ##      +##
+                  ###########   #########     ##+           ##+           ##+      ##
+                  ###########   #########     ##            ##+           ##      +##
+                  ##+      ##   ##            ##+           ##            ##      +##
+                  ##      +##   #####++#++#   ##+           ##+    + +    ##+  ++ ###
+                  ##+     +##   ###########   ###########   ###########     #######
+            Recognized: HELLO WORLD 2026
+            """, caption="--predict --input \"HELLO WORLD 2026\" (preview cropped to the first five letters)"),
         cpugpu("commands",
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences -- --cpu
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences -- --cpu --predict --input "i hate it;not boring"
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cpu
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cpu --predict --input "HELLO WORLD 2026"
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cpu --predict --image page.pgm
                """,
                """
-               dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences -- --cuda --batch-size 256
-               """),
-        h2("33.4 Real text"),
-        reftable(["Need", "How"], [
-            ["Build the vocabulary", "Count words in the training texts; keep those seen at least 2–5 times; reserve pad and unknown ids"],
-            ["Longer documents", "Raise <code>MaxLength</code> (and <code>PositionalEncoding</code>'s length); consider truncating from the start"],
-            ["More classes (topics, intents)", "<code>Linear(h, K)</code> and K-class labels"],
-            ["Several labels per text", "Sigmoid outputs with <code>BinaryCrossEntropyWithLogits</code> (" + ch("binary") + ")"],
-            ["Tag each word (names, dates)", "<code>returnSequences: true</code> and a per-step <code>Linear</code> (" + ch("recurrent") + ")"],
-            ["Misspellings and rare words", "Character-level input (as in " + ch("gpt") + ") or sub-word pieces"],
-        ], caption="Table 33.2 — From the sample to real text"),
-        trap("unknown words in production",
-             "<p>Words not in the training vocabulary map to <code>&lt;unk&gt;</code>. If many important words are unknown, "
-             "predictions degrade silently. Log the share of unknown tokens per request and retrain with a larger "
-             "vocabulary when it grows.</p>"),
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cuda
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --cuda --predict --save-image line.pgm
+               """,
+               "Convert a PNG or JPEG to PGM with any image tool, e.g. <code>magick scan.png scan.pgm</code> (ImageMagick)."),
+        h2("33.4 From the sample to real documents"),
+        reftable(["Real-world issue", "Approach"], [
+            ["Other fonts, lower case, punctuation", "Render training data from those fonts and characters (or collect labelled crops); enlarge the alphabet"],
+            ["Touching or broken characters", "Improve segmentation, or recognize whole words with a sequence model reading the line left to right (" + ch("recurrent") + ")"],
+            ["Skewed or noisy scans", "Deskew and threshold before segmenting; add rotation and noise to the training renderings"],
+            ["Handwriting", "Collect labelled samples; larger CNN; heavy augmentation"],
+            ["Confidence per character", "<code>Softmax()</code> of the logits; flag characters below e.g. 0.9 for review"],
+        ], caption="Table 33.1 — Going further"),
+        trap("recognizing characters one Predict call at a time",
+             "<p>A page may contain thousands of characters. One call per character pays the call overhead (and on the GPU "
+             "a synchronization) thousands of times; batch all glyphs into one tensor, as <code>Read</code> does.</p>"),
         practice([
-            (1, "Why can the bag-of-words model not tell \"not good\" from \"good not\"?",
-             "The mean of the word vectors is the same for both orders."),
-            (1, "What is the input shape for a batch of 64 sentences?",
-             "<code>[64, 12]</code> token ids; the embedding turns it into <code>[64, 12, 32]</code>."),
-            (2, "Add a third class \"neutral\" for sentences without sentiment words.",
-             "Generate or label neutral sentences, make the targets 3-class, and change every model's last layer to "
-             "<code>Linear(…, 3)</code>; the probability code then reads three columns."),
-            (2, "Make the transformer train faster on this data.",
-             "Try a higher learning rate with warm-up, one block instead of two, or a smaller <code>ffDim</code>; measure epochs to "
-             "99% accuracy rather than time per epoch."),
-            (3, "Classify real support tickets into 8 categories from a CSV with <code>text</code> and <code>category</code> columns.",
-             "Read the file with your own CSV code (text columns), build a <code>Vocabulary</code> from the training texts, encode to "
-             "<code>[N, T]</code> ids, build the dataset with <code>FromClassLabels(ids, labels, 8)</code> and <code>WithFeatureShape(T)</code>, "
-             "use the GRU model with <code>Linear(64, 8)</code>, and report per-class accuracy."),
+            (1, "Why does validation accuracy exceed training accuracy in the log?",
+             "Dropout is active and distortions are random during training; evaluation runs without dropout on clean test renderings."),
+            (1, "How many classes does the recognizer have, and what would change to add lower-case letters?",
+             "36. Adding a–z makes 62: extend the alphabet (and the renderer's font), and the last layer becomes <code>Linear(128, 62)</code>."),
+            (2, "Report the three least confident characters of a recognized line.",
+             "Apply <code>Softmax()</code> to the logits, take each row's maximum as confidence, and list the three glyphs with the lowest values."),
+            (2, "Read a multi-line PGM page and print the lines separately.",
+             "<code>Segmenter</code> already marks <code>NewLineBefore</code>; <code>Read</code> inserts line breaks, so split the result on newlines."),
+            (3, "Recognize license plates from photos.",
+             "Locate the plate (a separate detector or a fixed camera region), threshold and segment it like a text line, train the CNN on "
+             "renderings of the plate font with perspective and blur augmentations, and batch-recognize the characters; validate on "
+             "real labelled photos."),
         ], PART),
-        footer("Sequence classification", "Sentiment analysis", "Token", "Vocabulary", "Bag of words", "LSTM",
-               "GRU", "Transformer", "Padding"),
+        footer("OCR", "Segmentation", "Glyph", "Data augmentation", "Synthetic data", "PGM"),
     )

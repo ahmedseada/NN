@@ -1,153 +1,174 @@
-"""Chapter 35 — Inference Modes and Model Files in Practice."""
+"""Chapter 35 — GPT Text Generation."""
 from gen import *
 
-PART = "VII"
+PART = "VI"
 
 
 def build():
     return page(
         chapter_open(
-            "inference",
-            "Training happens once; inference happens every time the model is used. This chapter collects what every "
-            "project in Parts V and VI did to use a trained model: which files make up a model, how the samples switch "
-            "between training and prediction with <code>--mode predict</code>, how to load on either device, and what "
-            "inference really costs: a cold first call, then microseconds per row, especially in batches.",
-            "A deployable model is a <b>package</b>: weights, plus whatever turns raw input into tensors and outputs into answers (scalers, vocabularies, class names, configuration).",
-            "Build the architecture from one factory (or from a saved configuration), then <code>Load</code>, then <code>Eval()</code> once.",
-            "<code>Predict</code> = evaluation mode + no gradients + freed intermediates.",
-            "Measured: 13.6 ms cold first call, 20.6 µs per single-row call, 1.57 µs per row in batches of 1,000.",
-            "Every sample project has an inference mode: <code>--predict</code> (or <code>--mode predict</code>) with <code>--model</code> and <code>--input</code>.",
+            "gpt",
+            "A GPT is a decoder-only transformer trained to predict the next token of text; generating means "
+            "predicting, sampling and repeating. This project, the repository's <code>NeuralSharp.Samples.Transformer</code> "
+            "with the shared <code>CharGpt</code> class, trains a character-level GPT on 333,000 characters of simple "
+            "English from a small grammar (or any text file you give it), saves it with its configuration, and "
+            "generates text with a KV cache, on-device sampling, CUDA graphs and batched samples.",
+            "Model: <code>Embedding</code> → <code>PositionalEncoding</code> → 3 causal <code>TransformerEncoderLayer</code>s → <code>LayerNorm</code> → <code>Linear</code> to the vocabulary (341,309 parameters).",
+            "Training data: windows of 64 characters; the target is the same window shifted by one character; <code>SparseCrossEntropy</code> per position.",
+            "Result: 89.4% next-character accuracy; every generated word is a real word of the grammar.",
+            "Training: 136 s on the book's 4-core CPU; about 16 s on a laptop GeForce RTX 5050.",
+            "Generation on the CPU: 230 characters/s by full recompute, 3,429 with the KV cache, 10,081 with 32 samples at once.",
         ),
-        h2("35.1 What a model package contains"),
-        reftable(["Project", "Files", "Why each is needed"], [
-            ["House prices (" + ch("regression", None) + ")", "<code>house-price.weights</code>, <code>.features.txt</code>, <code>.price.txt</code>", "Weights; input scaling; output unscaling"],
-            ["Churn (" + ch("binary", None) + ")", "<code>churn.weights</code>, <code>churn.scaler</code> (+ chosen threshold)", "The threshold is a business decision made after training"],
-            ["Anomaly detector (" + ch("anomaly", None) + ")", "weights, scaler, threshold", "The detector is model + threshold"],
-            ["Recommender (" + ch("recommender", None) + ")", "weights, user and item id maps", "Ids must map to the same embedding rows"],
-            ["Sentiment (" + ch("sentiment", None) + ")", "weights, vocabulary", "Words must map to the same ids"],
-            ["OCR (" + ch("ocr", None) + ")", "weights, alphabet", "Class index → character"],
-            ["GPT (" + ch("gpt", None) + ")", "weights, config JSON (vocabulary, sizes, training record)", "The config rebuilds the architecture"],
-        ], caption="Table 35.1 — Model packages from this book"),
+        h2("35.1 The model and its configuration"),
         snippet("""
-            // A small manifest saved next to the weights; loading reads it first.
-            public sealed record ModelManifest(
-                string Name, int Version, string Architecture,      // e.g. "mlp-9-64-32-1"
-                string[] FeatureNames, string? TargetName,
-                string[]? ClassNames, float? Threshold,
-                DateTimeOffset TrainedAt, double ValidationScore)
+            public sealed record GptConfig(string Vocabulary, int Context = 64, int Dim = 96, int Heads = 4, int Layers = 3)
             {
-                public void Save(string path) => File.WriteAllText(path, JsonSerializer.Serialize(this));
-                public static ModelManifest Load(string path) => JsonSerializer.Deserialize<ModelManifest>(File.ReadAllText(path))!;
+                public int TrainedEpochs { get; init; }
+                public double? ValidationLoss { get; init; }
+                public double? ValidationAccuracy { get; init; }
+                public DateTimeOffset? TrainedAt { get; init; }
+                public string? Corpus { get; init; }
+                // Save(weightsPath) / Load(weightsPath): JSON next to the weights file
             }
 
-            // models/house-price/v3/ : model.weights, features.scaler, price.scaler, manifest.json
-            """, caption="A pattern for versioned model folders"),
-        trap("weights without their preprocessing",
-             "<p>Weights alone are not a model. A missing scaler, vocabulary or class list produces confident nonsense rather "
-             "than an error. Save everything the prediction path needs, in one folder, and load it together.</p>"),
-        h2("35.2 Inference modes in the samples"),
-        para("Every sample project trains, saves and demonstrates the model by default, and runs inference only with "
-             "<code>--predict</code>. The shared <code>SampleOptions</code> class (samples/Shared) parses the options, "
-             "so each <code>Program.cs</code> starts with the same few lines; reuse the pattern in your own tools."),
-        reftable(["Option", "Meaning"], [
-            ["<code>--mode train|predict</code>, <code>--predict</code>", "Train and save (default), or load and predict only"],
-            ["<code>--model &lt;path&gt;</code>", "Model file to save or load (default <code>models/&lt;sample&gt;.weights</code> next to the executable)"],
-            ["<code>--input &lt;value&gt;</code>", "Sample-specific input: features, sentences, shapes, a text line, a prompt"],
-            ["<code>--data &lt;file.csv&gt;</code>", "Predict every row of a file (house prices)"],
-            ["<code>--cpu</code>, <code>--cuda</code>, <code>--device cuda:N</code>", "Where inference runs"],
-            ["<code>--threads</code>, <code>--gpu-memory</code>, <code>--cpu-memory</code>", "Resource limits (" + ch("devices") + ")"],
-            ["<code>--log inference</code>, <code>--log-file run.jsonl</code>", "Latency telemetry (" + ch("telemetry") + ")"],
-        ], caption="Table 35.2 — Sample command-line options"),
-        snippet("""
-            if (SampleOptions.Parse(args) is not { } options) return 0;      // prints help on --help or errors
-            var device = options.Device;
-            string modelPath = options.ModelPath("house-price.weights");
-
-            if (options.PredictOnly)
+            public static CharGpt Create(GptConfig config, Device device, Random? random = null)
             {
-                if (!options.RequireModel(modelPath)) return 1;               // helpful message if not trained yet
-                using var model = BuildModel(FeatureCount);
-                model.Load(modelPath);
-                // ... parse options.Input, predict, print ...
-                return 0;
+                random ??= new Random(2);
+                var model = new Sequential
+                {
+                    new Embedding(config.Vocabulary.Length, config.Dim, device, random),
+                    new PositionalEncoding(config.Context, config.Dim, device),
+                };
+                for (int layer = 0; layer < config.Layers; layer++)
+                    model.Add(new TransformerEncoderLayer(config.Dim, config.Heads, ffDim: 4 * config.Dim,
+                                                          dropout: 0.1f, causal: true, device: device, random: random));
+                model.Add(new LayerNorm(config.Dim, device: device));
+                model.Add(new Linear(config.Dim, config.Vocabulary.Length, device: device, random: random));
+                return new CharGpt(config, model, device);
             }
-            // ... otherwise train, evaluate, save ...
-            """, caption="The skeleton every sample follows"),
-        cpugpu("the same model file on either device",
+            """, caption="samples/Shared/Gpt/CharGpt.cs (abridged)"),
+        para("<code>CharGpt</code>, <code>GptConfig</code>, <code>GptTraining</code> and <code>GenerationSettings</code> are "
+             "sample code in <code>samples/Shared/Gpt/CharGpt.cs</code>, built only on the public library API; copy the "
+             "file into your own project (or link it) to reuse them. The configuration (vocabulary, sizes, training "
+             "record) is saved as JSON next to the weights. Loading "
+             "reads the JSON first and builds the matching model, so an inference program never has to repeat the "
+             "architecture by hand: a pattern worth copying for any model whose shape is chosen at training time."),
+        h2("35.2 Training windows"),
+        snippet("""
+            public static Dataset Windows(string corpus, GptConfig config, int maxWindows, int seed)
+            {
+                var index = config.Vocabulary.Select((c, i) => (c, i)).ToDictionary(p => p.c, p => p.i);
+                var random = new Random(seed);
+                int context = config.Context;
+                int windows = Math.Min(maxWindows, Math.Max(1, corpus.Length / 4));
+                var features = new float[windows * context];
+                var targets = new float[windows * context];
+                for (int w = 0; w < windows; w++)
+                {
+                    int start = random.Next(corpus.Length - context - 1);
+                    for (int t = 0; t < context; t++)
+                    {
+                        features[w * context + t] = index[corpus[start + t]];       // characters t
+                        targets[w * context + t] = index[corpus[start + t + 1]];    // the character after each
+                    }
+                }
+                string[] positions = [.. Enumerable.Range(0, context).Select(t => $"t{t}")];
+                return Dataset.FromFlat(features, targets, windows, positions, positions);
+            }
+
+            // training: AdamW, cosine schedule, clipping; SparseCrossEntropy over [N, 64, V] logits and [N, 64] targets
+            var trainer = new Trainer(gpt.Model, optimizer, (logits, next) => Losses.SparseCrossEntropy(logits, next))
+            {
+                Metrics = { Metric.SparseAccuracy },
+                Scheduler = new CosineAnnealing(optimizer, epochs, minLearningRate: 2e-4f),
+                MaxGradientNorm = 1f,
+            };
+            """, caption="Every window teaches 64 predictions at once, thanks to the causal mask"),
+        output("""
+            Corpus: 333,267 characters, vocabulary of 29: "\\n ,.abcdefghiklmnopqrstuvwxyz"
+            Sample: "every morning, my neighbor forgot a wooden boat. the old wizard borrowed a shiny key and then opened a shiny key. last night, our teacher opened a wooden boat. ..."
+
+            Training on cpu (CPU (4 threads, 8-wide SIMD)) | 19,000 samples, 1,000 validation | batch 32, 594 steps/epoch | AdamW lr=0.002 | 341,309 parameters | 4 CPU threads
+            Epoch 1/2  loss 0.573884  accuracy 0.7999  val_loss 0.262710  val_accuracy 0.8926  70053.7 ms  271 samples/s  *
+            Epoch 2/2  loss 0.266744  accuracy 0.8895  val_loss 0.250425  val_accuracy 0.8938  65444.2 ms  290 samples/s  *
+            Finished 2 epochs in 135.51 s | best epoch 2 loss 0.250425
+            """, caption="Training output on the CPU"),
+        para("A validation loss of 0.25 is far below ln 29 ≈ 3.37, the loss of guessing. The remaining uncertainty "
+             "is real: after \"the old \" several nouns are equally valid in this grammar, so no model can reach 100%."),
+        h2("35.3 Generating"),
+        output("""
+            Prompt "the little robot " (temperature 0.7, KV cache):
+              the little robot built a tiny garden and then carried the heavy box.
+              a quiet student opened the heavy box on the hill. the old wizard sold a shiny key and then watched a shiny key. before dawn, the young pilot sold a tiny garden. ...
+              -> 400 characters in 112 ms (3585/s, 0.25 ms per step), first token 12.1 ms, average confidence 91 %, perplexity 1.20
+              -> 76/76 generated words are real vocabulary words (100 %)
+            """, caption="Generation after training (text shortened)"),
+        para("Perplexity 1.20 means the model is, on average, choosing between about 1.2 equally likely characters: "
+             "very sure of itself, as a simple grammar allows (glossary <b>Perplexity</b>). The generation loop in "
+             "<code>CharGpt.Generate</code> is the one explained in " + ch("generation") + ": prefill the prompt, "
+             "then one cached step per character, sampling on the device, reading tokens back in chunks, and "
+             "re-reading the last half of the window when the 64-character context is full."),
+        snippet("""
+            using var gpt = CharGpt.Load("models/transformer.weights", Device.Default);
+            var settings = new GenerationSettings(
+                Length: 400, Temperature: 0.7f, TopK: 0, Seed: 6,
+                Samples: 1, UseCache: true, UseGraph: true);
+            var result = gpt.Generate("the little robot ", settings,
+                onToken: token => Console.Write(token.Token));            // streams characters as they arrive
+            Console.WriteLine($"\\n{result.Metrics.TokensPerSecond:F0} chars/s, perplexity {result.Metrics.Perplexity:F2}");
+            """, caption="Using a trained model from your own code"),
+        h2("35.4 How fast, and why"),
+        output("""
+            Benchmark on cpu (CPU (4 threads, 8-wide SIMD)), 400 characters per sample
+
+              mode                            chars/s   ms/step   first token   note
+              full recompute, 1 sample            230      4.36        4.1 ms   1.0x
+              KV cache, 1 sample                 3429      0.29        2.4 ms   14.9x
+              KV cache + graph, 1 sample         4260      0.23        1.8 ms   18.6x  graphs are GPU-only; CPU runs the step directly
+              KV cache + graph, 8 samples        6271      1.26        8.7 ms   27.3x  graphs are GPU-only; CPU runs the step directly
+              KV cache + graph, 32 samples      10081      3.13       20.4 ms   43.9x  graphs are GPU-only; CPU runs the step directly
+            """, caption="--predict --benchmark true on the CPU"),
+        para("The cache removes the repeated work (15×); batching samples shares each step's fixed costs (up to 44× in "
+             "total characters per second). On the CPU the graph rows differ from the plain cache only by timing noise "
+             "and warm-up; on a GPU, recording the step as a CUDA graph removes the launch overhead of the step's "
+             "several hundred kernels, which is where most of a small model's GPU time goes."),
+        cpugpu("commands",
                """
-               using var model = BuildModel(device: Device.Cpu);
-               model.Load("models/house-price.weights");
-               model.Eval();
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cpu
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cpu --predict --input "the old wizard" --temperature 0.8
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cpu --corpus mybook.txt --epochs 5
                """,
                """
-               using var model = BuildModel(device: Device.Cuda());
-               model.Load("models/house-price.weights");              // the file does not know about devices
-               model.Eval();
-               """),
-        h2("35.3 What inference costs"),
-        mex("cold start, single rows and batches (house-price model, CPU)", None,
-            """
-            model.Eval();
-            var one = new float[1, 9];
-            var many = new float[1000, 9];
-
-            var cold = Stopwatch.StartNew();
-            model.Predict(one);
-            Console.WriteLine($"first call (cold): {cold.Elapsed.TotalMilliseconds:F2} ms");
-
-            for (int i = 0; i < 200; i++) model.Predict(one);               // warm-up
-            var sw = Stopwatch.StartNew();
-            for (int i = 0; i < 1000; i++) model.Predict(one);
-            Console.WriteLine($"1 row per call:     {sw.Elapsed.TotalMilliseconds:F1} µs per call");  // 1000 calls: ms = µs each
-
-            for (int i = 0; i < 20; i++) model.Predict(many);
-            sw.Restart();
-            for (int i = 0; i < 100; i++) model.Predict(many);
-            double ms = sw.Elapsed.TotalMilliseconds / 100;
-            Console.WriteLine($"1,000 rows per call: {ms:F3} ms per call = {ms:F2} µs per row");
-            """,
-            out="""
-            first call (cold): 13.60 ms
-            1 row per call:     20.6 µs per call
-            1,000 rows per call: 1.574 ms per call = 1.57 µs per row
-            """,
-            after="The cold call pays for JIT compilation and first allocations; do one warm-up prediction at startup. "
-                  "Batching makes each row about 13× cheaper, because per-call costs are shared. On the GPU the difference "
-                  "is larger still: a single-row call is dominated by launches and the copy back."),
-        reftable(["Situation", "Recommendation"], [
-            ["Interactive, one request at a time", "CPU; warm up at startup; <code>Predict(float[,])</code>"],
-            ["Many requests per second", "Batch requests arriving within a few milliseconds into one <code>Predict</code> (micro-batching)"],
-            ["Nightly scoring of millions of rows", "Large batches (10,000+); the GPU for big models; <code>Trainer.Predict(dataset)</code> batches for you"],
-            ["Latency budget below 1 ms", "Small model on the CPU; avoid per-request allocations of large arrays"],
-        ], caption="Table 35.3 — Inference setups"),
-        h2("35.4 Concurrency"),
-        para("A loaded model can serve many threads at once if it is put in evaluation mode once after loading: "
-             "<code>Predict</code> then never changes the model's state, each call works on its own tensors, and memory "
-             "pools are thread-safe. The house-price Web API of " + ch("webapi") + " served 200 concurrent requests this "
-             "way. Two cases still need a lock (for example a <code>SemaphoreSlim</code>): moving the model between devices "
-             "while serving, and stateful generation with a KV cache, where one generation owns the caches (the GPT API "
-             "serializes requests for this reason)."),
-        trap("calling Eval() per request",
-             "<p><code>Predict</code> switches to evaluation mode and restores the previous mode afterwards. If the model was "
-             "left in training mode, two concurrent calls can interleave these switches so one runs with dropout active. "
-             "Call <code>Eval()</code> once after loading and leave it.</p>"),
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cuda
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cuda --predict --benchmark true
+               dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cuda --predict --samples 8 --top-k 10
+               """,
+               "The Web API of " + ch("webapi") + " serves the same model with a browser interface and live metrics."),
+        h2("35.5 Training on your own text"),
+        reftable(["Corpus size", "Suggested configuration", "Notes"], [
+            ["~100 KB (a short story)", "Dim 64, 2 layers, context 64, 5–10 epochs", "Learns spelling and common words; expect memorized phrases"],
+            ["1–5 MB (a few books)", "Dim 128–192, 4 layers, context 128, GPU", "Plausible sentences in the author's style"],
+            ["Larger", "Dim 256+, 6+ layers, context 256; a GPU is essential", "Consider word pieces instead of characters"],
+        ], caption="Table 35.1 — Sizing a character GPT"),
+        trap("expecting knowledge from a small GPT",
+             "<p>A model of a few hundred thousand parameters learns the surface of its corpus (spelling, grammar, style), "
+             "not facts or reasoning. It is excellent for text in a fixed format (logs, product names, code-like strings, "
+             "templated reports) and for learning how language models work.</p>"),
         practice([
-            (1, "List the files needed to serve the churn model and explain each.",
-             "Weights (the network), the feature scaler (to scale inputs like training data), and the chosen threshold "
-             "(to turn probabilities into decisions)."),
-            (1, "Why warm up a model at startup?",
-             "The first call includes one-off JIT compilation and allocation (13.6 ms here, far more for GPU kernel "
-             "compilation); a warm-up moves that cost out of the first user's request."),
-            (2, "Write a <code>ModelPackage.Load(folder)</code> that reads a manifest, builds the right architecture and loads weights and scaler.",
-             "Read <code>manifest.json</code>; switch on <code>Architecture</code> to call the matching factory; <code>Load</code> the "
-             "weights; <code>StandardScaler.Load</code> the scaler files; <code>Eval()</code>; return an object exposing <code>Predict</code>."),
-            (2, "Score a CSV of 2 million rows as fast as possible.",
-             "Stream the file in chunks of e.g. 50,000 rows, scale each chunk, call <code>Predict</code> on the chunk (or several "
-             "chunks in parallel on the CPU), write results as you go; on a GPU use chunks of 100,000+."),
-            (3, "Implement micro-batching for a web API: collect requests for up to 5 ms or 256 rows, predict once, and complete each request.",
-             "Use a <code>Channel</code> of (input, <code>TaskCompletionSource</code>) pairs; a background loop reads the first item, "
-             "keeps reading until 5 ms have passed or 256 rows are collected, stacks the rows, calls <code>Predict</code>, and sets each "
-             "request's result from its row of the output."),
+            (1, "Why does one training window give 64 training examples?",
+             "The causal mask lets position t see only characters 0…t, so each of the 64 positions is an independent "
+             "next-character prediction, all computed in one forward pass."),
+            (1, "What does temperature 0.7 do compared with 1.0?",
+             "It sharpens the distribution, favouring likely characters: more conservative, more repetitive text (" + ch("generation") + ")."),
+            (2, "Train on your own text file and generate with three temperatures (0.5, 0.8, 1.2). Describe the differences.",
+             "<code>--corpus file.txt</code>, then <code>--predict --temperature …</code>. Low temperatures repeat frequent phrases; high "
+             "temperatures invent words and break grammar; around 0.7–0.9 is usually most readable."),
+            (2, "Generate 8 different continuations of the same prompt in one call.",
+             "<code>--samples 8</code>, or <code>GenerationSettings(Samples: 8, …)</code>; the result holds 8 sequences, generated as one batch."),
+            (3, "Double the model (Dim 192, 6 layers, context 128) and train it on the GPU. What changes in the code?",
+             "Only the <code>GptConfig</code> passed to <code>CharGpt.Create</code>; the saved JSON records the new sizes, so "
+             "<code>CharGpt.Load</code> and the Web API pick them up without changes."),
         ], PART),
-        footer("Inference mode", "Model package", "Manifest", "Warm-up", "Latency", "Micro-batching", "Evaluation mode"),
+        footer("GPT", "Language model", "Character-level model", "Next-token prediction", "Causal mask",
+               "Perplexity", "Temperature", "KV cache", "Context length"),
     )

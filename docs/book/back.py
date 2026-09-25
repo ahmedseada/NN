@@ -64,6 +64,9 @@ def outro(version, commit, date):
             ["images", ch("cnn") + ", " + ch("ocr")],
             ["sentences or event sequences", ch("sentiment")],
             ["text to continue", ch("gpt")],
+            ["a chat assistant with tools", ch("textgen")],
+            ["search results to re-order", ch("reranker")],
+            ["documents to condense", ch("summarizer")],
             ["a trained model to ship", ch("inference") + "–" + ch("projecttypes")],
         ], caption="Table O.1 — Choosing a starting point"),
         h2("Going deeper", toc=False),
@@ -75,6 +78,7 @@ def outro(version, commit, date):
         h2("Colophon", toc=False),
         reftable(["", ""], [
             ["Book", f"NeuralSharp · The Library and Its Projects, version {version}, {date}"],
+            ["Author", "Ahmed Seada"],
             ["Library", f"NeuralSharp for .NET 10, repository commit {commit}"],
             ["Examples", "Every printed output comes from a real run on a 4-core cloud CPU (AVX-512, 8-wide Vector&lt;float&gt;) "
                          "unless marked otherwise; GPU figures quoted from runs on a laptop GeForce RTX 5050"],

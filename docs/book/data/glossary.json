@@ -1,4 +1,9 @@
 {
+ "Abstractive summarization": {
+  "def": "Summarizing by generating new text, which may combine, compare and rephrase facts from the source.",
+  "hint": "",
+  "see": "{ch:summarizer}"
+ },
  "Accuracy": {
   "def": "The share of predictions that are correct.",
   "hint": "",
@@ -104,6 +109,11 @@
   "hint": "",
   "see": "{ch:projecttypes}"
  },
+ "BM25": {
+  "def": "A classic ranking function that scores documents by matching query words, weighting rare words more and damping repeated words and long documents.",
+  "hint": "Logarithms for the inverse document frequency (Pre-Calc volume).",
+  "see": "{ch:reranker}"
+ },
  "Body and head": {
   "def": "The shared feature-extracting layers of a network (body) and the task-specific output layers on top (head).",
   "hint": "",
@@ -169,6 +179,11 @@
   "hint": "",
   "see": "{ch:gpt}"
  },
+ "Chat template": {
+  "def": "The fixed text format that turns chat messages (system, user, assistant, tool) into one prompt for a language model; ChatML is a common one.",
+  "hint": "",
+  "see": "{ch:textgen}"
+ },
  "Class imbalance": {
   "def": "Some classes being much more frequent than others, which makes plain accuracy misleading.",
   "hint": "",
@@ -219,6 +234,11 @@
   "hint": "",
   "see": "{ch:attention}, {ch:gpt}"
  },
+ "Context window": {
+  "def": "The number of tokens a model can read at once (num_ctx). Longer texts must be truncated or processed in sliding windows.",
+  "hint": "",
+  "see": "{ch:textgen}; {ch:attention}"
+ },
  "Convolution": {
   "def": "Sliding a small learned filter over an input and taking the weighted sum at every position.",
   "hint": "Same weights reused at every position.",
@@ -233,6 +253,11 @@
   "def": "The dot product of two vectors divided by the product of their lengths: 1 for the same direction, 0 for perpendicular, −1 for opposite.",
   "hint": "The cosine of the angle between the vectors.",
   "see": "{ch:embedding}; Pre-Calc volume <i>Numbers, Shapes, and Functions</i>, trigonometry"
+ },
+ "Cross-encoder": {
+  "def": "A model that reads a query and a document together as one input and outputs a relevance score.",
+  "hint": "",
+  "see": "{ch:reranker}"
  },
  "Cross-entropy": {
   "def": "The standard classification loss: the average negative log-probability the model assigns to the correct class. Starts near ln K for K classes.",
@@ -373,6 +398,11 @@
   "def": "A running average in which each new value gets a fixed weight and older values fade geometrically.",
   "hint": "avg ← β·avg + (1 − β)·new.",
   "see": "{ch:optimizers}, {ch:norm}"
+ },
+ "Extractive summarization": {
+  "def": "Summarizing by selecting sentences from the source text unchanged.",
+  "hint": "",
+  "see": "{ch:summarizer}"
  },
  "F1 score": {
   "def": "The harmonic mean of precision and recall: one number that is high only when both are.",
@@ -519,6 +549,11 @@
   "hint": "",
   "see": "{ch:recurrent}"
  },
+ "Hard negative": {
+  "def": "A wrong example that looks right (for example a passage the first stage ranks highly), used in training so the model learns fine distinctions.",
+  "hint": "",
+  "see": "{ch:reranker}"
+ },
  "Health check": {
   "def": "An endpoint that reports whether a service is ready, used by load balancers and orchestrators.",
   "hint": "",
@@ -589,6 +624,11 @@
   "hint": "",
   "see": "{ch:telemetry}"
  },
+ "Keep-alive": {
+  "def": "How long a model stays loaded after a request (for example \"30m\"; 0 unloads at once; a negative value keeps it forever).",
+  "hint": "",
+  "see": "{ch:textgen}"
+ },
  "Kernel": {
   "def": "A function that runs on the GPU in many parallel threads, one launch per operation.",
   "hint": "",
@@ -649,6 +689,11 @@
   "hint": "",
   "see": "{ch:dense}"
  },
+ "Listwise loss": {
+  "def": "A ranking loss computed over a whole list of candidates for one query, here softmax cross-entropy with the correct candidate as the class.",
+  "hint": "",
+  "see": "{ch:reranker}; {ch:losses}"
+ },
  "Logits": {
   "def": "Raw, unnormalized class scores from the last Linear layer; softmax or sigmoid turns them into probabilities.",
   "hint": "",
@@ -658,6 +703,11 @@
   "def": "A single number that measures how wrong the predictions are; training minimizes it.",
   "hint": "",
   "see": "{ch:losses}"
+ },
+ "Loss masking": {
+  "def": "Excluding some positions from the loss (for example the input part of a sequence), so the model is trained only on the outputs that matter.",
+  "hint": "",
+  "see": "{ch:summarizer}"
  },
  "LSTM": {
   "def": "Long short-term memory: a recurrent layer with input, forget and output gates and a separate cell state.",
@@ -724,6 +774,11 @@
   "hint": "",
   "see": "{ch:inference}, {ch:webapi}"
  },
+ "Min-p sampling": {
+  "def": "Keep only tokens whose probability is at least a fraction m of the most likely token's probability; the cut adapts to the model's confidence.",
+  "hint": "",
+  "see": "{ch:textgen}"
+ },
  "Mini-batch": {
   "def": "A small subset of the training data used for one optimizer step.",
   "hint": "",
@@ -769,6 +824,11 @@
   "hint": "An exponential moving average.",
   "see": "{ch:norm}"
  },
+ "MRR": {
+  "def": "Mean reciprocal rank: the average over queries of 1 / (rank of the first correct result); 1 means always first.",
+  "hint": "Reciprocals and averages (Pre-Calc volume).",
+  "see": "{ch:reranker}"
+ },
  "MSE": {
   "def": "Mean squared error: the average of the squared differences between prediction and target. The default loss for regression.",
   "hint": "Squaring punishes large errors more than small ones.",
@@ -803,6 +863,11 @@
   "def": "The image tensor layout used by NeuralSharp: batch, channels, height, width.",
   "hint": "",
   "see": "{ch:conv}"
+ },
+ "NDJSON": {
+  "def": "Newline-delimited JSON: one complete JSON object per line, used for streamed responses.",
+  "hint": "",
+  "see": "{ch:textgen}"
  },
  "Next-token prediction": {
   "def": "The training task of a language model: at every position, predict the token that follows.",
@@ -899,6 +964,11 @@
   "hint": "",
   "see": "{ch:ocr}"
  },
+ "Placeholder token": {
+  "def": "A generic token such as <w0> that stands for a rare word, numbered by first appearance, so a model can match words it has never seen.",
+  "hint": "",
+  "see": "{ch:reranker}"
+ },
  "Pooling": {
   "def": "Combining many values into one: max or average over an image window, or mean over a sequence.",
   "hint": "",
@@ -944,10 +1014,20 @@
   "hint": "",
   "see": "{ch:tensors}"
  },
+ "Re-ranking": {
+  "def": "Re-ordering a short list of candidates from a fast first stage with a slower, more accurate model.",
+  "hint": "",
+  "see": "{ch:reranker}"
+ },
  "Recall": {
   "def": "Of the truly positive cases, the share that were flagged.",
   "hint": "TP / (TP + FN).",
   "see": "{ch:binary}"
+ },
+ "Recall@k": {
+  "def": "The share of queries whose correct result appears among the top k; Hit@1 is the special case k = 1.",
+  "hint": "",
+  "see": "{ch:reranker}"
  },
  "Recommender system": {
   "def": "A model that suggests items a user is likely to want.",
@@ -1004,6 +1084,11 @@
   "hint": "Gradient is 1 for positive inputs and 0 otherwise.",
   "see": "Activation Functions volume, ReLU"
  },
+ "Repetition penalty": {
+  "def": "Lowers the scores of tokens that appeared recently (divide a positive score, multiply a negative one) to reduce loops; presence and frequency penalties subtract a fixed amount per token or per occurrence.",
+  "hint": "",
+  "see": "{ch:textgen}"
+ },
  "Reserved": {
   "def": "InUse + Cached: all memory the library currently holds from the system on a device.",
   "hint": "",
@@ -1033,6 +1118,11 @@
   "def": "The probability that a randomly chosen positive is scored above a randomly chosen negative: 0.5 is random ranking, 1 is perfect.",
   "hint": "Area under the curve of true-positive rate against false-positive rate.",
   "see": "{ch:binary}"
+ },
+ "ROUGE": {
+  "def": "Summary quality scores based on overlap with a reference: ROUGE-1 (words), ROUGE-2 (word pairs), ROUGE-L (longest common subsequence), reported as F1.",
+  "hint": "Precision, recall and their harmonic mean (Pre-Calc volume).",
+  "see": "{ch:summarizer}"
  },
  "Row-major": {
   "def": "Storage order in which the last dimension changes fastest: a matrix is stored row after row.",
@@ -1159,6 +1249,11 @@
   "hint": "",
   "see": "{ch:schedules}"
  },
+ "Stop sequence": {
+  "def": "A string that ends generation when it appears; it is not included in the returned text.",
+  "hint": "",
+  "see": "{ch:textgen}"
+ },
  "Stream": {
   "def": "A GPU work queue: operations on one stream run in order, asynchronously to the CPU.",
   "hint": "",
@@ -1169,6 +1264,11 @@
   "hint": "",
   "see": "{ch:cuda}, {ch:generation}"
  },
+ "Streaming": {
+  "def": "Returning output piece by piece while it is produced, instead of all at the end.",
+  "hint": "",
+  "see": "{ch:textgen}; {ch:webapi}"
+ },
  "Streaming multiprocessor": {
   "def": "One of the GPU's independent processing units (SMs); a GPU has from a few to over a hundred, each running many threads.",
   "hint": "",
@@ -1178,6 +1278,11 @@
   "def": "The step between successive positions of a convolution or pooling window; stride 2 halves the output size.",
   "hint": "",
   "see": "{ch:conv}"
+ },
+ "Summarization": {
+  "def": "Producing a short text that keeps the main content of a longer one.",
+  "hint": "",
+  "see": "{ch:summarizer}"
  },
  "Synchronization": {
   "def": "Waiting until the GPU has finished all queued work, e.g. when a value is read back.",
@@ -1229,6 +1334,11 @@
   "hint": "",
   "see": "{ch:memory}"
  },
+ "Thinking": {
+  "def": "Reasoning text a chat model writes before its answer, delimited by think tags and returned separately from the answer.",
+  "hint": "",
+  "see": "{ch:textgen}"
+ },
  "Thread block": {
   "def": "A group of GPU threads (256 for most NeuralSharp kernels) that run together and can share fast memory.",
   "hint": "",
@@ -1259,10 +1369,25 @@
   "hint": "",
   "see": "{ch:embedding}, {ch:gpt}"
  },
+ "Tokenizer": {
+  "def": "Converts text to a sequence of token ids and back. Character, word and sub-word tokenizers trade vocabulary size against sequence length.",
+  "hint": "",
+  "see": "{ch:textgen}"
+ },
+ "Tool calling": {
+  "def": "A model's ability to request that the application run a function (a tool) with JSON arguments; the result is sent back as a tool message.",
+  "hint": "",
+  "see": "{ch:textgen}"
+ },
  "Top-k sampling": {
   "def": "Sampling only among the k most likely tokens.",
   "hint": "",
   "see": "{ch:generation}"
+ },
+ "Top-p sampling": {
+  "def": "Nucleus sampling: keep the smallest set of most likely tokens whose probabilities add up to at least p, renormalize, and sample from it.",
+  "hint": "Cumulative sums of a sorted list; probabilities as fractions (Pre-Calc volume).",
+  "see": "{ch:textgen}"
  },
  "Train/test split": {
   "def": "Dividing data into a part to learn from and a part held back to measure performance.",
@@ -1293,6 +1418,11 @@
   "def": "An architecture of stacked blocks, each attention plus a feed-forward network with residual connections and normalization.",
   "hint": "",
   "see": "{ch:attention}"
+ },
+ "Two-stage retrieval": {
+  "def": "Search that first retrieves candidates cheaply over the whole collection, then re-ranks only those candidates.",
+  "hint": "",
+  "see": "{ch:reranker}"
  },
  "Unit test": {
   "def": "An automated check of one piece of code against expected behaviour.",

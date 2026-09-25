@@ -9,11 +9,25 @@ internal static partial class Tests
     private static readonly (string Name, Action<Device> Run)[] Generation =
     [
         ("generation: parser splits thinking, content and tool calls from any chunking", ParserSplitsOutput),
+        ("generation: word tokenizer splits, maps unknown words and decodes piecewise", WordTokenizerBehaviour),
         ("generation: ChatML template renders system, tools, turns and think modes", TemplateRendering),
         ("generation: keep-alive durations and model host expiry", KeepAliveAndHost),
         ("generation: num_predict, stop sequences, cache/graph/recompute agree", GeneratorBehaviour),
         ("generation: chat end to end yields a final message and stats", ChatEndToEnd),
     ];
+
+    private static void WordTokenizerBehaviour(Device device)
+    {
+        _ = device;
+        var tokenizer = WordTokenizer.FromTexts(["the lions beat the eagles 3 to 1 .", "rain is likely , bring a coat !"], ["<pad>", "<sum>", "<end>"]);
+        Check(tokenizer.Vocabulary[0] == "<pad>" && tokenizer.Vocabulary[2] == "<end>" && tokenizer.Vocabulary[3] == "the", "specials first, then by frequency");
+        var ids = tokenizer.Encode("The Lions beat the wolves 3 to 1. <sum> <end>");
+        Check(ids.Count == 11 && ids[4] == tokenizer["<unk>"] && ids[8] == tokenizer["."] && ids[9] == 1 && ids[10] == 2, $"encode {string.Join(",", ids)}");
+        string whole = tokenizer.Decode(ids);
+        Check(whole == " the lions beat the <unk> 3 to 1. <sum> <end>", $"decode '{whole}'");
+        string pieces = string.Concat(Enumerable.Range(0, ids.Count).Select(i => tokenizer.Decode([ids[i]])));
+        Check(pieces == whole, "piecewise decoding equals whole decoding");
+    }
 
     private static void ParserSplitsOutput(Device device)
     {
