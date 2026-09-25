@@ -69,13 +69,13 @@ api.MapPost("/generate", async Task<Results<Ok<GenerationResult>, ProblemHttpRes
     })
     .WithName("Generate")
     .WithSummary("Generate text")
-    .WithDescription("Continues the prompt and returns the text, every generated character with its probability, entropy and top alternatives, and aggregate metrics (latency, throughput, confidence, perplexity, memory). Set device to switch between cpu and cuda.");
+    .WithDescription("Continues the prompt and returns one or more samples, every generated character with its probability, entropy and top alternatives, and aggregate metrics (latency, throughput, confidence, perplexity, memory, decoding mode). Set device to switch between cpu and cuda; samples to generate a batch; useCache/useGraph to compare decoding modes.");
 
 api.MapPost("/generate/stream", Results<ServerSentEventsResult<object>, ProblemHttpResult> (GenerateRequest request, GptService gpt, CancellationToken cancellationToken) =>
         gpt.Status.Status == ModelStatus.Ready ? TypedResults.ServerSentEvents(gpt.StreamAsync(request, cancellationToken)) : NotReady(gpt))
     .WithName("GenerateStream")
     .WithSummary("Generate text as a live stream (server-sent events)")
-    .WithDescription("Same as /api/generate, but emits a \"token\" event for each character as soon as it is produced, then a \"metrics\" event.");
+    .WithDescription("Same as /api/generate, but emits \"token\" events (each with its sample index) every chunkSize characters as they are produced, then a \"metrics\" event.");
 
 app.Run();
 

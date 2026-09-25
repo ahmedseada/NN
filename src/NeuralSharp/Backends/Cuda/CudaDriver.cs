@@ -143,4 +143,38 @@ internal static unsafe partial class CudaDriver
 
     [LibraryImport(Library)]
     public static partial int cuGetErrorName(int error, out byte* text);
+
+    // Streams, asynchronous copies and CUDA Graphs (stream capture).
+
+    public const int StreamCaptureModeRelaxed = 2;
+
+    [LibraryImport(Library)]
+    public static partial int cuStreamCreate(out IntPtr stream, uint flags);
+
+    [LibraryImport(Library)]
+    public static partial int cuStreamSynchronize(IntPtr stream);
+
+    [LibraryImport(Library)]
+    public static partial int cuMemsetD32Async(ulong destination, uint value, nuint count, IntPtr stream);
+
+    [LibraryImport(Library, EntryPoint = "cuMemcpyDtoDAsync_v2")]
+    public static partial int cuMemcpyDtoDAsync(ulong destination, ulong source, nuint bytes, IntPtr stream);
+
+    [LibraryImport(Library, EntryPoint = "cuStreamBeginCapture_v2")]
+    public static partial int cuStreamBeginCapture(IntPtr stream, int mode);
+
+    [LibraryImport(Library)]
+    public static partial int cuStreamEndCapture(IntPtr stream, out IntPtr graph);
+
+    [LibraryImport(Library)]
+    public static partial int cuGraphInstantiateWithFlags(out IntPtr executable, IntPtr graph, ulong flags);
+
+    [LibraryImport(Library)]
+    public static partial int cuGraphLaunch(IntPtr executable, IntPtr stream);
+
+    [LibraryImport(Library)]
+    public static partial int cuGraphExecDestroy(IntPtr executable);
+
+    [LibraryImport(Library)]
+    public static partial int cuGraphDestroy(IntPtr graph);
 }

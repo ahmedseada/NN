@@ -16,9 +16,11 @@ internal static partial class PtxKernels
 
     public const int MaxPermuteRank = 6;
 
-    private static readonly string Log2E = F(1.4426950408889634f);
-    private static readonly string Ln2 = F(0.6931471805599453f);
-    private static readonly string NegInf = "0fFF800000";
+    // Constants (not static readonly): Source is built during static initialization, before other partial files'
+    // static fields are guaranteed to be initialized.
+    private const string Log2E = "0f3FB8AA3B";
+    private const string Ln2 = "0f3F317218";
+    private const string NegInf = "0fFF800000";
 
     private static void BuildAdvanced(StringBuilder sb)
     {

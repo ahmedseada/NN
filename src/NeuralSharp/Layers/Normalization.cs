@@ -140,6 +140,11 @@ public sealed class LayerNorm : Module
             throw new ArgumentException($"LayerNorm({Features}) expects [..., {Features}], got {Tensor.FormatShape(input.Shape)}.");
         }
 
+        if (!Autograd.IsEnabled)
+        {
+            return input.LayerNormFused(Gamma, Beta, Epsilon);   // inference: one kernel instead of three
+        }
+
         int rows = input.Size / Features;
         var normalized = input.Normalize(1, rows, Features, Epsilon, out var mean, out var variance);
         mean.Dispose();

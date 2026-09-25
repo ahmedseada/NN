@@ -100,10 +100,12 @@ dotnet run -c Release --project samples/NeuralSharp.Samples.GptApi
 | `GET /api/status` | Loading / Training (with live progress) / Ready / Failed |
 | `GET /api/model` | parameters, blocks, heads, width, context, vocabulary, validation results, layer summary |
 | `GET /api/devices` | CPU and CUDA GPUs with memory usage and the active one |
-| `POST /api/generate` | text, plus each character's probability, entropy, top-5 alternatives and latency, plus aggregate metrics |
-| `POST /api/generate/stream` | the same as server-sent events: one `token` event per character, then `metrics` |
+| `POST /api/generate` | one or more samples, each character's probability, entropy, top-5 alternatives and latency, plus aggregate metrics (including decoding mode) |
+| `POST /api/generate/stream` | the same as server-sent events: `token` events (with their sample index) every `chunkSize` characters, then `metrics` |
 
-The request body is `{ "prompt", "length", "temperature", "topK", "seed", "device": "cpu" | "cuda" }`.
+The request body is `{ "prompt", "length", "temperature", "topK", "seed", "device": "cpu" | "cuda",
+"samples", "useCache", "useGraph", "chunkSize" }`. The UI has matching controls: a samples slider
+(shown as tabs), and KV cache and CUDA graph switches for comparing modes.
 The device can change per request, and the model moves between CPU and GPU as needed.
 
 The service loads `Gpt:ModelPath` from `appsettings.json`. Point it at a model saved by the
@@ -275,6 +277,40 @@ using var m = Tensor.From(new int[,] { { 1, 2 }, { 3, 4 } });
 int[] ints = t.ToArray<int>();                               // saturating, truncating conversion
 ```
 
+### Fast autoregressive generation
+
+Generating text one token at a time is dominated by overhead rather than math, so NeuralSharp provides
+three tools that work together (`CharGpt.Generate` in `samples/Shared/Gpt` shows them in use):
+
+* **KV cache.** Pass a `DecodingContext` to `Sequential.ForwardCached(ids, context)`. The prompt is
+  processed once (prefill), then every step processes only the newest token, while each attention
+  layer's keys and values accumulate in a `KeyValueCache`. `MultiHeadAttention`,
+  `TransformerEncoderLayer` and `PositionalEncoding` implement `ICachedModule`.
+* **On-device sampling.** `TokenSampler` draws the next token (temperature, top-k) on the device
+  that holds the logits and writes each token's probability, entropy and top-5 alternatives to a
+  device buffer. The next step therefore needs no host round trip; `Read` fetches the statistics in
+  chunks. Its randomness is counter-based (seed, step, row), so results are reproducible and match
+  between CPU and GPU.
+* **Compute graphs.** `DecodingContext.CaptureStep(step)` records a whole decoding step, and
+  `ReplayStep` runs it again with one launch; on CUDA this is a CUDA Graph. The position counter,
+  causal mask and cache offsets are computed on the device, so one recording is valid at every
+  position. On the CPU, or if the driver refuses, replay simply re-runs the step.
+* **Batching and fused kernels.** Many samples decode together as one batch. During inference,
+  scale+mask+softmax, LayerNorm and bias+GELU each run as a single kernel; training uses the
+  differentiable path.
+
+Measured on the sample GPT (341K parameters) on a 4-core CPU container
+(`dotnet run --project samples/NeuralSharp.Samples.Transformer -- --predict --benchmark true`):
+
+| Mode | chars/s | Speedup |
+|------|---------|---------|
+| Full recompute, 1 sample | 283 | 1× |
+| KV cache, 1 sample | 4,119 | 14.5× |
+| KV cache, 8 samples | 6,595 | 23× |
+| KV cache, 32 samples | 8,957 | 32× |
+
+On a GPU, CUDA graphs remove the per-step launch cost, and batching keeps the GPU busy.
+
 ### Optimizers and schedules
 
 `Sgd(momentum, weightDecay)`, `Adam(weightDecay)` (L2) and `AdamW` (decoupled weight decay) are
@@ -385,7 +421,7 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 51 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 56 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
@@ -393,8 +429,9 @@ data loading, telemetry, memory limits and thread budgets. The suite runs on eve
 
 ## Status
 
-* **Verified on real hardware.** All 51 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
-  Laptop GPU (Blackwell), 102 of 102. That covers every GPU kernel: matrix products, softmax,
+* **Verified on real hardware.** 51 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
+  Laptop GPU (Blackwell), 102 of 102. The 5 newer decoding tests (KV cache, batched decoding, graph
+  replay, sampler, fused kernels) pass on the CPU and still need a run on a GPU. That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.
 * The 51 GPU kernels also assemble without errors or register spills for sm_50, sm_75, sm_86, sm_90

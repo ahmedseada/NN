@@ -15,7 +15,7 @@ namespace NeuralSharp.Layers;
 /// };
 /// </code>
 /// </summary>
-public sealed class Sequential : Module, IEnumerable<Module>
+public sealed class Sequential : Module, IEnumerable<Module>, ICachedModule
 {
     private readonly List<Module> _modules = [];
 
@@ -50,6 +50,34 @@ public sealed class Sequential : Module, IEnumerable<Module>
 
     /// <inheritdoc />
     public override IEnumerable<Module> Children() => _modules;
+
+    /// <summary>
+    /// Incremental forward pass: layers implementing <see cref="ICachedModule"/> use their cached path, others run
+    /// normally on the new positions only. Brackets the pass with <see cref="DecodingContext.BeginStep"/> /
+    /// <see cref="DecodingContext.EndStep"/> when called at the top level.
+    /// </summary>
+    public Tensor ForwardCached(Tensor input, DecodingContext context)
+    {
+        bool outermost = context.Mask is null;
+        int steps = input.Shape[1];
+        if (outermost)
+        {
+            context.BeginStep(steps);
+        }
+
+        var x = input;
+        foreach (var module in _modules)
+        {
+            x = module is ICachedModule cached ? cached.ForwardCached(x, context) : module.Forward(x);
+        }
+
+        if (outermost)
+        {
+            context.EndStep(steps);
+        }
+
+        return x;
+    }
 
     /// <inheritdoc />
     public IEnumerator<Module> GetEnumerator() => _modules.GetEnumerator();

@@ -30,36 +30,56 @@ public sealed record GptConfig(string Vocabulary, int Context = 64, int Dim = 96
         ?? throw new InvalidDataException($"Invalid model config {ConfigPath(weightsPath)}.");
 }
 
-/// <summary>Sampling settings for <see cref="CharGpt.Generate"/>.</summary>
-/// <param name="Length">Characters to generate.</param>
+/// <summary>Sampling and execution settings for <see cref="CharGpt.Generate"/>.</summary>
+/// <param name="Length">Characters to generate per sample.</param>
 /// <param name="Temperature">Softmax temperature: below 1 is more conservative, above 1 more random.</param>
 /// <param name="TopK">Sample only among the k most likely characters (0 = all).</param>
 /// <param name="Seed">Random seed for reproducible output (null = random).</param>
-public sealed record GenerationSettings(int Length = 200, float Temperature = 0.7f, int TopK = 0, int? Seed = null);
+/// <param name="Samples">Independent continuations generated together as one batch (1-64).</param>
+/// <param name="UseCache">Incremental decoding with a KV cache (false = recompute the whole window every step).</param>
+/// <param name="UseGraph">Record the decoding step once and replay it (CUDA Graphs on GPU); needs the cache.</param>
+/// <param name="ChunkSize">Tokens generated between host synchronizations when streaming (larger = faster, less live).</param>
+public sealed record GenerationSettings(
+    int Length = 200, float Temperature = 0.7f, int TopK = 0, int? Seed = null, int Samples = 1,
+    bool UseCache = true, bool UseGraph = true, int ChunkSize = 16);
 
 /// <summary>A likely alternative for one position.</summary>
 public sealed record Alternative(string Token, float Probability);
 
-/// <summary>One generated character with its probability, the distribution's entropy (bits), the top alternatives and its latency.</summary>
-public sealed record GeneratedToken(int Index, string Token, float Probability, float Entropy, IReadOnlyList<Alternative> Alternatives, double LatencyMs);
+/// <summary>One generated character of one sample, with its probability, the distribution's entropy (bits), top alternatives and latency.</summary>
+public sealed record GeneratedToken(int Sample, int Index, string Token, float Probability, float Entropy, IReadOnlyList<Alternative> Alternatives, double LatencyMs);
 
-/// <summary>Aggregate inference metrics.</summary>
+/// <summary>One generated continuation.</summary>
+public sealed record GeneratedSequence(int Sample, string Text, IReadOnlyList<GeneratedToken> Tokens);
+
+/// <summary>Aggregate inference metrics (throughput counts every sample's characters).</summary>
 public sealed record GenerationMetrics(
     string Device,
+    string Mode,
+    bool GraphRecorded,
+    string? GraphNote,
+    int Samples,
     int PromptTokens,
     int GeneratedTokens,
+    int TotalTokens,
     double TotalMs,
     double FirstTokenMs,
     double MsPerToken,
+    double MsPerStep,
     double TokensPerSecond,
     double AverageProbability,
     double Perplexity,
     double AverageEntropyBits,
+    int ContextResets,
     long MemoryInUseBytes,
     long MemoryCachedBytes);
 
 /// <summary>The output of a generation call.</summary>
-public sealed record GenerationResult(string Prompt, string Text, IReadOnlyList<GeneratedToken> Tokens, GenerationMetrics Metrics);
+public sealed record GenerationResult(string Prompt, IReadOnlyList<GeneratedSequence> Samples, GenerationMetrics Metrics)
+{
+    /// <summary>The first sample's text.</summary>
+    public string Text => Samples[0].Text;
+}
 
 /// <summary>
 /// A decoder-only character-level transformer: embeddings + sinusoidal positions → causal transformer blocks →
@@ -132,95 +152,187 @@ public sealed class CharGpt : IDisposable
     public List<int> Encode(string text) => [.. text.Where(_index.ContainsKey).Select(c => _index[c])];
 
     /// <summary>
-    /// Generates text autoregressively: each step feeds the last Context characters, turns the final position's
-    /// logits into probabilities (temperature, optional top-k), samples one character and reports it.
+    /// Generates <see cref="GenerationSettings.Samples"/> continuations of <paramref name="prompt"/>. With the cache,
+    /// the prompt is processed once (prefill) and each step then processes only the newest character per sample;
+    /// sampling runs on the model's device, so on a GPU the loop runs ahead without waiting for the host except
+    /// every <see cref="GenerationSettings.ChunkSize"/> tokens (to report progress) and when the context window is
+    /// full (it then re-reads the last half of the window). <paramref name="onToken"/> receives tokens chunk by chunk.
     /// </summary>
     public GenerationResult Generate(string prompt, GenerationSettings settings, Action<GeneratedToken>? onToken = null, CancellationToken cancellationToken = default)
     {
-        var random = settings.Seed is { } seed ? new Random(seed) : new Random();
-        var ids = Encode(prompt);
-        int promptTokens = ids.Count;
-        if (ids.Count == 0)
+        int samples = Math.Clamp(settings.Samples, 1, 64), length = Math.Max(settings.Length, 1);
+        uint seed = (uint)(settings.Seed ?? Random.Shared.Next());
+        var promptIds = Encode(prompt);
+        int promptTokens = promptIds.Count;
+        if (promptIds.Count == 0)
         {
-            ids.Add(_index.GetValueOrDefault(' '));
+            promptIds.Add(_index.GetValueOrDefault(' '));
         }
 
-        var tokens = new List<GeneratedToken>(settings.Length);
-        var text = new StringBuilder();
-        var total = Stopwatch.StartNew();
-        double firstTokenMs = 0, logProbabilitySum = 0, probabilitySum = 0, entropySum = 0;
-        float inverseTemperature = 1f / Math.Max(settings.Temperature, 1e-3f);
-        for (int i = 0; i < settings.Length && !cancellationToken.IsCancellationRequested; i++)
+        var history = Enumerable.Range(0, samples).Select(_ => new List<int>(promptIds)).ToArray();
+        var tokens = Enumerable.Range(0, samples).Select(_ => new List<GeneratedToken>(length)).ToArray();
+        using var sampler = new TokenSampler(Device, samples, Config.Vocabulary.Length, length)
         {
-            long start = Stopwatch.GetTimestamp();
-            float[] probabilities;
-            using (var scope = new TensorScope())
+            Temperature = settings.Temperature,
+            TopK = settings.TopK,
+            Seed = seed,
+        };
+
+        var clock = Stopwatch.StartNew();
+        double firstTokenMs = 0, lastChunkMs = 0;
+        int emitted = 0, resets = 0;
+        bool graphRecorded = false;
+        string? graphNote = null;
+
+        // Downloads the statistics of steps [emitted, produced) (one synchronization) and reports them.
+        void Flush(int produced)
+        {
+            if (produced <= emitted)
             {
-                var window = ids.Skip(Math.Max(0, ids.Count - Config.Context)).Select(id => (float)id).ToArray();
-                var input = Tensor.From(window, [1, window.Length], Device);
-                var logits = Model.Predict(input);
-                probabilities = (logits.Narrow(1, window.Length - 1, 1).Reshape(-1) * inverseTemperature).Softmax().ToArray();
+                return;
             }
 
-            if (settings.TopK > 0 && settings.TopK < probabilities.Length)
+            var chunk = sampler.Read(emitted, produced);
+            double now = clock.Elapsed.TotalMilliseconds;
+            double perStep = (now - lastChunkMs) / chunk.Length;
+            lastChunkMs = now;
+            for (int s = 0; s < chunk.Length; s++)
             {
-                float cutoff = probabilities.OrderDescending().ElementAt(settings.TopK - 1);
-                float kept = 0;
-                for (int c = 0; c < probabilities.Length; c++)
+                for (int r = 0; r < samples; r++)
                 {
-                    probabilities[c] = probabilities[c] >= cutoff ? probabilities[c] : 0f;
-                    kept += probabilities[c];
-                }
-
-                for (int c = 0; c < probabilities.Length; c++)
-                {
-                    probabilities[c] /= kept;
+                    var t = chunk[s][r];
+                    history[r].Add(t.Id);
+                    var token = new GeneratedToken(r, emitted + s, Config.Vocabulary[t.Id].ToString(), t.Probability, t.Entropy,
+                        [.. t.Alternatives.Where(a => a.Id >= 0).Select(a => new Alternative(Config.Vocabulary[a.Id].ToString(), a.Probability))],
+                        emitted + s == 0 ? firstTokenMs : perStep);
+                    tokens[r].Add(token);
+                    onToken?.Invoke(token);
                 }
             }
 
-            int next = Sample(probabilities, random);
-            ids.Add(next);
-            double entropy = -probabilities.Where(p => p > 0).Sum(p => p * Math.Log2(p));
-            var alternatives = probabilities.Select((p, c) => new Alternative(Config.Vocabulary[c].ToString(), p))
-                .OrderByDescending(a => a.Probability).Take(5).ToList();
-            double latency = Stopwatch.GetElapsedTime(start).TotalMilliseconds;
-            if (i == 0)
-            {
-                firstTokenMs = latency;
-            }
-
-            var token = new GeneratedToken(i, Config.Vocabulary[next].ToString(), probabilities[next], (float)entropy, alternatives, latency);
-            tokens.Add(token);
-            text.Append(token.Token);
-            logProbabilitySum += Math.Log(Math.Max(probabilities[next], 1e-12f));
-            probabilitySum += probabilities[next];
-            entropySum += entropy;
-            onToken?.Invoke(token);
+            emitted = produced;
         }
 
-        total.Stop();
-        int n = Math.Max(tokens.Count, 1);
+        Tensor Window(int keep)
+        {
+            var window = new float[samples * keep];
+            for (int r = 0; r < samples; r++)
+            {
+                var h = history[r];
+                for (int t = 0; t < keep; t++)
+                {
+                    window[r * keep + t] = h[h.Count - keep + t];
+                }
+            }
+
+            return Tensor.From(window, [samples, keep], Device);
+        }
+
+        using (Autograd.NoGrad())
+        {
+            if (!settings.UseCache)
+            {
+                // Reference path: recompute the whole window every step (O(steps²) attention, one sync per step).
+                for (int step = 0; step < length && !cancellationToken.IsCancellationRequested; step++)
+                {
+                    using var scope = new TensorScope();
+                    var logits = Model.Predict(Window(Math.Min(history[0].Count, Config.Context)));
+                    sampler.Sample(logits);
+                    if (step == 0)
+                    {
+                        sampler.Read(0, 1);
+                        firstTokenMs = clock.Elapsed.TotalMilliseconds;
+                    }
+
+                    Flush(step + 1);
+                }
+            }
+            else
+            {
+                Model.Eval();
+                using var context = new DecodingContext(Device, samples, Config.Context);
+                ComputeGraph? graph = null;
+                void Step()
+                {
+                    var logits = Model.ForwardCached(sampler.Ids.Reshape(samples, 1), context);
+                    sampler.Sample(logits);
+                }
+
+                void Prefill(int keep)
+                {
+                    using var scope = new TensorScope();
+                    context.Reset();
+                    sampler.Sample(Model.ForwardCached(Window(keep), context));
+                }
+
+                try
+                {
+                    Prefill(Math.Min(history[0].Count, Config.Context - 1));
+                    sampler.Read(0, 1);   // synchronize once: time to first token
+                    firstTokenMs = clock.Elapsed.TotalMilliseconds;
+                    int produced = 1;
+                    for (; produced < length && !cancellationToken.IsCancellationRequested; produced++)
+                    {
+                        if (context.Length >= Config.Context)
+                        {
+                            // Window full: fetch pending tokens, then re-read the last half of each sequence.
+                            Flush(produced);
+                            Prefill(Config.Context / 2);
+                            resets++;
+                            continue;
+                        }
+
+                        if (graph is null && settings.UseGraph)
+                        {
+                            graph = context.CaptureStep(Step);
+                            graphRecorded = graph.IsRecorded;
+                            graphNote = graph.IsRecorded ? "decode step recorded as a CUDA graph"
+                                : Device.Type == DeviceType.Cpu ? "graphs are GPU-only; CPU runs the step directly"
+                                : $"graph recording failed, using normal launches: {graph.FailureReason}";
+                        }
+
+                        if (graph is not null)
+                        {
+                            context.ReplayStep(graph);
+                        }
+                        else
+                        {
+                            using var scope = new TensorScope();
+                            Step();
+                        }
+
+                        if (onToken is not null && (produced + 1) % Math.Max(settings.ChunkSize, 1) == 0)
+                        {
+                            Flush(produced + 1);
+                        }
+                    }
+
+                    Flush(produced);
+                }
+                finally
+                {
+                    graph?.Dispose();
+                }
+            }
+
+            Flush(Math.Max(emitted, tokens[0].Count));
+        }
+
+        Device.Synchronize();
+        clock.Stop();
+        var all = tokens.SelectMany(t => t).ToList();
+        int generated = tokens[0].Count, n = Math.Max(all.Count, 1);
+        double totalMs = clock.Elapsed.TotalMilliseconds;
         var memory = ComputeResources.GetMemoryUsage(Device);
+        string mode = !settings.UseCache ? "full recompute (no cache)" : graphRecorded ? "KV cache + CUDA graph" : "KV cache";
         var metrics = new GenerationMetrics(
-            $"{Device} ({Device.Name})", promptTokens, tokens.Count, total.Elapsed.TotalMilliseconds, firstTokenMs,
-            total.Elapsed.TotalMilliseconds / n, tokens.Count / Math.Max(total.Elapsed.TotalSeconds, 1e-9),
-            probabilitySum / n, Math.Exp(-logProbabilitySum / n), entropySum / n, memory.InUse, memory.Cached);
-        return new GenerationResult(prompt, text.ToString(), tokens, metrics);
-    }
-
-    private static int Sample(float[] probabilities, Random random)
-    {
-        double roll = random.NextDouble(), cumulative = 0;
-        for (int c = 0; c < probabilities.Length; c++)
-        {
-            cumulative += probabilities[c];
-            if (roll < cumulative)
-            {
-                return c;
-            }
-        }
-
-        return Array.FindLastIndex(probabilities, p => p > 0);
+            $"{Device} ({Device.Name})", mode, graphRecorded, graphNote, samples, promptTokens, generated, all.Count,
+            totalMs, firstTokenMs, totalMs / Math.Max(generated, 1) / samples, (totalMs - firstTokenMs) / Math.Max(generated - 1, 1),
+            all.Count / Math.Max(totalMs / 1000, 1e-9),
+            all.Average(t => (double)t.Probability), Math.Exp(-all.Sum(t => Math.Log(Math.Max(t.Probability, 1e-12f))) / n),
+            all.Average(t => (double)t.Entropy), resets, memory.InUse, memory.Cached);
+        var sequences = tokens.Select((t, r) => new GeneratedSequence(r, string.Concat(t.Select(x => x.Token)), t)).ToList();
+        return new GenerationResult(prompt, sequences, metrics);
     }
 
     public void Dispose() => Model.Dispose();

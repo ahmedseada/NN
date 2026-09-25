@@ -29,7 +29,11 @@ internal static partial class PtxKernels
         "sgd_momentum_f32", "adam_f32", "matmul_f32",
     ];
 
-    public static string Source { get; } = Build();
+    // Built on first use (not in a static initializer): the kernels read static fields declared in the other
+    // partial files, whose initialization order relative to this file is unspecified.
+    private static readonly Lazy<string> LazySource = new(Build);
+
+    public static string Source => LazySource.Value;
 
     private static string Build()
     {
@@ -270,6 +274,7 @@ internal static partial class PtxKernels
         Sum(sb);
         MatMul(sb);
         BuildAdvanced(sb);
+        BuildDecoding(sb);
         return sb.ToString();
     }
 
@@ -290,7 +295,7 @@ internal static partial class PtxKernels
         sb.AppendLine(string.Join(",\n", parameters));
         sb.AppendLine(")");
         sb.AppendLine("{");
-        sb.AppendLine("    .reg .pred %p<8>;");
+        sb.AppendLine("    .reg .pred %p<16>;");
         sb.AppendLine("    .reg .f32 %f<32>;");
         sb.AppendLine("    .reg .b32 %r<32>;");
         sb.AppendLine("    .reg .b64 %rd<16>;");

@@ -23,6 +23,16 @@ internal sealed unsafe partial class CudaBackend : Backend
     private static IntPtr t_currentContext;
 
     private readonly IntPtr _context;
+
+    /// <summary>
+    /// All work runs on this (blocking) stream rather than the legacy default stream, because only work on an
+    /// explicit stream can be recorded into a CUDA Graph. Synchronous copies on the legacy stream still order
+    /// correctly with it.
+    /// </summary>
+    private readonly IntPtr _stream;
+
+    /// <summary>Non-null while a graph is being recorded: blocks freed during capture, owned by the graph.</summary>
+    private Dictionary<int, Stack<ulong>>? _captureFree;
     private readonly Dictionary<int, Stack<ulong>> _pool = [];
     private readonly MemoryAccountant _memory;
     private readonly int _multiprocessors;
@@ -37,6 +47,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         Check(cuDeviceGet(out int device, ordinal), nameof(cuDeviceGet));
         Check(cuDevicePrimaryCtxRetain(out _context, device), nameof(cuDevicePrimaryCtxRetain));
         MakeCurrent();
+        Check(cuStreamCreate(out _stream, 0), nameof(cuStreamCreate));
 
         byte* name = stackalloc byte[256];
         Check(cuDeviceGetName(name, 256, device), nameof(cuDeviceGetName));
@@ -81,7 +92,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         _sgdMomentum = Fn("sgd_momentum_f32");
         _adam = Fn("adam_f32");
         _matmul = Fn("matmul_f32");
-        _kernels = PtxKernels.AdvancedNames.ToDictionary(k => k, Fn);
+        _kernels = PtxKernels.AdvancedNames.Concat(PtxKernels.DecodingNames).ToDictionary(k => k, Fn);
     }
 
     public static int DeviceCount => Probe.Value.Count;
@@ -175,7 +186,13 @@ internal sealed unsafe partial class CudaBackend : Backend
         ulong pointer = 0;
         lock (_pool)
         {
-            if (_pool.TryGetValue(length, out var bucket) && bucket.Count > 0)
+            if (_captureFree is not null && _captureFree.TryGetValue(length, out var captured) && captured.Count > 0)
+            {
+                // Reuse a block freed earlier in this capture: stream order keeps the recorded uses apart.
+                pointer = captured.Pop();
+                _memory.Reused(bytes);
+            }
+            else if (_pool.TryGetValue(length, out var bucket) && bucket.Count > 0)
             {
                 pointer = bucket.Pop();
                 _memory.Reused(bytes);
@@ -195,7 +212,7 @@ internal sealed unsafe partial class CudaBackend : Backend
 
         if (zeroed && length > 0)
         {
-            Check(cuMemsetD32(pointer, 0, (nuint)length), nameof(cuMemsetD32));
+            Check(cuMemsetD32Async(pointer, 0, (nuint)length, _stream), nameof(cuMemsetD32Async));
         }
 
         return new CudaStorage(this, pointer, length);
@@ -246,9 +263,12 @@ internal sealed unsafe partial class CudaBackend : Backend
         var s = (CudaStorage)storage;
         lock (_pool)
         {
-            if (!_pool.TryGetValue(s.Length, out var bucket))
+            // While recording a graph, freed blocks belong to the graph: returning them to the shared pool would let
+            // unrelated tensors reuse memory the graph writes on every replay.
+            var target = _captureFree ?? _pool;
+            if (!target.TryGetValue(s.Length, out var bucket))
             {
-                _pool[s.Length] = bucket = new Stack<ulong>();
+                target[s.Length] = bucket = new Stack<ulong>();
             }
 
             bucket.Push(s.Pointer);
@@ -265,12 +285,14 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
     }
 
-    public override void Download(Storage source, Span<float> destination)
+    public override void Download(Storage source, Span<float> destination) => DownloadRange(source, 0, destination);
+
+    public override void DownloadRange(Storage source, int offset, Span<float> destination)
     {
         MakeCurrent();
         fixed (float* p = destination)
         {
-            Check(cuMemcpyDtoH(p, P(source), (nuint)destination.Length * sizeof(float)), nameof(cuMemcpyDtoH));
+            Check(cuMemcpyDtoH(p, P(source) + (ulong)offset * sizeof(float), (nuint)destination.Length * sizeof(float)), nameof(cuMemcpyDtoH));
         }
     }
 
@@ -279,7 +301,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void Copy(Storage x, Storage y, int n)
     {
         MakeCurrent();
-        Check(cuMemcpyDtoD(P(y), P(x), (nuint)n * sizeof(float)), nameof(cuMemcpyDtoD));
+        Check(cuMemcpyDtoDAsync(P(y), P(x), (nuint)n * sizeof(float), _stream), nameof(cuMemcpyDtoDAsync));
     }
 
     public override void Unary(UnaryOp op, Storage x, Storage y, int n)
@@ -345,7 +367,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void Sum(Storage x, Storage result, int n, float scale)
     {
         MakeCurrent();
-        Check(cuMemsetD32(P(result), 0, 1), nameof(cuMemsetD32));
+        Check(cuMemsetD32Async(P(result), 0, 1, _stream), nameof(cuMemsetD32Async));
         if (n == 0)
         {
             return;
@@ -434,7 +456,7 @@ internal sealed unsafe partial class CudaBackend : Backend
             pointers[i] = &values[i];
         }
 
-        Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, 0, IntPtr.Zero, pointers, null), nameof(cuLaunchKernel));
+        Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, 0, _stream, pointers, null), nameof(cuLaunchKernel));
     }
 
     private static ulong P(Storage s) => ((CudaStorage)s).Pointer;

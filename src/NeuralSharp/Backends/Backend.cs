@@ -78,6 +78,9 @@ internal abstract class Backend
 
     public abstract void Download(Storage source, Span<float> destination);
 
+    /// <summary>Copies destination.Length floats starting at element <paramref name="offset"/>.</summary>
+    public abstract void DownloadRange(Storage source, int offset, Span<float> destination);
+
     public abstract void Fill(Storage y, int n, float value);
 
     public abstract void Copy(Storage x, Storage y, int n);
@@ -214,6 +217,70 @@ internal abstract class Backend
     public abstract void DropoutBackward(Storage dy, Storage dx, int n, float p, uint seed);
 
     public abstract void Synchronize();
+
+    // ---------------------------------------------------------------- fused inference kernels
+
+    /// <summary>y[r, :] = softmax(scale * x[r, :] + mask[r % maskRows, :]) (mask optional).</summary>
+    public abstract void ScaleMaskSoftmax(Storage x, Storage? mask, Storage y, int rows, int cols, int maskRows, float scale);
+
+    /// <summary>y[r, :] = (x[r, :] - mean) / sqrt(var + eps) * gamma + beta over the last dimension.</summary>
+    public abstract void LayerNormFused(Storage x, Storage gamma, Storage beta, Storage y, int rows, int cols, float eps);
+
+    /// <summary>y[i] = gelu(x[i] + bias[i % cols]).</summary>
+    public abstract void BiasGelu(Storage x, Storage bias, Storage y, int n, int cols);
+
+    // ---------------------------------------------------------------- incremental decoding (positions live on the device)
+
+    /// <summary>mask[i, j] = j ≤ position + i ? 0 : -1e9 for a [rows, capacity] mask; position is read from device memory.</summary>
+    public abstract void DecoderMask(Storage position, Storage mask, int rows, int capacity);
+
+    /// <summary>cache[bh, position + t, :] = source[bh, t, :] for [heads, steps, dim] → [heads, capacity, dim].</summary>
+    public abstract void KeyValueWrite(Storage source, Storage cache, Storage position, int heads, int steps, int capacity, int dim);
+
+    /// <summary>
+    /// Draws one token per row from softmax(logits / temperature), optionally restricted to the top-k scores, using
+    /// the counter-based random stream (seed, step, row). Writes the token to ids[row] and 13 statistics to
+    /// stats[(step * rows + row) * 13]: id, probability, entropy (bits), then the top-5 (id, probability) pairs.
+    /// The step number is read from device memory. Row r's logits start at element r * rowStride + rowOffset.
+    /// </summary>
+    public abstract void SampleRows(Storage logits, Storage ids, Storage stats, Storage step, int rows, int vocabulary,
+        int rowStride, int rowOffset, float temperature, int topK, uint seed);
+
+    // ---------------------------------------------------------------- graphs
+
+    /// <summary>Whether this device can record and replay work as a graph.</summary>
+    public virtual bool SupportsGraphs => false;
+
+    /// <summary>Starts recording all subsequent work on this device instead of running it.</summary>
+    public virtual void BeginCapture() => throw new NotSupportedException();
+
+    /// <summary>Stops recording and returns a replayable graph plus the device blocks it owns.</summary>
+    public virtual (IntPtr Executable, IntPtr Graph, List<Storage> Owned) EndCapture() => throw new NotSupportedException();
+
+    /// <summary>Stops recording after a failure, discarding the partial graph.</summary>
+    public virtual List<Storage> AbortCapture() => [];
+
+    public virtual void ReplayGraph(IntPtr executable) => throw new NotSupportedException();
+
+    public virtual void DestroyGraph(IntPtr executable, IntPtr graph)
+    {
+    }
+}
+
+/// <summary>Stateless counter-based random numbers shared by every backend (the sampler's random stream).</summary>
+internal static class CounterRandom
+{
+    /// <summary>A uniform float in [0, 1) from (seed, step, row) via the MurmurHash3 finalizer.</summary>
+    public static float Uniform(uint seed, uint step, uint row)
+    {
+        uint h = seed ^ (step * 0x9E3779B9u) ^ (row * 0x85EBCA6Bu);
+        h ^= h >> 16;
+        h *= 0x85EBCA6Bu;
+        h ^= h >> 13;
+        h *= 0xC2B2AE35u;
+        h ^= h >> 16;
+        return (h >> 8) * (1f / 16777216f);
+    }
 }
 
 /// <summary>

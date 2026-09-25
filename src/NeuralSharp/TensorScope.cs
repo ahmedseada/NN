@@ -48,6 +48,24 @@ public sealed class TensorScope : IDisposable
         return tensor;
     }
 
+    /// <summary>
+    /// Closes the scope without disposing its tensors and hands them to the caller, who becomes responsible for them
+    /// (used by <see cref="ComputeGraph"/>, whose recorded work keeps using those tensors).
+    /// </summary>
+    internal List<Tensor> Detach()
+    {
+        if (t_current != this)
+        {
+            throw new InvalidOperationException("Only the innermost TensorScope can be detached.");
+        }
+
+        _disposed = true;
+        t_current = _parent;
+        var tensors = new List<Tensor>(_tensors);
+        _tensors.Clear();
+        return tensors;
+    }
+
     /// <summary>Disposes the tensors created in this scope and restores the enclosing scope.</summary>
     public void Dispose()
     {

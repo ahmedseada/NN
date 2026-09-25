@@ -4,7 +4,7 @@ namespace NeuralSharp.Layers;
 /// Multi-head scaled dot-product self-attention over [batch, time, dim]: every position attends to every
 /// other (or only to earlier ones when <see cref="Causal"/>). Heads run as one batched matrix product.
 /// </summary>
-public sealed class MultiHeadAttention : Module
+public sealed class MultiHeadAttention : Module, ICachedModule
 {
     private readonly Linear _qkv;
     private readonly Linear _output;
@@ -60,13 +60,24 @@ public sealed class MultiHeadAttention : Module
         var q = SplitHeads(0);
         var k = SplitHeads(1);
         var v = SplitHeads(2);
-        var scores = q.MatMul(k, transposeB: true) * (1f / MathF.Sqrt(dh)); // [N·H, T, T]
-        if (Causal)
+        var raw = q.MatMul(k, transposeB: true);                           // [N·H, T, T]
+        Tensor weights;
+        if (!Autograd.IsEnabled)
         {
-            scores = scores + CausalMask(t, input.Device);
+            // Inference: scale, mask and softmax in one kernel.
+            weights = raw.ScaleMaskSoftmax(1f / MathF.Sqrt(dh), Causal ? CausalMask(t, input.Device) : null);
+        }
+        else
+        {
+            var scores = raw * (1f / MathF.Sqrt(dh));
+            if (Causal)
+            {
+                scores = scores + CausalMask(t, input.Device);
+            }
+
+            weights = scores.Softmax();
         }
 
-        var weights = scores.Softmax();
         if (_dropout is not null)
         {
             weights = _dropout.Forward(weights);
@@ -77,6 +88,33 @@ public sealed class MultiHeadAttention : Module
             .Permute(0, 2, 1, 3)
             .Reshape(n, t, Dim);
         return _output.Forward(context);
+    }
+
+    /// <summary>
+    /// Cached attention for the new positions of [batch, newSteps, dim]: their keys and values are appended to this
+    /// layer's <see cref="KeyValueCache"/>, and each new query attends to every cached position up to its own
+    /// (the causal mask comes from the context), so a decoding step costs O(capacity) instead of O(steps²).
+    /// </summary>
+    public Tensor ForwardCached(Tensor input, DecodingContext context)
+    {
+        int n = input.Shape[0], t = input.Shape[1], dh = Dim / Heads;
+        var cache = context.CacheFor(this, n * Heads, dh);
+        var qkv = _qkv.Forward(input);
+        Tensor SplitHeads(int part) => qkv.Narrow(2, part * Dim, Dim)
+            .Reshape(n, t, Heads, dh)
+            .Permute(0, 2, 1, 3)
+            .Reshape(n * Heads, t, dh);
+
+        var q = SplitHeads(0);
+        Tensor.WriteKeyValues(SplitHeads(1), cache.Keys, context.Position);
+        Tensor.WriteKeyValues(SplitHeads(2), cache.Values, context.Position);
+        var weights = q.MatMul(cache.Keys, transposeB: true)             // [N·H, t, capacity]
+            .ScaleMaskSoftmax(1f / MathF.Sqrt(dh), context.Mask);       // unwritten positions are masked out
+        var output = weights.MatMul(cache.Values)                         // [N·H, t, dh]
+            .Reshape(n, Heads, t, dh)
+            .Permute(0, 2, 1, 3)
+            .Reshape(n, t, Dim);
+        return _output.Forward(output);
     }
 
     /// <summary>[T, T] with 0 on and below the diagonal and -1e9 above, cached per length and device.</summary>
@@ -119,7 +157,7 @@ public sealed class MultiHeadAttention : Module
 /// One pre-norm transformer encoder block over [batch, time, dim]:
 /// x + Attention(LayerNorm(x)), then x + FeedForward(LayerNorm(x)) with a GELU feed-forward of width ffDim.
 /// </summary>
-public sealed class TransformerEncoderLayer : Module
+public sealed class TransformerEncoderLayer : Module, ICachedModule
 {
     private readonly LayerNorm _norm1;
     private readonly MultiHeadAttention _attention;
@@ -155,9 +193,22 @@ public sealed class TransformerEncoderLayer : Module
     {
         var attended = _attention.Forward(_norm1.Forward(input));
         var x = input + (_dropout?.Forward(attended) ?? attended);
-        var hidden = _feedForward2.Forward(_feedForward1.Forward(_norm2.Forward(x)).Gelu());
+        var hidden = _feedForward2.Forward(FeedForwardHidden(_norm2.Forward(x)));
         return x + (_dropout?.Forward(hidden) ?? hidden);
     }
+
+    /// <inheritdoc />
+    public Tensor ForwardCached(Tensor input, DecodingContext context)
+    {
+        var x = input + _attention.ForwardCached(_norm1.Forward(input), context);
+        return x + _feedForward2.Forward(FeedForwardHidden(_norm2.Forward(x)));
+    }
+
+    /// <summary>GELU(x·W1 + b1); fused into one kernel (plus the product) during inference.</summary>
+    private Tensor FeedForwardHidden(Tensor x) =>
+        !Autograd.IsEnabled && _feedForward1.Bias is { } bias
+            ? x.MatMul(_feedForward1.Weight).BiasGelu(bias)
+            : _feedForward1.Forward(x).Gelu();
 
     /// <inheritdoc />
     public override IEnumerable<Module> Children() =>
@@ -173,7 +224,7 @@ public sealed class TransformerEncoderLayer : Module
 /// Adds fixed sinusoidal position information to [batch, time, dim] embeddings, so attention can tell
 /// positions apart. Supports sequences up to <see cref="MaxLength"/>.
 /// </summary>
-public sealed class PositionalEncoding : Module
+public sealed class PositionalEncoding : Module, ICachedModule
 {
     private Tensor _table;
 
@@ -212,6 +263,10 @@ public sealed class PositionalEncoding : Module
 
         return input + (t == MaxLength ? _table : _table.Narrow(0, 0, t));
     }
+
+    /// <inheritdoc />
+    public Tensor ForwardCached(Tensor input, DecodingContext context) =>
+        input + _table.EmbeddingLookup(context.Positions ?? throw new InvalidOperationException("Call DecodingContext.BeginStep first."));
 
     /// <inheritdoc />
     protected internal override void MoveTo(Device device) => _table = MoveTensor(_table, device);

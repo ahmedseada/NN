@@ -45,13 +45,18 @@ public sealed record ModelInfo(
 
 /// <summary>A text-generation request. Omitted fields use the defaults shown.</summary>
 /// <param name="Prompt">Text to continue.</param>
-/// <param name="Length">Characters to generate (1-2000).</param>
+/// <param name="Length">Characters to generate per sample (1-2000).</param>
 /// <param name="Temperature">Sampling temperature (0.05-3): lower is more predictable, higher more varied.</param>
 /// <param name="TopK">Sample only among the k most likely characters; 0 uses all.</param>
 /// <param name="Seed">Random seed for reproducible output; null for random.</param>
 /// <param name="Device">"cpu", "cuda" or "cuda:N"; null keeps the current device.</param>
+/// <param name="Samples">Independent continuations generated together as one batch (1-32).</param>
+/// <param name="UseCache">Incremental decoding with a KV cache; false recomputes the whole window every step (for comparison).</param>
+/// <param name="UseGraph">Record the decoding step once and replay it as a CUDA graph (GPU only; needs the cache).</param>
+/// <param name="ChunkSize">Characters generated between synchronizations when streaming (1-128): larger is faster, smaller is more live.</param>
 public sealed record GenerateRequest(
-    string Prompt = "the little robot ", int Length = 200, float Temperature = 0.7f, int TopK = 0, int? Seed = null, string? Device = null);
+    string Prompt = "the little robot ", int Length = 200, float Temperature = 0.7f, int TopK = 0, int? Seed = null, string? Device = null,
+    int Samples = 1, bool UseCache = true, bool UseGraph = true, int ChunkSize = 16);
 
 /// <summary>
 /// Owns the model: loads it (or trains one in the background when none is saved), serializes access
@@ -237,7 +242,11 @@ public sealed class GptService(IConfiguration configuration, ILogger<GptService>
             Length: Math.Clamp(request.Length, 1, 2000),
             Temperature: Math.Clamp(request.Temperature, 0.05f, 3f),
             TopK: Math.Clamp(request.TopK, 0, gpt.Config.Vocabulary.Length),
-            Seed: request.Seed);
+            Seed: request.Seed,
+            Samples: Math.Clamp(request.Samples, 1, 32),
+            UseCache: request.UseCache,
+            UseGraph: request.UseGraph,
+            ChunkSize: Math.Clamp(request.ChunkSize, 1, 128));
         return gpt;
     }
 
