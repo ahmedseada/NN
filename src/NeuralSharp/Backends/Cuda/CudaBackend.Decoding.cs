@@ -28,9 +28,17 @@ internal sealed unsafe partial class CudaBackend
     }
 
     public override void SampleRows(Storage logits, Storage ids, Storage stats, Storage step, int rows, int vocabulary,
-        int rowStride, int rowOffset, float temperature, int topK, uint seed) =>
+        int rowStride, int rowOffset, float temperature, int topK, float topP, float minP, uint seed) =>
         Launch1D(K("sample_rows_f32"), rows, P(logits), P(ids), P(stats), P(step),
-            U(vocabulary), U(rowStride), U(rowOffset), F(1f / MathF.Max(temperature, 1e-3f)), U(topK), seed, U(rows), U(rows));
+            U(vocabulary), U(rowStride), U(rowOffset), F(1f / MathF.Max(temperature, 1e-3f)), U(topK), F(topP), F(minP), seed, U(rows), U(rows));
+
+    public override void PenalizeRows(Storage logits, Storage work, Storage history, Storage length, int rows, int vocabulary,
+        int rowStride, int rowOffset, int capacity, int lastN, float repeat, float presence, float frequency) =>
+        Launch1D(K("penalize_rows_f32"), rows, P(logits), P(work), P(history), P(length),
+            U(vocabulary), U(rowStride), U(rowOffset), U(capacity), U(Math.Min(lastN, capacity)), F(repeat), F(presence), F(frequency), U(rows));
+
+    public override void HistoryPush(Storage ids, Storage history, Storage length, int rows, int capacity) =>
+        Launch1D(K("history_push_f32"), rows, P(ids), P(history), P(length), U(capacity), U(rows));
 
     public override bool SupportsGraphs => true;
 

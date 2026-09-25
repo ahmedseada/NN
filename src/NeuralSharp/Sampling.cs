@@ -18,16 +18,69 @@ public sealed class TokenSampler : IDisposable
     private const int StatsPerToken = 13;
     private readonly Tensor _stats;
     private readonly Tensor _step;
+    private readonly Tensor _history;
+    private readonly Tensor _historyLength;
+    private readonly Tensor _work;
 
     /// <summary>Creates a sampler for <paramref name="rows"/> sequences over <paramref name="vocabulary"/> tokens, for up to <paramref name="maxSteps"/> steps.</summary>
-    public TokenSampler(Device device, int rows, int vocabulary, int maxSteps)
+    /// <param name="device">Where sampling runs (the logits' device).</param>
+    /// <param name="rows">Sequences sampled per step.</param>
+    /// <param name="vocabulary">Vocabulary size.</param>
+    /// <param name="maxSteps">Capacity of the per-token statistics buffer.</param>
+    /// <param name="historyCapacity">Tokens remembered per row for repetition penalties (the largest usable <see cref="RepeatLastN"/>).</param>
+    public TokenSampler(Device device, int rows, int vocabulary, int maxSteps, int historyCapacity = 256)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(historyCapacity);
         Rows = rows;
         Vocabulary = vocabulary;
         MaxSteps = maxSteps;
+        HistoryCapacity = historyCapacity;
         Ids = Tensor.Persistent(new float[rows], [rows], device, requiresGrad: false);
         _stats = Tensor.Persistent(new float[maxSteps * rows * StatsPerToken], [maxSteps, rows, StatsPerToken], device, requiresGrad: false);
         _step = Tensor.Persistent([0f], [1], device, requiresGrad: false);
+        _history = Tensor.Persistent(new float[rows * historyCapacity], [rows, historyCapacity], device, requiresGrad: false);
+        _historyLength = Tensor.Persistent([0f], [1], device, requiresGrad: false);
+        _work = Tensor.Persistent(new float[rows * vocabulary], [rows, vocabulary], device, requiresGrad: false);
+    }
+
+    /// <summary>Tokens remembered per row for repetition penalties.</summary>
+    public int HistoryCapacity { get; }
+
+    /// <summary>Nucleus sampling: keep the smallest set of most likely tokens holding this share of the probability (1 = off).</summary>
+    public float TopP { get; set; } = 1f;
+
+    /// <summary>Keep only tokens at least this fraction as likely as the most likely one (0 = off).</summary>
+    public float MinP { get; set; }
+
+    /// <summary>Divides positive (multiplies negative) scores of tokens seen in the last <see cref="RepeatLastN"/> tokens (1 = off).</summary>
+    public float RepeatPenalty { get; set; } = 1f;
+
+    /// <summary>How many recent tokens the penalties look at (at most <see cref="HistoryCapacity"/>; 0 disables penalties).</summary>
+    public int RepeatLastN { get; set; } = 64;
+
+    /// <summary>Subtracted from the score of every token present in the recent window (0 = off).</summary>
+    public float PresencePenalty { get; set; }
+
+    /// <summary>Subtracted from a token's score once per occurrence in the recent window (0 = off).</summary>
+    public float FrequencyPenalty { get; set; }
+
+    /// <summary>
+    /// Sets the recent-token history of every row (e.g. the prompt), which the repetition penalties look at, and which each
+    /// sampled token then extends. Call before sampling (and not while recording a graph).
+    /// </summary>
+    public void SetHistory(IReadOnlyList<int> tokens)
+    {
+        var values = new float[Rows * HistoryCapacity];
+        for (int t = Math.Max(0, tokens.Count - HistoryCapacity); t < tokens.Count; t++)
+        {
+            for (int r = 0; r < Rows; r++)
+            {
+                values[r * HistoryCapacity + t % HistoryCapacity] = tokens[t];
+            }
+        }
+
+        _history.Load(values);
+        _historyLength.FillInPlace(tokens.Count);
     }
 
     /// <summary>Sequences sampled per step.</summary>
@@ -64,13 +117,32 @@ public sealed class TokenSampler : IDisposable
             throw new ArgumentException($"Expected [{Rows}, ..., {Vocabulary}] logits, got {Tensor.FormatShape(logits.Shape)}.");
         }
 
-        logits.Backend.SampleRows(logits.Storage, Ids.Storage, _stats.Storage, _step.Storage, Rows, Vocabulary,
-            steps * vocabulary, (steps - 1) * vocabulary, Temperature, TopK, Seed);
+        var backend = logits.Backend;
+        var source = logits.Storage;
+        int rowStride = steps * vocabulary, rowOffset = (steps - 1) * vocabulary;
+        int lastN = Math.Min(RepeatLastN, HistoryCapacity);
+        if (lastN > 0 && (RepeatPenalty != 1f || PresencePenalty != 0f || FrequencyPenalty != 0f))
+        {
+            backend.PenalizeRows(source, _work.Storage, _history.Storage, _historyLength.Storage, Rows, Vocabulary,
+                rowStride, rowOffset, HistoryCapacity, lastN, RepeatPenalty, PresencePenalty, FrequencyPenalty);
+            source = _work.Storage;
+            rowStride = vocabulary;
+            rowOffset = 0;
+        }
+
+        backend.SampleRows(source, Ids.Storage, _stats.Storage, _step.Storage, Rows, Vocabulary,
+            rowStride, rowOffset, Temperature, TopK, TopP, MinP, Seed);
+        backend.HistoryPush(Ids.Storage, _history.Storage, _historyLength.Storage, Rows, HistoryCapacity);
+        _historyLength.AddInPlace(1f);
         _step.AddInPlace(1f);
     }
 
-    /// <summary>Restarts step counting (and the random stream) from step 0.</summary>
-    public void Reset() => _step.FillInPlace(0f);
+    /// <summary>Restarts step counting (and the random stream) from step 0 and clears the penalty history.</summary>
+    public void Reset()
+    {
+        _step.FillInPlace(0f);
+        _historyLength.FillInPlace(0f);
+    }
 
     /// <summary>Downloads the statistics of steps [<paramref name="fromStep"/>, <paramref name="toStep"/>) as [step][row] tokens (one synchronization).</summary>
     public SampledToken[][] Read(int fromStep, int toStep)
@@ -104,5 +176,8 @@ public sealed class TokenSampler : IDisposable
         Ids.Dispose();
         _stats.Dispose();
         _step.Dispose();
+        _history.Dispose();
+        _historyLength.Dispose();
+        _work.Dispose();
     }
 }

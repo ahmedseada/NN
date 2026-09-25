@@ -11,6 +11,7 @@ internal static partial class Tests
         ("batched cached decoding matches sequences decoded one by one", BatchedDecoding),
         ("graph replay gives the same tokens as direct execution", GraphReplay),
         ("sampler: distribution, top-k, temperature, determinism, CPU parity", SamplerBehaviour),
+        ("sampler: top-p, min-p, repeat/presence/frequency penalties, history", SamplerFilters),
     ];
 
     private static Sequential TinyGpt(Device device, int vocabulary = 11, int dim = 16, int context = 12)
@@ -244,6 +245,84 @@ internal static partial class Tests
             var deviceIds = plain.Read(0, 1)[0].Select(t => t.Id).ToArray();
             int differences = cpuIds.Zip(deviceIds).Count(p => p.First != p.Second);
             Check(differences <= Rows / 200, $"{differences} of {Rows} samples differ between CPU and {device} (rounding only)");
+        }
+    }
+
+    private static void SamplerFilters(Device device)
+    {
+        const int Rows = 2000, V = 5;
+        float[] logits = [2f, 1f, 0f, -1f, 0.5f];     // probabilities ≈ 0.563, 0.207, 0.076, 0.028, 0.126
+        var all = new float[Rows * V];
+        for (int r = 0; r < Rows; r++)
+        {
+            logits.CopyTo(all, r * V);
+        }
+
+        using var x = Tensor.From(all, [Rows, V], device);
+        int[] Sample(TokenSampler sampler)
+        {
+            sampler.Sample(x);
+            return [.. sampler.Read(0, 1)[0].Select(t => t.Id)];
+        }
+
+        using (var topP = new TokenSampler(device, Rows, V, 1) { TopP = 0.7f, Seed = 5 })
+        {
+            var ids = Sample(topP);
+            Check(ids.All(i => i is 0 or 1), "top-p 0.7 keeps exactly the two most likely tokens (0.563 + 0.207)");
+            Check(ids.Contains(1), "top-p keeps the second token");
+        }
+
+        using (var narrow = new TokenSampler(device, Rows, V, 1) { TopP = 0.5f, Seed = 5 })
+        {
+            Check(Sample(narrow).All(i => i == 0), "top-p below the best token's probability is greedy");
+        }
+
+        using (var minP = new TokenSampler(device, Rows, V, 1) { MinP = 0.2f, Seed = 5 })
+        {
+            var ids = Sample(minP);
+            Check(ids.All(i => i is 0 or 1 or 4), "min-p 0.2 drops tokens less than 0.2 x as likely as the best");
+            Check(ids.Contains(4), "min-p keeps token 4 (ratio 0.22)");
+        }
+
+        // Penalties, greedy, one row: history [0, 0, 1].
+        using var one = Tensor.From(logits, [1, V], device);
+        int Greedy(Action<TokenSampler> configure)
+        {
+            using var sampler = new TokenSampler(device, 1, V, 1) { Temperature = 0.01f, Seed = 1 };
+            configure(sampler);
+            sampler.SetHistory([0, 0, 1]);
+            sampler.Sample(one);
+            return sampler.Read(0, 1)[0][0].Id;
+        }
+
+        Check(Greedy(s => s.RepeatPenalty = 2f) == 0, "repeat penalty 2: scores 1, 0.5, 0, -1, 0.5 -> token 0");
+        Check(Greedy(s => s.PresencePenalty = 3f) == 4, "presence penalty 3: scores -1, -2, 0, -1, 0.5 -> token 4");
+        Check(Greedy(s => { s.RepeatPenalty = 2f; s.FrequencyPenalty = 1f; }) == 4, "repeat 2 + frequency 1: scores -1, -0.5, 0, -1, 0.5 -> token 4");
+        Check(Greedy(s => { s.PresencePenalty = 3f; s.RepeatLastN = 1; }) == 0, "a window of 1 only sees token 1: token 0 stays best");
+
+        // Each sampled token joins the history: a large frequency penalty forces a new token every step.
+        using var cycle = new TokenSampler(device, 1, V, 5) { Temperature = 0.01f, FrequencyPenalty = 10f, Seed = 1 };
+        for (int step = 0; step < 5; step++)
+        {
+            cycle.Sample(one);
+        }
+
+        var sequence = cycle.Read(0, 5).Select(s => s[0].Id).ToArray();
+        Check(sequence.SequenceEqual([0, 1, 4, 2, 3]), $"history-driven penalties give 0 1 4 2 3, got {string.Join(" ", sequence)}");
+
+        if (device.Type != DeviceType.Cpu)
+        {
+            using var cpuX = Tensor.From(all, [Rows, V], Device.Cpu);
+            using var cpu = new TokenSampler(Device.Cpu, Rows, V, 1) { TopP = 0.9f, MinP = 0.05f, RepeatPenalty = 1.3f, Seed = 9 };
+            using var gpu = new TokenSampler(device, Rows, V, 1) { TopP = 0.9f, MinP = 0.05f, RepeatPenalty = 1.3f, Seed = 9 };
+            cpu.SetHistory([0, 4]);
+            gpu.SetHistory([0, 4]);
+            cpu.Sample(cpuX);
+            gpu.Sample(x);
+            var a = cpu.Read(0, 1)[0].Select(t => t.Id).ToArray();
+            var b = gpu.Read(0, 1)[0].Select(t => t.Id).ToArray();
+            int differences = a.Zip(b).Count(p => p.First != p.Second);
+            Check(differences <= Rows / 200, $"{differences} of {Rows} filtered samples differ between CPU and {device}");
         }
     }
 }

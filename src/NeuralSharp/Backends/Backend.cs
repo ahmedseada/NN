@@ -238,13 +238,27 @@ internal abstract class Backend
     public abstract void KeyValueWrite(Storage source, Storage cache, Storage position, int heads, int steps, int capacity, int dim);
 
     /// <summary>
-    /// Draws one token per row from softmax(logits / temperature), optionally restricted to the top-k scores, using
-    /// the counter-based random stream (seed, step, row). Writes the token to ids[row] and 13 statistics to
-    /// stats[(step * rows + row) * 13]: id, probability, entropy (bits), then the top-5 (id, probability) pairs.
-    /// The step number is read from device memory. Row r's logits start at element r * rowStride + rowOffset.
+    /// Draws one token per row from softmax(logits / temperature), restricted in turn to the top-k scores (topK &gt; 0),
+    /// to the smallest set holding topP of the probability (0 &lt; topP &lt; 1; the cut-off is found by bisection on the
+    /// score) and to tokens at least minP times as likely as the best one (minP &gt; 0), using the counter-based random
+    /// stream (seed, step, row). Writes the token to ids[row] and 13 statistics to stats[(step * rows + row) * 13]:
+    /// id, probability, entropy (bits), then the top-5 (id, probability) pairs. The step number is read from device
+    /// memory. Row r's logits start at element r * rowStride + rowOffset.
     /// </summary>
     public abstract void SampleRows(Storage logits, Storage ids, Storage stats, Storage step, int rows, int vocabulary,
-        int rowStride, int rowOffset, float temperature, int topK, uint seed);
+        int rowStride, int rowOffset, float temperature, int topK, float topP, float minP, uint seed);
+
+    /// <summary>
+    /// Copies each row's logits (row r at r * rowStride + rowOffset) to work[r, :] and applies repetition penalties for
+    /// the last min(length, lastN) tokens of the row's history ring history[r, pos % capacity] (length read from device
+    /// memory). Each distinct token in the window is penalized once: repeat (x &gt; 0 ? x / repeat : x * repeat), then
+    /// x -= presence + frequency * (occurrences in the window).
+    /// </summary>
+    public abstract void PenalizeRows(Storage logits, Storage work, Storage history, Storage length, int rows, int vocabulary,
+        int rowStride, int rowOffset, int capacity, int lastN, float repeat, float presence, float frequency);
+
+    /// <summary>history[r, length % capacity] = ids[r] for every row (length read from device memory, not advanced).</summary>
+    public abstract void HistoryPush(Storage ids, Storage history, Storage length, int rows, int capacity);
 
     // ---------------------------------------------------------------- graphs
 

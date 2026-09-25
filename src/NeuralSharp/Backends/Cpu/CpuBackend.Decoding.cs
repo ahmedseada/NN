@@ -112,7 +112,7 @@ internal sealed partial class CpuBackend
     }
 
     public override void SampleRows(Storage logits, Storage ids, Storage stats, Storage step, int rows, int vocabulary,
-        int rowStride, int rowOffset, float temperature, int topK, uint seed)
+        int rowStride, int rowOffset, float temperature, int topK, float topP, float minP, uint seed)
     {
         float[] lv = D(logits), iv = D(ids), sv = D(stats);
         uint stepNumber = (uint)D(step)[0];
@@ -147,6 +147,45 @@ internal sealed partial class CpuBackend
 
                     threshold = next;
                 }
+            }
+
+            // Min-p: keep tokens at least minP times as likely as the best: s >= max + ln(minP).
+            if (minP > 0f)
+            {
+                threshold = MathF.Max(threshold, max + MathF.Log(minP));
+            }
+
+            // Top-p (nucleus): the highest cut-off whose kept mass is still >= topP of the total, by bisection.
+            if (topP > 0f && topP < 1f)
+            {
+                float total = 0f;
+                foreach (float v in z)
+                {
+                    float s = v * invT;
+                    total += s >= threshold ? MathF.Exp(s - max) : 0f;
+                }
+
+                float goal = total * topP, lo = MathF.Max(max - 40f, threshold), hi = max;
+                for (int it = 0; it < 24; it++)
+                {
+                    float mid = (lo + hi) * 0.5f, mass = 0f;
+                    foreach (float v in z)
+                    {
+                        float s = v * invT;
+                        mass += s >= threshold && s >= mid ? MathF.Exp(s - max) : 0f;
+                    }
+
+                    if (mass >= goal)
+                    {
+                        lo = mid;
+                    }
+                    else
+                    {
+                        hi = mid;
+                    }
+                }
+
+                threshold = lo;
             }
 
             float sum = 0f;
@@ -203,6 +242,52 @@ internal sealed partial class CpuBackend
                 sv[o + 3 + 2 * a] = best;
                 sv[o + 4 + 2 * a] = best < 0 ? 0f : e[best] / sum;
             }
+        }
+    }
+    public override void PenalizeRows(Storage logits, Storage work, Storage history, Storage length, int rows, int vocabulary,
+        int rowStride, int rowOffset, int capacity, int lastN, float repeat, float presence, float frequency)
+    {
+        float[] lv = D(logits), wv = D(work), hv = D(history);
+        uint len = (uint)D(length)[0];
+        int n = (int)Math.Min(len, (uint)Math.Min(lastN, capacity));
+        for (int r = 0; r < rows; r++)
+        {
+            var w = wv.AsSpan(r * vocabulary, vocabulary);
+            lv.AsSpan(r * rowStride + rowOffset, vocabulary).CopyTo(w);
+            for (int k = 0; k < n; k++)
+            {
+                int id = (int)hv[r * capacity + (int)((len - 1 - (uint)k) % (uint)capacity)];
+                bool seenMoreRecently = false;
+                int count = 0;
+                for (int q = 0; q < n; q++)
+                {
+                    int other = (int)hv[r * capacity + (int)((len - 1 - (uint)q) % (uint)capacity)];
+                    if (other == id)
+                    {
+                        count++;
+                        seenMoreRecently |= q < k;
+                    }
+                }
+
+                if (seenMoreRecently || (uint)id >= (uint)vocabulary)
+                {
+                    continue;
+                }
+
+                float x = w[id];
+                x = x > 0f ? x / repeat : x * repeat;
+                w[id] = x - presence - frequency * count;
+            }
+        }
+    }
+
+    public override void HistoryPush(Storage ids, Storage history, Storage length, int rows, int capacity)
+    {
+        float[] iv = D(ids), hv = D(history);
+        uint len = (uint)D(length)[0];
+        for (int r = 0; r < rows; r++)
+        {
+            hv[r * capacity + (int)(len % (uint)capacity)] = iv[r];
         }
     }
 }

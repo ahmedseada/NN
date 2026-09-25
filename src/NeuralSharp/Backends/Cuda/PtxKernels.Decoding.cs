@@ -8,6 +8,7 @@ internal static partial class PtxKernels
     public static readonly string[] DecodingNames =
     [
         "scale_mask_softmax_f32", "layernorm_fused_f32", "bias_gelu_f32", "decoder_mask_f32", "kv_write_f32", "sample_rows_f32",
+        "penalize_rows_f32", "history_push_f32",
     ];
 
     private const string PosInf = "0f7F800000";
@@ -216,6 +217,46 @@ internal static partial class PtxKernels
             add.u32 %r7, %r7, 1;
             bra TK;
             THR_DONE:
+            setp.gt.f32 %p7, %s_minp, {Zero};
+            @!%p7 bra MINP_DONE;
+            lg2.approx.ftz.f32 %f19, %s_minp;
+            mul.f32 %f19, %f19, {F(0.6931471805599453f)};
+            add.f32 %f19, %f19, %f1;
+            max.f32 %f3, %f3, %f19;
+            MINP_DONE:
+            setp.lt.f32 %p7, %s_topp, {One};
+            setp.gt.and.f32 %p7, %s_topp, {Zero}, %p7;
+            @!%p7 bra TOPP_DONE;
+            mov.f32 %f20, {Zero};
+            """);
+        body.AppendLine(VocabularyLoop("TPM", "add.f32 %f20, %f20, %f5;"));
+        body.AppendLine($"""
+            mul.f32 %f20, %f20, %s_topp;
+            sub.f32 %f21, %f1, {F(40f)};
+            max.f32 %f21, %f21, %f3;
+            mov.f32 %f22, %f1;
+            mov.u32 %r19, 0;
+            BIS:
+            setp.ge.u32 %p8, %r19, 24;
+            @%p8 bra BIS_END;
+            add.f32 %f23, %f21, %f22;
+            mul.f32 %f23, %f23, {F(0.5f)};
+            mov.f32 %f24, {Zero};
+            """);
+        body.AppendLine(VocabularyLoop("TPB", $"""
+            setp.ge.f32 %p9, %f2, %f23;
+            selp.f32 %f25, %f5, {Zero}, %p9;
+            add.f32 %f24, %f24, %f25;
+            """));
+        body.AppendLine($"""
+            setp.ge.f32 %p9, %f24, %f20;
+            selp.f32 %f21, %f23, %f21, %p9;
+            selp.f32 %f22, %f22, %f23, %p9;
+            add.u32 %r19, %r19, 1;
+            bra BIS;
+            BIS_END:
+            mov.f32 %f3, %f21;
+            TOPP_DONE:
             mov.f32 %f6, {Zero};
             """);
         body.AppendLine(VocabularyLoop("PSUM", "add.f32 %f6, %f6, %f5;"));
@@ -305,7 +346,103 @@ internal static partial class PtxKernels
         }
 
         Elementwise(sb, "sample_rows_f32", ["logits", "ids", "stats", "step"],
-            [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("f32", "invt"), ("u32", "topk"), ("u32", "seed"), ("u32", "rows")],
+            [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("f32", "invt"), ("u32", "topk"), ("f32", "topp"), ("f32", "minp"), ("u32", "seed"), ("u32", "rows")],
             body.ToString());
+
+        // Repetition penalties: copy the row to work[r, :], then penalize each distinct token of the last n history entries once.
+        Elementwise(sb, "penalize_rows_f32", ["logits", "work", "history", "len"],
+            [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("u32", "cap"), ("u32", "lastn"), ("f32", "repeat"), ("f32", "presence"), ("f32", "frequency"), ("u32", "rows")],
+            $"""
+            mad.lo.u32 %r5, %i, %s_rowstride, %s_rowoffset;
+            mul.wide.u32 %rd1, %r5, 4;
+            add.u64 %rd2, %b_logits, %rd1;
+            mul.lo.u32 %r6, %i, %s_vocab;
+            mul.wide.u32 %rd1, %r6, 4;
+            add.u64 %rd3, %b_work, %rd1;
+            mov.u32 %r7, 0;
+            COPY:
+            setp.ge.u32 %p1, %r7, %s_vocab;
+            @%p1 bra COPY_END;
+            mul.wide.u32 %rd4, %r7, 4;
+            add.u64 %rd5, %rd2, %rd4;
+            ld.global.f32 %f1, [%rd5];
+            add.u64 %rd5, %rd3, %rd4;
+            st.global.f32 [%rd5], %f1;
+            add.u32 %r7, %r7, 1;
+            bra COPY;
+            COPY_END:
+            ld.global.f32 %f2, [%b_len];
+            cvt.rzi.u32.f32 %r8, %f2;
+            min.u32 %r9, %r8, %s_lastn;
+            mul.lo.u32 %r10, %i, %s_cap;
+            mov.u32 %r11, 0;
+            PK:
+            setp.ge.u32 %p1, %r11, %r9;
+            @%p1 bra PK_END;
+            sub.u32 %r12, %r8, 1;
+            sub.u32 %r12, %r12, %r11;
+            rem.u32 %r12, %r12, %s_cap;
+            add.u32 %r12, %r12, %r10;
+            mul.wide.u32 %rd4, %r12, 4;
+            add.u64 %rd4, %b_history, %rd4;
+            ld.global.f32 %f3, [%rd4];
+            cvt.rzi.u32.f32 %r13, %f3;
+            mov.u32 %r14, 0;
+            mov.u32 %r15, 0;
+            mov.u32 %r16, 0;
+            PQ:
+            setp.ge.u32 %p2, %r14, %r9;
+            @%p2 bra PQ_END;
+            sub.u32 %r12, %r8, 1;
+            sub.u32 %r12, %r12, %r14;
+            rem.u32 %r12, %r12, %s_cap;
+            add.u32 %r12, %r12, %r10;
+            mul.wide.u32 %rd4, %r12, 4;
+            add.u64 %rd4, %b_history, %rd4;
+            ld.global.f32 %f4, [%rd4];
+            cvt.rzi.u32.f32 %r17, %f4;
+            setp.eq.u32 %p3, %r17, %r13;
+            @!%p3 bra PQ_NEXT;
+            add.u32 %r15, %r15, 1;
+            setp.lt.u32 %p4, %r14, %r11;
+            @%p4 mov.u32 %r16, 1;
+            PQ_NEXT:
+            add.u32 %r14, %r14, 1;
+            bra PQ;
+            PQ_END:
+            setp.ne.u32 %p5, %r16, 0;
+            @%p5 bra PK_NEXT;
+            setp.ge.u32 %p5, %r13, %s_vocab;
+            @%p5 bra PK_NEXT;
+            mul.wide.u32 %rd4, %r13, 4;
+            add.u64 %rd5, %rd3, %rd4;
+            ld.global.f32 %f5, [%rd5];
+            setp.gt.f32 %p6, %f5, {Zero};
+            div.rn.f32 %f6, %f5, %s_repeat;
+            mul.f32 %f7, %f5, %s_repeat;
+            selp.f32 %f5, %f6, %f7, %p6;
+            sub.f32 %f5, %f5, %s_presence;
+            cvt.rn.f32.u32 %f8, %r15;
+            mul.f32 %f8, %f8, %s_frequency;
+            sub.f32 %f5, %f5, %f8;
+            st.global.f32 [%rd5], %f5;
+            PK_NEXT:
+            add.u32 %r11, %r11, 1;
+            bra PK;
+            PK_END:
+            """);
+
+        // history[r, len % cap] = ids[r]
+        Elementwise(sb, "history_push_f32", ["ids", "history", "len"], [("u32", "cap"), ("u32", "rows")],
+            """
+            ld.global.f32 %f1, [%b_len];
+            cvt.rzi.u32.f32 %r5, %f1;
+            rem.u32 %r5, %r5, %s_cap;
+            mad.lo.u32 %r5, %i, %s_cap, %r5;
+            mul.wide.u32 %rd1, %r5, 4;
+            add.u64 %rd1, %b_history, %rd1;
+            ld.global.f32 %f2, [%a_ids];
+            st.global.f32 [%rd1], %f2;
+            """);
     }
 }
