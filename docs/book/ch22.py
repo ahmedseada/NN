@@ -8,14 +8,14 @@ def pipeline_svg():
     w, h = 480, 150
     boxes = [
         (8, "messages", "tools, think"), (100, "ChatTemplate", "→ prompt text"), (192, "ITokenizer", "text ⇄ ids"),
-        (284, "TextGenerator", "KV cache, sampler"), (376, "ChatOutputParser", "→ content, thinking,"),
+        (284, "TextGenerator", "KV cache, sampler"), (376, "ChatOutputParser", "content, thinking"),
     ]
     p = [f'<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
     for x, name, sub in boxes:
         p.append(f'<rect x="{x}" y="40" width="88" height="44" rx="4" fill="#e6f2ef" stroke="#0f6b5c" stroke-width="0.8"/>')
-        p.append(svg_text(x + 44, 58, name, 8.2, "#0f6b5c"))
-        p.append(svg_text(x + 44, 73, sub, 7.6, "#56606a"))
-    p.append(svg_text(420, 95, "tool calls", 7.6, "#56606a"))
+        p.append(svg_text(x + 44, 56, name, 8.2, "#0f6b5c"))
+        p.append(svg_text(x + 44, 70, sub, 7.6, "#56606a"))
+    p.append(svg_text(420, 82, "tool calls", 7.6, "#56606a"))
     for x in (96, 188, 280, 372):
         p.append(f'<path d="M{x} 62 L{x + 4} 62" stroke="#1a1f23" stroke-width="1"/><path d="M{x + 4} 59 L{x + 7} 62 L{x + 4} 65 Z" fill="#1a1f23"/>')
     p.append(svg_text(240, 20, "ChatGenerator: one request in, a stream of ChatChunks out", 8.4, "#1a1f23"))
