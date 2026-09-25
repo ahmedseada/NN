@@ -75,8 +75,8 @@ def compute_index(pdf_bytes):
     """Per-page search of chapter body text: first Part page to the first Answer Key page; at most 10 pages per term."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     texts = [p.get_text() for p in doc]
-    start = next(i for i, t in enumerate(texts) if "PART I" in t and "Foundations" in t and "Getting Started" in t and i > 2)
-    end = next(i for i, t in enumerate(texts) if "ANSWER KEY" in t and i > start)
+    start = next(i for i, t in enumerate(texts) if gen.PARTS["I"][1][:40] in t)          # the Part I title page
+    end = next(i for i, t in enumerate(texts) if i > start and t.startswith("BACK MATTER\nANSWER KEY"))
     entries = []
     for term, search in index_terms():
         short = len(search) <= 3

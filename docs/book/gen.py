@@ -168,15 +168,26 @@ def mex(title, intro, snippet, out=None, caption=None, after=None):
         parts.append(output(out))
     if after:
         parts.append(f"<p>{after}</p>")
-    return f'<div class="station mex">{"".join(parts)}</div>'
+    return f'<div class="{_cls(snippet, out)} mex">{"".join(parts)}</div>'
+
+
+LONG_LINES = 40   # stations with more code lines than this may break across pages (they cannot fit on one)
+
+
+def _cls(*texts):
+    lines = sum(t.count("\n") for t in texts if t)
+    return "station long" if lines > LONG_LINES else "station"
 
 
 def snippet(text, caption=None):
-    """A standalone code block kept on one page."""
-    return f'<div class="station">{code(text, caption)}</div>'
+    """A standalone code block, kept on one page unless it is longer than a page can hold."""
+    return f'<div class="{_cls(text)}">{code(text, caption)}</div>'
 
 
 def diagram(title, svg, caption):
+    # SVG user units are CSS px (0.75pt); draw at 4/3 so a label of size 8 prints at 8pt.
+    svg = re.sub(r'<svg width="([\d.]+)" height="([\d.]+)"',
+                 lambda m: f'<svg width="{float(m.group(1)) * 4 / 3:.0f}" height="{float(m.group(2)) * 4 / 3:.0f}"', svg, count=1)
     return f'<div class="station diagram"><div class="title">{title}</div>{svg}<div class="cap">{caption}</div></div>'
 
 
@@ -301,7 +312,7 @@ def partpage(part):
 def cpugpu(title, cpu, gpu, note=None):
     """The CPU and GPU versions of the same code, labelled, in one atomic station."""
     n = f"<p>{note}</p>" if note else ""
-    return (f'<div class="station box cpugpu"><div class="title">CPU and GPU · {title}</div>'
+    return (f'<div class="{_cls(cpu, gpu)} box cpugpu"><div class="title">CPU and GPU · {title}</div>'
             f'<div class="lbl cpu">CPU</div>{code(cpu)}<div class="lbl gpu">GPU</div>{code(gpu)}{n}</div>')
 
 

@@ -145,3 +145,5 @@ sup, sub { font-size: 7.8pt; line-height: 0; }
 .ixk { font-weight: 700; color: var(--teal); font-size: 9.6pt; break-after: avoid; margin-top: 3pt; }
 .ix { break-inside: avoid; padding-left: 8pt; text-indent: -8pt; line-height: 1.35; }
 .ixp { color: var(--muted); }
+.station.long { break-inside: auto; }
+.station.long pre { break-inside: auto; }
