@@ -154,6 +154,11 @@
   "hint": "",
   "see": "{ch:conv}"
  },
+ "Character-level model": {
+  "def": "A language model whose tokens are single characters: tiny vocabulary, no unknown words, longer sequences.",
+  "hint": "",
+  "see": "{ch:gpt}"
+ },
  "Class imbalance": {
   "def": "Some classes being much more frequent than others, which makes plain accuracy misleading.",
   "hint": "",
@@ -233,6 +238,11 @@
   "def": "A recorded sequence of GPU work replayed with a single launch; used for fast token-by-token generation.",
   "hint": "",
   "see": "{ch:generation}, {ch:cuda}"
+ },
+ "Data augmentation": {
+  "def": "Creating extra training examples by transforming existing ones (shifts, flips, noise, distortions) so the model learns to ignore those variations.",
+  "hint": "",
+  "see": "{ch:cnn}, {ch:ocr}"
  },
  "Data leakage": {
   "def": "Information from validation or test data influencing training (shared scaler statistics, duplicates, overlapping windows), making scores look better than reality.",
@@ -434,6 +444,16 @@
   "hint": "",
   "see": "{ch:conv}"
  },
+ "Glyph": {
+  "def": "The image of one character.",
+  "hint": "",
+  "see": "{ch:ocr}"
+ },
+ "GPT": {
+  "def": "Generative pre-trained transformer: a decoder-only, causal transformer trained to predict the next token.",
+  "hint": "",
+  "see": "{ch:gpt}, {ch:attention}"
+ },
  "Gradient": {
   "def": "For every parameter, how much the loss changes when that parameter is nudged; the optimizer moves each parameter against its gradient.",
   "hint": "The vector of partial derivatives; its negative points downhill.",
@@ -494,6 +514,11 @@
   "hint": "",
   "see": "{ch:conv}, {ch:cpu}"
  },
+ "Image classification": {
+  "def": "Assigning one label to a whole image.",
+  "hint": "",
+  "see": "{ch:cnn}"
+ },
  "Implicit feedback": {
   "def": "Interaction data without explicit ratings (clicks, views, purchases).",
   "hint": "",
@@ -553,6 +578,11 @@
   "def": "A layer that wraps any tensor function, e.g. averaging over time.",
   "hint": "",
   "see": "{ch:modules}"
+ },
+ "Language model": {
+  "def": "A model that assigns probabilities to the next token given the previous ones, and can therefore generate text.",
+  "hint": "",
+  "see": "{ch:gpt}"
  },
  "Latency": {
   "def": "The time from request to answer for one call.",
@@ -709,6 +739,11 @@
   "hint": "",
   "see": "{ch:conv}"
  },
+ "Next-token prediction": {
+  "def": "The training task of a language model: at every position, predict the token that follows.",
+  "hint": "",
+  "see": "{ch:gpt}"
+ },
  "NoGrad": {
   "def": "A scope in which operations are not recorded for autograd; used for inference and evaluation.",
   "hint": "",
@@ -718,6 +753,11 @@
   "def": "The bell-shaped distribution of values around a mean with a given standard deviation; used to initialize weights and add noise.",
   "hint": "About 68% of values lie within one standard deviation of the mean.",
   "see": "{ch:tensors}; any introductory statistics text"
+ },
+ "OCR": {
+  "def": "Optical character recognition: turning an image of text into a string.",
+  "hint": "",
+  "see": "{ch:ocr}"
  },
  "One-hot": {
   "def": "A vector of zeros with a single 1 at the position of a class index.",
@@ -778,6 +818,16 @@
   "def": "The value below which a given share of the data falls; the 99th percentile is exceeded by 1% of values.",
   "hint": "",
   "see": "{ch:anomaly}"
+ },
+ "Perplexity": {
+  "def": "e raised to the average cross-entropy: roughly the number of equally likely choices the model hesitates between per token.",
+  "hint": "1 means certainty; K means uniform guessing among K tokens.",
+  "see": "{ch:gpt}; Pre-Calc volume, exponentials and logarithms"
+ },
+ "PGM": {
+  "def": "Portable graymap: a minimal image format (a header and one byte per pixel) that the OCR sample reads and writes.",
+  "hint": "",
+  "see": "{ch:ocr}"
  },
  "Pooling": {
   "def": "Combining many values into one: max or average over an image window, or mean over a sequence.",
@@ -944,10 +994,25 @@
   "hint": "Scaling keeps the softmax from saturating as d grows.",
   "see": "{ch:attention}"
  },
+ "Segmentation": {
+  "def": "Cutting an image into parts (lines, characters) before recognizing each.",
+  "hint": "",
+  "see": "{ch:ocr}"
+ },
+ "Sentiment analysis": {
+  "def": "Classifying text by the opinion it expresses (positive, negative, …).",
+  "hint": "",
+  "see": "{ch:sentiment}"
+ },
  "Sequence": {
   "def": "An ordered list of items (tokens, measurements) processed by recurrent or attention layers; shape [N, T, F] or [N, T].",
   "hint": "",
   "see": "{ch:recurrent}"
+ },
+ "Sequence classification": {
+  "def": "Assigning one label to a whole sequence (a sentence, a click stream).",
+  "hint": "",
+  "see": "{ch:sentiment}"
  },
  "Sequential": {
   "def": "The container module that runs its layers in order.",
@@ -1043,6 +1108,11 @@
   "def": "Waiting until all queued work on a device has finished: <code>device.Synchronize()</code>.",
   "hint": "",
   "see": "{ch:devices}"
+ },
+ "Synthetic data": {
+  "def": "Training data generated by a program rather than collected; useful for learning, testing and bootstrapping.",
+  "hint": "",
+  "see": "{ch:ocr}, {ch:regression}"
  },
  "Tanh": {
   "def": "Activation that squashes any number into the range −1 to 1; zero-centred, a good default for small networks.",
