@@ -5,6 +5,9 @@
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --cpu
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --cuda
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --threads 2 --log training,inference --log-file run.jsonl
+//   dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --predict --input "2100,4,2,15,9.5,7,2,0,6500"
+//        inference with the saved model; features: area, bedrooms, bathrooms, age, distance km, quality, garage, pool, lot
+//        (separate several houses with ';', or pass --data file.csv to price every row of a CSV)
 
 using System.Diagnostics;
 using NeuralSharp;
@@ -33,6 +36,16 @@ using var consoleHook = Telemetry.Subscribe(new ConsoleLogger(options.LogLevels,
 using var recorderHook = Telemetry.Subscribe(recorder);
 await using var fileLog = options.LogFile is { } logPath ? new JsonLinesLogger(logPath, TelemetryLevel.All & ~TelemetryLevel.Operations) : null;
 using var fileHook = fileLog is null ? null : Telemetry.Subscribe(fileLog);
+
+string modelPath = options.ModelPath("house-price.weights");
+string featureScalerPath = Path.ChangeExtension(modelPath, ".features.txt");
+string priceScalerPath = Path.ChangeExtension(modelPath, ".price.txt");
+const int FeatureCount = 9;
+
+if (options.PredictOnly)
+{
+    return PredictOnly();
+}
 
 // ---------------------------------------------------------------- data
 string dataPath = options.DataFile ?? Path.Combine(AppContext.BaseDirectory, "data", "houses.csv");
@@ -65,17 +78,7 @@ var trainLoader = new DataLoader(trainScaled, batchSize, shuffle: true, device: 
 var testLoader = new DataLoader(testScaled, batchSize: 512, device: device);
 
 // ---------------------------------------------------------------- model
-var random = new Random(1);
-using var model = new Sequential
-{
-    new Linear(houses.FeatureCount, 64, device: device, random: random),
-    new ReLU(),
-    new Dropout(0.05f, random),
-    new Linear(64, 32, device: device, random: random),
-    new ReLU(),
-    new Linear(32, 1, device: device, random: random),
-};
-model.Name = "house-price-mlp";
+using var model = BuildModel(houses.FeatureCount, new Random(1));
 
 using var optimizer = new Adam(model.Parameters(), learningRate: 0.002f);
 var trainer = new Trainer(model, optimizer, Losses.MeanSquaredError)
@@ -138,15 +141,88 @@ for (int i = 0; i < descriptions.Length; i++)
 }
 
 // ---------------------------------------------------------------- save
-string outputDir = Path.Combine(AppContext.BaseDirectory, "output");
-Directory.CreateDirectory(outputDir);
-model.Save(Path.Combine(outputDir, "house-price.weights"));
-featureScaler.Save(Path.Combine(outputDir, "feature-scaler.txt"));
-priceScaler.Save(Path.Combine(outputDir, "price-scaler.txt"));
-recorder.SaveCsv(Path.Combine(outputDir, "training-history.csv"));
-Console.WriteLine($"\nSaved model, scalers and training history to {outputDir}");
+model.Save(modelPath);
+featureScaler.Save(featureScalerPath);
+priceScaler.Save(priceScalerPath);
+string historyPath = Path.Combine(Path.GetDirectoryName(modelPath)!, "house-price-history.csv");
+recorder.SaveCsv(historyPath);
+Console.WriteLine($"\nSaved the model and its scalers to {modelPath} (test it with --predict), training history to {historyPath}");
 Console.WriteLine($"Memory on {device}: {ComputeResources.GetMemoryUsage(device)}");
 
 return report.RSquared > 0.8 ? 0 : 1;
+
+// The architecture, shared by training and inference so saved weights always fit.
+Sequential BuildModel(int features, Random? random = null)
+{
+    var model = new Sequential
+    {
+        new Linear(features, 64, device: device, random: random),
+        new ReLU(),
+        new Dropout(0.05f, random),
+        new Linear(64, 32, device: device, random: random),
+        new ReLU(),
+        new Linear(32, 1, device: device, random: random),
+    };
+    model.Name = "house-price-mlp";
+    return model;
+}
+
+// Inference mode: load the saved model and scalers, then price the given houses.
+int PredictOnly()
+{
+    if (!options.RequireModel(modelPath) || !options.RequireModel(featureScalerPath) || !options.RequireModel(priceScalerPath))
+    {
+        return 1;
+    }
+
+    using var model = BuildModel(FeatureCount);
+    model.Load(modelPath);
+    var featureScaler = StandardScaler.Load(featureScalerPath);
+    var priceScaler = StandardScaler.Load(priceScalerPath);
+    Console.WriteLine($"Loaded {modelPath}\n");
+
+    string[] labels;
+    float[] features;
+    float[]? actual = null;
+    if (options.DataFile is { } csv)
+    {
+        var data = Dataset.LoadCsv(csv, new CsvOptions { TargetColumns = ["price"], IgnoreColumns = ["id"] });
+        labels = [.. Enumerable.Range(1, data.Count).Select(i => $"row {i}")];
+        features = data.Features.ToArray();
+        actual = data.Targets.ToArray();
+    }
+    else
+    {
+        var rows = (options.Input ?? "950,2,1,45,30,4,0,0,2900;2100,4,2,15,9.5,7,2,0,6500;4200,5,4,2,2,10,3,1,12000")
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        features = [.. rows.SelectMany(r => r.Split(',').Select(v => float.Parse(v, System.Globalization.CultureInfo.InvariantCulture)))];
+        if (features.Length != rows.Length * FeatureCount)
+        {
+            Console.Error.WriteLine($"error: each house needs {FeatureCount} comma-separated values: area, bedrooms, bathrooms, age, distance km, quality, garage, pool, lot.");
+            return 2;
+        }
+
+        labels = rows;
+    }
+
+    int count = features.Length / FeatureCount;
+    featureScaler.Transform(features, FeatureCount);
+    using var input = Tensor.From(features, [count, FeatureCount], device);
+    using var output = model.Predict(input);
+    var prices = output.ToArray();
+    priceScaler.InverseTransform(prices, 1);
+    for (int i = 0; i < Math.Min(count, 25); i++)
+    {
+        Console.WriteLine($"  {labels[i],-34} {Money(prices[i]),12}" + (actual is null ? "" : $"   actual {Money(actual[i])}"));
+    }
+
+    if (actual is not null)
+    {
+        var report = RegressionReport.Compute(prices, actual);
+        Console.WriteLine($"\n{count} rows: mean absolute error {Money((float)report.MeanAbsoluteError)}, R² {report.RSquared:F4}");
+    }
+
+    return 0;
+}
 
 static string Money(float value) => "$" + value.ToString("N0", System.Globalization.CultureInfo.InvariantCulture);

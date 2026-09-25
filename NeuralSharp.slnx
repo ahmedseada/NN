@@ -1,9 +1,12 @@
 <Solution>
   <Folder Name="/samples/">
     <Project Path="samples/NeuralSharp.Samples.Classification/NeuralSharp.Samples.Classification.csproj" />
+    <Project Path="samples/NeuralSharp.Samples.GptApi/NeuralSharp.Samples.GptApi.csproj" />
     <Project Path="samples/NeuralSharp.Samples.HousePrices/NeuralSharp.Samples.HousePrices.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Images/NeuralSharp.Samples.Images.csproj" />
+    <Project Path="samples/NeuralSharp.Samples.Ocr/NeuralSharp.Samples.Ocr.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Sequences/NeuralSharp.Samples.Sequences.csproj" />
+    <Project Path="samples/NeuralSharp.Samples.Transformer/NeuralSharp.Samples.Transformer.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Xor/NeuralSharp.Samples.Xor.csproj" />
   </Folder>
   <Folder Name="/src/">

@@ -3,6 +3,8 @@
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.Xor               GPU if available, else CPU
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.Xor -- --cpu      force the CPU
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.Xor -- --cuda     force the GPU
+//   dotnet run -c Release --project samples/NeuralSharp.Samples.Xor -- --predict --input "1,0;1,1"
+//                                                                     load the saved model and evaluate inputs
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.Xor -- --help     all options
 
 using NeuralSharp;
@@ -44,6 +46,35 @@ using var model = new Sequential
 };
 model.Name = "xor";
 
+string modelPath = options.ModelPath("xor.weights");
+if (options.PredictOnly)
+{
+    // Inference mode: load the trained weights and evaluate the given inputs ("a,b;a,b;...").
+    if (!options.RequireModel(modelPath))
+    {
+        return 1;
+    }
+
+    model.Load(modelPath);
+    var pairs = (options.Input ?? "0,0;0,1;1,0;1,1").Split(';', StringSplitOptions.RemoveEmptyEntries)
+        .Select(p => p.Split(',').Select(v => float.Parse(v, System.Globalization.CultureInfo.InvariantCulture)).ToArray()).ToArray();
+    var inputs = new float[pairs.Length, 2];
+    for (int i = 0; i < pairs.Length; i++)
+    {
+        inputs[i, 0] = pairs[i][0];
+        inputs[i, 1] = pairs[i][1];
+    }
+
+    var outputs = model.Predict(inputs);
+    Console.WriteLine($"Loaded {modelPath}\n\n  A     B   | output  | rounded");
+    for (int i = 0; i < pairs.Length; i++)
+    {
+        Console.WriteLine($"  {inputs[i, 0],-4}  {inputs[i, 1],-4}| {outputs[i, 0]:F4}  |   {(outputs[i, 0] >= 0.5f ? 1 : 0)}");
+    }
+
+    return 0;
+}
+
 using var optimizer = new Adam(model.Parameters(), learningRate: 0.05f);
 var trainer = new Trainer(model, optimizer, Losses.MeanSquaredError)
 {
@@ -52,6 +83,8 @@ var trainer = new Trainer(model, optimizer, Losses.MeanSquaredError)
 
 var loader = new DataLoader(data, batchSize: options.BatchSize ?? 4, device: device);
 trainer.Fit(loader, epochs: options.Epochs ?? 2000);
+model.Save(modelPath);
+Console.WriteLine($"Saved the model to {modelPath} (test it with --predict)");
 
 // Inference.
 var predictions = model.Predict(data.FeaturesToArray());

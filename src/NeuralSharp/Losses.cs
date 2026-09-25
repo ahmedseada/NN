@@ -30,6 +30,18 @@ public static class Losses
     }
 
     /// <summary>
+    /// Cross-entropy with integer class targets: <paramref name="classIndices"/> has the logits' shape without the
+    /// last dimension ([N] for [N, classes], [N, T] for per-token [N, T, vocabulary] outputs). Equivalent to
+    /// <see cref="CrossEntropy"/> with one-hot targets, without storing them.
+    /// </summary>
+    public static Tensor SparseCrossEntropy(Tensor logits, Tensor classIndices, float labelSmoothing = 0f)
+    {
+        // Not disposed here: the backward pass of the product inside CrossEntropy reads the targets.
+        var targets = Tensor.OneHot(classIndices.Reshape(logits.Shape[..^1]), logits.Shape[^1]);
+        return CrossEntropy(logits, targets, labelSmoothing);
+    }
+
+    /// <summary>
     /// Binary cross-entropy for probabilities in (0, 1), e.g. after a <see cref="Layers.Sigmoid"/> layer:
     /// -mean(y·log p + (1 - y)·log(1 - p)). Prefer <see cref="BinaryCrossEntropyWithLogits"/> for stability.
     /// </summary>

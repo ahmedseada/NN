@@ -3,3 +3,8 @@ obj/
 *.user
 .vs/
 .idea/
+
+# Trained models and sample outputs
+models/
+output/
+*.weights

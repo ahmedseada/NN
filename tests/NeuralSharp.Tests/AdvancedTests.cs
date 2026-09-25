@@ -39,6 +39,17 @@ internal static partial class Tests
             AssertClose([Losses.BinaryCrossEntropy(logits.Sigmoid(), targets).Item()], [Losses.BinaryCrossEntropyWithLogits(logits, targets).Item()], 1e-4f, "BCE forms agree");
         }),
         ("argmax and accuracy", ArgMaxAndAccuracy),
+        ("one-hot and sparse cross-entropy match dense", d =>
+        {
+            using var labels = Tensor.From(new float[,] { { 2, 0 }, { 1, 2 } }, d);
+            var oneHot = Tensor.OneHot(labels, 3);
+            Check(oneHot.Shape.SequenceEqual([2, 2, 3]), "one-hot shape");
+            AssertClose([0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1], oneHot.ToArray(), 0, "one-hot values");
+            using var logits = Tensor.From(RandomArray(new Random(40), 12, 2f), [2, 2, 3], d);
+            AssertClose([Losses.CrossEntropy(logits, oneHot).Item()], [Losses.SparseCrossEntropy(logits, labels).Item()], 1e-6f, "sparse == dense");
+            GradCheck(d, [2, 2, 3], x => Losses.SparseCrossEntropy(x, labels, labelSmoothing: 0.1f), scale: 2f);
+            AssertClose([Metric.Accuracy.BatchMean(logits, oneHot).Item()], [Metric.SparseAccuracy.BatchMean(logits, labels).Item()], 0, "sparse accuracy");
+        }),
         ("batched matmul matches reference and gradients", BatchedMatMul),
         ("gradient: N-D × 2-D matmul (shared weight)", d =>
         {

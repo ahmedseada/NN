@@ -2,6 +2,8 @@
 // triangles and crosses at random positions and sizes, with noise. Conv2d, BatchNorm, MaxPool2d, Dropout.
 //
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.Images            (add --cpu / --cuda)
+//   dotnet run -c Release --project samples/NeuralSharp.Samples.Images -- --predict --input "circle,cross,square"
+//        draw new random images of those shapes and classify them with the saved model
 
 using NeuralSharp;
 using NeuralSharp.Data;
@@ -22,10 +24,6 @@ using var logger = Telemetry.Subscribe(new ConsoleLogger(options.LogLevels));
 
 const int Size = 16;
 string[] shapes = ["circle", "square", "triangle", "cross"];
-var train = Draw(4000, seed: 1);
-var test = Draw(800, seed: 2);
-Console.WriteLine($"{train.Count} training and {test.Count} test images of {Size}x{Size} pixels, {shapes.Length} classes\n");
-
 var init = new Random(3);
 using var model = new Sequential
 {
@@ -38,6 +36,36 @@ using var model = new Sequential
     new Linear(64, shapes.Length, device: device, random: init),
 };
 model.Name = "shape-cnn";
+
+string modelPath = options.ModelPath("shapes.weights");
+if (options.PredictOnly)
+{
+    // Inference mode: draw fresh images of the requested shapes and classify them with the saved model.
+    if (!options.RequireModel(modelPath))
+    {
+        return 1;
+    }
+
+    model.Load(modelPath);
+    Console.WriteLine($"Loaded {modelPath}\n");
+    var requested = (options.Input ?? "circle,square,triangle,cross").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    int[] labels = [.. requested.Select(name => Array.IndexOf(shapes, name.ToLowerInvariant()))];
+    if (labels.Any(l => l < 0))
+    {
+        Console.Error.WriteLine($"error: shapes must be among: {string.Join(", ", shapes)}.");
+        return 2;
+    }
+
+    var images = Draw(labels.Length, seed: Environment.TickCount, labels);
+    using var batch = Tensor.From(images.Features, [images.Count, 1, Size, Size], device);
+    using var logits = model.Predict(batch);
+    Show(images, logits.ToArray2D(), images.Count);
+    return 0;
+}
+
+var train = Draw(4000, seed: 1);
+var test = Draw(800, seed: 2);
+Console.WriteLine($"{train.Count} training and {test.Count} test images of {Size}x{Size} pixels, {shapes.Length} classes\n");
 
 int epochs = options.Epochs ?? 12;
 using var optimizer = new AdamW(model.Parameters(), learningRate: 0.003f);
@@ -52,41 +80,49 @@ trainer.Fit(new DataLoader(train, options.BatchSize ?? 64, shuffle: true, device
 var result = trainer.Evaluate(new DataLoader(test, 400, device: device));
 Console.WriteLine($"\nTest accuracy: {result.Metrics["accuracy"]:P1}\n");
 
-// Show a few test images with the model's guess and confidence.
-var scores = trainer.Predict(test);
-for (int i = 0; i < 4; i++)
-{
-    var logits = Enumerable.Range(0, shapes.Length).Select(c => scores[i, c]).ToArray();
-    float max = logits.Max();
-    var exp = logits.Select(v => MathF.Exp(v - max)).ToArray();
-    int guess = Array.IndexOf(logits, max);
-    int actual = test.GetTargets(i).IndexOf(1f);
-    Console.WriteLine($"Image {i + 1}: predicted {shapes[guess]} ({exp[guess] / exp.Sum():P0}), actually {shapes[actual]}");
-    var pixels = test.GetFeatures(i);
-    for (int y = 0; y < Size; y += 2)
-    {
-        var line = new char[Size];
-        for (int x = 0; x < Size; x++)
-        {
-            float v = (pixels[y * Size + x] + pixels[(y + 1) * Size + x]) / 2;
-            line[x] = v switch { > 0.6f => '#', > 0.3f => '+', > 0.15f => '.', _ => ' ' };
-        }
+model.Save(modelPath);
+Console.WriteLine($"Saved the model to {modelPath} (test it with --predict)\n");
 
-        Console.WriteLine("    " + new string(line));
-    }
-}
+// Show a few test images with the model's guess and confidence.
+Show(test, trainer.Predict(test), 4);
 
 return result.Metrics["accuracy"] > 0.9 ? 0 : 1;
 
-// Renders `count` images, cycling through the shape classes.
-Dataset Draw(int count, int seed)
+// Prints each image as ASCII art with the model's guess, confidence and the true shape.
+void Show(Dataset data, float[,] scores, int count)
+{
+    for (int i = 0; i < count; i++)
+    {
+        var logits = Enumerable.Range(0, shapes.Length).Select(c => scores[i, c]).ToArray();
+        float max = logits.Max();
+        var exp = logits.Select(v => MathF.Exp(v - max)).ToArray();
+        int guess = Array.IndexOf(logits, max);
+        int actual = data.GetTargets(i).IndexOf(1f);
+        Console.WriteLine($"Image {i + 1}: predicted {shapes[guess]} ({exp[guess] / exp.Sum():P0}), actually {shapes[actual]}");
+        var pixels = data.GetFeatures(i);
+        for (int y = 0; y < Size; y += 2)
+        {
+            var line = new char[Size];
+            for (int x = 0; x < Size; x++)
+            {
+                float v = (pixels[y * Size + x] + pixels[(y + 1) * Size + x]) / 2;
+                line[x] = v switch { > 0.6f => '#', > 0.3f => '+', > 0.15f => '.', _ => ' ' };
+            }
+
+            Console.WriteLine("    " + new string(line));
+        }
+    }
+}
+
+// Renders `count` images, cycling through the shape classes (or using the given labels).
+Dataset Draw(int count, int seed, int[]? only = null)
 {
     var random = new Random(seed);
     var pixels = new float[count, Size * Size];
     var labels = new int[count];
     for (int s = 0; s < count; s++)
     {
-        int shape = s % shapes.Length;
+        int shape = only?[s] ?? s % shapes.Length;
         labels[s] = shape;
         float r = 3 + random.NextSingle() * 3.5f;
         float cx = r + random.NextSingle() * (Size - 1 - 2 * r), cy = r + random.NextSingle() * (Size - 1 - 2 * r);

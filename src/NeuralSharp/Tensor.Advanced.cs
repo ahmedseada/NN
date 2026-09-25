@@ -158,6 +158,28 @@ public sealed partial class Tensor
         }
     }
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Device, int), Tensor> IdentityTables = new();
+
+    /// <summary>
+    /// One-hot rows for integer-valued class <paramref name="indices"/> of any shape: [...] → [..., classes].
+    /// Built on the device (an embedding lookup into a cached identity matrix), so no large target arrays are needed.
+    /// </summary>
+    public static Tensor OneHot(Tensor indices, int classes)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(classes);
+        var identity = IdentityTables.GetOrAdd((indices.Device, classes), key =>
+        {
+            var values = new float[key.Item2 * key.Item2];
+            for (int i = 0; i < key.Item2; i++)
+            {
+                values[i * key.Item2 + i] = 1f;
+            }
+
+            return Persistent(values, [key.Item2, key.Item2], key.Item1, requiresGrad: false);
+        });
+        return identity.EmbeddingLookup(indices);
+    }
+
     // ---------------------------------------------------------------- reductions along a dimension
 
     /// <summary>Sums along <paramref name="dim"/> (negative counts from the end); keepDim leaves it as size 1.</summary>

@@ -38,7 +38,11 @@ samples/
   NeuralSharp.Samples.Classification  multi-class: 3 spirals, softmax + cross-entropy, BatchNorm
   NeuralSharp.Samples.Images          CNN: classify drawn shapes (Conv2d, MaxPool2d, BatchNorm)
   NeuralSharp.Samples.Sequences       sentiment with negation: bag-of-words vs LSTM, GRU, Transformer
-  Shared/SampleOptions.cs             command-line options shared by the samples
+  NeuralSharp.Samples.Ocr             OCR: CNN character recognizer + line segmentation, reads PGM images
+  NeuralSharp.Samples.Transformer     small GPT: character-level causal transformer that generates text
+  NeuralSharp.Samples.GptApi          ASP.NET Core Web API + browser UI serving the GPT (Scalar docs, streaming)
+  Shared/SampleOptions.cs             command-line options shared by the samples (train / predict modes)
+  Shared/Gpt/                         GPT model, generation with metrics, training (console + Web API)
 tests/NeuralSharp.Tests             self-contained test runner (runs on every available device)
 ```
 
@@ -51,6 +55,68 @@ tests/NeuralSharp.Tests             self-contained test runner (runs on every av
 | `Classification` | softmax + cross-entropy, BatchNorm, AdamW, cosine schedule, confusion matrix | 97.8% accuracy, 2.4 s |
 | `Images` | Conv2d, MaxPool2d, BatchNorm, Flatten on 16×16 images | 100% accuracy, about 11 s |
 | `Sequences` | Embedding, LSTM, GRU, Transformer vs an order-blind baseline | LSTM/GRU/Transformer 99.5–100%, bag of words 70% |
+| `Ocr` | CNN over 36 characters, projection-profile segmentation, PGM input | 100% per character, 99.9% of characters across whole lines |
+| `Transformer` | decoder-only GPT: causal attention, sparse cross-entropy, sampling | 89% next-character accuracy, 100% real words generated |
+| `GptApi` | serving a model: REST + server-sent events, Scalar, browser UI | about 600 characters/s on 4 CPU cores |
+
+### Train and predict modes
+
+Every console sample trains, saves its model under `models/` (next to the executable), and can then run
+**inference only** from the saved model:
+
+```bash
+dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices                       # train + save
+dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices -- --predict --input "2100,4,2,15,9.5,7,2,0,6500"
+dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences -- --predict --input "the movie was not good;not bad at all"
+dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --predict --input "HELLO WORLD 2026"
+dotnet run -c Release --project samples/NeuralSharp.Samples.Ocr -- --predict --image scan.pgm
+dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --predict --input "the old wizard " --temperature 0.8
+```
+
+| Sample | `--input` in predict mode |
+|--------|---------------------------|
+| `Xor` | `"a,b;a,b"` bit pairs |
+| `HousePrices` | 9 features per house, `;` between houses (or `--data file.csv` to price every row) |
+| `Classification` | `"x,y;x,y"` points in [-1, 1] |
+| `Images` | shape names to draw and classify, e.g. `"circle,cross"` |
+| `Sequences` | sentences separated by `;`, judged by all four saved models side by side |
+| `Ocr` | text to render and read (or `--image file.pgm`) |
+| `Transformer` | prompt to continue (`--length`, `--temperature`, `--top-k`) |
+
+Everything a model needs at inference time is saved next to its weights. That includes the scalers for
+house prices, the BatchNorm running statistics, and the GPT's vocabulary and architecture (a `.json`
+file). `--model <path>` chooses another location.
+
+### GPT Web API
+
+```bash
+dotnet run -c Release --project samples/NeuralSharp.Samples.GptApi
+# http://localhost:5080         inference UI
+# http://localhost:5080/scalar  API reference (Scalar)
+```
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/status` | Loading / Training (with live progress) / Ready / Failed |
+| `GET /api/model` | parameters, blocks, heads, width, context, vocabulary, validation results, layer summary |
+| `GET /api/devices` | CPU and CUDA GPUs with memory usage and the active one |
+| `POST /api/generate` | text, plus each character's probability, entropy, top-5 alternatives and latency, plus aggregate metrics |
+| `POST /api/generate/stream` | the same as server-sent events: one `token` event per character, then `metrics` |
+
+The request body is `{ "prompt", "length", "temperature", "topK", "seed", "device": "cpu" | "cuda" }`.
+The device can change per request, and the model moves between CPU and GPU as needed.
+
+The service loads `Gpt:ModelPath` from `appsettings.json`. Point it at a model saved by the
+`Transformer` sample (or pass `--Gpt:ModelPath path`). When no model exists, the service trains one in
+the background and reports progress through NeuralSharp telemetry.
+
+The browser UI (`wwwroot/index.html`, dark and light themes, responsive) is laid out in two columns:
+- **Left:** the streamed output, with each character coloured by the model's confidence (hover a
+  character for its alternatives, click it for the token inspector); metric cards for throughput,
+  total time, first-token latency, time per token, confidence, perplexity, entropy and device
+  memory; and live confidence and latency charts.
+- **Right:** prompt, length, temperature, top-k, seed and streaming controls; the CPU/GPU switch; and
+  the model's parameters and layer summary.
 
 All samples take the same options:
 

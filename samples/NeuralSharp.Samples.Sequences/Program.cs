@@ -3,6 +3,8 @@
 // LSTM, GRU and a Transformer can. Embedding, LSTM, GRU, PositionalEncoding, TransformerEncoderLayer.
 //
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences            (add --cpu / --cuda)
+//   dotnet run -c Release --project samples/NeuralSharp.Samples.Sequences -- --predict --input "the movie was not good;not bad at all"
+//        classify sentences with every saved model (separate sentences with ';')
 
 using NeuralSharp;
 using NeuralSharp.Data;
@@ -28,12 +30,6 @@ string[] neutral = ["the", "movie", "was", "a", "plot", "acting", "really", "ver
 string[] vocabulary = ["<pad>", "<unk>", "not", .. positive, .. negative, .. neutral];
 var ids = vocabulary.Select((word, id) => (word, id)).ToDictionary(p => p.word, p => p.id);
 const int MaxLength = 12;
-
-var random = new Random(1);
-var (train, trainNegated) = Generate(6000);
-var (test, testNegated) = Generate(1500);
-Console.WriteLine($"{train.Count} training / {test.Count} test sentences, vocabulary {vocabulary.Length}, length {MaxLength}");
-Console.WriteLine($"Example: \"{Decode(test.GetFeatures(0))}\" -> {(test.GetTargets(0)[1] == 1 ? "positive" : "negative")}\n");
 
 // ---------------------------------------------------------------- models
 const int Dim = 32;
@@ -70,6 +66,53 @@ var models = new (string Name, int Epochs, Func<Random, Module> Create)[]
     }),
 };
 
+string ModelFile(string name) => options.ModelPath($"sentiment-{new string([.. name.ToLowerInvariant().TakeWhile(char.IsLetter)])}.weights");
+string[] sentences = options.Input is { } input
+    ? input.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+    : ["i really love this movie", "the movie was not good", "not bad at all", "the plot was boring and the acting was awful", "it was not boring it was wonderful", "i hate it"];
+
+if (options.PredictOnly)
+{
+    // Inference mode: load every saved model and compare their verdicts on the sentences.
+    var loaded = new List<(string Name, Module Model)>();
+    foreach (var (name, _, create) in models)
+    {
+        string path = ModelFile(name);
+        if (File.Exists(path))
+        {
+            var model = create(new Random(2));
+            model.Load(path);
+            loaded.Add((name, model));
+        }
+    }
+
+    if (loaded.Count == 0)
+    {
+        return options.RequireModel(ModelFile(models[1].Name)) ? 0 : 1;
+    }
+
+    Console.WriteLine($"Loaded {loaded.Count} models from {Path.GetDirectoryName(ModelFile("x"))}\n");
+    var verdicts = loaded.Select(m => PositiveProbabilities(m.Model, sentences)).ToList();
+    for (int s = 0; s < sentences.Length; s++)
+    {
+        Console.WriteLine($"\"{sentences[s]}\"");
+        for (int m = 0; m < loaded.Count; m++)
+        {
+            float positiveProbability = verdicts[m][s];
+            Console.WriteLine($"    {loaded[m].Name,-36} {(positiveProbability >= 0.5f ? "positive" : "negative"),-8} ({Math.Max(positiveProbability, 1 - positiveProbability):P0})");
+        }
+    }
+
+    loaded.ForEach(m => m.Model.Dispose());
+    return 0;
+}
+
+var random = new Random(1);
+var (train, trainNegated) = Generate(6000);
+var (test, testNegated) = Generate(1500);
+Console.WriteLine($"{train.Count} training / {test.Count} test sentences, vocabulary {vocabulary.Length}, length {MaxLength}");
+Console.WriteLine($"Example: \"{Decode(test.GetFeatures(0))}\" -> {(test.GetTargets(0)[1] == 1 ? "positive" : "negative")}\n");
+
 var results = new List<(string Name, double Accuracy, double Negated, Module Model)>();
 foreach (var (name, defaultEpochs, create) in models)
 {
@@ -87,7 +130,8 @@ foreach (var (name, defaultEpochs, create) in models)
     double accuracy = trainer.Evaluate(new DataLoader(test, 500, device: device)).Metrics["accuracy"];
     double negated = trainer.Evaluate(new DataLoader(testNegated, 500, device: device)).Metrics["accuracy"];
     results.Add((name, accuracy, negated, model));
-    Console.WriteLine();
+    model.Save(ModelFile(name));
+    Console.WriteLine($"Saved to {ModelFile(name)}\n");
 }
 
 Console.WriteLine("Model                                   test accuracy   sentences with \"not\"");
@@ -99,34 +143,14 @@ foreach (var (name, accuracy, negated, _) in results)
 // ---------------------------------------------------------------- try new sentences with the best model
 var best = results.MaxBy(r => r.Accuracy);
 Console.WriteLine($"\nClassifying new sentences with the {best.Name}:");
-string[] sentences =
-[
-    "i really love this movie",
-    "the movie was not good",
-    "not bad at all",
-    "the plot was boring and the acting was awful",
-    "it was not boring it was wonderful",
-    "i hate it",
-];
-var encoded = new float[sentences.Length, MaxLength];
+var bestVerdicts = PositiveProbabilities(best.Model, sentences);
 for (int s = 0; s < sentences.Length; s++)
 {
-    var words = sentences[s].Split(' ');
-    for (int t = 0; t < Math.Min(words.Length, MaxLength); t++)
-    {
-        encoded[s, t] = ids.GetValueOrDefault(words[t], ids["<unk>"]);
-    }
-}
-
-using var input = Tensor.From(encoded, device);
-using var logits = best.Model.Predict(input);
-using var probabilities = logits.Softmax();
-var p = probabilities.ToArray();
-for (int s = 0; s < sentences.Length; s++)
-{
-    float positiveProbability = p[s * 2 + 1];
+    float positiveProbability = bestVerdicts[s];
     Console.WriteLine($"  {(positiveProbability >= 0.5f ? "positive" : "negative"),-8} ({Math.Max(positiveProbability, 1 - positiveProbability):P0})  \"{sentences[s]}\"");
 }
+
+Console.WriteLine("\nCompare all saved models on your own sentences with: --predict --input \"sentence one;sentence two\"");
 
 foreach (var r in results)
 {
@@ -134,6 +158,26 @@ foreach (var r in results)
 }
 
 return best.Accuracy > 0.9 ? 0 : 1;
+
+// Tokenizes sentences (unknown words map to <unk>) and returns each one's probability of being positive.
+float[] PositiveProbabilities(Module model, string[] texts)
+{
+    var encoded = new float[texts.Length, MaxLength];
+    for (int s = 0; s < texts.Length; s++)
+    {
+        var words = texts[s].ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        for (int t = 0; t < Math.Min(words.Length, MaxLength); t++)
+        {
+            encoded[s, t] = ids.GetValueOrDefault(words[t], ids["<unk>"]);
+        }
+    }
+
+    using var input = Tensor.From(encoded, device);
+    using var logits = model.Predict(input);
+    using var probabilities = logits.Softmax();
+    var p = probabilities.ToArray();
+    return [.. Enumerable.Range(0, texts.Length).Select(s => p[s * 2 + 1])];
+}
 
 // Builds `count` labelled sentences, plus the subset that contains a negation.
 (Dataset All, Dataset Negated) Generate(int count)

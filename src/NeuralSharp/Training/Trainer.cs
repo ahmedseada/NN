@@ -27,6 +27,13 @@ public sealed record Metric(string Name, Func<Tensor, Tensor, Tensor> BatchMean,
     /// </summary>
     public static Metric Accuracy { get; } = new("accuracy", (p, t) => Tensor.MatchRate(p, t, 0.5f));
 
+    /// <summary>Accuracy with integer class targets (the logits' shape without the last dimension), e.g. next-token prediction.</summary>
+    public static Metric SparseAccuracy { get; } = new("accuracy", (p, t) =>
+    {
+        using var oneHot = Tensor.OneHot(t.Reshape(p.Shape[..^1]), p.Shape[^1]);
+        return Tensor.MatchRate(p, oneHot, 0.5f);
+    });
+
     /// <summary>Binary accuracy for a single output column: (prediction ≥ threshold) == (target ≥ 0.5). Use threshold 0 for logits.</summary>
     public static Metric BinaryAccuracy(float threshold = 0.5f) => new("accuracy", (p, t) => Tensor.MatchRate(p, t, threshold));
 }
