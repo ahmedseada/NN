@@ -22,18 +22,28 @@ def build():
         para("The test project is a self-contained console program (no test framework needed). It runs each test once on "
              "the CPU and once on every GPU, inside a <code>TensorScope</code>, and prints a line per test:"),
         output("""
-            CUDA not available (the NVIDIA driver library (libcuda.so.1 / libcuda.so) was not found); testing the CPU only.
-            == cpu: CPU (4 threads, 8-wide SIMD)
-              PASS matmul matches reference (all transposes, beta 0 and 1) (87 ms)
-              PASS element-wise ops match reference (25 ms)
-              PASS large tensors (parallel / multi-block paths) (235 ms)
-              PASS gradient: sigmoid, sum (7 ms)
+            == cpu: CPU (16 threads, 8-wide SIMD)
+              PASS matmul matches reference (all transposes, beta 0 and 1) (54 ms)
+              PASS element-wise ops match reference (14 ms)
               ...
-              PASS batched cached decoding matches sequences decoded one by one (5 ms)
-              PASS graph replay gives the same tokens as direct execution (12 ms)
-              PASS sampler: distribution, top-k, temperature, determinism, CPU parity (19 ms)
-            56 passed, 0 failed
-            """, caption="The test run in this book's container (CPU only); on a machine with one GPU, 112 tests run"),
+              PASS generation: chat end to end yields a final message and stats (6 ms)
+            == cuda:0: NVIDIA GeForce RTX 5050 Laptop GPU (8150 MiB, 20 SMs)
+              PASS matmul matches reference (all transposes, beta 0 and 1) (30 ms)
+              ...
+              PASS sampler: top-p, min-p, repeat/presence/frequency penalties, history (12 ms)
+              PASS cuda: every kernel's declared parameter count is known (launch argument check) (0 ms)
+              ...
+              PASS generation: num_predict, stop sequences, cache/graph/recompute agree (51 ms)
+              PASS generation: chat end to end yields a final message and stats (6 ms)
+            128 passed, 0 failed
+            """, caption="dotnet run -c Release --project tests/NeuralSharp.Tests -- --cuda on a laptop with an RTX 5050: 64 tests on each device (shortened)"),
+        trap("a GPU bug that no CPU test can see",
+             "<p>While this book was written, the Summarizer (" + ch("summarizer") + ") crashed on the GPU with "
+             "<code>cuLaunchKernel failed: CUDA_ERROR_INVALID_VALUE</code>, although every CPU test passed and the PTX "
+             "assembled cleanly. Two new sampler launches passed one argument fewer than their kernels declare; the "
+             "driver read past the argument list. The fix added the argument, and <code>CudaBackend</code> now compares "
+             "every launch with the parameter count parsed from the generated PTX, so the same mistake fails at once "
+             "with the kernel's name. The lesson: run the suite on every device you ship to.</p>"),
         reftable(["Test kind", "Examples in the suite", "Catches"], [
             ["Reference comparison", "matmul (all transposes), element-wise ops, softmax, convolution, pooling against simple loops", "Wrong kernels, indexing errors"],
             ["Gradient checks", "every operation and every layer, including dropout with a fixed mask", "Wrong backward formulas"],

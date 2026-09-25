@@ -480,7 +480,7 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 63 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 64 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
@@ -490,13 +490,13 @@ streaming parser, keep-alive expiry). The suite runs on every available device.
 
 ## Status
 
-* **Verified on real hardware.** 51 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
-  Laptop GPU (Blackwell), 102 of 102. The 5 newer decoding tests (KV cache, batched decoding, graph
-  replay, sampler, fused kernels) and the 7 newest ones (sampler filters and penalties, generation layer, word tokenizer)
-  pass on the CPU and still need a run on a GPU. That covers every GPU kernel: matrix products, softmax,
+* **Verified on real hardware.** All 64 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
+  Laptop GPU (Blackwell), 128 of 128, including KV-cache and batched decoding, graph replay, the
+  sampler with top-p, min-p and penalties, the generation layer and the kernel-signature check.
+  That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.
-* The 59 GPU kernels also assemble without errors for sm_50, sm_75, sm_89 and sm_120 (checked with
+* Every kernel launch is checked against the kernel's declared parameter count. The 59 GPU kernels also assemble without errors for sm_50, sm_75, sm_89 and sm_120 (checked with
   `ptxas` 12.9), covering Maxwell through Blackwell.
 * Everything computes in float32. Tensors hold up to 2³¹ elements, and embedding ids must be below
   2²⁴ (the largest integer a float stores exactly).
