@@ -19,8 +19,8 @@ import front
 import back
 
 HERE = pathlib.Path(__file__).parent
-CHAPTERS = ["ch01", "ch02", "ch03", "ch04", "ch05"]   # extended per Part as content groups are written
-PARTS = ["I"]
+CHAPTERS = [f"ch{i:02d}" for i in range(1, 13)]   # extended per Part as content groups are written
+PARTS = ["I", "II"]
 
 
 def assemble():

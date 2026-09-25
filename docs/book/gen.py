@@ -10,7 +10,7 @@ import re
 
 ALLOWED_TAGS = {"b", "i", "em", "strong", "code", "span", "br", "ul", "ol", "li", "p", "div", "table", "thead",
                 "tbody", "tr", "th", "td", "pre", "h1", "h2", "h3", "a", "sub", "sup", "svg", "g", "rect", "line",
-                "circle", "text", "path", "polygon", "defs", "marker", "dl", "dt", "dd", "section", "tspan"}
+                "circle", "text", "path", "polygon", "polyline", "defs", "marker", "dl", "dt", "dd", "section", "tspan"}
 _TAG = re.compile(r"</?([a-zA-Z][a-zA-Z0-9]*)(\s[^<>]*)?/?>")
 
 

@@ -1,4 +1,9 @@
 {
+ "Activation function": {
+  "def": "A non-linear function applied element-wise between layers (ReLU, GELU, Tanh, Sigmoid). Without it, stacked linear layers collapse into one.",
+  "hint": "",
+  "see": "{ch:dense}; Activation Functions volume"
+ },
  "Adam": {
   "def": "Optimizer that keeps a running mean of each parameter's gradient and of its square, and steps by their ratio, so every parameter gets its own step size.",
   "hint": "Two moving averages plus a bias correction for the first steps.",
@@ -13,6 +18,11 @@
   "def": "GPU operations return as soon as they are queued and run later in order; reading a value waits for them.",
   "hint": "",
   "see": "{ch:devices}"
+ },
+ "Attention": {
+  "def": "A layer in which each position computes a weighted mix of all positions' values, with weights from query–key similarity.",
+  "hint": "Softmax of dot products, then a weighted average.",
+  "see": "{ch:attention}"
  },
  "Autograd": {
   "def": "The mechanism that records every operation on tensors that require gradients (the tape) and replays it backwards on <code>Backward()</code> to compute all gradients.",
@@ -29,15 +39,65 @@
   "hint": "Local derivatives multiplied along each path and summed over paths.",
   "see": "{ch:autograd}"
  },
+ "Bag of words": {
+  "def": "Representing a text by its words regardless of order, e.g. by averaging their embeddings.",
+  "hint": "",
+  "see": "{ch:embedding}"
+ },
+ "BatchNorm": {
+  "def": "Normalizes each channel with the batch's mean and variance in training and with running averages in evaluation, then scales and shifts.",
+  "hint": "",
+  "see": "{ch:norm}"
+ },
+ "Bias": {
+  "def": "The learned constant a layer adds to each output, letting it shift its result independently of the input.",
+  "hint": "The intercept b in y = wx + b.",
+  "see": "{ch:dense}"
+ },
  "Broadcasting": {
   "def": "Reusing a smaller tensor across the leading dimensions of a larger one, as when a bias vector is added to every row of a batch. In NeuralSharp only <code>+</code> broadcasts.",
   "hint": "",
   "see": "{ch:tensors}"
  },
+ "Buffer": {
+  "def": "Non-trainable tensor state of a module (running statistics, masks), saved and moved with the model but not optimized.",
+  "hint": "",
+  "see": "{ch:modules}"
+ },
+ "Categorical feature": {
+  "def": "A column whose values are categories (country, product type) rather than quantities; fed to a network through an embedding or one-hot encoding.",
+  "hint": "",
+  "see": "{ch:embedding}, {ch:recommender}"
+ },
+ "Causal mask": {
+  "def": "A mask that hides future positions from attention, so position t sees only positions 0…t; required for next-token prediction.",
+  "hint": "",
+  "see": "{ch:attention}"
+ },
+ "Cell state": {
+  "def": "The LSTM's second, gated memory vector, carried from step to step alongside the hidden state.",
+  "hint": "",
+  "see": "{ch:recurrent}"
+ },
  "Chain rule": {
   "def": "The rule for differentiating a composition: the derivative of an outer function applied to an inner one is the outer derivative times the inner derivative. Autograd applies it once per recorded operation.",
   "hint": "Rates of change multiply along a chain.",
   "see": "Pre-Calc volume <i>Numbers, Shapes, and Functions</i>, function composition; any calculus text for the derivative form"
+ },
+ "Channel": {
+  "def": "One of the parallel feature maps of an image tensor: 3 for RGB input, the number of filters after a convolution.",
+  "hint": "",
+  "see": "{ch:conv}"
+ },
+ "CNN": {
+  "def": "Convolutional neural network: a network built mainly from convolution and pooling layers, used for images.",
+  "hint": "",
+  "see": "{ch:conv}, {ch:cnn}"
+ },
+ "Composite module": {
+  "def": "A module built from other modules, which it lists in <code>Children()</code>.",
+  "hint": "",
+  "see": "{ch:modules}"
  },
  "Computation graph": {
   "def": "The record of which operation produced which tensor, built during the forward pass and consumed by <code>Backward()</code>.",
@@ -49,10 +109,30 @@
   "hint": "",
   "see": "{ch:devices}"
  },
+ "Context length": {
+  "def": "The maximum number of positions a sequence model looks at in one pass.",
+  "hint": "",
+  "see": "{ch:attention}, {ch:gpt}"
+ },
+ "Convolution": {
+  "def": "Sliding a small learned filter over an input and taking the weighted sum at every position.",
+  "hint": "Same weights reused at every position.",
+  "see": "{ch:conv}"
+ },
+ "Cosine similarity": {
+  "def": "The dot product of two vectors divided by the product of their lengths: 1 for the same direction, 0 for perpendicular, −1 for opposite.",
+  "hint": "The cosine of the angle between the vectors.",
+  "see": "{ch:embedding}; Pre-Calc volume <i>Numbers, Shapes, and Functions</i>, trigonometry"
+ },
  "CUDA": {
   "def": "NVIDIA's platform for general computing on GPUs. NeuralSharp uses only its driver API, which ships with the display driver.",
   "hint": "",
   "see": "{ch:devices}, {ch:cuda}"
+ },
+ "Dense layer": {
+  "def": "A layer in which every output depends on every input through its own weight; <code>Linear</code> in NeuralSharp.",
+  "hint": "",
+  "see": "{ch:dense}"
  },
  "Detach": {
   "def": "A tensor that shares data with another but has no history, so gradients stop there.",
@@ -69,6 +149,16 @@
   "hint": "",
   "see": "{ch:memory}"
  },
+ "Dropout": {
+  "def": "Randomly zeroing a fraction of values during training to reduce overfitting; disabled in evaluation mode.",
+  "hint": "",
+  "see": "{ch:norm}"
+ },
+ "Embedding": {
+  "def": "A learned vector for each id of a vocabulary, looked up from a table.",
+  "hint": "",
+  "see": "{ch:embedding}"
+ },
  "Epoch": {
   "def": "One full pass over the training data. Training usually runs many epochs.",
   "hint": "",
@@ -78,6 +168,26 @@
   "def": "Module state for inference, set by <code>Eval()</code>: dropout is off and normalization uses its running statistics. <code>Train()</code> switches back.",
   "hint": "",
   "see": "{ch:memory}, {ch:norm}"
+ },
+ "Factory method": {
+  "def": "A method that builds a model the same way every time, shared by the training and inference programs so saved weights always fit.",
+  "hint": "",
+  "see": "{ch:modules}"
+ },
+ "Feature map": {
+  "def": "The output channel of one convolution filter: where in the image that filter's pattern appears.",
+  "hint": "",
+  "see": "{ch:conv}"
+ },
+ "Feed-forward network": {
+  "def": "The two-layer MLP (D → 4D → D with GELU) applied to every position inside a transformer block.",
+  "hint": "",
+  "see": "{ch:attention}"
+ },
+ "Filter": {
+  "def": "A small learned weight array (k×k over all input channels) that a convolution slides over the input; also called a kernel.",
+  "hint": "",
+  "see": "{ch:conv}"
  },
  "Finalizer": {
   "def": "A .NET safety net that frees a tensor's memory if it was never disposed; it runs late and unpredictably.",
@@ -89,15 +199,35 @@
   "hint": "The slope of a short chord approximates the slope of the tangent.",
   "see": "{ch:autograd}; Pre-Calc volume <i>Numbers, Shapes, and Functions</i>, rates of change"
  },
+ "Flatten": {
+  "def": "Merging all dimensions after the batch into one: [N, C, H, W] → [N, C·H·W].",
+  "hint": "",
+  "see": "{ch:tensors}, {ch:conv}"
+ },
  "Float32": {
   "def": "The 32-bit floating-point number type (<code>float</code>) in which every tensor stores and computes its values; about 7 significant digits.",
   "hint": "",
   "see": "{ch:tensors}"
  },
+ "Gate": {
+  "def": "A sigmoid-valued vector (between 0 and 1) that scales how much of a signal passes; the mechanism of LSTM and GRU memory.",
+  "hint": "",
+  "see": "{ch:recurrent}; Activation Functions volume, Sigmoid"
+ },
+ "GELU": {
+  "def": "Gaussian error linear unit: a smooth ReLU-like activation, standard in transformers.",
+  "hint": "Approximately x · sigmoid(1.702x).",
+  "see": "{ch:dense}; Activation Functions volume, GELU"
+ },
  "GFLOP/s": {
   "def": "Billions of floating-point operations per second; the usual measure of arithmetic throughput.",
   "hint": "",
   "see": "{ch:devices}, {ch:performance}"
+ },
+ "Global average pooling": {
+  "def": "Averaging each channel over all positions: [N, C, H, W] → [N, C].",
+  "hint": "",
+  "see": "{ch:conv}"
  },
  "Gradient": {
   "def": "For every parameter, how much the loss changes when that parameter is nudged; the optimizer moves each parameter against its gradient.",
@@ -109,30 +239,90 @@
   "hint": "",
   "see": "{ch:autograd}"
  },
+ "GRU": {
+  "def": "Gated recurrent unit: a recurrent layer with reset and update gates and a single state; lighter than an LSTM.",
+  "hint": "",
+  "see": "{ch:recurrent}"
+ },
+ "Hidden state": {
+  "def": "The vector a recurrent layer carries from one time step to the next and outputs.",
+  "hint": "",
+  "see": "{ch:recurrent}"
+ },
+ "im2col": {
+  "def": "Unfolding every convolution window into a row of a matrix so the whole convolution becomes one matrix product.",
+  "hint": "",
+  "see": "{ch:conv}, {ch:cpu}"
+ },
+ "Initialization": {
+  "def": "How weights are set before training. NeuralSharp uses Xavier-uniform for Linear, He-uniform for Conv2d, N(0, 1) for embeddings, and zeros for biases.",
+  "hint": "Keep the size of signals roughly equal from layer to layer.",
+  "see": "{ch:dense}"
+ },
  "InUse": {
   "def": "Bytes of device memory currently held by live tensors, as reported by <code>MemoryUsage.InUse</code>.",
   "hint": "",
   "see": "{ch:memory}"
+ },
+ "Inverted dropout": {
+  "def": "Dropout that scales surviving values by 1/(1 − p) during training, so nothing needs rescaling at inference.",
+  "hint": "",
+  "see": "{ch:norm}"
  },
  "Kernel": {
   "def": "A function that runs on the GPU in many parallel threads, one launch per operation.",
   "hint": "",
   "see": "{ch:cuda}"
  },
+ "KV cache": {
+  "def": "Stored keys and values of already-processed positions, so generating each new token only computes the new position.",
+  "hint": "",
+  "see": "{ch:attention}, {ch:generation}"
+ },
+ "Lambda": {
+  "def": "A layer that wraps any tensor function, e.g. averaging over time.",
+  "hint": "",
+  "see": "{ch:modules}"
+ },
+ "LayerNorm": {
+  "def": "Normalizes each sample over its last dimension, then scales and shifts per feature; independent of the batch.",
+  "hint": "",
+  "see": "{ch:norm}"
+ },
  "Leaf": {
   "def": "A tensor created directly rather than by a recorded operation: data, targets, parameters. Gradients are kept on leaves.",
   "hint": "",
   "see": "{ch:autograd}"
+ },
+ "Linear": {
+  "def": "NeuralSharp's dense layer: y = x · W + b over the last dimension.",
+  "hint": "",
+  "see": "{ch:dense}"
+ },
+ "Logits": {
+  "def": "Raw, unnormalized class scores from the last Linear layer; softmax or sigmoid turns them into probabilities.",
+  "hint": "",
+  "see": "{ch:dense}, {ch:losses}"
  },
  "Loss": {
   "def": "A single number that measures how wrong the predictions are; training minimizes it.",
   "hint": "",
   "see": "{ch:losses}"
  },
+ "LSTM": {
+  "def": "Long short-term memory: a recurrent layer with input, forget and output gates and a separate cell state.",
+  "hint": "",
+  "see": "{ch:recurrent}"
+ },
  "Matrix product": {
   "def": "The product of an [m, k] and a [k, n] matrix: each output element is the dot product of a row and a column. <code>MatMul</code> in NeuralSharp.",
   "hint": "Rows times columns.",
   "see": "{ch:tensors}"
+ },
+ "Max pooling": {
+  "def": "Keeping the largest value of each window of a feature map; shrinks the map and adds tolerance to small shifts.",
+  "hint": "",
+  "see": "{ch:conv}"
  },
  "Memory cache": {
   "def": "Freed device memory blocks kept per size for reuse, so repeated steps allocate nothing new.",
@@ -149,15 +339,35 @@
   "hint": "",
   "see": "{ch:devices}"
  },
+ "MLP": {
+  "def": "Multilayer perceptron: a stack of dense layers with activations between them.",
+  "hint": "",
+  "see": "{ch:dense}"
+ },
  "Module": {
   "def": "Anything that maps input tensors to output tensors and may own parameters: a layer, an activation, or a <code>Sequential</code> of them.",
   "hint": "",
   "see": "{ch:modules}"
  },
+ "Momentum (BatchNorm)": {
+  "def": "The weight of the newest batch in BatchNorm's running averages (0.1 by default).",
+  "hint": "An exponential moving average.",
+  "see": "{ch:norm}"
+ },
  "MSE": {
   "def": "Mean squared error: the average of the squared differences between prediction and target. The default loss for regression.",
   "hint": "Squaring punishes large errors more than small ones.",
   "see": "{ch:losses}"
+ },
+ "Multi-head attention": {
+  "def": "Several attention computations in parallel on slices of the vectors, recombined by a linear layer.",
+  "hint": "",
+  "see": "{ch:attention}"
+ },
+ "NCHW": {
+  "def": "The image tensor layout used by NeuralSharp: batch, channels, height, width.",
+  "hint": "",
+  "see": "{ch:conv}"
  },
  "NoGrad": {
   "def": "A scope in which operations are not recorded for autograd; used for inference and evaluation.",
@@ -179,25 +389,65 @@
   "hint": "",
   "see": "{ch:optimizers}"
  },
+ "Overfitting": {
+  "def": "Learning the training data too specifically, so the training loss keeps falling while the validation loss rises.",
+  "hint": "",
+  "see": "{ch:norm}, {ch:trainer}"
+ },
+ "Padding": {
+  "def": "(1) Zeros added around an image so a convolution can cover its borders. (2) Filler ids (usually 0) that bring token sequences to a common length.",
+  "hint": "",
+  "see": "{ch:conv}; {ch:embedding}"
+ },
  "Parameter": {
   "def": "A tensor the network learns (weights and biases). Created with gradient tracking on and exposed through <code>Module.Parameters()</code>.",
   "hint": "",
   "see": "{ch:modules}"
+ },
+ "Pooling": {
+  "def": "Combining many values into one: max or average over an image window, or mean over a sequence.",
+  "hint": "",
+  "see": "{ch:embedding}, {ch:conv}"
+ },
+ "Positional encoding": {
+  "def": "Fixed sine and cosine patterns added to token vectors so attention can tell positions apart.",
+  "hint": "Each dimension oscillates at a different frequency along the positions.",
+  "see": "{ch:attention}; Pre-Calc volume, trigonometric functions"
+ },
+ "Pre-norm": {
+  "def": "Placing LayerNorm before each transformer sub-block (inside the residual branch), which makes deep stacks train stably.",
+  "hint": "",
+  "see": "{ch:attention}"
  },
  "PTX": {
   "def": "NVIDIA's portable GPU assembly language. NeuralSharp writes its kernels in PTX; the driver compiles them for the installed GPU.",
   "hint": "",
   "see": "{ch:cuda}"
  },
+ "Query, key, value": {
+  "def": "The three projections of each position in attention: the query is compared with every key; the matching values are mixed.",
+  "hint": "",
+  "see": "{ch:attention}"
+ },
  "Rank": {
   "def": "The number of dimensions of a tensor: 0 for a scalar, 1 for a vector, 2 for a matrix.",
   "hint": "",
   "see": "{ch:tensors}"
  },
+ "Recurrent layer": {
+  "def": "A layer that processes a sequence step by step, carrying a hidden state (LSTM, GRU).",
+  "hint": "",
+  "see": "{ch:recurrent}"
+ },
  "Reference counting": {
   "def": "Tracking how many tensors share a memory block, so it is freed only when the last one is.",
   "hint": "",
   "see": "{ch:memory}"
+ },
+ "Regularization": {
+  "def": "Anything that discourages overfitting: dropout, weight decay, more data, early stopping.",
+  "hint": "",
+  "see": "{ch:norm}, {ch:optimizers}"
  },
  "ReLU": {
   "def": "Activation that keeps positive inputs and replaces negative ones with zero. Cheap and the usual default in deep networks; a unit whose input stays negative stops learning.",
@@ -214,15 +464,50 @@
   "hint": "",
   "see": "{ch:tensors}"
  },
+ "Residual connection": {
+  "def": "Adding a block's input to its output (x + f(x)), so information and gradients can bypass the block.",
+  "hint": "",
+  "see": "{ch:modules}, {ch:attention}"
+ },
+ "Return sequences": {
+  "def": "The recurrent-layer option to output the state at every step ([N, T, H]) instead of only the last ([N, H]).",
+  "hint": "",
+  "see": "{ch:recurrent}"
+ },
  "Row-major": {
   "def": "Storage order in which the last dimension changes fastest: a matrix is stored row after row.",
   "hint": "",
   "see": "{ch:tensors}"
  },
+ "Running statistics": {
+  "def": "Moving averages of each channel's mean and variance that BatchNorm keeps for evaluation mode.",
+  "hint": "",
+  "see": "{ch:norm}"
+ },
+ "Saturation": {
+  "def": "When an activation such as sigmoid or tanh flattens out for large inputs, so its slope, and the gradient through it, is nearly zero.",
+  "hint": "",
+  "see": "{ch:dense}; Activation Functions volume"
+ },
  "Scalar": {
   "def": "A single number; as a tensor, rank 0 with shape [].",
   "hint": "",
   "see": "{ch:tensors}"
+ },
+ "Scaled dot-product attention": {
+  "def": "softmax(Q·Kᵀ / √d) · V: scores from query–key dot products, scaled by the square root of the head width.",
+  "hint": "Scaling keeps the softmax from saturating as d grows.",
+  "see": "{ch:attention}"
+ },
+ "Sequence": {
+  "def": "An ordered list of items (tokens, measurements) processed by recurrent or attention layers; shape [N, T, F] or [N, T].",
+  "hint": "",
+  "see": "{ch:recurrent}"
+ },
+ "Sequential": {
+  "def": "The container module that runs its layers in order.",
+  "hint": "",
+  "see": "{ch:modules}"
  },
  "SGD": {
   "def": "Stochastic gradient descent: move each parameter by −learning rate × gradient, optionally with momentum.",
@@ -249,10 +534,20 @@
   "hint": "Larger scores get exponentially larger shares; the row sums to 1.",
   "see": "{ch:tensors}; Activation Functions volume, Softmax; Pre-Calc volume, exponential functions"
  },
+ "Standardization": {
+  "def": "Shifting and scaling values to mean 0 and standard deviation 1.",
+  "hint": "(x − mean) / standard deviation.",
+  "see": "{ch:norm}, {ch:data}"
+ },
  "Streaming multiprocessor": {
   "def": "One of the GPU's independent processing units (SMs); a GPU has from a few to over a hundred, each running many threads.",
   "hint": "",
   "see": "{ch:devices}, {ch:cuda}"
+ },
+ "Stride": {
+  "def": "The step between successive positions of a convolution or pooling window; stride 2 halves the output size.",
+  "hint": "",
+  "see": "{ch:conv}"
  },
  "Synchronize": {
   "def": "Waiting until all queued work on a device has finished: <code>device.Synchronize()</code>.",
@@ -274,10 +569,55 @@
   "hint": "",
   "see": "{ch:memory}"
  },
+ "Time step": {
+  "def": "One position of a sequence.",
+  "hint": "",
+  "see": "{ch:recurrent}"
+ },
+ "Token": {
+  "def": "One unit of text given an id: a word, a sub-word or a character.",
+  "hint": "",
+  "see": "{ch:embedding}, {ch:gpt}"
+ },
+ "Training mode": {
+  "def": "Module state during training (<code>Train()</code>): dropout active, BatchNorm using batch statistics.",
+  "hint": "",
+  "see": "{ch:modules}"
+ },
+ "Transformer": {
+  "def": "An architecture of stacked blocks, each attention plus a feed-forward network with residual connections and normalization.",
+  "hint": "",
+  "see": "{ch:attention}"
+ },
+ "Unknown token": {
+  "def": "A reserved id for words not in the vocabulary.",
+  "hint": "",
+  "see": "{ch:embedding}"
+ },
+ "Vanishing gradient": {
+  "def": "Gradients shrinking as they pass back through many layers or time steps, so early parts learn slowly; gates, residual connections and normalization counter it.",
+  "hint": "Repeated multiplication by numbers below 1.",
+  "see": "{ch:recurrent}; Activation Functions volume"
+ },
  "View": {
   "def": "A tensor that shares another tensor's memory (from <code>Reshape</code>, <code>Flatten</code>, <code>Detach</code>).",
   "hint": "",
   "see": "{ch:memory}"
+ },
+ "Vocabulary": {
+  "def": "The set of ids a model knows (words, characters, categories) and the mapping to them.",
+  "hint": "",
+  "see": "{ch:embedding}"
+ },
+ "Weight": {
+  "def": "A learned multiplier; a layer's weights form a matrix or filter bank.",
+  "hint": "",
+  "see": "{ch:dense}"
+ },
+ "Weights file": {
+  "def": "The binary file written by <code>Save</code>: every parameter and buffer with its shape, but not the architecture.",
+  "hint": "",
+  "see": "{ch:modules}"
  },
  "XOR": {
   "def": "Exclusive or: the output is 1 when exactly one of two inputs is 1. The smallest problem a network without a hidden layer cannot solve.",
