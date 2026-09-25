@@ -19,6 +19,11 @@
   "hint": "",
   "see": "{ch:optimizers}"
  },
+ "Anomaly detection": {
+  "def": "Finding records that differ from normal behaviour, often without labelled examples of anomalies.",
+  "hint": "",
+  "see": "{ch:anomaly}"
+ },
  "ArgMax": {
   "def": "The position of the largest value along the last dimension; turns class scores into a predicted class index.",
   "hint": "",
@@ -33,6 +38,11 @@
   "def": "A layer in which each position computes a weighted mix of all positions' values, with weights from query–key similarity.",
   "hint": "Softmax of dot products, then a weighted average.",
   "see": "{ch:attention}"
+ },
+ "Autoencoder": {
+  "def": "A network trained to reproduce its input through a narrow middle layer; its reconstruction error measures how typical an input is.",
+  "hint": "",
+  "see": "{ch:anomaly}"
  },
  "Autograd": {
   "def": "The mechanism that records every operation on tensors that require gradients (the tape) and replays it backwards on <code>Backward()</code> to compute all gradients.",
@@ -59,6 +69,11 @@
   "hint": "",
   "see": "{ch:embedding}"
  },
+ "Baseline": {
+  "def": "A simple reference prediction (the mean, yesterday's value, last week's value) that a model must beat to be useful.",
+  "hint": "",
+  "see": "{ch:timeseries}"
+ },
  "Batch size": {
   "def": "The number of samples processed together in one optimizer step.",
   "hint": "",
@@ -74,10 +89,20 @@
   "hint": "The intercept b in y = wx + b.",
   "see": "{ch:dense}"
  },
+ "Binary classification": {
+  "def": "Predicting one of two answers (yes/no).",
+  "hint": "",
+  "see": "{ch:binary}"
+ },
  "Binary cross-entropy": {
   "def": "The loss for yes/no targets: the average negative log-probability given to the correct answer.",
   "hint": "−[y·log p + (1 − y)·log(1 − p)].",
   "see": "{ch:losses}; Pre-Calc volume, logarithms"
+ },
+ "Bottleneck": {
+  "def": "The narrowest layer of an autoencoder, which forces a compact summary of the input.",
+  "hint": "",
+  "see": "{ch:anomaly}"
  },
  "Broadcasting": {
   "def": "Reusing a smaller tensor across the leading dimensions of a larger one, as when a bias vector is added to every row of a batch. In NeuralSharp only <code>+</code> broadcasts.",
@@ -139,6 +164,11 @@
   "hint": "",
   "see": "{ch:conv}, {ch:cnn}"
  },
+ "Cold start": {
+  "def": "Having to recommend for a user or item with no interaction history yet.",
+  "hint": "",
+  "see": "{ch:recommender}"
+ },
  "Composite module": {
   "def": "A module built from other modules, which it lists in <code>Children()</code>.",
   "hint": "",
@@ -153,6 +183,11 @@
   "def": "Static class that caps CPU threads and per-device memory and reports memory usage.",
   "hint": "",
   "see": "{ch:devices}"
+ },
+ "Confusion matrix": {
+  "def": "A table counting, for each actual class, how often each class was predicted.",
+  "hint": "",
+  "see": "{ch:multiclass}"
  },
  "Context length": {
   "def": "The maximum number of positions a sequence model looks at in one pass.",
@@ -214,6 +249,11 @@
   "hint": "",
   "see": "{ch:data}"
  },
+ "Decision boundary": {
+  "def": "The line or surface in input space where the predicted class changes.",
+  "hint": "",
+  "see": "{ch:multiclass}"
+ },
  "Dense layer": {
   "def": "A layer in which every output depends on every input through its own weight; <code>Linear</code> in NeuralSharp.",
   "hint": "",
@@ -238,6 +278,11 @@
   "def": "Returning a tensor's memory to the device cache immediately (<code>using</code> calls it automatically).",
   "hint": "",
   "see": "{ch:memory}"
+ },
+ "Dot product": {
+  "def": "The sum of element-wise products of two vectors; large when they point the same way.",
+  "hint": "a·b = Σ aᵢbᵢ.",
+  "see": "{ch:recommender}; Pre-Calc volume, vectors"
  },
  "Driver API": {
   "def": "The low-level CUDA interface shipped with the NVIDIA display driver, which NeuralSharp calls directly.",
@@ -294,10 +339,25 @@
   "hint": "avg ← β·avg + (1 − β)·new.",
   "see": "{ch:optimizers}, {ch:norm}"
  },
+ "F1 score": {
+  "def": "The harmonic mean of precision and recall: one number that is high only when both are.",
+  "hint": "2·P·R / (P + R).",
+  "see": "{ch:binary}"
+ },
  "Factory method": {
   "def": "A method that builds a model the same way every time, shared by the training and inference programs so saved weights always fit.",
   "hint": "",
   "see": "{ch:modules}"
+ },
+ "False alarm": {
+  "def": "A normal case flagged as positive (a false positive).",
+  "hint": "",
+  "see": "{ch:anomaly}, {ch:binary}"
+ },
+ "Feature": {
+  "def": "One input column (a measured property of a sample).",
+  "hint": "",
+  "see": "{ch:data}"
  },
  "Feature map": {
   "def": "The output channel of one convolution filter: where in the image that filter's pattern appears.",
@@ -333,6 +393,11 @@
   "def": "The 32-bit floating-point number type (<code>float</code>) in which every tensor stores and computes its values; about 7 significant digits.",
   "hint": "",
   "see": "{ch:tensors}"
+ },
+ "Forecasting": {
+  "def": "Predicting future values of a time series from its past.",
+  "hint": "",
+  "see": "{ch:timeseries}"
  },
  "Freezing": {
   "def": "Keeping some parameters fixed during training, by leaving them out of the optimizer and turning off their gradients.",
@@ -414,6 +479,11 @@
   "hint": "",
   "see": "{ch:telemetry}"
  },
+ "Horizon": {
+  "def": "How far ahead a forecast reaches (1 day, 14 days, …).",
+  "hint": "",
+  "see": "{ch:timeseries}"
+ },
  "Huber loss": {
   "def": "A regression loss that is squared for small errors and linear for large ones; robust to outliers yet smooth.",
   "hint": "",
@@ -423,6 +493,16 @@
   "def": "Unfolding every convolution window into a row of a matrix so the whole convolution becomes one matrix product.",
   "hint": "",
   "see": "{ch:conv}, {ch:cpu}"
+ },
+ "Implicit feedback": {
+  "def": "Interaction data without explicit ratings (clicks, views, purchases).",
+  "hint": "",
+  "see": "{ch:recommender}"
+ },
+ "Inference mode": {
+  "def": "Running a trained model to make predictions only, without training; in the samples, <code>--predict</code>.",
+  "hint": "",
+  "see": "{ch:inference}"
  },
  "Initialization": {
   "def": "How weights are set before training. NeuralSharp uses Xavier-uniform for Linear, He-uniform for Conv2d, N(0, 1) for embeddings, and zeros for biases.",
@@ -529,6 +609,11 @@
   "hint": "",
   "see": "{ch:metrics}"
  },
+ "Matrix factorization": {
+  "def": "Representing a users × items rating table as the product of a user-vector matrix and an item-vector matrix.",
+  "hint": "",
+  "see": "{ch:recommender}"
+ },
  "Matrix product": {
   "def": "The product of an [m, k] and a [k, n] matrix: each output element is the dot product of a row and a column. <code>MatMul</code> in NeuralSharp.",
   "hint": "Rows times columns.",
@@ -604,6 +689,11 @@
   "hint": "Squaring punishes large errors more than small ones.",
   "see": "{ch:losses}"
  },
+ "Multi-class classification": {
+  "def": "Predicting one of K > 2 categories.",
+  "hint": "",
+  "see": "{ch:multiclass}"
+ },
  "Multi-head attention": {
   "def": "Several attention computations in parallel on slices of the vectors, recombined by a linear layer.",
   "hint": "",
@@ -654,6 +744,11 @@
   "hint": "",
   "see": "{ch:testing}"
  },
+ "Oversampling": {
+  "def": "Repeating examples of a rare class in the training set so the model sees them more often.",
+  "hint": "",
+  "see": "{ch:binary}"
+ },
  "Padding": {
   "def": "(1) Zeros added around an image so a convolution can cover its borders. (2) Filler ids (usually 0) that bring token sequences to a common length.",
   "hint": "",
@@ -679,6 +774,11 @@
   "hint": "",
   "see": "{ch:trainer}"
  },
+ "Percentile": {
+  "def": "The value below which a given share of the data falls; the 99th percentile is exceeded by 1% of values.",
+  "hint": "",
+  "see": "{ch:anomaly}"
+ },
  "Pooling": {
   "def": "Combining many values into one: max or average over an image window, or mean over a sequence.",
   "hint": "",
@@ -693,6 +793,11 @@
   "def": "Placing LayerNorm before each transformer sub-block (inside the residual branch), which makes deep stacks train stably.",
   "hint": "",
   "see": "{ch:attention}"
+ },
+ "Precision": {
+  "def": "Of the cases flagged positive, the share that really are positive.",
+  "hint": "TP / (TP + FP).",
+  "see": "{ch:binary}"
  },
  "Prefill": {
   "def": "Processing the whole prompt at once to fill the KV cache before token-by-token generation.",
@@ -719,10 +824,30 @@
   "hint": "",
   "see": "{ch:tensors}"
  },
+ "Recall": {
+  "def": "Of the truly positive cases, the share that were flagged.",
+  "hint": "TP / (TP + FN).",
+  "see": "{ch:binary}"
+ },
+ "Recommender system": {
+  "def": "A model that suggests items a user is likely to want.",
+  "hint": "",
+  "see": "{ch:recommender}"
+ },
+ "Reconstruction error": {
+  "def": "How different an autoencoder's output is from its input; the anomaly score.",
+  "hint": "",
+  "see": "{ch:anomaly}"
+ },
  "Recurrent layer": {
   "def": "A layer that processes a sequence step by step, carrying a hidden state (LSTM, GRU).",
   "hint": "",
   "see": "{ch:recurrent}"
+ },
+ "Recursive forecasting": {
+  "def": "Forecasting several steps ahead by feeding each prediction back as an input.",
+  "hint": "",
+  "see": "{ch:timeseries}"
  },
  "Reference counting": {
   "def": "Tracking how many tensors share a memory block, so it is freed only when the last one is.",
@@ -738,6 +863,11 @@
   "def": "Keeping a small tile of a matrix product's result in CPU registers for the whole inner loop so each loaded value is reused.",
   "hint": "",
   "see": "{ch:cpu}"
+ },
+ "Regression": {
+  "def": "Predicting a number.",
+  "hint": "",
+  "see": "{ch:regression}"
  },
  "Regularization": {
   "def": "Anything that discourages overfitting: dropout, weight decay, more data, early stopping.",
@@ -778,6 +908,11 @@
   "def": "Root mean squared error: the square root of MSE, in target units; weights large errors more than MAE does.",
   "hint": "",
   "see": "{ch:metrics}"
+ },
+ "ROC AUC": {
+  "def": "The probability that a randomly chosen positive is scored above a randomly chosen negative: 0.5 is random ranking, 1 is perfect.",
+  "hint": "Area under the curve of true-positive rate against false-positive rate.",
+  "see": "{ch:binary}"
  },
  "Row-major": {
   "def": "Storage order in which the last dimension changes fastest: a matrix is stored row after row.",
@@ -844,6 +979,11 @@
   "hint": "",
   "see": "{ch:devices}, {ch:cpu}"
  },
+ "Sliding window": {
+  "def": "A fixed-length stretch of consecutive values, moved along a series to create training samples.",
+  "hint": "",
+  "see": "{ch:timeseries}, {ch:data}"
+ },
  "Smoke test": {
   "def": "A quick check that something basically works, such as overfitting a tiny batch.",
   "hint": "",
@@ -909,6 +1049,11 @@
   "hint": "A rescaled and shifted sigmoid.",
   "see": "Activation Functions volume, Tanh"
  },
+ "Target": {
+  "def": "The value a model learns to predict for each sample.",
+  "hint": "",
+  "see": "{ch:data}"
+ },
  "Telemetry": {
   "def": "NeuralSharp's event system for logging and tracking training, layers, operations and inference.",
   "hint": "",
@@ -948,6 +1093,11 @@
   "def": "Work done per unit time, e.g. samples or tokens per second.",
   "hint": "",
   "see": "{ch:performance}"
+ },
+ "Time series": {
+  "def": "Measurements ordered in time.",
+  "hint": "",
+  "see": "{ch:timeseries}"
  },
  "Time step": {
   "def": "One position of a sequence.",
@@ -998,6 +1148,11 @@
   "def": "A reserved id for words not in the vocabulary.",
   "hint": "",
   "see": "{ch:embedding}"
+ },
+ "Unsupervised learning": {
+  "def": "Learning from data without target labels, e.g. an autoencoder learning normal behaviour.",
+  "hint": "",
+  "see": "{ch:anomaly}"
  },
  "Validation set": {
   "def": "Data held out from training and used to monitor generalization, choose settings and stop early.",
