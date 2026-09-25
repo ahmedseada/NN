@@ -1,8 +1,9 @@
 # NeuralSharp
 
 A self-contained neural network library for **.NET 10**, written in pure C#. There is **no TensorFlow.dll,
-no NuGet dependencies and no native libraries of its own**. It includes tensors, automatic
-differentiation, layers, losses, optimizers, a training loop, data loading, resource limits and
+no NuGet dependencies and no native libraries of its own**. It includes N-D tensors with automatic
+differentiation; dense, convolutional, recurrent and transformer layers; regression and classification
+losses; optimizers with learning-rate schedules; a training loop; data loading; resource limits; and
 telemetry hooks.
 
 | Backend | How it works | Requirements |
@@ -17,27 +18,41 @@ Set `NEURALSHARP_DISABLE_CUDA=1` to force the CPU.
 
 ```
 src/NeuralSharp/
-  Tensor.cs, Tensor.Operations.cs   tensors, operators, autograd
+  Tensor*.cs                        N-D tensors, operators, autograd, shape ops, number-type interop
   Device.cs, ComputeResources.cs    devices; thread and memory budgets
   Autograd.cs, TensorScope.cs       NoGrad(); deterministic disposal
-  Losses.cs                         MeanSquaredError, MeanAbsoluteError
-  Layers/                           Module, Sequential, Linear, ReLU, Tanh, Sigmoid, Dropout
-  Optimizers/                       Sgd (momentum), Adam
-  Data/                             Dataset (CSV loading), StandardScaler, MinMaxScaler, DataLoader
-  Training/                         Trainer, Metric, RegressionReport
+  Losses.cs                         MSE, MAE, CrossEntropy, BinaryCrossEntropy(WithLogits)
+  Layers/                           Linear, Conv2d, MaxPool2d, GlobalAveragePool2d, Flatten,
+                                    BatchNorm, LayerNorm, Embedding, LSTM, GRU,
+                                    MultiHeadAttention, TransformerEncoderLayer, PositionalEncoding,
+                                    ReLU, Tanh, Sigmoid, GELU, Softmax, Dropout, Lambda, Sequential
+  Optimizers/                       Sgd, Adam, AdamW, schedulers (step, exponential, cosine + warm-up)
+  Data/                             Dataset (CSV, class labels, feature shapes), scalers, DataLoader
+  Training/                         Trainer, Metric (MAE, RMSE, Accuracy), RegressionReport
   Diagnostics/                      Telemetry hub, events, ConsoleLogger, MetricsRecorder,
                                     ChannelTelemetry, JsonLinesLogger
-  Backends/Cpu, Backends/Cuda       device implementations
+  Backends/Cpu, Backends/Cuda       device implementations (CPU SIMD kernels, PTX kernels)
 samples/
-  NeuralSharp.Samples.Xor           the classic XOR problem
-  NeuralSharp.Samples.HousePrices   regression: predict house prices from a CSV file
-  Shared/SampleOptions.cs           command-line options shared by the samples
+  NeuralSharp.Samples.Xor             the classic XOR problem
+  NeuralSharp.Samples.HousePrices     regression: predict house prices from a CSV file
+  NeuralSharp.Samples.Classification  multi-class: 3 spirals, softmax + cross-entropy, BatchNorm
+  NeuralSharp.Samples.Images          CNN: classify drawn shapes (Conv2d, MaxPool2d, BatchNorm)
+  NeuralSharp.Samples.Sequences       sentiment with negation: bag-of-words vs LSTM, GRU, Transformer
+  Shared/SampleOptions.cs             command-line options shared by the samples
 tests/NeuralSharp.Tests             self-contained test runner (runs on every available device)
 ```
 
 ## Samples
 
-Both samples take the same options:
+| Sample | Shows | Typical CPU result |
+|--------|-------|--------------------|
+| `Xor` | smallest possible network | 4/4 correct in 0.1 s |
+| `HousePrices` | CSV loading, scaling, regression, early stopping | R² 0.975, 5.3% mean error, 1 s |
+| `Classification` | softmax + cross-entropy, BatchNorm, AdamW, cosine schedule, confusion matrix | 97.8% accuracy, 2.4 s |
+| `Images` | Conv2d, MaxPool2d, BatchNorm, Flatten on 16×16 images | 100% accuracy, about 11 s |
+| `Sequences` | Embedding, LSTM, GRU, Transformer vs an order-blind baseline | LSTM/GRU/Transformer 99.5–100%, bag of words 70% |
+
+All samples take the same options:
 
 ```bash
 dotnet run -c Release --project samples/NeuralSharp.Samples.HousePrices               # GPU if available, else CPU
@@ -116,6 +131,90 @@ for (int epoch = 0; epoch < 1000; epoch++)
 
 using var prediction = model.Predict(inputs);   // evaluation mode, no gradients
 ```
+
+### Classification
+
+Classifiers output raw scores (logits). `CrossEntropy` applies log-softmax itself, which is more
+stable than a separate softmax layer. Add `Softmax` only when you want probabilities at inference time.
+
+```csharp
+var data = Dataset.FromClassLabels(features, labels, classes: 3);      // one-hot targets
+// or: Dataset.LoadCsv(path, new CsvOptions { TargetColumns = ["label"] }).ToOneHot(3)
+
+var trainer = new Trainer(model, new AdamW(model.Parameters(), 1e-3f), (p, t) => Losses.CrossEntropy(p, t))
+{
+    Metrics = { Metric.Accuracy },
+    Scheduler = new CosineAnnealing(optimizer, totalEpochs: 100, warmupEpochs: 5),
+};
+using var probabilities = model.Predict(x).Softmax();
+using var classes = probabilities.ArgMax();
+```
+
+For two classes with one output column, use `Losses.BinaryCrossEntropyWithLogits` and
+`Metric.BinaryAccuracy(threshold: 0)`.
+
+### Images (CNN)
+
+```csharp
+var images = Dataset.FromClassLabels(pixels, labels, 10).WithFeatureShape(1, 28, 28);   // batches are [N, 1, 28, 28]
+var cnn = new Sequential
+{
+    new Conv2d(1, 32, kernelSize: 3, padding: 1), new BatchNorm(32), new ReLU(), new MaxPool2d(2),
+    new Conv2d(32, 64, kernelSize: 3, padding: 1), new BatchNorm(64), new ReLU(), new MaxPool2d(2),
+    new Flatten(), new Linear(64 * 7 * 7, 128), new ReLU(), new Dropout(0.3f), new Linear(128, 10),
+};
+```
+
+`Conv2d` unfolds image patches (im2col) and runs one large matrix product on the same optimized GEMM
+as `Linear`, on both CPU and GPU.
+
+### Sequences (RNN and transformer)
+
+Token ids go in as floats, shape [batch, time]:
+
+```csharp
+var lstm = new Sequential
+{
+    new Embedding(vocabulary, 64), new LSTM(64, 128), new Linear(128, classes),   // LSTM returns the last state
+};
+
+var transformer = new Sequential
+{
+    new Embedding(vocabulary, 64), new PositionalEncoding(maxLength, 64),
+    new TransformerEncoderLayer(64, heads: 4), new TransformerEncoderLayer(64, heads: 4),
+    new LayerNorm(64), new Lambda(x => x.Mean(1), "MeanOverTime"), new Linear(64, classes),
+};
+```
+
+Use `LSTM(..., returnSequences: true)` or `GRU` for per-step outputs. `MultiHeadAttention(dim, heads, causal: true)`
+masks future positions for autoregressive models. Setting `Trainer.MaxGradientNorm` clips gradients,
+which recurrent networks usually need.
+
+### Tensor operations
+
+N-D tensors support batched `MatMul` (with transpose flags), `Permute`, `Transpose`, `Narrow`,
+`Tensor.Concat`, `Tensor.Stack`, `Flatten`, `Sum(dim)`, `Mean(dim)`, `Softmax`, `LogSoftmax`,
+`ArgMax`, `Exp`, `Log` and `Gelu`. Adding a tensor whose shape matches the trailing dimensions
+broadcasts it, as with a bias [F] over [N, F] or a mask [T, T] over [B, T, T]. All of these are
+differentiated automatically.
+
+### Other number types
+
+Every kernel computes in float32, the standard for neural networks and the only type with fast
+SIMD and GPU paths everywhere. Data of any numeric type converts at the edges:
+
+```csharp
+using var t = Tensor.From<double>(doubles, [rows, cols]);   // also int, long, byte, Half, decimal, ...
+using var m = Tensor.From(new int[,] { { 1, 2 }, { 3, 4 } });
+int[] ints = t.ToArray<int>();                               // saturating, truncating conversion
+```
+
+### Optimizers and schedules
+
+`Sgd(momentum, weightDecay)`, `Adam(weightDecay)` (L2) and `AdamW` (decoupled weight decay) are
+available, together with the `StepDecay`, `ExponentialDecay`, `CosineAnnealing(warmupEpochs)` and
+`LambdaSchedule` schedulers. `optimizer.ClipGradientNorm(max)` and `optimizer.GradientNorm()` work
+in hand-written loops too.
 
 ## Telemetry: logging and tracking
 
@@ -220,19 +319,20 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 24 tests. They cover reference comparisons for every kernel, finite-difference gradient
-checks for every op, optimizers, CSV parsing and scalers, data-loader coverage (including the prefetch
-path), end-to-end training, telemetry subscribe/unsubscribe, memory limits, thread budgets, and
-inference memory. The suite runs on every available device.
+There are 50 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+convolution and pooling against direct implementations) and finite-difference gradient checks for
+every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
+classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
+data loading, telemetry, memory limits and thread budgets. The suite runs on every available device.
 
 ## Status
 
-* **Verified on real hardware.** The full test suite (24 tests) passes on both the CPU and an NVIDIA
-  GeForce RTX 5050 Laptop GPU (Blackwell), for 48 of 48 passing. The house-price sample gives the
-  same results on both devices (R² 0.975 on CPU, 0.975 on GPU).
-* The generated PTX also assembles without errors or register spills for sm_50, sm_75, sm_86 and
-  sm_90 (checked with NVIDIA's `ptxas`), covering Maxwell through Hopper.
-* The supported set is intentionally small: float32, 2-D matrix multiply, and the layers, losses and
-  activations listed above.
-* Small models such as the samples run at about the same speed on CPU and GPU, because each step is
-  dominated by kernel-launch overhead. The GPU pays off with wide layers and large batches.
+* **Verified on real hardware (main branch).** The original 24 tests pass on both the CPU and an
+  NVIDIA GeForce RTX 5050 Laptop GPU (Blackwell).
+* **This branch** adds 26 tests (50 in total) covering classification, normalization, embeddings,
+  convolution, pooling, LSTM/GRU, attention, schedulers and number types. They pass on the CPU.
+  The 26 new GPU kernels (51 in total) assemble without errors or register spills for sm_50, sm_75,
+  sm_86, sm_90 and sm_120 (checked with `ptxas`), but they still need a run on a GPU. Run
+  `dotnet run -c Release --project tests/NeuralSharp.Tests` on an NVIDIA machine to verify them.
+* Everything computes in float32. Tensors hold up to 2³¹ elements, and embedding ids must be below
+  2²⁴ (the largest integer a float stores exactly).

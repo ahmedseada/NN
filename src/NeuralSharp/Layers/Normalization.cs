@@ -75,6 +75,10 @@ public sealed class BatchNorm : Module
             var invStd = Tensor.Empty([Channels], input.Device);
             input.Backend.InvSqrt(RunningVariance.Storage, invStd.Storage, Channels, Epsilon);
             normalized = input.NormalizeWith(RunningMean, invStd, outer, Channels, inner);
+            if (!normalized.RequiresGrad)
+            {
+                invStd.Dispose();
+            }
         }
 
         return normalized.GroupAffine(Gamma, Beta, Channels, inner);

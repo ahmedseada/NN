@@ -256,7 +256,7 @@ public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tens
         }
     }
 
-    /// <summary>Predicts every sample of <paramref name="data"/>, batch by batch; returns [Count, outputs].</summary>
+    /// <summary>Predicts every sample of <paramref name="data"/>, batch by batch; returns [Count, outputs] (each sample's output flattened).</summary>
     public float[,] Predict(Dataset data, int batchSize = 1024)
     {
         var device = Device;
@@ -266,7 +266,7 @@ public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tens
             using var _ = batch;
             using var output = Model.Predict(batch.Features);
             var values = output.ToArray();
-            int outputs = output.Shape[1];
+            int outputs = output.Size / batch.Size;
             result ??= new float[data.Count, outputs];
             int row0 = batch.Index * batchSize;
             for (int r = 0; r < batch.Size; r++)

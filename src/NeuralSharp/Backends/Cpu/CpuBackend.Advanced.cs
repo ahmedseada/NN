@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace NeuralSharp.Backends.Cpu;
@@ -150,132 +151,241 @@ internal sealed partial class CpuBackend
 
     public override void NormStats(Storage x, Storage mean, Storage variance, Storage invStd, int outer, int groups, int inner, float eps)
     {
-        float[] xv = D(x), mv = D(mean), vv = D(variance), sv = D(invStd);
-        int m = outer * inner;
-        For(groups, (long)groups * m * 2, (start, end) =>
+        var s1 = new double[groups];
+        var s2 = new double[groups];
+        GroupMoments(D(x), null, outer, groups, inner, s1, s2);
+        float[] mv = D(mean), vv = D(variance), sv = D(invStd);
+        double m = Math.Max(outer * inner, 1);
+        for (int g = 0; g < groups; g++)
         {
-            for (int g = start; g < end; g++)
+            double mu = s1[g] / m;
+            double var = Math.Max(s2[g] / m - mu * mu, 0);
+            mv[g] = (float)mu;
+            vv[g] = (float)var;
+            sv[g] = (float)(1.0 / Math.Sqrt(var + eps));
+        }
+    }
+
+    /// <summary>
+    /// s1[g] += Σ a and s2[g] += Σ a·(b ?? a) over each group of the [outer, groups, inner] view, SIMD-vectorized.
+    /// Long contiguous runs (inner ≥ vector width) are summed per group; short ones (e.g. inner = 1, where a
+    /// group is a column) are accumulated row by row across all groups at once.
+    /// </summary>
+    private static void GroupMoments(float[] a, float[]? b, int outer, int groups, int inner, double[] s1, double[] s2)
+    {
+        int w = Vector<float>.Count;
+        if (inner >= w)
+        {
+            For(groups, (long)groups * outer * inner * 2, (start, end) =>
             {
-                double sum = 0;
-                for (int o = 0; o < outer; o++)
+                for (int g = start; g < end; g++)
                 {
-                    var block = xv.AsSpan((o * groups + g) * inner, inner);
-                    foreach (float v in block)
+                    double t1 = 0, t2 = 0;
+                    for (int o = 0; o < outer; o++)
                     {
-                        sum += v;
+                        int offset = (o * groups + g) * inner;
+                        var (p1, p2) = Moments(a.AsSpan(offset, inner), b is null ? a.AsSpan(offset, inner) : b.AsSpan(offset, inner));
+                        t1 += p1;
+                        t2 += p2;
+                    }
+
+                    s1[g] += t1;
+                    s2[g] += t2;
+                }
+            });
+            return;
+        }
+
+        int row = groups * inner;
+        var gate = new Lock();
+        For(outer, (long)outer * row * 2, (start, end) =>
+        {
+            var acc1 = new float[row];
+            var acc2 = new float[row];
+            for (int o = start; o < end; o++)
+            {
+                var ra = a.AsSpan(o * row, row);
+                var rb = b is null ? ra : b.AsSpan(o * row, row);
+                AddInPlace(acc1, ra);
+                MultiplyAddInPlace(acc2, ra, rb);
+            }
+
+            lock (gate)
+            {
+                for (int i = 0; i < row; i++)
+                {
+                    s1[i / inner] += acc1[i];
+                    s2[i / inner] += acc2[i];
+                }
+            }
+        });
+    }
+
+    private static (double Sum, double SumProduct) Moments(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
+    {
+        var av = MemoryMarshal.Cast<float, Vector<float>>(a);
+        var bv = MemoryMarshal.Cast<float, Vector<float>>(b);
+        Vector<float> v1 = default, v2 = default;
+        for (int i = 0; i < av.Length; i++)
+        {
+            v1 += av[i];
+            v2 = Vector.FusedMultiplyAdd(av[i], bv[i], v2);
+        }
+
+        double t1 = Vector.Sum(v1), t2 = Vector.Sum(v2);
+        for (int i = av.Length * Vector<float>.Count; i < a.Length; i++)
+        {
+            t1 += a[i];
+            t2 += a[i] * b[i];
+        }
+
+        return (t1, t2);
+    }
+
+    private static void MultiplyAddInPlace(Span<float> target, ReadOnlySpan<float> a, ReadOnlySpan<float> b)
+    {
+        var tv = MemoryMarshal.Cast<float, Vector<float>>(target);
+        var av = MemoryMarshal.Cast<float, Vector<float>>(a);
+        var bv = MemoryMarshal.Cast<float, Vector<float>>(b);
+        for (int i = 0; i < tv.Length; i++)
+        {
+            tv[i] = Vector.FusedMultiplyAdd(av[i], bv[i], tv[i]);
+        }
+
+        for (int i = tv.Length * Vector<float>.Count; i < target.Length; i++)
+        {
+            target[i] += a[i] * b[i];
+        }
+    }
+
+    /// <summary>
+    /// Applies y (+)= x * scale + shift where scale/shift are per group of the [outer, groups, inner] view.
+    /// For inner = 1 the per-group values form a contiguous vector matching each row; otherwise they are
+    /// broadcast over each contiguous inner run.
+    /// </summary>
+    private static void GroupAffineCore(float[] x, float[] y, int n, int groups, int inner, Func<int, float> scaleOf, Func<int, float> shiftOf,
+        float[]? scaleRow, float[]? shiftRow, bool accumulate)
+    {
+        int w = Vector<float>.Count;
+        if (inner == 1 && groups >= w && scaleRow is not null && shiftRow is not null)
+        {
+            int rows = n / groups;
+            For(rows, n, (start, end) =>
+            {
+                var sv = MemoryMarshal.Cast<float, Vector<float>>(scaleRow.AsSpan(0, groups));
+                var hv = MemoryMarshal.Cast<float, Vector<float>>(shiftRow.AsSpan(0, groups));
+                for (int r = start; r < end; r++)
+                {
+                    var xs = x.AsSpan(r * groups, groups);
+                    var ys = y.AsSpan(r * groups, groups);
+                    var xv = MemoryMarshal.Cast<float, Vector<float>>(xs);
+                    var yv = MemoryMarshal.Cast<float, Vector<float>>(ys);
+                    for (int i = 0; i < xv.Length; i++)
+                    {
+                        var v = Vector.FusedMultiplyAdd(xv[i], sv[i], hv[i]);
+                        yv[i] = accumulate ? yv[i] + v : v;
+                    }
+
+                    for (int i = xv.Length * w; i < groups; i++)
+                    {
+                        float v = xs[i] * scaleRow[i] + shiftRow[i];
+                        ys[i] = accumulate ? ys[i] + v : v;
                     }
                 }
+            });
+            return;
+        }
 
-                double mu = sum / m;
-                double sq = 0;
-                for (int o = 0; o < outer; o++)
-                {
-                    var block = xv.AsSpan((o * groups + g) * inner, inner);
-                    foreach (float v in block)
-                    {
-                        sq += (v - mu) * (v - mu);
-                    }
-                }
-
-                double var = sq / m;
-                mv[g] = (float)mu;
-                vv[g] = (float)var;
-                sv[g] = (float)(1.0 / Math.Sqrt(var + eps));
-            }
-        });
-    }
-
-    public override void NormApply(Storage x, Storage mean, Storage invStd, Storage y, int outer, int groups, int inner)
-    {
-        float[] xv = D(x), mv = D(mean), sv = D(invStd), yv = D(y);
-        For(outer * groups, (long)outer * groups * inner, (start, end) =>
-        {
-            for (int b = start; b < end; b++)
-            {
-                int g = b % groups;
-                float mu = mv[g], s = sv[g];
-                int o = b * inner;
-                for (int i = 0; i < inner; i++)
-                {
-                    yv[o + i] = (xv[o + i] - mu) * s;
-                }
-            }
-        });
-    }
-
-    public override void NormBackward(Storage dxhat, Storage xhat, Storage sum1, Storage sum2, Storage invStd, Storage dx, int outer, int groups, int inner)
-    {
-        float[] gv = D(dxhat), hv = D(xhat), s1 = D(sum1), s2 = D(sum2), sv = D(invStd), dv = D(dx);
-        float m = outer * inner;
-        For(outer * groups, (long)outer * groups * inner, (start, end) =>
-        {
-            for (int b = start; b < end; b++)
-            {
-                int g = b % groups;
-                float scale = sv[g] / m, a = s1[g], c = s2[g];
-                int o = b * inner;
-                for (int i = 0; i < inner; i++)
-                {
-                    dv[o + i] += scale * (m * gv[o + i] - a - hv[o + i] * c);
-                }
-            }
-        });
-    }
-
-    public override void GroupScaleShift(Storage x, Storage? scale, Storage? shift, Storage y, int n, int groups, int inner, bool accumulate)
-    {
-        float[] xv = D(x), yv = D(y);
-        float[]? sc = scale is null ? null : D(scale);
-        float[]? sh = shift is null ? null : D(shift);
         int blocks = n / inner;
         For(blocks, n, (start, end) =>
         {
-            for (int b = start; b < end; b++)
+            for (int blk = start; blk < end; blk++)
             {
-                int g = b % groups;
-                float s = sc?[g] ?? 1f, t = sh?[g] ?? 0f;
-                int o = b * inner;
-                for (int i = 0; i < inner; i++)
+                int g = blk % groups;
+                float sc = scaleOf(g), sh = shiftOf(g);
+                var xs = x.AsSpan(blk * inner, inner);
+                var ys = y.AsSpan(blk * inner, inner);
+                var xv = MemoryMarshal.Cast<float, Vector<float>>(xs);
+                var yv = MemoryMarshal.Cast<float, Vector<float>>(ys);
+                var vs = new Vector<float>(sc);
+                var vh = new Vector<float>(sh);
+                for (int i = 0; i < xv.Length; i++)
                 {
-                    float v = xv[o + i] * s + t;
-                    yv[o + i] = accumulate ? yv[o + i] + v : v;
+                    var v = Vector.FusedMultiplyAdd(xv[i], vs, vh);
+                    yv[i] = accumulate ? yv[i] + v : v;
+                }
+
+                for (int i = xv.Length * w; i < inner; i++)
+                {
+                    float v = xs[i] * sc + sh;
+                    ys[i] = accumulate ? ys[i] + v : v;
                 }
             }
         });
     }
+
+
+    public override void NormApply(Storage x, Storage mean, Storage invStd, Storage y, int outer, int groups, int inner)
+    {
+        // (x - mean) * invStd == x * invStd + (-mean * invStd)
+        float[] mv = D(mean), sv = D(invStd);
+        var scale = sv.AsSpan(0, groups).ToArray();
+        var shift = new float[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            shift[g] = -mv[g] * sv[g];
+        }
+
+        GroupAffineCore(D(x), D(y), outer * groups * inner, groups, inner, g => scale[g], g => shift[g], scale, shift, accumulate: false);
+    }
+
+
+    public override void NormBackward(Storage dxhat, Storage xhat, Storage sum1, Storage sum2, Storage invStd, Storage dx, int outer, int groups, int inner)
+    {
+        // dx += invStd/M * (M*dxhat - s1 - xhat*s2): two fused affine passes, dx += dxhat*invStd, then dx += xhat*(-invStd*s2/M) - invStd*s1/M.
+        float[] s1 = D(sum1), s2 = D(sum2), sv = D(invStd);
+        float m = outer * inner;
+        var scale1 = sv.AsSpan(0, groups).ToArray();
+        var zero = new float[groups];
+        var scale2 = new float[groups];
+        var shift2 = new float[groups];
+        for (int g = 0; g < groups; g++)
+        {
+            scale2[g] = -sv[g] * s2[g] / m;
+            shift2[g] = -sv[g] * s1[g] / m;
+        }
+
+        int n = outer * groups * inner;
+        GroupAffineCore(D(dxhat), D(dx), n, groups, inner, g => scale1[g], _ => 0f, scale1, zero, accumulate: true);
+        GroupAffineCore(D(xhat), D(dx), n, groups, inner, g => scale2[g], g => shift2[g], scale2, shift2, accumulate: true);
+    }
+
+
+    public override void GroupScaleShift(Storage x, Storage? scale, Storage? shift, Storage y, int n, int groups, int inner, bool accumulate)
+    {
+        var sc = scale is null ? Enumerable.Repeat(1f, groups).ToArray() : D(scale).AsSpan(0, groups).ToArray();
+        var sh = shift is null ? new float[groups] : D(shift).AsSpan(0, groups).ToArray();
+        GroupAffineCore(D(x), D(y), n, groups, inner, g => sc[g], g => sh[g], sc, sh, accumulate);
+    }
+
 
     public override void GroupReduce(Storage a, Storage? b, Storage sumA, Storage? sumAB, int outer, int groups, int inner)
     {
-        float[] av = D(a), s1 = D(sumA);
-        float[]? bv = b is null ? null : D(b);
-        float[]? s2 = sumAB is null ? null : D(sumAB);
-        For(groups, (long)groups * outer * inner * 2, (start, end) =>
+        var s1 = new double[groups];
+        var s2 = new double[groups];
+        GroupMoments(D(a), b is null ? null : D(b), outer, groups, inner, s1, s2);
+        float[] r1 = D(sumA);
+        float[]? r2 = sumAB is null ? null : D(sumAB);
+        for (int g = 0; g < groups; g++)
         {
-            for (int g = start; g < end; g++)
+            r1[g] += (float)s1[g];
+            if (r2 is not null)
             {
-                double sa = 0, sab = 0;
-                for (int o = 0; o < outer; o++)
-                {
-                    int offset = (o * groups + g) * inner;
-                    for (int i = 0; i < inner; i++)
-                    {
-                        float v = av[offset + i];
-                        sa += v;
-                        if (bv is not null)
-                        {
-                            sab += v * bv[offset + i];
-                        }
-                    }
-                }
-
-                s1[g] += (float)sa;
-                if (s2 is not null)
-                {
-                    s2[g] += (float)sab;
-                }
+                r2[g] += (float)s2[g];
             }
-        });
+        }
     }
+
 
     public override void InvSqrt(Storage x, Storage y, int n, float eps)
     {
@@ -337,118 +447,157 @@ internal sealed partial class CpuBackend
     {
         float[] xv = D(x), cv = D(cols);
         var geo = g;
-        int oh = g.OH, ow = g.OW, patch = g.PatchSize;
-        For(g.N * oh, (long)g.Positions * patch, (start, end) =>
+        For(g.N * g.OH, (long)g.Positions * g.PatchSize, (start, end) => Im2ColRows(xv, cv, geo, start, end));
+    }
+
+    /// <summary>Fills the column rows of output rows [start, end) of (n, oh); each patch row is copied as contiguous runs.</summary>
+    private static void Im2ColRows(float[] xv, float[] cv, ConvGeometry g, int start, int end)
+    {
+        int c = g.C, h = g.H, w = g.W, kh = g.KH, kw = g.KW, sh = g.SH, sw = g.SW, ph = g.PH, pw = g.PW, oh = g.OH, ow = g.OW, patch = g.PatchSize;
+        for (int noh = start; noh < end; noh++)
         {
-            for (int noh = start; noh < end; noh++)
+            int n = noh / oh, y = noh % oh;
+            for (int x0 = 0; x0 < ow; x0++)
             {
-                int n = noh / oh, y = noh % oh;
-                for (int x0 = 0; x0 < ow; x0++)
+                var row = cv.AsSpan((noh * ow + x0) * patch, patch);
+                int col = 0;
+                int iw0 = x0 * sw - pw;
+                for (int ch = 0; ch < c; ch++)
                 {
-                    int row = (noh * ow + x0) * patch;
-                    int col = 0;
-                    for (int c = 0; c < geo.C; c++)
+                    int plane = (n * c + ch) * h;
+                    for (int ki = 0; ki < kh; ki++, col += kw)
                     {
-                        int plane = (n * geo.C + c) * geo.H;
-                        for (int kh = 0; kh < geo.KH; kh++)
+                        int ih = y * sh - ph + ki;
+                        var target = row.Slice(col, kw);
+                        if ((uint)ih >= (uint)h)
                         {
-                            int ih = y * geo.SH - geo.PH + kh;
-                            for (int kw = 0; kw < geo.KW; kw++, col++)
-                            {
-                                int iw = x0 * geo.SW - geo.PW + kw;
-                                cv[row + col] = (uint)ih < (uint)geo.H && (uint)iw < (uint)geo.W ? xv[(plane + ih) * geo.W + iw] : 0f;
-                            }
+                            target.Clear();
+                            continue;
+                        }
+
+                        if (iw0 >= 0 && iw0 + kw <= w)
+                        {
+                            xv.AsSpan((plane + ih) * w + iw0, kw).CopyTo(target);
+                            continue;
+                        }
+
+                        for (int kj = 0; kj < kw; kj++)
+                        {
+                            int iw = iw0 + kj;
+                            target[kj] = (uint)iw < (uint)w ? xv[(plane + ih) * w + iw] : 0f;
                         }
                     }
                 }
             }
-        });
+        }
     }
+
 
     public override void Col2Im(Storage dcols, Storage dx, in ConvGeometry g)
     {
         float[] cv = D(dcols), dv = D(dx);
         var geo = g;
-        int oh = g.OH, ow = g.OW, patch = g.PatchSize;
 
         // Images write to disjoint parts of dx, so they can run in parallel without atomics.
-        For(g.N, (long)g.Positions * patch, (start, end) =>
-        {
-            for (int n = start; n < end; n++)
-            {
-                for (int y = 0; y < oh; y++)
-                {
-                    for (int x0 = 0; x0 < ow; x0++)
-                    {
-                        int row = ((n * oh + y) * ow + x0) * patch;
-                        int col = 0;
-                        for (int c = 0; c < geo.C; c++)
-                        {
-                            int plane = (n * geo.C + c) * geo.H;
-                            for (int kh = 0; kh < geo.KH; kh++)
-                            {
-                                int ih = y * geo.SH - geo.PH + kh;
-                                for (int kw = 0; kw < geo.KW; kw++, col++)
-                                {
-                                    int iw = x0 * geo.SW - geo.PW + kw;
-                                    if ((uint)ih < (uint)geo.H && (uint)iw < (uint)geo.W)
-                                    {
-                                        dv[(plane + ih) * geo.W + iw] += cv[row + col];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        For(g.N, (long)g.Positions * g.PatchSize, (start, end) => Col2ImImages(cv, dv, geo, start, end));
     }
 
-    public override void MaxPool(Storage x, Storage y, Storage argmax, in ConvGeometry g)
+    private static void Col2ImImages(float[] cv, float[] dv, ConvGeometry g, int start, int end)
     {
-        float[] xv = D(x), yv = D(y);
-        var geo = g;
-        int oh = g.OH, ow = g.OW;
-        var indices = new int[g.N * g.C * oh * ow];
-        For(g.N * g.C, (long)indices.Length * g.KH * g.KW, (start, end) =>
+        int c = g.C, h = g.H, w = g.W, kh = g.KH, kw = g.KW, sh = g.SH, sw = g.SW, ph = g.PH, pw = g.PW, oh = g.OH, ow = g.OW, patch = g.PatchSize;
+        for (int n = start; n < end; n++)
         {
-            for (int nc = start; nc < end; nc++)
+            for (int y = 0; y < oh; y++)
             {
-                int plane = nc * geo.H * geo.W;
-                for (int y0 = 0; y0 < oh; y0++)
+                for (int x0 = 0; x0 < ow; x0++)
                 {
-                    for (int x0 = 0; x0 < ow; x0++)
+                    var row = cv.AsSpan(((n * oh + y) * ow + x0) * patch, patch);
+                    int col = 0;
+                    int iw0 = x0 * sw - pw;
+                    for (int ch = 0; ch < c; ch++)
                     {
-                        float best = float.NegativeInfinity;
-                        int bestIndex = plane;
-                        for (int kh = 0; kh < geo.KH; kh++)
+                        int plane = (n * c + ch) * h;
+                        for (int ki = 0; ki < kh; ki++, col += kw)
                         {
-                            int ih = y0 * geo.SH - geo.PH + kh;
-                            if ((uint)ih >= (uint)geo.H)
+                            int ih = y * sh - ph + ki;
+                            if ((uint)ih >= (uint)h)
                             {
                                 continue;
                             }
 
-                            for (int kw = 0; kw < geo.KW; kw++)
+                            var source = row.Slice(col, kw);
+                            if (iw0 >= 0 && iw0 + kw <= w)
                             {
-                                int iw = x0 * geo.SW - geo.PW + kw;
-                                if ((uint)iw < (uint)geo.W && xv[plane + ih * geo.W + iw] > best)
+                                AddInPlace(dv.AsSpan((plane + ih) * w + iw0, kw), source);
+                                continue;
+                            }
+
+                            for (int kj = 0; kj < kw; kj++)
+                            {
+                                int iw = iw0 + kj;
+                                if ((uint)iw < (uint)w)
                                 {
-                                    best = xv[plane + ih * geo.W + iw];
-                                    bestIndex = plane + ih * geo.W + iw;
+                                    dv[(plane + ih) * w + iw] += source[kj];
                                 }
                             }
                         }
-
-                        int o = (nc * oh + y0) * ow + x0;
-                        yv[o] = best;
-                        indices[o] = bestIndex;
                     }
                 }
             }
-        });
-        indices.AsSpan().CopyTo(MemoryMarshal.Cast<float, int>(D(argmax).AsSpan()));
+        }
     }
+
+
+    public override void MaxPool(Storage x, Storage y, Storage argmax, in ConvGeometry g)
+    {
+        float[] xv = D(x), yv = D(y), av = D(argmax);
+        var geo = g;
+        For(g.N * g.C, (long)g.N * g.C * g.OH * g.OW * g.KH * g.KW, (start, end) => MaxPoolPlanes(xv, yv, av, geo, start, end));
+    }
+
+    // Kernel bodies live in static methods so loop bounds are register locals, not closure fields.
+    private static void MaxPoolPlanes(float[] xv, float[] yv, float[] av, ConvGeometry g, int start, int end)
+    {
+        int h = g.H, w = g.W, kh = g.KH, kw = g.KW, sh = g.SH, sw = g.SW, ph = g.PH, pw = g.PW, oh = g.OH, ow = g.OW;
+        var indices = MemoryMarshal.Cast<float, int>(av.AsSpan());
+        for (int nc = start; nc < end; nc++)
+        {
+            int planeOffset = nc * h * w;
+            var plane = xv.AsSpan(planeOffset, h * w);
+            int o = nc * oh * ow;
+            for (int y0 = 0; y0 < oh; y0++)
+            {
+                int r0 = y0 * sh - ph;
+                int rStart = Math.Max(r0, 0), rEnd = Math.Min(r0 + kh, h);
+                for (int x0 = 0; x0 < ow; x0++, o++)
+                {
+                    int c0 = x0 * sw - pw;
+                    int cStart = Math.Max(c0, 0), cEnd = Math.Min(c0 + kw, w);
+                    float best = float.NegativeInfinity;
+                    int bestIndex = 0;
+                    for (int r = rStart; r < rEnd; r++)
+                    {
+                        int rowOffset = r * w;
+                        for (int c = cStart; c < cEnd; c++)
+                        {
+                            // Branch-free arg-max: a data-dependent branch here mispredicts about half the
+                            // time on real activations (measured 3x slower), so select the index with a bit mask.
+                            float v = plane[rowOffset + c];
+                            bool greater = v > best;
+                            int mask = -Unsafe.As<bool, byte>(ref greater);
+                            bestIndex = (bestIndex & ~mask) | ((rowOffset + c) & mask);
+                            best = MathF.Max(best, v);
+                        }
+                    }
+
+                    yv[o] = best;
+                    indices[o] = planeOffset + bestIndex;
+                }
+            }
+        }
+    }
+
+
 
     public override void MaxPoolBackward(Storage dy, Storage argmax, Storage dx, int count)
     {
@@ -622,14 +771,32 @@ internal sealed partial class CpuBackend
     private const float GeluK = 0.7978845608f;
     private const float GeluC = 0.044715f;
 
+    /// <summary>tanh(u) = 1 - 2 / (e^(2u) + 1), vectorized; saturates cleanly to ±1.</summary>
+    private static Vector<float> TanhVector(Vector<float> u) =>
+        Vector<float>.One - new Vector<float>(2f) / (Vector.Exp(u + u) + Vector<float>.One);
+
     private readonly struct GeluKernel(float[] x, float[] y) : IRangeKernel
     {
         public void Execute(int start, int end)
         {
-            for (int i = start; i < end; i++)
+            var xs = x.AsSpan(start, end - start);
+            var ys = y.AsSpan(start, end - start);
+            var xv = MemoryMarshal.Cast<float, Vector<float>>(xs);
+            var yv = MemoryMarshal.Cast<float, Vector<float>>(ys);
+            var k = new Vector<float>(GeluK);
+            var c = new Vector<float>(GeluC);
+            var half = new Vector<float>(0.5f);
+            for (int i = 0; i < xv.Length; i++)
             {
-                float v = x[i];
-                y[i] = 0.5f * v * (1f + MathF.Tanh(GeluK * (v + GeluC * v * v * v)));
+                var v = xv[i];
+                var t = TanhVector(k * Vector.FusedMultiplyAdd(c * v * v, v, v));
+                yv[i] = half * v * (Vector<float>.One + t);
+            }
+
+            for (int i = xv.Length * Vector<float>.Count; i < xs.Length; i++)
+            {
+                float v = xs[i];
+                ys[i] = 0.5f * v * (1f + MathF.Tanh(GeluK * (v + GeluC * v * v * v)));
             }
         }
     }
@@ -638,12 +805,32 @@ internal sealed partial class CpuBackend
     {
         public void Execute(int start, int end)
         {
-            for (int i = start; i < end; i++)
+            var xs = x.AsSpan(start, end - start);
+            var gs = dy.AsSpan(start, end - start);
+            var ds = dx.AsSpan(start, end - start);
+            var xv = MemoryMarshal.Cast<float, Vector<float>>(xs);
+            var gv = MemoryMarshal.Cast<float, Vector<float>>(gs);
+            var dv = MemoryMarshal.Cast<float, Vector<float>>(ds);
+            var k = new Vector<float>(GeluK);
+            var c = new Vector<float>(GeluC);
+            var c3 = new Vector<float>(3f * GeluC);
+            var half = new Vector<float>(0.5f);
+            var one = Vector<float>.One;
+            for (int i = 0; i < xv.Length; i++)
             {
-                float v = x[i];
+                var v = xv[i];
+                var v2 = v * v;
+                var t = TanhVector(k * Vector.FusedMultiplyAdd(c * v2, v, v));
+                var derivative = half * (one + t) + half * v * (one - t * t) * k * Vector.FusedMultiplyAdd(c3, v2, one);
+                dv[i] = Vector.FusedMultiplyAdd(gv[i], derivative, dv[i]);
+            }
+
+            for (int i = xv.Length * Vector<float>.Count; i < xs.Length; i++)
+            {
+                float v = xs[i];
                 float t = MathF.Tanh(GeluK * (v + GeluC * v * v * v));
                 float derivative = 0.5f * (1f + t) + 0.5f * v * (1f - t * t) * GeluK * (1f + 3f * GeluC * v * v);
-                dx[i] += dy[i] * derivative;
+                ds[i] += gs[i] * derivative;
             }
         }
     }

@@ -361,7 +361,7 @@ public sealed partial class Tensor
         long start = Telemetry.Start(TelemetryLevel.Operations);
         mean = Empty([groups], Device);
         variance = Empty([groups], Device);
-        var invStd = Empty([groups], Device);
+        var invStd = Empty([groups], Device, track: false);
         Backend.NormStats(Storage, mean.Storage, variance.Storage, invStd.Storage, outer, groups, inner, eps);
         var y = Empty(_shape, Device);
         Backend.NormApply(Storage, mean.Storage, invStd.Storage, y.Storage, outer, groups, inner);
@@ -374,7 +374,12 @@ public sealed partial class Tensor
                 using var sum2 = Empty([groups], x.Device, zeroed: true, track: false);
                 x.Backend.GroupReduce(g.Storage, y.Storage, sum1.Storage, sum2.Storage, outer, groups, inner);
                 x.Backend.NormBackward(g.Storage, y.Storage, sum1.Storage, sum2.Storage, invStd.Storage, x.GradStorage(), outer, groups, inner);
+                invStd.Dispose();
             }, x);
+        }
+        else
+        {
+            invStd.Dispose();
         }
 
         return Traced("normalize", y, start);
@@ -472,12 +477,20 @@ public sealed partial class Tensor
         var g0 = geometry;
         long start = Telemetry.Start(TelemetryLevel.Operations);
         var y = Empty([g0.N, g0.C, g0.OH, g0.OW], Device);
-        var argmax = Empty([y.Size], Device);
+        var argmax = Empty([y.Size], Device, track: false);
         Backend.MaxPool(Storage, y.Storage, argmax.Storage, g0);
         if (WillRecord(this))
         {
             var x = this;
-            y.Record("maxpool", g => x.Backend.MaxPoolBackward(g.Storage, argmax.Storage, x.GradStorage(), y.Size), x);
+            y.Record("maxpool", g =>
+            {
+                x.Backend.MaxPoolBackward(g.Storage, argmax.Storage, x.GradStorage(), y.Size);
+                argmax.Dispose();   // backward runs once; recycle the indices immediately
+            }, x);
+        }
+        else
+        {
+            argmax.Dispose();
         }
 
         return Traced("maxpool", y, start);

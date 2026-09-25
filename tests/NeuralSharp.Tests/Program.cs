@@ -99,6 +99,11 @@ internal static partial class Tests
         using var cpuOnes = Tensor.Ones([N], Device.Cpu);
         var cpu = cpuOnes.Dropout(0.25f, 99).ToArray();
         Check(cpu.SequenceEqual(y), "the dropout mask must be identical on every device");
+        for (int i = 0; i < N; i++)
+        {
+            // The vectorized kernels must reproduce the scalar reference hash exactly.
+            Check((y[i] != 0f) == NeuralSharp.Backends.DropoutMask.Keep(99, (uint)i, 0.25f), $"dropout mask differs from the reference at {i}");
+        }
 
         var layer = new Dropout(0.5f);
         layer.Eval();

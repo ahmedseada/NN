@@ -375,7 +375,40 @@ internal sealed partial class CpuBackend : Backend
         public void Execute(int start, int end)
         {
             float scale = 1f / (1f - p);
-            for (int i = start; i < end; i++)
+            int w = Vector<uint>.Count;
+            int i = start;
+            if (end - start >= w)
+            {
+                // Vectorized DropoutMask.Keep: the same MurmurHash3 finalizer on w consecutive indices at once.
+                Span<uint> lanes = stackalloc uint[w];
+                for (int l = 0; l < w; l++)
+                {
+                    lanes[l] = (uint)l;
+                }
+
+                var laneOffsets = new Vector<uint>(lanes);
+                var vseed = new Vector<uint>(seed);
+                var vp = new Vector<float>(p);
+                var vscale = new Vector<float>(scale);
+                var inv24 = new Vector<float>(1f / 16777216f);
+                for (; i + w <= end; i += w)
+                {
+                    var h = (new Vector<uint>((uint)i) + laneOffsets) * new Vector<uint>(0x9E3779B9u) ^ vseed;
+                    h ^= Vector.ShiftRightLogical(h, 16);
+                    h *= new Vector<uint>(0x85EBCA6Bu);
+                    h ^= Vector.ShiftRightLogical(h, 13);
+                    h *= new Vector<uint>(0xC2B2AE35u);
+                    h ^= Vector.ShiftRightLogical(h, 16);
+                    var u = Vector.ConvertToSingle(Vector.ShiftRightLogical(h, 8)) * inv24;
+                    var keep = Vector.GreaterThanOrEqual(u, vp);
+                    var xv = Vector.LoadUnsafe(ref x[i]);
+                    var v = Vector.ConditionalSelect(keep, xv * vscale, Vector<float>.Zero);
+                    ref float target = ref y[i];
+                    (accumulate ? Vector.LoadUnsafe(ref target) + v : v).StoreUnsafe(ref target);
+                }
+            }
+
+            for (; i < end; i++)
             {
                 float v = DropoutMask.Keep(seed, (uint)i, p) ? x[i] * scale : 0f;
                 y[i] = accumulate ? y[i] + v : v;
