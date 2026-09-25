@@ -143,6 +143,14 @@ def checks(path):
     return len(doc), body, sorted(set(fails))
 
 
+def compress(path):
+    """Lossless: drops unused objects, deduplicates and deflates streams and fonts (WeasyPrint output is ~6x larger)."""
+    doc = fitz.open(path)
+    data = doc.tobytes(garbage=4, deflate=True, deflate_fonts=True, clean=True)
+    doc.close()
+    path.write_bytes(data)
+
+
 if __name__ == "__main__":
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else HERE / "out" / "NeuralSharp.pdf")
     out.parent.mkdir(exist_ok=True)
@@ -155,6 +163,7 @@ if __name__ == "__main__":
             break
         index = new_index
     stamp(pdf, out)
+    compress(out)
     pages, body, fails = checks(out)
     print(f"{out.name}: {pages} pages, body {body}pt, {passes} layout passes, {len(index)} index terms")
     print("CHECKS: PASS" if not fails else "CHECKS: FAIL\n  " + "\n  ".join(fails[:40]))
