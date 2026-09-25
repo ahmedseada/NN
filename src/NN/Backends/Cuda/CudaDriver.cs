@@ -1,0 +1,146 @@
+using System.Reflection;
+using System.Runtime.InteropServices;
+
+namespace NN.Backends.Cuda;
+
+/// <summary>Thrown when a CUDA driver call fails.</summary>
+public sealed class CudaException(string message) : Exception(message);
+
+/// <summary>
+/// Bindings to the CUDA driver API. The driver ships with the NVIDIA display driver
+/// (nvcuda.dll on Windows, libcuda.so.1 on Linux), so nothing beyond a GPU driver is required:
+/// no CUDA toolkit, cuBLAS, cuDNN or TensorFlow binaries.
+/// </summary>
+internal static unsafe partial class CudaDriver
+{
+    private const string Library = "cuda";
+
+    static CudaDriver()
+    {
+        NativeLibrary.SetDllImportResolver(typeof(CudaDriver).Assembly, Resolve);
+    }
+
+    /// <summary>Loads the driver library; returns false (with a reason) when no NVIDIA driver is installed.</summary>
+    public static bool TryLoad(out string reason)
+    {
+        foreach (var name in CandidateNames())
+        {
+            if (NativeLibrary.TryLoad(name, out var handle))
+            {
+                NativeLibrary.Free(handle);
+                reason = "";
+                return true;
+            }
+        }
+
+        reason = $"the NVIDIA driver library ({string.Join(" / ", CandidateNames())}) was not found";
+        return false;
+    }
+
+    private static IntPtr Resolve(string name, Assembly assembly, DllImportSearchPath? searchPath)
+    {
+        if (name != Library)
+        {
+            return IntPtr.Zero;
+        }
+
+        foreach (var candidate in CandidateNames())
+        {
+            if (NativeLibrary.TryLoad(candidate, assembly, searchPath, out var handle))
+            {
+                return handle;
+            }
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private static string[] CandidateNames() =>
+        OperatingSystem.IsWindows() ? ["nvcuda.dll"] :
+        OperatingSystem.IsLinux() ? ["libcuda.so.1", "libcuda.so"] :
+        [];
+
+    public static void Check(int result, string call)
+    {
+        if (result == 0)
+        {
+            return;
+        }
+
+        string name = "CUDA_ERROR";
+        if (cuGetErrorName(result, out var text) == 0 && text != null)
+        {
+            name = Marshal.PtrToStringAnsi((IntPtr)text) ?? name;
+        }
+
+        throw new CudaException($"{call} failed: {name} ({result})");
+    }
+
+    public const int ErrorOutOfMemory = 2;
+
+    public const int JitErrorLogBuffer = 5;
+    public const int JitErrorLogBufferSizeBytes = 6;
+
+    public const int AttributeMultiprocessorCount = 16;
+
+    [LibraryImport(Library)]
+    public static partial int cuInit(uint flags);
+
+    [LibraryImport(Library)]
+    public static partial int cuDeviceGetCount(out int count);
+
+    [LibraryImport(Library)]
+    public static partial int cuDeviceGet(out int device, int ordinal);
+
+    [LibraryImport(Library)]
+    public static partial int cuDeviceGetName(byte* name, int length, int device);
+
+    [LibraryImport(Library)]
+    public static partial int cuDeviceGetAttribute(out int value, int attribute, int device);
+
+    [LibraryImport(Library, EntryPoint = "cuDeviceTotalMem_v2")]
+    public static partial int cuDeviceTotalMem(out nuint bytes, int device);
+
+    [LibraryImport(Library, EntryPoint = "cuDevicePrimaryCtxRetain")]
+    public static partial int cuDevicePrimaryCtxRetain(out IntPtr context, int device);
+
+    [LibraryImport(Library)]
+    public static partial int cuCtxSetCurrent(IntPtr context);
+
+    [LibraryImport(Library)]
+    public static partial int cuCtxSynchronize();
+
+    [LibraryImport(Library)]
+    public static partial int cuModuleLoadDataEx(out IntPtr module, byte* image, uint numOptions, int* options, void** optionValues);
+
+    [LibraryImport(Library)]
+    public static partial int cuModuleGetFunction(out IntPtr function, IntPtr module, byte* name);
+
+    [LibraryImport(Library, EntryPoint = "cuMemAlloc_v2")]
+    public static partial int cuMemAlloc(out ulong pointer, nuint bytes);
+
+    [LibraryImport(Library, EntryPoint = "cuMemFree_v2")]
+    public static partial int cuMemFree(ulong pointer);
+
+    [LibraryImport(Library, EntryPoint = "cuMemcpyHtoD_v2")]
+    public static partial int cuMemcpyHtoD(ulong destination, void* source, nuint bytes);
+
+    [LibraryImport(Library, EntryPoint = "cuMemcpyDtoH_v2")]
+    public static partial int cuMemcpyDtoH(void* destination, ulong source, nuint bytes);
+
+    [LibraryImport(Library, EntryPoint = "cuMemcpyDtoD_v2")]
+    public static partial int cuMemcpyDtoD(ulong destination, ulong source, nuint bytes);
+
+    [LibraryImport(Library, EntryPoint = "cuMemsetD32_v2")]
+    public static partial int cuMemsetD32(ulong destination, uint value, nuint count);
+
+    [LibraryImport(Library)]
+    public static partial int cuLaunchKernel(
+        IntPtr function,
+        uint gridX, uint gridY, uint gridZ,
+        uint blockX, uint blockY, uint blockZ,
+        uint sharedMemBytes, IntPtr stream, void** kernelParams, void** extra);
+
+    [LibraryImport(Library)]
+    public static partial int cuGetErrorName(int error, out byte* text);
+}

@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>NN</RootNamespace>
+    <AssemblyName>NN</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <Optimize>true</Optimize>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageId>NN</PackageId>
+    <Description>Self-contained neural network library for .NET: tensors, autograd, layers and optimizers with a SIMD CPU backend and a CUDA backend that talks to the NVIDIA driver directly. No TensorFlow, no native dependencies.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="NN.Tests" />
+  </ItemGroup>
+
+</Project>
