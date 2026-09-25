@@ -385,7 +385,7 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 50 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 51 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
@@ -393,8 +393,8 @@ data loading, telemetry, memory limits and thread budgets. The suite runs on eve
 
 ## Status
 
-* **Verified on real hardware.** All 50 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
-  Laptop GPU (Blackwell), 100 of 100. That covers every GPU kernel: matrix products, softmax,
+* **Verified on real hardware.** All 51 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
+  Laptop GPU (Blackwell), 102 of 102. That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.
 * The 51 GPU kernels also assemble without errors or register spills for sm_50, sm_75, sm_86, sm_90
