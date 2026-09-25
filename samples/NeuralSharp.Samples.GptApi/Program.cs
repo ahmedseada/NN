@@ -8,6 +8,7 @@
 // the Transformer sample, or leave the default: when no model exists, one is trained in the background
 // and /api/status reports the progress.
 
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.HttpResults;
 using NeuralSharp.Samples.Gpt;
@@ -23,6 +24,7 @@ builder.Services.AddOpenApi(options => options.AddDocumentTransformer((document,
 }));
 builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<GptService>();
+builder.Services.AddSingleton<ChatService>();
 builder.Services.AddHostedService(services => services.GetRequiredService<GptService>());
 
 var app = builder.Build();
@@ -76,6 +78,64 @@ api.MapPost("/generate/stream", Results<ServerSentEventsResult<object>, ProblemH
     .WithName("GenerateStream")
     .WithSummary("Generate text as a live stream (server-sent events)")
     .WithDescription("Same as /api/generate, but emits \"token\" events (each with its sample index) every chunkSize characters as they are produced, then a \"metrics\" event.");
+
+// ---------------------------------------------------------------- Ollama-compatible endpoints
+var ollama = app.MapGroup("/api").WithTags("Ollama-compatible");
+var ndjson = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+
+ollama.MapPost("/chat", (OllamaChatRequest request, ChatService chat, CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            ChatService.Translate(request);                                // validate before anything is streamed
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or FormatException)
+        {
+            return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        if (!chat.IsAvailable)
+        {
+            return Results.Json(new { error = $"model '{request.Model}' is not available yet: no trained model file" }, statusCode: StatusCodes.Status404NotFound);
+        }
+
+        if (request.Stream == false)
+        {
+            return Results.Stream(async body =>
+            {
+                OllamaChatResponse? last = null;
+                await foreach (var item in chat.ChatAsync(request, stream: false, cancellationToken))
+                {
+                    last = item;
+                }
+
+                await JsonSerializer.SerializeAsync(body, last, ndjson, cancellationToken);
+            }, "application/json");
+        }
+
+        return Results.Stream(async body =>
+        {
+            await foreach (var item in chat.ChatAsync(request, stream: true, cancellationToken))
+            {
+                await JsonSerializer.SerializeAsync(body, item, ndjson, cancellationToken);
+                await body.WriteAsync("\n"u8.ToArray(), cancellationToken);
+                await body.FlushAsync(cancellationToken);
+            }
+        }, "application/x-ndjson");
+    })
+    .WithName("OllamaChat")
+    .WithSummary("Chat (Ollama-compatible)")
+    .WithDescription("Accepts the Ollama /api/chat body: model (any name selects the served model), messages (system, user, assistant, tool), " +
+                     "stream (NDJSON lines, default true), think (true/false or low/medium/high), keep_alive (e.g. \"30m\", 0, -1), options " +
+                     "(temperature, top_k, top_p, min_p, repeat_penalty, repeat_last_n, presence_penalty, frequency_penalty, seed, num_ctx, " +
+                     "num_predict, stop; others ignored) and tools (function definitions; calls come back in message.tool_calls).");
+
+ollama.MapGet("/tags", (ChatService chat) => Results.Ok(new { models = chat.Tags() }))
+    .WithName("OllamaTags").WithSummary("Available models (Ollama-compatible)");
+ollama.MapGet("/ps", (ChatService chat) => Results.Ok(new { models = chat.Running() }))
+    .WithName("OllamaPs").WithSummary("Loaded models and when they expire (Ollama-compatible)");
+ollama.MapGet("/version", () => Results.Ok(new { version = "0.1.0-neuralsharp" }))
+    .WithName("OllamaVersion").WithSummary("Server version (Ollama-compatible)");
 
 app.Run();
 

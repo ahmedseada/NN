@@ -286,7 +286,8 @@ three tools that work together (`CharGpt.Generate` in `samples/Shared/Gpt` shows
   processed once (prefill), then every step processes only the newest token, while each attention
   layer's keys and values accumulate in a `KeyValueCache`. `MultiHeadAttention`,
   `TransformerEncoderLayer` and `PositionalEncoding` implement `ICachedModule`.
-* **On-device sampling.** `TokenSampler` draws the next token (temperature, top-k) on the device
+* **On-device sampling.** `TokenSampler` draws the next token (temperature, top-k, top-p, min-p,
+  repeat/presence/frequency penalties over a device-side history of recent tokens) on the device
   that holds the logits and writes each token's probability, entropy and top-5 alternatives to a
   device buffer. The next step therefore needs no host round trip; `Read` fetches the statistics in
   chunks. Its randomness is counter-based (seed, step, row), so results are reproducible and match
@@ -310,6 +311,58 @@ Measured on the sample GPT (341K parameters) on a 4-core CPU container
 | KV cache, 32 samples | 8,957 | 32× |
 
 On a GPU, CUDA graphs remove the per-step launch cost, and batching keeps the GPU busy.
+
+### Text generation, chat and tools (`NeuralSharp.Generation`)
+
+A higher-level layer on top of the cache, sampler and graphs, with the options and conventions of common
+local LLM servers:
+
+| Type | Purpose |
+|------|---------|
+| `ITokenizer`, `CharTokenizer` | text ↔ token ids |
+| `GenerationOptions` | `Temperature`, `TopK`, `TopP`, `MinP`, `RepeatPenalty`, `RepeatLastN`, `PresencePenalty`, `FrequencyPenalty`, `Seed`, `NumCtx`, `NumPredict`, `Stop`, plus `UseCache`, `UseGraph`, `ChunkSize` |
+| `TextGenerator` | streams a continuation: prompt truncated to `NumCtx`, sliding context window, stop sequences (never partially emitted), done reason `stop` / `length`, prompt and generation timings |
+| `ChatMessage`, `ToolDefinition`, `ToolCall` | conversations with `system`, `user`, `assistant` and `tool` roles, and function tools |
+| `ChatTemplate`, `ChatMLTemplate` | renders a conversation and its tools as the prompt (Qwen-style ChatML: `<think>`, `<tool_call>`, `<tool_response>`); `think: false` closes an empty reasoning block |
+| `ChatOutputParser` | splits streamed output into reasoning, answer and tool calls (JSON), holding back partial tags |
+| `ChatGenerator` | chat = template + generator + parser; streams `ChatChunk`s and ends with the full assistant message and statistics |
+| `ModelHost<T>`, `KeepAlive` | keeps models loaded and unloads each one when its keep-alive (`"30m"`, `"1h30m"`, `300`, `0`, `-1`) expires |
+
+```csharp
+var chat = new ChatGenerator(new TextGenerator(model, new CharTokenizer(vocabulary), contextLength: 256));
+var request = new ChatRequest(
+    [new ChatMessage("system", "You are a helpful assistant."), new ChatMessage("user", "What is the latest Ollama version?")],
+    Tools: [new ToolDefinition("web_fetch", "Fetch a page.", JsonNode.Parse("""{"type":"object","properties":{"url":{"type":"string"}}}"""))],
+    Think: true,
+    Options: new GenerationOptions { Temperature = 1f, TopK = 20, TopP = 0.95f, NumCtx = 4096, NumPredict = 2048 });
+foreach (var chunk in chat.Stream(request))
+    Console.Write(chunk.Delta.Thinking + chunk.Delta.Content);   // chunk.Delta.ToolCalls: completed tool calls
+```
+
+### Ollama-compatible chat API
+
+The GPT Web API also serves `POST /api/chat` with the Ollama request body: `model` (any name selects the
+served model), `messages`, `stream` (NDJSON, default true), `think` (true/false or low/medium/high),
+`keep_alive`, `options` (the keys above in snake_case; other keys are accepted and ignored) and `tools`.
+Replies have Ollama's shape: `message.content`, `message.thinking`, `message.tool_calls`, `done`,
+`done_reason` and nanosecond `total_duration`, `load_duration`, `prompt_eval_count`,
+`prompt_eval_duration`, `eval_count`, `eval_duration`. `GET /api/tags`, `GET /api/ps` (loaded models with
+`expires_at`) and `GET /api/version` are there too.
+
+```bash
+curl http://localhost:5080/api/chat -d '{"model":"any","stream":true,"think":true,"keep_alive":"30m",
+  "options":{"temperature":1,"top_k":20,"top_p":0.95,"num_ctx":4096,"num_predict":2048},
+  "messages":[{"role":"user","content":"What is the latest Ollama version?"}],
+  "tools":[{"type":"function","function":{"name":"web_fetch","parameters":{"type":"object","properties":{"url":{"type":"string"}}}}}]}'
+```
+
+The endpoint serves `Gpt:ChatModelPath` if that file exists, otherwise `Gpt:ModelPath`. A model trained on
+plain text only continues text. To see reasoning and tool calls, train the small chat model on synthetic
+ChatML transcripts (reasoning, `web_fetch` calls, answers citing tool results):
+
+```bash
+dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --chat true   # saves models/chat.weights and runs a two-turn demo
+```
 
 ### Optimizers and schedules
 
@@ -421,21 +474,24 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 56 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 62 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
-data loading, telemetry, memory limits and thread budgets. The suite runs on every available device.
+data loading, telemetry, memory limits and thread budgets, the sampler's filters and penalties, and the
+generation layer (stop sequences, context sliding, cache/graph/recompute agreement, template rendering,
+streaming parser, keep-alive expiry). The suite runs on every available device.
 
 ## Status
 
 * **Verified on real hardware.** 51 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
   Laptop GPU (Blackwell), 102 of 102. The 5 newer decoding tests (KV cache, batched decoding, graph
-  replay, sampler, fused kernels) pass on the CPU and still need a run on a GPU. That covers every GPU kernel: matrix products, softmax,
+  replay, sampler, fused kernels) and the 6 newest ones (sampler filters and penalties, generation layer)
+  pass on the CPU and still need a run on a GPU. That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.
-* The 51 GPU kernels also assemble without errors or register spills for sm_50, sm_75, sm_86, sm_90
-  and sm_120 (checked with `ptxas`), covering Maxwell through Blackwell.
+* The 59 GPU kernels also assemble without errors for sm_50, sm_75, sm_89 and sm_120 (checked with
+  `ptxas` 12.9), covering Maxwell through Blackwell.
 * Everything computes in float32. Tensors hold up to 2³¹ elements, and embedding ids must be below
   2²⁴ (the largest integer a float stores exactly).
 * Small models such as the samples are dominated by kernel-launch overhead on the GPU. Recurrent

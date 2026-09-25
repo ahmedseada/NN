@@ -22,7 +22,8 @@ if (SampleOptions.Parse(args,
         ("samples", "continuations generated together as one batch (default 1)"),
         ("cache", "on|off: incremental decoding with a KV cache (default on)"),
         ("graph", "on|off: record the decoding step as a CUDA graph on GPU (default on)"),
-        ("benchmark", "true: compare decoding modes and batch sizes")) is not { } options)
+        ("benchmark", "true: compare decoding modes and batch sizes"),
+        ("chat", "true: train (or load) a chat model on synthetic ChatML transcripts with reasoning and web_fetch tool calls")) is not { } options)
 {
     return 0;
 }
@@ -30,7 +31,8 @@ if (SampleOptions.Parse(args,
 var device = options.Device;
 Console.WriteLine($"Device: {device} - {device.Name}\n");
 using var logger = Telemetry.Subscribe(new ConsoleLogger(options.LogLevels));
-string modelPath = options.ModelPath("transformer.weights");
+bool chatMode = options.Get("chat") is "true" or "1";
+string modelPath = options.ModelPath(chatMode ? "chat.weights" : "transformer.weights");
 
 CharGpt gpt;
 if (options.PredictOnly)
@@ -47,16 +49,30 @@ if (options.PredictOnly)
 else
 {
     string? corpusPath = options.Get("corpus");
-    string corpus = corpusPath is not null ? File.ReadAllText(corpusPath) : Grammar.Corpus(sentences: 6000, seed: 1);
+    string corpus = corpusPath is not null ? File.ReadAllText(corpusPath)
+        : chatMode ? ChatCorpus.Generate(count: 4000, seed: 1)
+        : Grammar.Corpus(sentences: 6000, seed: 1);
     string vocabulary = new([.. corpus.Distinct().Order()]);
     Console.WriteLine($"Corpus: {corpus.Length:N0} characters, vocabulary of {vocabulary.Length}: \"{vocabulary.Replace("\n", "\\n")}\"");
     Console.WriteLine($"Sample: \"{corpus[..160].Replace("\n", " ")}...\"\n");
 
     // Small enough to train in a couple of minutes on a CPU; raise Dim / Layers / Context on a GPU.
-    gpt = CharGpt.Create(new GptConfig(vocabulary, Context: 64, Dim: 96, Heads: 4, Layers: 3), device);
-    var trained = GptTraining.Train(gpt, corpus, options.Epochs ?? 2, options.BatchSize ?? 32, corpusPath ?? "built-in grammar");
+    gpt = CharGpt.Create(chatMode ? new GptConfig(vocabulary, Context: 256, Dim: 96, Heads: 4, Layers: 3)
+                                  : new GptConfig(vocabulary, Context: 64, Dim: 96, Heads: 4, Layers: 3), device);
+    var trained = GptTraining.Train(gpt, corpus, options.Epochs ?? (chatMode ? 6 : 2), options.BatchSize ?? 32,
+        corpusPath ?? (chatMode ? "synthetic ChatML transcripts" : "built-in grammar"));
     gpt.Save(modelPath, trained);
     Console.WriteLine($"\nSaved the model to {modelPath}\nTest it later with: --predict --input \"the little robot\"\n");
+}
+
+if (chatMode)
+{
+    using (gpt)
+    {
+        ChatDemo(gpt);
+    }
+
+    return 0;
 }
 
 using (gpt)
@@ -122,5 +138,43 @@ static void Benchmark(CharGpt gpt, GenerationSettings settings)
         var m = gpt.Generate("the little robot ", s).Metrics;
         baseline ??= m.TokensPerSecond;
         Console.WriteLine($"  {name,-30} {m.TokensPerSecond,8:F0}  {m.MsPerStep,8:F2}  {m.FirstTokenMs,9:F1} ms   {m.TokensPerSecond / baseline:F1}x{(m.GraphNote is { } note ? "  " + note : "")}");
+    }
+}
+
+// The chat model on a request like an Ollama /api/chat call: reasoning, a tool call, then an answer from the tool result.
+static void ChatDemo(CharGpt gpt)
+{
+    var chat = new NeuralSharp.Generation.ChatGenerator(new NeuralSharp.Generation.TextGenerator(gpt.Model,
+        new NeuralSharp.Generation.CharTokenizer(gpt.Config.Vocabulary), gpt.Config.Context));
+    var options = new NeuralSharp.Generation.GenerationOptions { Temperature = 1f, TopK = 20, TopP = 0.95f, MinP = 0f, RepeatPenalty = 1f, NumCtx = 4096, NumPredict = 300, Seed = 7 };
+    var messages = new List<NeuralSharp.Generation.ChatMessage>
+    {
+        new("system", "You are a helpful assistant. Cite sources as [1], [2] when a research pack is present."),
+        new("user", "What is the latest Ollama version?"),
+    };
+    NeuralSharp.Generation.ToolDefinition[] tools = [ChatCorpus.WebFetch];
+
+    void Turn(string title)
+    {
+        var reply = chat.Chat(new NeuralSharp.Generation.ChatRequest(messages, tools, Think: true, Options: options));
+        var m = reply.Message!;
+        Console.WriteLine($"{title}");
+        Console.WriteLine($"  thinking:   {m.Thinking}");
+        Console.WriteLine($"  content:    {m.Content}");
+        foreach (var call in m.ToolCalls ?? [])
+        {
+            Console.WriteLine($"  tool call:  {call.Name}({call.Arguments.ToJsonString()})");
+        }
+
+        Console.WriteLine($"  done: {reply.DoneReason}, {reply.Stats!.PromptTokens} prompt tokens, {reply.Stats.GeneratedTokens} generated, {reply.Stats.TokensPerSecond:F0} tokens/s\n");
+        messages.Add(m);
+    }
+
+    Turn("Turn 1 (tools offered, think = true):");
+    if (messages[^1].ToolCalls is { Count: > 0 } calls)
+    {
+        string url = calls[0].Arguments["url"]?.GetValue<string>() ?? "";
+        messages.Add(new("tool", $"[1] {url}: Ollama 0.12.3 is the latest release.", ToolName: "web_fetch"));
+        Turn("Turn 2 (after the tool result):");
     }
 }
