@@ -227,9 +227,12 @@ inference memory. The suite runs on every available device.
 
 ## Status
 
-* The CPU backend is covered by the test suite.
-* The generated PTX assembles without errors or register spills for sm_50, sm_75, sm_86 and sm_90
-  (checked with NVIDIA's `ptxas`). It has **not yet been executed on real GPU hardware**. Running the
-  tests on a machine with an NVIDIA GPU runs the whole suite against CUDA as well.
+* **Verified on real hardware.** The full test suite (24 tests) passes on both the CPU and an NVIDIA
+  GeForce RTX 5050 Laptop GPU (Blackwell), for 48 of 48 passing. The house-price sample gives the
+  same results on both devices (R² 0.975 on CPU, 0.975 on GPU).
+* The generated PTX also assembles without errors or register spills for sm_50, sm_75, sm_86 and
+  sm_90 (checked with NVIDIA's `ptxas`), covering Maxwell through Hopper.
 * The supported set is intentionally small: float32, 2-D matrix multiply, and the layers, losses and
   activations listed above.
+* Small models such as the samples run at about the same speed on CPU and GPU, because each step is
+  dominated by kernel-launch overhead. The GPU pays off with wide layers and large batches.
