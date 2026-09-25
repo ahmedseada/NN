@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/NeuralSharp.Samples.HousePrices/NeuralSharp.Samples.HousePrices.csproj" />
+    <Project Path="samples/NeuralSharp.Samples.Xor/NeuralSharp.Samples.Xor.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/NeuralSharp/NeuralSharp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/NeuralSharp.Tests/NeuralSharp.Tests.csproj" />
+  </Folder>
+</Solution>
