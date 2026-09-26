@@ -61,6 +61,12 @@ internal sealed unsafe partial class CudaBackend
     public override void InvSqrt(Storage x, Storage y, int n, float eps) =>
         Launch1D(K("inv_sqrt_f32"), n, P(x), P(y), F(eps), U(n));
 
+    public override void GatherBFloat16(Storage packed, Storage indices, Storage y, int count, int dim, int vocabulary)
+    {
+        int n = count * dim;
+        Launch1D(K("gather_bf16_f32"), n, P(packed), P(indices), P(y), U(dim), U(vocabulary - 1), U((dim + 1) / 2), U(n));
+    }
+
     public override void Gather(Storage table, Storage indices, Storage y, int count, int dim, int vocabulary)
     {
         int n = count * dim;

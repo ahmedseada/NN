@@ -255,6 +255,12 @@ public static class ModuleExtensions
             count++;
         }
 
+        foreach (var embedding in model.Descendants().OfType<Embedding>().Where(e => e.BFloat16 is not null).ToList())
+        {
+            embedding.ToFloat32(trainable);
+            count++;
+        }
+
         return count;
     }
 

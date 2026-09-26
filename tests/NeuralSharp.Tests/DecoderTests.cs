@@ -15,7 +15,62 @@ internal static partial class Tests
         ("decoder: DecoderSpec variants match a plain reference implementation (GQA, q/k norm, biases, rope, tied, post-norms, parallel)", DecoderMatchesReference),
         ("decoder: cached decoding (float32 and int8 KV) and int8 weights match the full pass; generation", DecoderCachedAndInt8),
         ("decoder: LoRA by layer name trains; JSON and package round trip", DecoderLoraAndPackage),
+        ("decoder: tied head shares the table; last-position prefill; bf16 embedding tables save and load", DecoderMemory),
     ];
+
+    private static void DecoderMemory(Device device)
+    {
+        var spec = SmallSpec with { TieEmbeddings = true };
+        int[] ids = [1, 4, 9, 16, 2, 7];
+        int T = ids.Length, V = spec.Vocabulary;
+        using var sequence = Tensor.From([.. ids.Select(i => (float)i)], [1, T], device);
+
+        // Tied: one table (the head owns no weight), and the head's gradient reaches the embedding.
+        using var model = spec.Build(new RandomWeights(64), new DecoderBuildOptions { Device = device });
+        var head = model.Descendants().OfType<Linear>().Last();
+        var embedding = model.Descendants().OfType<Embedding>().Single();
+        Check(ReferenceEquals(head.TiedTo, embedding) && !head.Parameters().Any(), "the head reads the embedding table");
+        Check(model.Parameters().Sum(p => (long)p.Size) == spec.ParameterCount, $"parameters {model.Parameters().Sum(p => (long)p.Size)} = {spec.ParameterCount}");
+        var full = model.Predict(sequence).ToArray();
+        using (var scope = new TensorScope())
+        {
+            using var hidden = Tensor.From(Enumerable.Range(0, spec.Dim).Select(i => MathF.Sin(i)).ToArray(), [1, spec.Dim], device);
+            head.Forward(hidden).Sum().Backward();
+            Check(embedding.Weight.Grad is { } g && g.ToArray().Any(v => v != 0f), "tied head gradient reaches the embedding");
+        }
+
+        // Last position only: the same last-row logits from a [1, 1, V] output.
+        using (Autograd.NoGrad())
+        {
+            model.Eval();
+            using var context = new DecodingContext(device, 1, 16) { LastPositionOnly = true };
+            var last = model.ForwardCached(sequence, context);
+            Check(last.Shape.SequenceEqual([1, 1, V]), $"last-position logits {Tensor.FormatShape(last.Shape)}");
+            AssertClose(full[((T - 1) * V)..], last.ToArray(), 1e-4f, "last-position logits");
+        }
+
+        // Frozen builds keep the table as bfloat16; a float model loads the file with a bf16 table as bf16.
+        using var half = spec.Build(new RandomWeights(64), new DecoderBuildOptions { Device = device, BFloat16 = true });
+        Check(half.Descendants().OfType<Embedding>().Single().BFloat16 is not null, "bf16 embedding table");
+        var predicted = half.Predict(sequence).ToArray();
+        AssertClose(full, predicted, 0.05f * full.Max(MathF.Abs), "bf16 build near float32");
+        string path = Path.GetTempFileName();
+        try
+        {
+            half.Save(path);
+            using var reloaded = (SmallSpec with { TieEmbeddings = true }).Build(new RandomWeights(1), new DecoderBuildOptions { Device = device, BFloat16 = true });
+            reloaded.Descendants().OfType<Embedding>().Single().ToFloat32(trainable: false);
+            reloaded.Load(path);
+            Check(reloaded.Descendants().OfType<Embedding>().Single().BFloat16 is not null, "the table loads as bf16");
+            Check(reloaded.Predict(sequence).ToArray().SequenceEqual(predicted), "reloaded predictions are identical");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+
+        Check(half.ToFloat32() > 0 && half.Descendants().OfType<Embedding>().Single().BFloat16 is null, "ToFloat32 restores the table");
+    }
 
     private static void DecoderGradients(Device device)
     {

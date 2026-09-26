@@ -201,7 +201,11 @@ public sealed record DecoderSpec
             var embeddingValues = weights is null
                 ? [.. Enumerable.Range(0, Vocabulary * Dim).Select(_ => (float)(random.NextDouble() * 2 - 1) * 0.02f)]
                 : weights.Read("embed.weight", [Vocabulary, Dim]) ?? throw new InvalidDataException($"The weights have no 'embed.weight' [{Vocabulary}, {Dim}].");
-            var embedding = Embedding.FromWeights(NeuralSharp.Tensor.Persistent(embeddingValues, [Vocabulary, Dim], device, requiresGrad: true));
+            // Frozen-weight builds keep the table as bfloat16 (half the memory; lossless for bfloat16 checkpoints).
+            bool frozen = options.Int8 || options.Int4 || options.BFloat16;
+            var embedding = frozen
+                ? Embedding.FromBFloat16(BFloat16Weight.FromValues(embeddingValues, Vocabulary, Dim, device))
+                : Embedding.FromWeights(NeuralSharp.Tensor.Persistent(embeddingValues, [Vocabulary, Dim], device, requiresGrad: true));
             embedding.Name = "embed";
             created.Add(embedding);
             if (EmbeddingScale is { } scale)
@@ -235,7 +239,10 @@ public sealed record DecoderSpec
             var norm = Normalization("norm", Dim);
             norm.Name = "norm";
             created.Add(norm);
-            var head = Projection("head", Dim, Vocabulary, HeadBias, TieEmbeddings ? embeddingValues : null);
+            // A float tied head reads the embedding table in place; packed heads get their own (transposed) copy.
+            var head = TieEmbeddings && !frozen
+                ? Linear.Tied(embedding, HeadBias ? Tensor("head.bias", [Vocabulary], () => new float[Vocabulary]) : null)
+                : Projection("head", Dim, Vocabulary, HeadBias, TieEmbeddings ? embeddingValues : null);
             head.Name = "head";
             created.Add(head);
             var model = new Sequential(created) { Name = "decoder" };

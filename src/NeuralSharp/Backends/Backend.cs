@@ -187,6 +187,9 @@ internal abstract class Backend
     /// <summary>Embedding lookup: y[i, :] = table[indices[i], :] for count indices of width dim.</summary>
     public abstract void Gather(Storage table, Storage indices, Storage y, int count, int dim, int vocabulary);
 
+    /// <summary><see cref="Gather"/> from a bfloat16 table packed as in <see cref="BFloat16MatMul"/> ([vocabulary, dim]).</summary>
+    public abstract void GatherBFloat16(Storage packed, Storage indices, Storage y, int count, int dim, int vocabulary);
+
     /// <summary>dtable[indices[i], :] += dy[i, :].</summary>
     public abstract void ScatterAdd(Storage dy, Storage indices, Storage dtable, int count, int dim, int vocabulary);
 

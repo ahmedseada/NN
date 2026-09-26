@@ -186,7 +186,7 @@ public sealed class OnnxExporter
                 OnnxAttribute.Of("pads", [pool.Padding, pool.Padding, pool.Padding, pool.Padding])),
             GlobalAveragePool2d => g.Node("Flatten", [g.Node("GlobalAveragePool", [x])], shape, OnnxAttribute.Of("axis", 1L)),
             Layers.Flatten => g.Node("Flatten", [x], shape, OnnxAttribute.Of("axis", 1L)),
-            Embedding e => g.Node("Gather", [Weights(g, "embedding", e.Weight), g.Node("Cast", [x], null, OnnxAttribute.Of("to", 7L))], shape,
+            Embedding e => g.Node("Gather", [g.Constant("embedding", e.WeightValues(), e.Vocabulary, e.Dim), g.Node("Cast", [x], null, OnnxAttribute.Of("to", 7L))], shape,
                 OnnxAttribute.Of("axis", 0L)),
             PositionalEncoding pe => g.Node("Add", [x, g.Constant("positions", PositionTable(x.Shape![^2], pe.Dim), x.Shape[^2], pe.Dim)], shape),
             MultiHeadAttention mha => Attention(g, mha, x, shape),

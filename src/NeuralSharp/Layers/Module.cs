@@ -15,7 +15,7 @@ public abstract class Module : IDisposable
     private const uint FileMagic = 0x3257_534E; // "NSW2": parameters followed by buffers (float32)
     private const uint FileMagic3 = 0x3357_534E; // "NSW3": int8 layers, then tensors each with an element type
     private const uint FileMagic4 = 0x3457_534E; // "NSW4": int8 layers, bfloat16 layers, then tensors as in NSW3
-    private const uint FileMagic5 = 0x3557_534E; // "NSW5": int8, bfloat16 and int4 layers, then tensors as in NSW3
+    private const uint FileMagic5 = 0x3557_534E; // "NSW5": int8, bfloat16, int4 layers, bfloat16 embeddings, then tensors as in NSW3
 
     /// <summary>An optional name shown in summaries and telemetry.</summary>
     public string? Name { get; set; }
@@ -228,19 +228,22 @@ public abstract class Module : IDisposable
         var int8 = linears.Select((l, i) => (l, i)).Where(p => p.l.Int8 is not null).ToList();
         var half = linears.Select((l, i) => (l, i)).Where(p => p.l.BFloat16 is not null).ToList();
         var int4 = linears.Select((l, i) => (l, i)).Where(p => p.l.Int4 is not null).ToList();
+        var tables = this.Descendants().OfType<Embedding>().Select((e, i) => (e, i)).Where(p => p.e.BFloat16 is not null).ToList();
         var exact = int8.SelectMany(p => new[] { p.l.Int8!.Packed, p.l.Int8.Scales }).Concat(half.Select(p => p.l.BFloat16!.Packed))
             .Concat(int4.SelectMany(p => new[] { p.l.Int4!.Packed, p.l.Int4.Scales }))
+            .Concat(tables.Select(p => p.e.BFloat16!.Packed))
             .ToHashSet(ReferenceEqualityComparer.Instance);
         using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
         var parameters = Parameters().Concat(Buffers()).ToList();
-        writer.Write(int4.Count > 0 ? FileMagic5 : half.Count > 0 ? FileMagic4 : FileMagic3);
+        bool five = int4.Count > 0 || tables.Count > 0;
+        writer.Write(five ? FileMagic5 : half.Count > 0 ? FileMagic4 : FileMagic3);
         writer.Write(int8.Count);
         foreach (var (_, index) in int8)
         {
             writer.Write(index);
         }
 
-        if (half.Count > 0 || int4.Count > 0)
+        if (half.Count > 0 || five)
         {
             writer.Write(half.Count);
             foreach (var (_, index) in half)
@@ -249,10 +252,16 @@ public abstract class Module : IDisposable
             }
         }
 
-        if (int4.Count > 0)
+        if (five)
         {
             writer.Write(int4.Count);
             foreach (var (_, index) in int4)
+            {
+                writer.Write(index);
+            }
+
+            writer.Write(tables.Count);
+            foreach (var (_, index) in tables)
             {
                 writer.Write(index);
             }
@@ -330,6 +339,19 @@ public abstract class Module : IDisposable
                 }
 
                 linears[index].QuantizeInt4();
+            }
+
+            var embeddings = this.Descendants().OfType<Embedding>().ToList();
+            int tables = magic == FileMagic5 ? reader.ReadInt32() : 0;
+            for (int i = 0; i < tables; i++)
+            {
+                int index = reader.ReadInt32();
+                if (index >= embeddings.Count)
+                {
+                    throw new InvalidDataException($"The file stores Embedding {index} as bfloat16, but the model has {embeddings.Count}.");
+                }
+
+                embeddings[index].ToBFloat16();
             }
         }
 

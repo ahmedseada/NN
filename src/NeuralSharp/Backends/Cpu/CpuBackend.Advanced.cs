@@ -406,6 +406,22 @@ internal sealed partial class CpuBackend
         }
     }
 
+    public override void GatherBFloat16(Storage packed, Storage indices, Storage y, int count, int dim, int vocabulary)
+    {
+        var halves = System.Runtime.InteropServices.MemoryMarshal.Cast<float, ushort>(D(packed).AsSpan());
+        float[] iv = D(indices), yv = D(y);
+        int stride = (dim + 1) / 2 * 2;
+        for (int i = 0; i < count; i++)
+        {
+            var row = halves.Slice(CheckIndex(iv[i], vocabulary) * stride, dim);
+            var target = yv.AsSpan(i * dim, dim);
+            for (int j = 0; j < dim; j++)
+            {
+                target[j] = BitConverter.Int32BitsToSingle(row[j] << 16);
+            }
+        }
+    }
+
     public override void ScatterAdd(Storage dy, Storage indices, Storage dtable, int count, int dim, int vocabulary)
     {
         float[] gv = D(dy), iv = D(indices), tv = D(dtable);

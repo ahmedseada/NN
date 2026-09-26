@@ -494,6 +494,21 @@ public sealed partial class Tensor
         return Traced("embedding", y, start);
     }
 
+    /// <summary>Embedding lookup from a bfloat16 [vocabulary, dim] table (fixed: no gradient).</summary>
+    internal static Tensor EmbeddingLookup(Layers.BFloat16Weight table, Tensor indices)
+    {
+        indices.ThrowIfDisposed();
+        if (table.Packed.Device != indices.Device)
+        {
+            throw new ArgumentException($"The embedding table is on {table.Packed.Device}, the ids on {indices.Device}.");
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty([.. indices._shape, table.Columns], indices.Device);
+        indices.Backend.GatherBFloat16(table.Packed.Storage, indices.Storage, y.Storage, indices.Size, table.Columns, table.Rows);
+        return Traced("embedding_bf16", y, start);
+    }
+
     /// <summary>Unfolds [N, C, H, W] into [N·OH·OW, C·KH·KW] patch rows for convolution as a matrix product.</summary>
     internal Tensor Im2Col(in ConvGeometry geometry)
     {
