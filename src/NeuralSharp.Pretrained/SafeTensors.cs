@@ -92,15 +92,50 @@ public sealed class SafeTensorsReader : IDisposable
     public float[] Read(string name)
     {
         var info = _tensors.TryGetValue(name, out var t) ? t : throw new KeyNotFoundException($"No tensor named '{name}'.");
-        var bytes = new byte[info.Length];
-        var stream = _files[info.File];
-        lock (stream)
+        // Positional reads (no shared stream position, so tensors can be read concurrently) straight into the result:
+        // float32 bytes land in place; 16-bit types are widened chunk by chunk through one pooled buffer.
+        int count = checked((int)info.Count);
+        var handle = _files[info.File].SafeFileHandle;
+        var values = GC.AllocateUninitializedArray<float>(count);
+        if (info.Type == SafeTensorType.F32 && BitConverter.IsLittleEndian)
         {
-            stream.Position = info.Offset;
-            stream.ReadExactly(bytes);
+            ReadAt(handle, MemoryMarshal.AsBytes(values.AsSpan()), info.Offset);
+            return values;
         }
 
-        return Decode(bytes, info.Type, checked((int)info.Count));
+        const int ChunkValues = 1 << 22;                                            // 8 MB of 16-bit values
+        byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent((int)Math.Min(info.Length, 2L * ChunkValues));
+        try
+        {
+            for (int first = 0; first < count; first += ChunkValues)
+            {
+                int n = Math.Min(ChunkValues, count - first);
+                int width = info.Type == SafeTensorType.F32 ? 4 : 2;
+                ReadAt(handle, buffer.AsSpan(0, n * width), info.Offset + (long)first * width);
+                DecodeInto(buffer, info.Type, values, first, n);
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        return values;
+    }
+
+    private static void ReadAt(Microsoft.Win32.SafeHandles.SafeFileHandle handle, Span<byte> destination, long offset)
+    {
+        while (!destination.IsEmpty)
+        {
+            int read = RandomAccess.Read(handle, destination, offset);
+            if (read <= 0)
+            {
+                throw new EndOfStreamException("The safetensors file ends before the tensor data.");
+            }
+
+            destination = destination[read..];
+            offset += read;
+        }
     }
 
     private void ReadHeader(string file)
@@ -147,16 +182,26 @@ public sealed class SafeTensorsReader : IDisposable
 
     internal static float[] Decode(byte[] bytes, SafeTensorType type, int count)
     {
-        var values = new float[count];
+        var values = GC.AllocateUninitializedArray<float>(count);
+        DecodeInto(bytes, type, values, 0, count);
+        return values;
+    }
+
+    // Widens `count` stored values from the start of bytes into values[offset..] (all cores for large chunks).
+    private static void DecodeInto(byte[] bytes, SafeTensorType type, float[] values, int offset, int count)
+    {
         switch (type)
         {
             case SafeTensorType.F32:
-                MemoryMarshal.Cast<byte, float>(bytes.AsSpan(0, count * 4)).CopyTo(values);         // little-endian hosts
-                if (!BitConverter.IsLittleEndian)
+                if (BitConverter.IsLittleEndian)
+                {
+                    MemoryMarshal.Cast<byte, float>(bytes.AsSpan(0, count * 4)).CopyTo(values.AsSpan(offset, count));
+                }
+                else
                 {
                     for (int i = 0; i < count; i++)
                     {
-                        values[i] = BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(i * 4));
+                        values[offset + i] = BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(i * 4));
                     }
                 }
 
@@ -166,7 +211,7 @@ public sealed class SafeTensorsReader : IDisposable
                 {
                     for (int i = first; i < last; i++)
                     {
-                        values[i] = (float)BinaryPrimitives.ReadHalfLittleEndian(bytes.AsSpan(i * 2));
+                        values[offset + i] = (float)BinaryPrimitives.ReadHalfLittleEndian(bytes.AsSpan(i * 2));
                     }
                 });
                 break;
@@ -175,7 +220,7 @@ public sealed class SafeTensorsReader : IDisposable
                 NeuralSharp.HostParallel.For(count, 1 << 16, (first, last) =>
                 {
                     var halves = MemoryMarshal.Cast<byte, ushort>(bytes.AsSpan(first * 2, (last - first) * 2));
-                    var bits = MemoryMarshal.Cast<float, uint>(values.AsSpan(first, last - first));
+                    var bits = MemoryMarshal.Cast<float, uint>(values.AsSpan(offset + first, last - first));
                     for (int i = 0; i < halves.Length; i++)
                     {
                         bits[i] = (uint)(BitConverter.IsLittleEndian ? halves[i] : BinaryPrimitives.ReverseEndianness(halves[i])) << 16;
@@ -183,8 +228,6 @@ public sealed class SafeTensorsReader : IDisposable
                 });
                 break;
         }
-
-        return values;
     }
 
     /// <inheritdoc />
