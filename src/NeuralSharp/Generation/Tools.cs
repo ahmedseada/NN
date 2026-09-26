@@ -253,6 +253,17 @@ public sealed class ToolRegistryBuilder
         return this;
     }
 
+    /// <summary>Adds several tools (for example those of an MCP server).</summary>
+    public ToolRegistryBuilder Add(IEnumerable<Tool> tools)
+    {
+        foreach (var tool in tools)
+        {
+            Add(tool);
+        }
+
+        return this;
+    }
+
     /// <summary>Adds a tool with an explicit JSON schema (<see cref="Tool.Create"/>).</summary>
     public ToolRegistryBuilder Add(string name, string description, JsonNode parameters, Func<JsonObject, CancellationToken, Task<string>> invoke) =>
         Add(Tool.Create(name, description, parameters, invoke));
@@ -484,17 +495,25 @@ internal static class ToolSchema
         return null;
     }
 
-    private static string Describe(JsonNode? property) => (string?)property?["type"] ?? "any type";
+    // Works for parsed numbers and for values created in code (a JsonValue holding an int does not convert to long).
+    private static bool IsWhole(JsonNode value) =>
+        decimal.TryParse(value.ToJsonString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var d)
+        && d == decimal.Truncate(d);
+
+    private static string Describe(JsonNode? property) => TypeOf(property) ?? "any type";
+
+    // "type" may also be an array (["string", "null"]) in schemas from other sources; only a single type is checked.
+    private static string? TypeOf(JsonNode? property) => property?["type"] is JsonValue v && v.TryGetValue(out string? type) ? type : null;
 
     private static string? Mismatch(JsonObject property, JsonNode value)
     {
         var kind = value.GetValueKind();
-        string? type = (string?)property["type"];
+        string? type = TypeOf(property);
         bool ok = type switch
         {
             "string" => kind == JsonValueKind.String,
             "boolean" => kind is JsonValueKind.True or JsonValueKind.False,
-            "integer" => kind == JsonValueKind.Number && value.AsValue().TryGetValue(out long _),
+            "integer" => kind == JsonValueKind.Number && IsWhole(value),
             "number" => kind == JsonValueKind.Number,
             "array" => kind == JsonValueKind.Array,
             "object" => kind == JsonValueKind.Object,
@@ -505,9 +524,9 @@ internal static class ToolSchema
             return $"a{(type is "integer" or "array" or "object" ? "n" : "")} {type}";
         }
 
-        if (property["enum"] is JsonArray options && kind == JsonValueKind.String && !options.Any(o => (string?)o == (string?)value))
+        if (property["enum"] is JsonArray options && !options.Any(o => JsonNode.DeepEquals(o, value)))
         {
-            return $"one of {string.Join(", ", options.Select(o => (string?)o))}";
+            return $"one of {string.Join(", ", options.Select(o => o?.ToString() ?? "null"))}";
         }
 
         return null;

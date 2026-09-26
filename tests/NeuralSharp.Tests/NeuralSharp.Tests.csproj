@@ -12,6 +12,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\NeuralSharp\NeuralSharp.csproj" />
     <ProjectReference Include="..\..\src\NeuralSharp.AspNetCore\NeuralSharp.AspNetCore.csproj" />
+    <ProjectReference Include="..\..\src\NeuralSharp.Mcp\NeuralSharp.Mcp.csproj" />
   </ItemGroup>
 
 </Project>

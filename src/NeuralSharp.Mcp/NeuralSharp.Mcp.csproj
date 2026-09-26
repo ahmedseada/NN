@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>NeuralSharp.Mcp</RootNamespace>
+    <AssemblyName>NeuralSharp.Mcp</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsAotCompatible>true</IsAotCompatible>
+    <PackageId>NeuralSharp.Mcp</PackageId>
+    <Description>Model Context Protocol for NeuralSharp: use the tools of MCP servers in conversations and the inference engine, and serve NeuralSharp tools to MCP clients.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol.Core" Version="2.2.0" />
+    <ProjectReference Include="..\NeuralSharp\NeuralSharp.csproj" />
+  </ItemGroup>
+
+</Project>

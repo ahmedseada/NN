@@ -32,10 +32,13 @@ src/NeuralSharp/
   Training/                         Trainer, TrainingRun, Metric (MAE, RMSE, Accuracy), RegressionReport
   Generation/                       tokenizers, TextGenerator, chat, Conversation, tools (ToolRegistry), ModelHost
   Inference/                        Predictor, ModelPackage (.nsm), InferenceEngine
+  Retrieval/                        chunking, BM25, TextEncoder (bi-encoder), VectorIndex, RetrievalIndex (hybrid
+                                    search with rank fusion), CrossEncoder (re-ranking), Rag pipeline, search tool
   Diagnostics/                      Telemetry hub, events, ConsoleLogger, MetricsRecorder,
                                     ChannelTelemetry, JsonLinesLogger
   Backends/Cpu, Backends/Cuda       device implementations (CPU SIMD kernels, PTX kernels)
 src/NeuralSharp.AspNetCore/         optional package: AddNeuralSharp(), MapPredictor, MapGenerate, MapOllamaApi, MapNeuralSharpStatus
+src/NeuralSharp.Mcp/                optional package: tools of Model Context Protocol servers, and serving tools over MCP
 samples/
   NeuralSharp.Samples.Xor             the classic XOR problem
   NeuralSharp.Samples.HousePrices     regression: predict house prices from a CSV file
@@ -48,6 +51,7 @@ samples/
   NeuralSharp.Samples.HouseApi        house-price Web API in a few lines (NeuralSharp.AspNetCore + the HousePrices package)
   NeuralSharp.Samples.ReRanker        search re-ranking: BM25 first stage + transformer cross-encoder, listwise training
   NeuralSharp.Samples.Summarizer      summarization: extractive baselines vs a word-level transformer (WordTokenizer + TextGenerator)
+  NeuralSharp.Samples.Rag             retrieval-augmented generation: hybrid search, re-ranking, a chat model that cites passages
   Shared/SampleOptions.cs             command-line options shared by the samples (train / predict modes)
   Shared/Gpt/                         GPT model, generation with metrics, training (console + Web API)
 tests/NeuralSharp.Tests             self-contained test runner (runs on every available device)
@@ -574,6 +578,50 @@ The endpoints are ordinary ASP.NET Core endpoints (`.RequireAuthorization()`, ra
 as usual), and `IPredictor<TIn, TOut>` can be injected (keyed by model name). The GptApi sample serves its
 Ollama-compatible API this way, and the HouseApi sample is a complete prediction API in about ten lines.
 
+### Retrieval and RAG (`NeuralSharp.Retrieval`)
+
+These are new building blocks; the original way is writing the search, the scoring loop and the prompt by hand.
+
+```csharp
+var encoder = new TextEncoder(model, tokenizer, maxLength: 20, padId: 0);     // token ids → unit vectors (masked mean)
+encoder.Train(pairs, epochs: 20, batchSize: 64, p => new AdamW(p, 2e-3f), temperature: 0.05f, seed: 3);   // in-batch negatives
+
+var index = RetrievalIndex.Create()
+    .Documents(documents, ChunkUnit.Sentences, size: 1, overlap: 0)          // or .Add(chunks)
+    .Bm25(k1: 1.2, b: 0.75)                                                  // keyword search
+    .Embeddings(encoder)                                                     // vector search
+    .Fusion(k: 60, depth: 20)                                                // required when both are on
+    .Build();
+index.Save("towns.index");                                                   // RetrievalIndex.Load(path, encoder)
+
+var rag = Rag.For(chatModel)                                                 // any IChatModel: ChatGenerator, engine model, fake
+    .Retrieve(index, top: 10)
+    .Rerank(new CrossEncoder(scorer, encodePair, pairShape: [36]), keep: 3)   // optional
+    .Prompt((question, passages) => ...)                                     // optional (Rag.DefaultPrompt)
+    .Build();
+var answer = await rag.AskAsync("who is the mayor of armorden");           // answer.Text, answer.Cited, answer.Passages
+
+var tools = ToolRegistry.Create().Add(RetrievalTools.Search(index, 3, "search_towns", "Searches facts about towns.")).Build();
+```
+
+`Bm25Index`, `VectorIndex` (exact SIMD search, dot or cosine, save/load) and `Chunker.Split` can also be used on
+their own.
+
+### MCP: the optional `NeuralSharp.Mcp` package
+
+```csharp
+await using var files = await McpTools.ConnectStdioAsync("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/data"]);
+var tools = ToolRegistry.Create()
+    .Add(await files.ListToolsAsync(prefix: "fs_"))                         // the server's tools as NeuralSharp tools
+    .RequireApproval("fs_write_file", (call, ct) => AskUserAsync(call, ct))
+    .Build();                                                                // use in a Conversation, the engine or MapOllamaApi
+
+options.ToolCollection = [.. McpTools.ServerTools(registry)];                // or serve a registry to MCP clients
+```
+
+`ConnectHttpAsync(uri)` and `ConnectAsync(transport)` connect to other servers. The package depends on
+`ModelContextProtocol.Core`; the core library stays dependency-free.
+
 ### Fine-tuning: freezing, a learning rate per group, saving only what changed, LoRA
 
 ```csharp
@@ -691,7 +739,7 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 82 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 88 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
@@ -700,15 +748,17 @@ generation layer (stop sequences, context sliding, cache/graph/recompute agreeme
 streaming parser, keep-alive expiry). The simplified API is tested against the original one (identical
 layers, weights, data splits and training histories), together with predictors, packages, tools,
 conversations, the inference engine (batching, copies, queue limits, timeouts, keep-alive with a manual
-clock) and the ASP.NET Core endpoints over a real Kestrel server. The suite runs on every available device.
+clock) and the ASP.NET Core endpoints over a real Kestrel server. Retrieval is checked against the formulas
+(BM25 scores, masked mean pooling, reciprocal rank fusion), and MCP tools round-trip through an in-process
+server. The suite runs on every available device; `NS_FILTER=text` runs only the tests whose name contains it.
 
 ## Status
 
 * **Verified on real hardware.** The first 64 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
   Laptop GPU (Blackwell), 128 of 128, including KV-cache and batched decoding, graph replay, the
   sampler with top-p, min-p and penalties, the generation layer and the kernel-signature check. The
-  18 newest ones (simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine,
-  ASP.NET Core) pass on the CPU and still need a run on a GPU.
+  24 newest ones (simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine,
+  ASP.NET Core, retrieval, MCP) pass on the CPU and still need a run on a GPU.
   That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.

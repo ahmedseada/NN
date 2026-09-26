@@ -1,6 +1,7 @@
 // Self-contained test runner (no test framework dependency).
 //   dotnet run --project tests/NeuralSharp.Tests                  run every test on every available device
 //   dotnet run --project tests/NeuralSharp.Tests -- --dump-ptx f  write the generated CUDA kernels to f
+//   NS_FILTER=retrieval dotnet run --project tests/NeuralSharp.Tests   only tests whose name contains the text
 
 using System.Diagnostics;
 using NeuralSharp;
@@ -32,7 +33,7 @@ int failed = 0, passed = 0;
 foreach (var device in devices)
 {
     Console.WriteLine($"== {device}: {device.Name}");
-    foreach (var (name, test) in Tests.All)
+    foreach (var (name, test) in Tests.All.Where(t => Environment.GetEnvironmentVariable("NS_FILTER") is not { } f || t.Name.Contains(f, StringComparison.OrdinalIgnoreCase)))
     {
         var sw = Stopwatch.StartNew();
         try
@@ -58,7 +59,7 @@ return failed == 0 ? 0 : 1;
 
 internal static partial class Tests
 {
-    public static (string Name, Action<Device> Run)[] All => [.. Basic, .. Advanced, .. Decoding, .. Generation, .. Simplified, .. AspNetCore];
+    public static (string Name, Action<Device> Run)[] All => [.. Basic, .. Advanced, .. Decoding, .. Generation, .. Simplified, .. AspNetCore, .. Retrieval];
 
     private static readonly (string Name, Action<Device> Run)[] Basic =
     [
