@@ -192,6 +192,56 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override void AttentionInt8(Storage q, Storage keys, Storage values, Storage keyScales, Storage valueScales, Storage position,
+        Storage y, int heads, int rowsPerHead, int steps, int capacity, int dim, float scale, bool tiled)
+    {
+        float[] qv = D(q), ks = D(keyScales), vs = D(valueScales), yv = D(y);
+        int position0 = (int)D(position)[0], stride = (dim + 3) / 4 * 4;
+        For(heads * rowsPerHead, (long)heads * rowsPerHead * dim * Math.Max(1, position0), (first, last) =>
+        {
+            var kb = MemoryMarshal.Cast<float, sbyte>(D(keys).AsSpan());
+            var vb = MemoryMarshal.Cast<float, sbyte>(D(values).AsSpan());
+            var scores = new float[capacity];
+            for (int row = first; row < last; row++)
+            {
+                int h = row / rowsPerHead, count = Math.Min(position0 + row % rowsPerHead % steps, capacity - 1) + 1;
+                var query = qv.AsSpan(row * dim, dim);
+                float max = float.NegativeInfinity;
+                for (int c = 0; c < count; c++)
+                {
+                    var key = kb.Slice((h * capacity + c) * stride, dim);
+                    float dot = 0f;
+                    for (int d = 0; d < dim; d++)
+                    {
+                        dot += query[d] * key[d];
+                    }
+
+                    scores[c] = dot * ks[h * capacity + c] * scale;
+                    max = MathF.Max(max, scores[c]);
+                }
+
+                float sum = 0f;
+                for (int c = 0; c < count; c++)
+                {
+                    scores[c] = MathF.Exp(scores[c] - max);
+                    sum += scores[c];
+                }
+
+                var output = yv.AsSpan(row * dim, dim);
+                output.Clear();
+                for (int c = 0; c < count; c++)
+                {
+                    float weight = scores[c] / sum * vs[h * capacity + c];
+                    var value = vb.Slice((h * capacity + c) * stride, dim);
+                    for (int d = 0; d < dim; d++)
+                    {
+                        output[d] += weight * value[d];
+                    }
+                }
+            }
+        });
+    }
+
     public override void AttentionScoresInt8(Storage q, Storage cache, Storage scales, Storage y, int rows, int steps, int capacity, int dim)
     {
         float[] qv = D(q), sv = D(scales), yv = D(y);

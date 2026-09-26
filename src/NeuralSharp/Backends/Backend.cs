@@ -298,10 +298,13 @@ internal abstract class Backend
         int steps, int capacity, int dim, float scale);
 
     /// <summary>
-    /// The same attention as <see cref="AttentionDecode"/> for many query rows at once (a prompt, a training sequence),
-    /// tiled so query rows share each key and value read; also writes each row's log-sum-exp of the scaled scores to
-    /// <paramref name="logSumExp"/> [heads, rowsPerHead] when given.
+    /// <see cref="AttentionDecode"/> (tiled: <paramref name="tiled"/>, for many query rows) over an int8 cache: keys and
+    /// values [heads, capacity, ⌈dim / 4⌉ words] of packed bytes with one scale per cached row (keyScales, valueScales
+    /// [heads, capacity]).
     /// </summary>
+    public abstract void AttentionInt8(Storage q, Storage keys, Storage values, Storage keyScales, Storage valueScales, Storage position,
+        Storage y, int heads, int rowsPerHead, int steps, int capacity, int dim, float scale, bool tiled);
+
     /// <summary>
     /// Gradient of <see cref="AttentionTiled"/> with causal offset 0 (training): given the output, each row's log-sum-exp
     /// and dOutput, adds to dq [heads, rowsPerHead, dim] and dkeys, dvalues [heads, capacity, dim]. The attention weights
@@ -310,6 +313,11 @@ internal abstract class Backend
     public abstract void AttentionTiledBackward(Storage q, Storage keys, Storage values, Storage output, Storage logSumExp, Storage dOutput,
         Storage dq, Storage dkeys, Storage dvalues, int heads, int rowsPerHead, int steps, int capacity, int dim, float scale);
 
+    /// <summary>
+    /// The same attention as <see cref="AttentionDecode"/> for many query rows at once (a prompt, a training sequence),
+    /// tiled so query rows share each key and value read; also writes each row's log-sum-exp of the scaled scores to
+    /// <paramref name="logSumExp"/> [heads, rowsPerHead] when given.
+    /// </summary>
     public virtual void AttentionTiled(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage? logSumExp, int heads,
         int rowsPerHead, int steps, int capacity, int dim, float scale) =>
         AttentionDecode(q, keys, values, position, y, heads, rowsPerHead, steps, capacity, dim, scale);

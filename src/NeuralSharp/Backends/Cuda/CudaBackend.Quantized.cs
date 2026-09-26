@@ -128,4 +128,26 @@ internal sealed unsafe partial class CudaBackend
             delta.Release();
         }
     }
+
+    public override void AttentionInt8(Storage q, Storage keys, Storage values, Storage keyScales, Storage valueScales, Storage position,
+        Storage y, int heads, int rowsPerHead, int steps, int capacity, int dim, float scale, bool tiled)
+    {
+        int words = (dim + 3) / 4;
+        if (tiled && dim <= PtxKernels.FlashMaxDim)
+        {
+            Launch(K("attention_flash_int8"), (uint)((rowsPerHead + PtxKernels.FlashTile - 1) / PtxKernels.FlashTile), (uint)heads, 1, 128, 1,
+                P(q), P(keys), P(values), P(position), P(y), 0UL, U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale),
+                P(keyScales), P(valueScales), U(words));
+            return;
+        }
+
+        if (dim > PtxKernels.DecodeMaxDim)
+        {
+            throw new NotSupportedException($"Int8 cache attention supports head sizes up to {PtxKernels.DecodeMaxDim} on CUDA.");
+        }
+
+        int rows = heads * rowsPerHead;
+        LaunchRows(K("attention_decode_int8"), rows, P(q), P(keys), P(values), P(keyScales), P(valueScales), P(position), P(y),
+            U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows));
+    }
 }

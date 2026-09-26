@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -222,7 +222,9 @@ internal static partial class PtxKernels
         GemvNN(sb, multi: true);
         GemvNT(sb);
         AttentionDecode(sb);
+        AttentionDecode(sb, int8: true);
         AttentionFlash(sb);
+        AttentionFlash(sb, int8: true);
         AttentionBackward(sb);
         Gemm(sb, "gemm128_f32", 128, 8);
         Gemm(sb, "gemm64_f32", 64, 4);
@@ -241,14 +243,16 @@ internal static partial class PtxKernels
     // sum update per row (online softmax), and the lanes then split the head dimension to add Σ_p weight_p · v_p.
     // Every query row reads each key and value once per block instead of once per row. Optionally stores each row's
     // log-sum-exp (for a backward pass). Grid: x = ⌈rowsPerHead / 32⌉, y = heads.
-    private static void AttentionFlash(StringBuilder sb)
+    // int8: keys and values come from an int8 cache (see AttentionDecode) with per-row scales, dequantized as the tiles
+    // are loaded into shared memory.
+    private static void AttentionFlash(StringBuilder sb, bool int8 = false)
     {
         const int T = FlashTile, D = FlashMaxDim, Rows = 8;
         var s = new StringBuilder();
         s.AppendLine($$"""
-            .visible .entry attention_flash_f32(
+            .visible .entry {{(int8 ? "attention_flash_int8" : "attention_flash_f32")}}(
                 .param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_pos, .param .u64 p_o, .param .u64 p_lse,
-                .param .u32 p_rph, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_dim, .param .f32 p_scale
+                .param .u32 p_rph, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_dim, .param .f32 p_scale{{(int8 ? ",\n    .param .u64 p_ks, .param .u64 p_vs, .param .u32 p_words" : "")}}
             )
             {
                 .reg .pred %p<16>;
@@ -298,12 +302,25 @@ internal static partial class PtxKernels
                 add.u64 %rd10, %rd1, %rd9;
                 add.u64 %rd11, %rd5, %rd9;
                 cvt.u64.u32 %rd7, %r12;
-                mul.lo.u64 %rd12, %rd7, %rd8;
+                {{(int8 ? "ld.param.u32 %r23, [p_words];\n    cvt.u64.u32 %rd20, %r23;\n    mul.lo.u64 %rd12, %rd7, %rd20;" : "mul.lo.u64 %rd12, %rd7, %rd8;")}}
                 shl.b64 %rd12, %rd12, 2;
                 add.u64 %rd13, %rd2, %rd12;
                 add.u64 %rd14, %rd3, %rd12;
                 mul.lo.u32 %r13, %r4, {{T}};
             """);
+        if (int8)
+        {
+            // Scale rows of this head: ks/vs + head · capacity.
+            s.AppendLine("""
+                    ld.param.u64 %rd21, [p_ks];
+                    ld.param.u64 %rd22, [p_vs];
+                    cvta.to.global.u64 %rd21, %rd21;
+                    cvta.to.global.u64 %rd22, %rd22;
+                    mul.wide.u32 %rd23, %r12, 4;
+                    add.u64 %rd21, %rd21, %rd23;
+                    add.u64 %rd22, %rd22, %rd23;
+                """);
+        }
         // Query tile: fa_q[r, d] for rows row0 + r (zeros past the head's rows).
         s.AppendLine($$"""
                 mov.u32 %r14, %r6;
@@ -379,15 +396,46 @@ internal static partial class PtxKernels
                 rem.u32 %r16, %r14, %r4;
                 add.u32 %r17, %r39, %r15;
                 setp.lt.u32 %p2, %r17, %r3;
-                mad.lo.u32 %r18, %r17, %r4, %r16;
-                mul.wide.u32 %rd15, %r18, 4;
-                add.u64 %rd16, %rd15, %rd13;
-                add.u64 %rd17, %rd15, %rd14;
                 mov.f32 %f2, 0f00000000;
                 mov.f32 %f3, 0f00000000;
-                @%p2 ld.global.f32 %f2, [%rd16];
-                @%p2 ld.global.f32 %f3, [%rd17];
             """);
+        if (int8)
+        {
+            // Word dim / 4 of the cached row, byte dim % 4, times the row's scale.
+            s.AppendLine("""
+                    shr.u32 %r18, %r16, 2;
+                    mad.lo.u32 %r18, %r17, %r23, %r18;
+                    mul.wide.u32 %rd15, %r18, 4;
+                    add.u64 %rd16, %rd15, %rd13;
+                    add.u64 %rd17, %rd15, %rd14;
+                    and.b32 %r22, %r16, 3;
+                    shl.b32 %r22, %r22, 3;
+                    @%p2 ld.global.u32 %r20, [%rd16];
+                    @%p2 bfe.s32 %r20, %r20, %r22, 8;
+                    @%p2 cvt.rn.f32.s32 %f2, %r20;
+                    @%p2 ld.global.u32 %r20, [%rd17];
+                    @%p2 bfe.s32 %r20, %r20, %r22, 8;
+                    @%p2 cvt.rn.f32.s32 %f3, %r20;
+                    mul.wide.u32 %rd15, %r17, 4;
+                    add.u64 %rd16, %rd15, %rd21;
+                    add.u64 %rd17, %rd15, %rd22;
+                    @%p2 ld.global.f32 %f4, [%rd16];
+                    @%p2 ld.global.f32 %f5, [%rd17];
+                    @%p2 mul.f32 %f2, %f2, %f4;
+                    @%p2 mul.f32 %f3, %f3, %f5;
+                """);
+        }
+        else
+        {
+            s.AppendLine("""
+                    mad.lo.u32 %r18, %r17, %r4, %r16;
+                    mul.wide.u32 %rd15, %r18, 4;
+                    add.u64 %rd16, %rd15, %rd13;
+                    add.u64 %rd17, %rd15, %rd14;
+                    @%p2 ld.global.f32 %f2, [%rd16];
+                    @%p2 ld.global.f32 %f3, [%rd17];
+                """);
+        }
         s.AppendLine($$"""
                     mad.lo.u32 %r19, %r16, {{T}}, %r15;
                     shl.b32 %r19, %r19, 2;
@@ -1267,11 +1315,36 @@ internal static partial class PtxKernels
     // per row; warp w takes positions w, w + 8, … with the lanes splitting the head dimension (lane + 32·i), keeping a
     // running maximum, softmax sum and weighted value sum (online softmax). The warps' partial results are then
     // combined in shared memory: part[w] = (max, sum, acc[256]).
-    private static void AttentionDecode(StringBuilder sb)
+    // int8: keys and values are an int8 cache (rows of `words` packed words, 4 bytes each, byte d % 4 of word d / 4 for
+    // dimension d) with one scale per cached row in kscales/vscales; a lane reads its dimension's byte and scales it.
+    private static void AttentionDecode(StringBuilder sb, bool int8 = false)
     {
         const int Stride = (2 + DecodeMaxDim) * 4;
+        string stride = int8 ? "%s_words" : "%s_dim";
+        string laneOffset = int8
+            ? """
+              shr.u32 %r17, %lane, 2;
+              mul.wide.u32 %rd7, %r17, 4;
+              and.b32 %r17, %lane, 3;
+              shl.b32 %r17, %r17, 3;
+              mul.wide.u32 %rd13, %r13, 4;
+              add.u64 %rd14, %b_kscales, %rd13;
+              add.u64 %rd15, %b_vscales, %rd13;
+              """
+            : "mov.u64 %rd7, %rd8;";
+        int step = int8 ? 32 : 128;
+
+        // Element i of this lane (dimension lane + 32·i) of the cached row at %rd{base}, as a float in %f3.
+        string Load(int i, string baseRegister, string scaleRegister) => int8
+            ? $"""
+              @%p{1 + i} ld.global.u32 %r16, [{baseRegister}+{step * i}];
+              @%p{1 + i} bfe.s32 %r16, %r16, %r17, 8;
+              @%p{1 + i} cvt.rn.f32.s32 %f3, %r16;
+              @%p{1 + i} mul.f32 %f3, %f3, {scaleRegister};
+              """
+            : $"@%p{1 + i} ld.global.f32 %f3, [{baseRegister}+{step * i}];";
         var b = new StringBuilder();
-        b.AppendLine("""
+        b.AppendLine($$"""
             div.u32 %r7, %row, %s_rph;
             rem.u32 %r8, %row, %s_rph;
             rem.u32 %r9, %r8, %s_steps;
@@ -1286,12 +1359,13 @@ internal static partial class PtxKernels
             add.u64 %rd2, %b_q, %rd1;
             add.u64 %rd3, %b_y, %rd1;
             mul.lo.u32 %r13, %r7, %s_cap;
-            mul.wide.u32 %rd4, %r13, %s_dim;
+            mul.wide.u32 %rd4, %r13, {{stride}};
             shl.b64 %rd4, %rd4, 2;
             add.u64 %rd5, %b_keys, %rd4;
             add.u64 %rd6, %b_values, %rd4;
             mul.wide.u32 %rd8, %lane, 4;
             add.u64 %rd9, %rd2, %rd8;
+            {{laneOffset}}
             """);
         for (int i = 0; i < 8; i++)
         {
@@ -1311,16 +1385,27 @@ internal static partial class PtxKernels
             DL:
             setp.ge.u32 %p9, %r15, %r10;
             @%p9 bra DL_END;
-            mul.wide.u32 %rd10, %r15, %s_dim;
+            mul.wide.u32 %rd10, %r15, {stride};
             shl.b64 %rd10, %rd10, 2;
-            add.u64 %rd10, %rd10, %rd8;
+            add.u64 %rd10, %rd10, %rd7;
             add.u64 %rd11, %rd5, %rd10;
             add.u64 %rd12, %rd6, %rd10;
             mov.f32 %f2, {Zero};
             """);
+        if (int8)
+        {
+            b.AppendLine("""
+                mul.wide.u32 %rd13, %r15, 4;
+                add.u64 %rd13, %rd13, %rd14;
+                ld.global.f32 %f7, [%rd13];
+                mul.wide.u32 %rd13, %r15, 4;
+                add.u64 %rd13, %rd13, %rd15;
+                ld.global.f32 %f8, [%rd13];
+                """);
+        }
         for (int i = 0; i < 8; i++)
         {
-            b.AppendLine($"@%p{1 + i} ld.global.f32 %f3, [%rd11+{128 * i}];");
+            b.AppendLine(Load(i, "%rd11", "%f7"));
             b.AppendLine($"@%p{1 + i} fma.rn.f32 %f2, %f{10 + i}, %f3, %f2;");
         }
 
@@ -1344,7 +1429,7 @@ internal static partial class PtxKernels
         for (int i = 0; i < 8; i++)
         {
             b.AppendLine($"mul.f32 %f{22 + i}, %f{22 + i}, %f5;");
-            b.AppendLine($"@%p{1 + i} ld.global.f32 %f3, [%rd12+{128 * i}];");
+            b.AppendLine(Load(i, "%rd12", "%f8"));
             b.AppendLine($"@%p{1 + i} fma.rn.f32 %f{22 + i}, %f6, %f3, %f{22 + i};");
         }
 
@@ -1427,9 +1512,18 @@ internal static partial class PtxKernels
             bra CO;
             CO_END:
             """);
-        RowBlock(sb, "attention_decode_f32", ["q", "keys", "values", "pos", "y"],
-            [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale")], b.ToString(),
-            sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
+        if (int8)
+        {
+            RowBlock(sb, "attention_decode_int8", ["q", "keys", "values", "kscales", "vscales", "pos", "y"],
+                [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale"), ("u32", "words")], b.ToString(),
+                sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
+        }
+        else
+        {
+            RowBlock(sb, "attention_decode_f32", ["q", "keys", "values", "pos", "y"],
+                [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale")], b.ToString(),
+                sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
+        }
     }
 
     /// <summary>Threads of a <c>gemv_nn_f32</c> block: 32 columns × 32 slices of k.</summary>

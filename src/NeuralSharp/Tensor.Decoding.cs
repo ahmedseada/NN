@@ -132,6 +132,17 @@ public sealed partial class Tensor
         return Traced("attention", y, start);
     }
 
+    /// <summary>Attention of q [heads, rowsPerHead, dim] over an int8 cache filled up to <paramref name="position"/>.</summary>
+    internal static Tensor AttentionInt8(Tensor q, Layers.KeyValueCache cache, Tensor position, int steps, float scale, bool tiled)
+    {
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int heads = q._shape[0], rowsPerHead = q._shape[1], dim = q._shape[2];
+        var y = Empty([heads, rowsPerHead, dim], q.Device);
+        q.Backend.AttentionInt8(q.Storage, cache.Keys.Storage, cache.Values.Storage, cache.KeyScales!.Storage, cache.ValueScales!.Storage,
+            position.Storage, y.Storage, heads, rowsPerHead, steps, cache.Keys._shape[1], dim, scale, tiled);
+        return Traced("attention_int8", y, start);
+    }
+
     /// <summary>q [rows, steps, dim] · int8 keysᵀ → [rows, steps, capacity].</summary>
     internal static Tensor AttentionScoresInt8(Tensor q, Layers.KeyValueCache cache)
     {
