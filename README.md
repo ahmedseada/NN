@@ -39,7 +39,7 @@ src/NeuralSharp/
   Backends/Cpu, Backends/Cuda       device implementations (CPU SIMD kernels, PTX kernels)
 src/NeuralSharp.AspNetCore/         optional package: AddNeuralSharp(), MapPredictor, MapGenerate, MapOllamaApi, MapNeuralSharpStatus
 src/NeuralSharp.Mcp/                optional package: tools of Model Context Protocol servers, and serving tools over MCP
-src/NeuralSharp.Onnx/               optional package, no dependencies: export networks to .onnx (opset 17)
+src/NeuralSharp.Onnx/               optional package, no dependencies: export networks to .onnx (opset 17), import .onnx into layers
 src/NeuralSharp.Onnx.Runtime/       optional package: run .onnx models with ONNX Runtime as NeuralSharp modules
 samples/
   NeuralSharp.Samples.Xor             the classic XOR problem
@@ -635,17 +635,24 @@ OnnxExport.For(model).Input(28)                                          // or c
     .Lambda("ClsToken", OnnxExport.FirstStep)                             // your own lambdas need a translator
     .Save("reranker.onnx");
 
-using var onnx = OnnxModule.Load("model.onnx", o => o.AppendExecutionProvider_CUDA());   // any .onnx file
-using var predictor = Predictor.For(onnx).Classes(["cat", "dog"]).Build();                // a Module like any other
+using var imported = OnnxImport.Load("model.onnx", Device.Cuda());       // .onnx → NeuralSharp layers, on NeuralSharp's CUDA kernels
+imported.Model.Predict(input);                                          // a Sequential: predict, fine-tune (LoRA), move devices
+imported.SavePackage("model.nsm");                                      // architecture + weights; Predictor.Load("model.nsm", device)
+
+using var onnx = OnnxModule.Load("model.onnx");                          // or run the file with ONNX Runtime (CPU package)
 ```
 
-`NeuralSharp.Onnx` has no dependencies: it writes the protobuf itself and exports Linear (LoRA adapters merged),
-activations, Softmax, BatchNorm, LayerNorm, Conv2d, pooling, Flatten, Embedding, PositionalEncoding, attention,
-transformer layers, LSTM, GRU and the builder's shape helpers. Only `NeuralSharp.Onnx.Runtime` references
-`Microsoft.ML.OnnxRuntime`, so apps that only export never load it. `OnnxModule` works with predictors, the
-inference engine (`engine.Predictor("m", () => OnnxModule.Load(path), ...)`) and the ASP.NET Core endpoints; the
-tests run every exported layer in ONNX Runtime and compare it with NeuralSharp (within 1e-4). Import into
-NeuralSharp layers is planned.
+`NeuralSharp.Onnx` has no dependencies: it reads and writes the protobuf itself. **Export** covers Linear (LoRA
+adapters merged), activations, Softmax, BatchNorm, LayerNorm, Conv2d, pooling, Flatten, Embedding,
+PositionalEncoding, attention, transformer layers, LSTM, GRU and the builder's shape helpers. **Import** rebuilds a
+chain of those layers from an .onnx file, including PyTorch-style graphs (Gemm with transposed weights, exact GELU,
+which becomes the tanh approximation and is listed in `Notes`); an operator without a NeuralSharp layer is reported
+by name. Imported models are ordinary NeuralSharp models, so they run on NeuralSharp's own CPU and CUDA backends.
+
+`NeuralSharp.Onnx.Runtime` references `Microsoft.ML.OnnxRuntime`, which is ONNX Runtime's **CPU** build; running
+ONNX Runtime on a GPU needs its `.Gpu` (CUDA) or `.DirectML` package instead. `OnnxModule` works with predictors,
+the inference engine and the ASP.NET Core endpoints. The tests run every exported layer in ONNX Runtime and
+import it back, and both must match NeuralSharp within 1e-4.
 
 ### Fine-tuning: freezing, a learning rate per group, saving only what changed, LoRA
 
@@ -764,7 +771,7 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 93 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 95 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
@@ -775,14 +782,14 @@ layers, weights, data splits and training histories), together with predictors, 
 conversations, the inference engine (batching, copies, queue limits, timeouts, keep-alive with a manual
 clock) and the ASP.NET Core endpoints over a real Kestrel server. Retrieval is checked against the formulas
 (BM25 scores, masked mean pooling, reciprocal rank fusion), MCP tools round-trip through an in-process
-server, and every layer exported to ONNX gives the same output in ONNX Runtime. The suite runs on every available device; `NS_FILTER=text` runs only the tests whose name contains it.
+server, and every layer exported to ONNX gives the same output in ONNX Runtime and after importing it back. The suite runs on every available device; `NS_FILTER=text` runs only the tests whose name contains it.
 
 ## Status
 
 * **Verified on real hardware.** The first 64 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
   Laptop GPU (Blackwell), 128 of 128, including KV-cache and batched decoding, graph replay, the
   sampler with top-p, min-p and penalties, the generation layer and the kernel-signature check. The
-  29 newest ones (simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine,
+  31 newest ones (simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine,
   ASP.NET Core, retrieval, MCP, ONNX) pass on the CPU and still need a run on a GPU.
   That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end

@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="NeuralSharp.Tests" />
+    <InternalsVisibleTo Include="NeuralSharp.Onnx" />
   </ItemGroup>
 
 </Project>

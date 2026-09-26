@@ -14,7 +14,120 @@ internal static partial class Tests
         ("onnx: LSTM and GRU (sequences and last state), LastStep, FirstStep, Reshape match", OnnxRecurrent),
         ("onnx: transformer classifier and causal GPT (Embedding, PositionalEncoding, attention) match", OnnxTransformer),
         ("onnx: LoRA merged on export, custom lambda translator, metadata, names, errors, predictor", OnnxExtras),
+        ("onnx import: MLP, CNN, LSTM/GRU, transformer, GPT round-trip into NeuralSharp layers on the device", OnnxImportRoundTrip),
+        ("onnx import: PyTorch-style Gemm and erf GELU; .nsm package; unsupported ops are named", OnnxImportForeign),
     ];
+
+    // Export → import into NeuralSharp layers (on `device`) → the same outputs as the original.
+    private static void CheckImport(Module model, int[] sampleShape, Tensor input, string what, Func<OnnxExporter, OnnxExporter>? configure = null)
+    {
+        model.Eval();
+        var exporter = OnnxExport.For(model).Input(sampleShape);
+        using var imported = OnnxImport.Load((configure?.Invoke(exporter) ?? exporter).ToBytes(), input.Device);
+        using var expected = model.Predict(input);
+        using var actual = imported.Model.Predict(input);
+        Check(actual.Shape.SequenceEqual(expected.Shape), $"{what}: shape {Tensor.FormatShape(actual.Shape)} vs {Tensor.FormatShape(expected.Shape)}");
+        float worst = actual.ToArray().Zip(expected.ToArray(), (x, y) => MathF.Abs(x - y)).Max();
+        Check(worst < 1e-4f, $"{what}: largest difference {worst}");
+    }
+
+    private static void OnnxImportRoundTrip(Device device)
+    {
+        var r = new Random(20);
+        using var mlp = Network.Input(6).OnDevice(device).Seed(2).Linear(16).BatchNorm().GELU().Dropout(0.3f).Linear(12).Tanh()
+            .Linear(8).Sigmoid().Linear(8).ReLU().Linear(5, bias: false).Softmax().Build();
+        WarmBatchNorm(mlp, RandomInput(device, r, 32, 6) * 3f);
+        CheckImport(mlp, [6], RandomInput(device, r, 4, 6), "mlp");
+
+        using var cnn = Network.Image(2, 12, 12).OnDevice(device).Seed(4).Conv2d(4, 3, padding: 1).BatchNorm().ReLU().MaxPool2d(2)
+            .Conv2d(6, 3, stride: 2, padding: 1).ReLU().GlobalAveragePool2d().Linear(3).Build();
+        WarmBatchNorm(cnn, RandomInput(device, r, 16, 2, 12, 12));
+        CheckImport(cnn, [2, 12, 12], RandomInput(device, r, 3, 2, 12, 12), "cnn");
+        using var flat = Network.Image(1, 8, 8).OnDevice(device).Seed(5).Conv2d(3, 3, bias: false).Flatten().Linear(4).Build();
+        CheckImport(flat, [1, 8, 8], RandomInput(device, r, 2, 1, 8, 8), "cnn with flatten");
+
+        using var rnn = Network.Sequence(7, 4).OnDevice(device).Seed(7).LSTM(6, returnSequences: true).GRU(5, returnSequences: true).LastStep().Linear(2).Build();
+        CheckImport(rnn, [7, 4], RandomInput(device, r, 3, 7, 4), "lstm → gru → last step");
+        using var last = Network.Sequence(5, 3).OnDevice(device).Seed(9).LSTM(4).Reshape(2, 2).Build();
+        CheckImport(last, [5, 3], RandomInput(device, r, 2, 5, 3), "lstm last state → reshape");
+        using var first = Network.Sequence(5, 3).OnDevice(device).Seed(10).GRU(4).Build();
+        CheckImport(first, [5, 3], RandomInput(device, r, 2, 5, 3), "gru last state");
+
+        using var classifier = Architectures.TransformerClassifier(vocabulary: 20, length: 10, dim: 16, heads: 4, layers: 2, ffDim: 32, dropout: 0.1f, outputs: 3)
+            .OnDevice(device).Seed(12).Build();
+        CheckImport(classifier, [10], RandomIds(device, r, 20, 3, 10), "transformer classifier");
+        using var gpt = Architectures.Gpt(vocabulary: 24, context: 12, dim: 16, heads: 2, layers: 2, ffDim: 32, dropout: 0.1f).OnDevice(device).Seed(13).Build();
+        CheckImport(gpt, [12], RandomIds(device, r, 24, 2, 12), "causal gpt");
+        using var attention = Network.Sequence(6, 8).OnDevice(device).Seed(14).MultiHeadAttention(heads: 2).LayerNorm().Build();
+        CheckImport(attention, [6, 8], RandomInput(device, r, 2, 6, 8), "attention alone");
+        using var cls = Network.Sequence(5, 3).OnDevice(device).Seed(21).GRU(4, returnSequences: true).FirstStep().Build();
+        CheckImport(cls, [5, 3], RandomInput(device, r, 2, 5, 3), "first step");
+    }
+
+    private static void OnnxImportForeign(Device device)
+    {
+        var r = new Random(22);
+        using var mlp = Network.Input(5).OnDevice(device).Seed(23).Linear(8).GELU().Linear(3).Softmax().Build();
+        mlp.Eval();
+        // Written the way PyTorch exports nn.Linear (Gemm with a transposed [out, in] weight) and exact GELU (erf).
+        var bytes = OnnxExport.For(mlp).Input(5)
+            .Module<Linear>((g, linear, x, shape) => g.Node("Gemm",
+                [x, g.Constant("w", TransposeRows(linear.Weight.ToArray(), linear.InFeatures, linear.OutFeatures), linear.OutFeatures, linear.InFeatures),
+                    g.Constant("b", linear.Bias!.ToArray(), linear.OutFeatures)], shape, OnnxAttribute.Of("transB", 1L)))
+            .Module<GELU>((g, _, x, shape) => g.Node("Mul", [g.Node("Mul", [x, g.Node("Add", [g.Node("Erf", [g.Node("Div", [x, g.Scalar("sqrt2", MathF.Sqrt(2f))])]),
+                g.Scalar("one", 1f)])]), g.Scalar("half", 0.5f)], shape))
+            .Metadata("source", "pytorch-style").ToBytes();
+        using var imported = OnnxImport.Load(bytes, device);
+        Check(imported.Model.Select(m => m.GetType().Name).SequenceEqual(["Linear", "GELU", "Linear", "Softmax"]), string.Join(", ", imported.Model.Select(m => m.ToString())));
+        Check(imported.Notes.Count == 1 && imported.Notes[0].Contains("erf"), "the erf → tanh approximation is reported");
+        Check(imported.Metadata["source"] == "pytorch-style", "metadata");
+        var x = RandomInput(device, r, 4, 5);
+        using var expected = mlp.Predict(x);
+        using var actual = imported.Model.Predict(x);
+        Check(actual.ToArray().Zip(expected.ToArray(), (a, b) => MathF.Abs(a - b)).Max() < 1e-5f, "gemm with transposed weights");
+
+        string path = Path.Combine(Path.GetTempPath(), $"ns-{Guid.NewGuid():N}.nsm");
+        try
+        {
+            imported.SavePackage(path);
+            using var predictor = Predictor.Load(path, device).Build();
+            var p = predictor.Predict([0.1f, -0.2f, 0.3f, 0.4f, -0.5f]);
+            using var single = Tensor.From([0.1f, -0.2f, 0.3f, 0.4f, -0.5f], [1, 5], device);
+            using var reference = mlp.Predict(single);
+            Check(p.Zip(reference.ToArray(), (a, b) => MathF.Abs(a - b)).Max() < 1e-5f, "the .nsm package predicts the same");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+
+        using var custom = new Sequential { new Linear(4, 4, device: device, random: new Random(24)), new Lambda(x => x * 2f + 1f, "Affine") };
+        var unsupported = OnnxExport.For(custom).Input(4)
+            .Lambda("Affine", (g, _, v, shape) => g.Node("Add", [g.Node("Mul", [v, g.Scalar("two", 2f)]), g.Scalar("one", 1f)], shape)).ToBytes();
+        try
+        {
+            OnnxImport.Load(unsupported, device).Dispose();
+            Check(false, "an unsupported operator must be rejected");
+        }
+        catch (NotSupportedException ex)
+        {
+            Check(ex.Message.Contains("Mul"), ex.Message);
+        }
+    }
+
+    private static float[] TransposeRows(float[] values, int rows, int columns)
+    {
+        var result = new float[values.Length];
+        for (int i = 0; i < rows; i++)
+        {
+            for (int j = 0; j < columns; j++)
+            {
+                result[j * rows + i] = values[i * columns + j];
+            }
+        }
+
+        return result;
+    }
 
     private static void CheckOnnx(Module model, int[] sampleShape, Tensor input, string what, Func<OnnxExporter, OnnxExporter>? configure = null)
     {
