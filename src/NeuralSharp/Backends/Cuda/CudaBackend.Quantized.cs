@@ -318,4 +318,11 @@ internal sealed unsafe partial class CudaBackend
         float eps, float offset, int heads, int steps, int half, bool interleaved) =>
         LaunchRows(K("rms_norm_rope_f32"), rows, P(x), P(gain), P(cos), P(sin), P(positions), P(y),
             U(cols), F(eps), F(offset), U(heads), U(steps), U(half), U(interleaved ? 1 : 0), U(rows));
+
+    public override void RmsNormRopePair(Storage x, Storage gain, Storage y, int rows1, float eps, float offset, int heads,
+        Storage x2, Storage gain2, Storage y2, int rows2, float eps2, float offset2, int heads2,
+        Storage cos, Storage sin, Storage positions, int cols, int steps, int half, bool interleaved) =>
+        LaunchRows(K("rms_norm_rope2_f32"), rows1 + rows2, P(x), P(gain), P(cos), P(sin), P(positions), P(y), P(x2), P(gain2), P(y2),
+            U(cols), F(eps), F(offset), U(heads), U(steps), U(half), U(interleaved ? 1 : 0), U(rows1), F(eps2), F(offset2), U(heads2),
+            U(rows1 + rows2));
 }

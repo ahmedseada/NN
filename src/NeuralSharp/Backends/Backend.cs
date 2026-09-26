@@ -314,6 +314,18 @@ internal abstract class Backend
     public abstract void RmsNormRope(Storage x, Storage gain, Storage cos, Storage sin, Storage positions, Storage y, int rows, int cols,
         float eps, float offset, int heads, int steps, int half, bool interleaved);
 
+    /// <summary>
+    /// <see cref="RmsNormRope"/> for two tensors sharing the positions and rotary tables (queries and keys): rows1 rows
+    /// of x (heads per step: heads) and rows2 of x2 (heads2). Devices may do both in one pass.
+    /// </summary>
+    public virtual void RmsNormRopePair(Storage x, Storage gain, Storage y, int rows1, float eps, float offset, int heads,
+        Storage x2, Storage gain2, Storage y2, int rows2, float eps2, float offset2, int heads2,
+        Storage cos, Storage sin, Storage positions, int cols, int steps, int half, bool interleaved)
+    {
+        RmsNormRope(x, gain, cos, sin, positions, y, rows1, cols, eps, offset, heads, steps, half, interleaved);
+        RmsNormRope(x2, gain2, cos, sin, positions, y2, rows2, cols, eps2, offset2, heads2, steps, half, interleaved);
+    }
+
     /// <summary>y = act(gate) · up element-wise; kind 0 = SiLU, 1 = GELU (tanh approximation), 2 = ReLU.</summary>
     public abstract void GatedActivation(Storage gate, Storage up, Storage y, int n, int kind);
 

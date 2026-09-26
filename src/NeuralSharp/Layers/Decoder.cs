@@ -358,8 +358,8 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         {
             // Inference: each head's normalization and rotation in one pass.
             int half = _cos.Shape[1];
-            q = q.RmsNormRope(QueryNorm.Gain, QueryNorm.Epsilon, QueryNorm.Offset, _cos, _sin, positions, half, Rope.Interleaved);
-            k = k.RmsNormRope(KeyNorm.Gain, KeyNorm.Epsilon, KeyNorm.Offset, _cos, _sin, positions, half, Rope.Interleaved);
+            (q, k) = Tensor.RmsNormRopePair(q, QueryNorm.Gain, QueryNorm.Epsilon, QueryNorm.Offset, k, KeyNorm.Gain, KeyNorm.Epsilon,
+                KeyNorm.Offset, _cos, _sin, positions, half, Rope.Interleaved);
         }
         else
         {

@@ -145,6 +145,23 @@ public sealed partial class Tensor
         return Traced("rms_norm_rope", y, start);
     }
 
+    /// <summary><see cref="RmsNormRope"/> of the queries and the keys (same positions and tables) in one pass where the device can.</summary>
+    internal static (Tensor Q, Tensor K) RmsNormRopePair(Tensor q, Tensor gainQ, float epsQ, float offsetQ, Tensor k, Tensor gainK, float epsK,
+        float offsetK, Tensor cos, Tensor sin, Tensor positions, int half, bool interleaved)
+    {
+        q.ThrowIfDisposed();
+        k.ThrowIfDisposed();
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int steps = q._shape[1], dim = q._shape[3];
+        var yq = Empty(q._shape, q.Device);
+        var yk = Empty(k._shape, k.Device);
+        q.Backend.RmsNormRopePair(q.Storage, gainQ.Storage, yq.Storage, q.Size / dim, epsQ, offsetQ, q._shape[2],
+            k.Storage, gainK.Storage, yk.Storage, k.Size / dim, epsK, offsetK, k._shape[2], cos.Storage, sin.Storage, positions.Storage,
+            dim, steps, half, interleaved);
+        Traced("rms_norm_rope", yq, start);
+        return (yq, Traced("rms_norm_rope", yk, start));
+    }
+
     /// <summary>act(gate) · up element-wise (kind 0 = SiLU, 1 = GELU, 2 = ReLU), with its gradient: one pass either way.</summary>
     internal static Tensor GatedActivation(Tensor gate, Tensor up, int kind)
     {
