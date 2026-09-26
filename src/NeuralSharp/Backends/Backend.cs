@@ -125,6 +125,22 @@ internal abstract class Backend
     public void MatMul(Storage a, Storage b, Storage c, int m, int n, int k, bool transA, bool transB, float beta) =>
         BatchedMatMul(a, b, c, 1, m, n, k, transA, transB, beta);
 
+    /// <summary>
+    /// Several products sharing one input: y_j = a · w_j (+ bias_j) for a [m, k] and w_j [k, n_j] (the query, key and
+    /// value projections, say). The default computes them one by one; devices may do them in one pass.
+    /// </summary>
+    public virtual void MatMulMany(Storage a, int m, int k, ReadOnlySpan<(Storage Weight, Storage? Bias, Storage Output, int Columns)> products)
+    {
+        foreach (var (weight, bias, output, columns) in products)
+        {
+            MatMul(a, weight, output, m, columns, k, false, false, 0f);
+            if (bias is not null)
+            {
+                AddRowVector(output, bias, output, m, columns);
+            }
+        }
+    }
+
     /// <summary><see cref="MatMul"/> for <paramref name="batch"/> independent, contiguous matrix triples.</summary>
     public abstract void BatchedMatMul(Storage a, Storage b, Storage c, int batch, int m, int n, int k, bool transA, bool transB, float beta);
 

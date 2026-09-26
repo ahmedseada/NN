@@ -418,6 +418,34 @@ internal sealed unsafe partial class CudaBackend : Backend
 
     public override void AddBroadcastScalar(Storage s, Storage y, int n, float scale) => Launch1D(_addScalar, n, P(s), P(y), F(scale), U(n));
 
+    public override void MatMulMany(Storage a, int m, int k, ReadOnlySpan<(Storage Weight, Storage? Bias, Storage Output, int Columns)> products)
+    {
+        if (products.Length is 0 or > 3 || m > PtxKernels.GemvRows)
+        {
+            base.MatMulMany(a, m, k, products);
+            return;
+        }
+
+        // One launch for all of them: grid y picks the product (up to three), x covers the widest.
+        var args = new ulong[3 + 4 * 3];
+        args[0] = P(a);
+        args[1] = U(m);
+        args[2] = U(k);
+        int widest = 0;
+        for (int j = 0; j < 3; j++)
+        {
+            var (weight, bias, output, columns) = products[Math.Min(j, products.Length - 1)];
+            bool used = j < products.Length;
+            args[3 + 4 * j] = P(weight);
+            args[4 + 4 * j] = bias is null ? 0UL : P(bias);
+            args[5 + 4 * j] = P(output);
+            args[6 + 4 * j] = used ? U(columns) : 0UL;
+            widest = Math.Max(widest, used ? columns : 0);
+        }
+
+        Launch(K("gemv_multi_f32"), (uint)((widest + 31) / 32), (uint)products.Length, 1, PtxKernels.GemvThreads, 1, args);
+    }
+
     public override void BatchedMatMul(Storage a, Storage b, Storage c, int batch, int m, int n, int k, bool transA, bool transB, float beta)
     {
         if (m == 0 || n == 0 || batch == 0)

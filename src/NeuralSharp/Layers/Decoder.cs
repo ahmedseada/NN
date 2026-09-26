@@ -332,9 +332,10 @@ public sealed class CausalSelfAttention : Module, ICachedModule
     private (Tensor Q, Tensor K, Tensor V) Project(Tensor input, Tensor positions)
     {
         int n = input.Shape[0], t = input.Shape[1], d = HeadDim;
-        var q = Query.Forward(input).Reshape(n, t, Heads, d);
-        var k = Key.Forward(input).Reshape(n, t, KvHeads, d);
-        var v = Value.Forward(input).Reshape(n, t, KvHeads, d);
+        var projected = Linear.ForwardMany(input, Query, Key, Value);
+        var q = projected[0].Reshape(n, t, Heads, d);
+        var k = projected[1].Reshape(n, t, KvHeads, d);
+        var v = projected[2].Reshape(n, t, KvHeads, d);
         if (QueryNorm is not null)
         {
             q = QueryNorm.Forward(q);
@@ -490,8 +491,16 @@ public sealed class FeedForward : Module
     /// <inheritdoc />
     protected override Tensor ForwardCore(Tensor input)
     {
-        var hidden = Gate is null ? Activate(Up.Forward(input))
-            : Tensor.GatedActivation(Gate.Forward(input), Up.Forward(input), (int)Activation);   // act(gate) · up in one kernel
+        Tensor hidden;
+        if (Gate is null)
+        {
+            hidden = Activate(Up.Forward(input));
+        }
+        else
+        {
+            var projected = Linear.ForwardMany(input, Gate, Up);
+            hidden = Tensor.GatedActivation(projected[0], projected[1], (int)Activation);    // act(gate) · up in one kernel
+        }
         return Down.Forward(hidden);
     }
 

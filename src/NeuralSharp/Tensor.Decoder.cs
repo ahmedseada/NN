@@ -31,6 +31,33 @@ public sealed partial class Tensor
         return Traced("rms_norm", y, start);
     }
 
+    /// <summary>
+    /// input · weights[j] (+ biases[j]) for every j in one pass over the input (inference: not recorded). The input is
+    /// [..., k]; each weight is [k, n_j]; results are [..., n_j].
+    /// </summary>
+    internal static Tensor[] MatMulMany(Tensor input, IReadOnlyList<Tensor> weights, IReadOnlyList<Tensor?> biases)
+    {
+        input.ThrowIfDisposed();
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int k = input._shape[^1], m = input.Size / k;
+        var outputs = new Tensor[weights.Count];
+        var products = new (Backends.Storage, Backends.Storage?, Backends.Storage, int)[weights.Count];
+        for (int j = 0; j < weights.Count; j++)
+        {
+            int n = weights[j]._shape[1];
+            outputs[j] = Empty([.. input._shape[..^1], n], input.Device);
+            products[j] = (weights[j].Storage, biases[j]?.Storage, outputs[j].Storage, n);
+        }
+
+        input.Backend.MatMulMany(input.Storage, m, k, products);
+        foreach (var output in outputs)
+        {
+            Traced("matmul_many", output, start);
+        }
+
+        return outputs;
+    }
+
     /// <summary>x / sqrt(mean(x²) + eps) · (gain + offset) over the last dimension in one pass (inference: not recorded).</summary>
     internal Tensor RmsNormAffine(Tensor gain, float eps, float offset)
     {

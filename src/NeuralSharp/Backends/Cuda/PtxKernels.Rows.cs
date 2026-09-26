@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "gemm128_f32", "gemm64_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "gemm128_f32", "gemm64_f32", "gemv_multi_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -219,6 +219,7 @@ internal static partial class PtxKernels
     private static void BuildRows(StringBuilder sb)
     {
         GemvNN(sb);
+        GemvNN(sb, multi: true);
         GemvNT(sb);
         AttentionDecode(sb);
         Gemm(sb, "gemm128_f32", 128, 8);
@@ -617,56 +618,129 @@ internal static partial class PtxKernels
     // c[b][r, j] = Σ_k a[b][r, k] · w[b][k, j] (+ beta · c) for m ≤ 8 rows. Block: 32 columns × 32 slices of k (slice s
     // takes k = s, s + 32, …, four at a time so several loads are in flight); each thread keeps 8 row sums, the slices
     // are added in shared memory and warp r writes row r. Grid: x = ⌈n / 32⌉, z = batch. Reads of w are coalesced.
-    private static void GemvNN(StringBuilder sb)
+    //
+    // gemv_multi_f32: up to three products sharing the input a [m, k] (the query/key/value or gate/up projections):
+    // y_j = a · w_j (+ bias_j) with w_j [k, n_j]; grid y selects j (blocks beyond n_j return at once).
+    private static void GemvNN(StringBuilder sb, bool multi = false)
     {
         var s = new StringBuilder();
-        s.AppendLine("""
-            .visible .entry gemv_nn_f32(
-                .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,
-                .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .f32 p_beta,
-                .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc
-            )
+        if (multi)
+        {
+            s.AppendLine("""
+                .visible .entry gemv_multi_f32(
+                    .param .u64 p_a, .param .u32 p_m, .param .u32 p_k,
+                    .param .u64 p_w0, .param .u64 p_bias0, .param .u64 p_y0, .param .u32 p_n0,
+                    .param .u64 p_w1, .param .u64 p_bias1, .param .u64 p_y1, .param .u32 p_n1,
+                    .param .u64 p_w2, .param .u64 p_bias2, .param .u64 p_y2, .param .u32 p_n2
+                )
+                {
+                    .reg .pred %p<16>;
+                    .reg .f32 %f<32>;
+                    .reg .b32 %r<24>;
+                    .reg .b64 %rd<24>;
+                    .reg .b64 %w<3>;
+                    .reg .b64 %bias<3>;
+                    .reg .b64 %y<3>;
+                    .reg .b32 %nn<3>;
+                    .shared .align 4 .f32 gemv_multi_part[8192];
+                    ld.param.u64 %rd1, [p_a];
+                    cvta.to.global.u64 %rd1, %rd1;
+                    ld.param.u32 %r1, [p_m];
+                    ld.param.u32 %r3, [p_k];
+                """);
+            for (int j = 0; j < 3; j++)
             {
-                .reg .pred %p<16>;
-                .reg .f32 %f<32>;
-                .reg .b32 %r<24>;
-                .reg .b64 %rd<24>;
-                .shared .align 4 .f32 gemv_nn_part[8192];
-                ld.param.u64 %rd1, [p_a];
-                ld.param.u64 %rd2, [p_b];
-                ld.param.u64 %rd3, [p_c];
-                cvta.to.global.u64 %rd1, %rd1;
-                cvta.to.global.u64 %rd2, %rd2;
-                cvta.to.global.u64 %rd3, %rd3;
-                ld.param.u32 %r1, [p_m];
-                ld.param.u32 %r2, [p_n];
-                ld.param.u32 %r3, [p_k];
-                ld.param.f32 %f20, [p_beta];
-                ld.param.u64 %rd4, [p_sa];
-                ld.param.u64 %rd5, [p_sb];
-                ld.param.u64 %rd6, [p_sc];
-                mov.u32 %r4, %ctaid.z;
-                cvt.u64.u32 %rd7, %r4;
-                mul.lo.u64 %rd8, %rd7, %rd4;
-                shl.b64 %rd8, %rd8, 2;
-                add.u64 %rd1, %rd1, %rd8;
-                mul.lo.u64 %rd8, %rd7, %rd5;
-                shl.b64 %rd8, %rd8, 2;
-                add.u64 %rd2, %rd2, %rd8;
-                mul.lo.u64 %rd8, %rd7, %rd6;
-                shl.b64 %rd8, %rd8, 2;
-                add.u64 %rd3, %rd3, %rd8;
-                mov.u32 %r5, %tid.x;
-                and.b32 %r6, %r5, 31;
-                shr.u32 %r7, %r5, 5;
-                mov.u32 %r8, %ctaid.x;
-                shl.b32 %r8, %r8, 5;
-                add.u32 %r8, %r8, %r6;
-                setp.lt.u32 %p9, %r8, %r2;
-                mul.wide.u32 %rd12, %r3, 4;
-                mul.wide.u32 %rd14, %r2, 128;
-                cvt.u64.u32 %rd10, %r8;
-            """);
+                s.AppendLine($"""
+                        ld.param.u64 %w{j}, [p_w{j}];
+                        ld.param.u64 %bias{j}, [p_bias{j}];
+                        ld.param.u64 %y{j}, [p_y{j}];
+                        ld.param.u32 %nn{j}, [p_n{j}];
+                    """);
+            }
+
+            // Select this block's matrix; the bias pointer stays 0 when the layer has none.
+            s.AppendLine("""
+                    mov.u32 %r4, %ctaid.y;
+                    setp.eq.u32 %p13, %r4, 1;
+                    setp.eq.u32 %p14, %r4, 2;
+                    selp.b64 %rd2, %w1, %w0, %p13;
+                    selp.b64 %rd2, %w2, %rd2, %p14;
+                    selp.b64 %rd15, %bias1, %bias0, %p13;
+                    selp.b64 %rd15, %bias2, %rd15, %p14;
+                    selp.b64 %rd3, %y1, %y0, %p13;
+                    selp.b64 %rd3, %y2, %rd3, %p14;
+                    selp.b32 %r2, %nn1, %nn0, %p13;
+                    selp.b32 %r2, %nn2, %r2, %p14;
+                    mov.u32 %r8, %ctaid.x;
+                    shl.b32 %r8, %r8, 5;
+                    setp.ge.u32 %p15, %r8, %r2;
+                    @%p15 bra DONE;
+                    cvta.to.global.u64 %rd2, %rd2;
+                    cvta.to.global.u64 %rd3, %rd3;
+                    setp.ne.u64 %p13, %rd15, 0;
+                    @%p13 cvta.to.global.u64 %rd15, %rd15;
+                    mov.f32 %f20, 0f00000000;
+                    mov.u32 %r5, %tid.x;
+                    and.b32 %r6, %r5, 31;
+                    shr.u32 %r7, %r5, 5;
+                    add.u32 %r8, %r8, %r6;
+                    setp.lt.u32 %p9, %r8, %r2;
+                    mul.wide.u32 %rd12, %r3, 4;
+                    mul.wide.u32 %rd14, %r2, 128;
+                    cvt.u64.u32 %rd10, %r8;
+                """);
+        }
+        else
+        {
+            s.AppendLine("""
+                .visible .entry gemv_nn_f32(
+                    .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,
+                    .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .f32 p_beta,
+                    .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc
+                )
+                {
+                    .reg .pred %p<16>;
+                    .reg .f32 %f<32>;
+                    .reg .b32 %r<24>;
+                    .reg .b64 %rd<24>;
+                    .shared .align 4 .f32 gemv_nn_part[8192];
+                    ld.param.u64 %rd1, [p_a];
+                    ld.param.u64 %rd2, [p_b];
+                    ld.param.u64 %rd3, [p_c];
+                    cvta.to.global.u64 %rd1, %rd1;
+                    cvta.to.global.u64 %rd2, %rd2;
+                    cvta.to.global.u64 %rd3, %rd3;
+                    ld.param.u32 %r1, [p_m];
+                    ld.param.u32 %r2, [p_n];
+                    ld.param.u32 %r3, [p_k];
+                    ld.param.f32 %f20, [p_beta];
+                    ld.param.u64 %rd4, [p_sa];
+                    ld.param.u64 %rd5, [p_sb];
+                    ld.param.u64 %rd6, [p_sc];
+                    mov.u32 %r4, %ctaid.z;
+                    cvt.u64.u32 %rd7, %r4;
+                    mul.lo.u64 %rd8, %rd7, %rd4;
+                    shl.b64 %rd8, %rd8, 2;
+                    add.u64 %rd1, %rd1, %rd8;
+                    mul.lo.u64 %rd8, %rd7, %rd5;
+                    shl.b64 %rd8, %rd8, 2;
+                    add.u64 %rd2, %rd2, %rd8;
+                    mul.lo.u64 %rd8, %rd7, %rd6;
+                    shl.b64 %rd8, %rd8, 2;
+                    add.u64 %rd3, %rd3, %rd8;
+                    mov.u32 %r5, %tid.x;
+                    and.b32 %r6, %r5, 31;
+                    shr.u32 %r7, %r5, 5;
+                    mov.u32 %r8, %ctaid.x;
+                    shl.b32 %r8, %r8, 5;
+                    add.u32 %r8, %r8, %r6;
+                    setp.lt.u32 %p9, %r8, %r2;
+                    mul.wide.u32 %rd12, %r3, 4;
+                    mul.wide.u32 %rd14, %r2, 128;
+                    cvt.u64.u32 %rd10, %r8;
+                """);
+        }
+
         for (int r = 0; r < GemvRows; r++)
         {
             s.AppendLine($"    mov.f32 %f{r}, 0f00000000;");
@@ -738,11 +812,12 @@ internal static partial class PtxKernels
         }
 
         // part[slice][row][lane]: slice stride 1024 bytes, row stride 128 bytes.
-        s.AppendLine("""
+        string part = multi ? "gemv_multi_part" : "gemv_nn_part";
+        s.AppendLine($$"""
                 add.u32 %r9, %r9, 32;
                 bra K1;
             KEND:
-                mov.u32 %r10, gemv_nn_part;
+                mov.u32 %r10, {{part}};
                 shl.b32 %r11, %r7, 10;
                 shl.b32 %r12, %r6, 2;
                 add.u32 %r11, %r11, %r12;
@@ -779,6 +854,21 @@ internal static partial class PtxKernels
                 ld.global.f32 %f19, [%rd13];
                 fma.rn.f32 %f17, %f19, %f20, %f17;
             STORE:
+            """);
+        if (multi)
+        {
+            s.AppendLine("""
+                    setp.ne.u64 %p13, %rd15, 0;
+                    @!%p13 bra NO_BIAS;
+                    mul.wide.u32 %rd16, %r8, 4;
+                    add.u64 %rd16, %rd16, %rd15;
+                    ld.global.f32 %f19, [%rd16];
+                    add.f32 %f17, %f17, %f19;
+                NO_BIAS:
+                """);
+        }
+
+        s.AppendLine("""
                 st.global.f32 [%rd13], %f17;
             DONE:
                 ret;

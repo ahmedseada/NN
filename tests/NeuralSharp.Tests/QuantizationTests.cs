@@ -249,6 +249,40 @@ internal static partial class Tests
             AssertClose(expected, actual, 1e-3f, $"batched [{B}x{M}x{K}] × [{B}x{K}x{N}]{(transB ? "ᵀ" : "")}");
         }
 
+        // Several products of one input in one pass (query/key/value when decoding), with and without biases.
+        foreach (int rows in new[] { 1, 3, 8 })
+        {
+            const int K = 520;
+            int[] widths = [1024, 300, 777];
+            using var input = Tensor.From([.. Enumerable.Range(0, rows * K).Select(_ => (float)(r.NextDouble() * 2 - 1))], [1, rows, K], device);
+            var ws = widths.Select(n => Tensor.From([.. Enumerable.Range(0, K * n).Select(_ => (float)(r.NextDouble() * 2 - 1))], [K, n], device)).ToList();
+            var bs = widths.Select((n, j) => j == 1 ? null : Tensor.From([.. Enumerable.Range(0, n).Select(_ => (float)r.NextDouble())], [n], device)).ToList();
+            foreach (int count in new[] { 2, 3 })
+            {
+                Tensor[] many;
+                using (Autograd.NoGrad())
+                {
+                    many = Tensor.MatMulMany(input, ws[..count], bs[..count]);
+                }
+
+                for (int j = 0; j < count; j++)
+                {
+                    var single = input.Reshape(rows, K).MatMul(ws[j]).ToArray();
+                    if (bs[j] is { } bias)
+                    {
+                        var bv = bias.ToArray();
+                        single = [.. single.Select((v, i) => v + bv[i % widths[j]])];
+                    }
+
+                    Check(many[j].Shape.SequenceEqual([1, rows, widths[j]]), $"product {j} shape");
+                    AssertClose(single, many[j].ToArray(), 1e-3f, $"{count} products, {rows} rows: product {j}");
+                }
+            }
+
+            ws.ForEach(w => w.Dispose());
+            bs.ForEach(b => b?.Dispose());
+        }
+
         // beta = 1 accumulates (the gradient path): dx += dy · wᵀ with one row.
         using var w = Tensor.From([.. Enumerable.Range(0, 300 * 700).Select(i => MathF.Sin(i * 0.01f))], [300, 700], device);
         using var x = Tensor.From([.. Enumerable.Range(0, 300).Select(i => MathF.Cos(i * 0.1f))], [1, 300], device, requiresGrad: true);

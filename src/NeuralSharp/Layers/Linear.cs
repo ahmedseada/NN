@@ -84,6 +84,21 @@ public sealed class Linear : Module
         return Bias is null ? product : product + Bias;
     }
 
+    /// <summary>
+    /// The outputs of several layers applied to the same input. When nothing needs gradients and the layers are plain
+    /// float projections (no adapter, not int8) with few input rows, they run as one device pass over the input
+    /// (token-by-token decoding: query/key/value, gate/up); otherwise each layer runs on its own.
+    /// </summary>
+    internal static Tensor[] ForwardMany(Tensor input, params Linear[] layers)
+    {
+        int k = input.Shape[^1], rows = input.Size / Math.Max(1, k);
+        bool fused = !Autograd.IsEnabled && layers.Length is > 1 and <= 3 && rows <= Backends.Cuda.PtxKernels.GemvRows
+            && input.Device.Type == DeviceType.Cuda
+            && layers.All(l => l.Int8 is null && l.Adapter is null && l.InFeatures == k && (long)l.OutFeatures * k >= 1 << 16);
+        return fused ? Tensor.MatMulMany(input, [.. layers.Select(l => l.Weight)], [.. layers.Select(l => l.Bias)])
+            : [.. layers.Select(l => l.Forward(input))];
+    }
+
     /// <summary>x·W, plus the adapter's low-rank term when an adapter is attached.</summary>
     internal Tensor ProjectWithoutBias(Tensor input)
     {
