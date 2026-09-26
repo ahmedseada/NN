@@ -256,8 +256,16 @@ internal static partial class Tests
         _ = device;
         var counts = NeuralSharp.Backends.Cuda.PtxKernels.ParameterCounts;
         string[] all = [.. NeuralSharp.Backends.Cuda.PtxKernels.Names, .. NeuralSharp.Backends.Cuda.PtxKernels.AdvancedNames,
-            .. NeuralSharp.Backends.Cuda.PtxKernels.DecodingNames];
+            .. NeuralSharp.Backends.Cuda.PtxKernels.DecodingNames, .. NeuralSharp.Backends.Cuda.PtxKernels.QuantizedNames];
         Check(counts.Count == all.Length && all.All(k => counts.TryGetValue(k, out int n) && n > 0), $"{counts.Count} kernels parsed, {all.Length} expected");
+        // Parameter names must be unique within a kernel (a duplicate makes the whole module fail to load on the GPU).
+        foreach (var entry in System.Text.RegularExpressions.Regex.Matches(NeuralSharp.Backends.Cuda.PtxKernels.Source, @"\.entry (\w+)\(([^)]*)\)"))
+        {
+            var match = (System.Text.RegularExpressions.Match)entry;
+            var names = System.Text.RegularExpressions.Regex.Matches(match.Groups[2].Value, @"\.param \.\w+ (\w+)").Select(m => m.Groups[1].Value).ToList();
+            Check(names.Count == names.Distinct().Count(), $"{match.Groups[1].Value}: duplicate parameter names {string.Join(", ", names)}");
+        }
+
         Check(counts["sample_rows_f32"] == 14 && counts["penalize_rows_f32"] == 14 && counts["history_push_f32"] == 6,
             $"sampler kernels: {counts["sample_rows_f32"]}, {counts["penalize_rows_f32"]}, {counts["history_push_f32"]}");
     }

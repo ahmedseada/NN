@@ -56,6 +56,7 @@ samples/
   NeuralSharp.Samples.Summarizer      summarization: extractive baselines vs a word-level transformer (WordTokenizer + TextGenerator)
   NeuralSharp.Samples.Rag             retrieval-augmented generation: hybrid search, re-ranking, a chat model that cites passages
   NeuralSharp.Samples.OnnxImport      imports another framework's .onnx model, runs it on NeuralSharp (CPU/CUDA), checks its outputs
+  NeuralSharp.Samples.Quantization    int8 weights and Float16/BFloat16 files: accuracy, size and decoding speed
 tools/pytorch/xor_to_onnx.py        trains XOR in PyTorch and exports it to ONNX with PyTorch's outputs, for OnnxImport
 tools/pytorch/export_models.py      exports a PyTorch CNN or ResNet (skip connections) to ONNX with PyTorch's outputs
   Shared/SampleOptions.cs             command-line options shared by the samples (train / predict modes)
@@ -78,6 +79,7 @@ tests/NeuralSharp.Tests             self-contained test runner (runs on every av
 | `ReRanker` | two-stage search: BM25 + cross-encoder, hard negatives, listwise loss, placeholder tokens for unseen names | Hit@1 on unseen towns 27.1% (BM25) → 86.6% re-ranked, 6.9 ms per question, 180 s training |
 | `HouseApi` | `AddNeuralSharp().AddPredictor(...)` + `MapPredictor`: the HousePrices package served over HTTP with micro-batching | same prices as `HousePrices --predict` |
 | `Summarizer` | word-level decoder-only transformer, loss masking, greedy generation with a stop token, ROUGE | ROUGE-1 0.999 vs 0.503 (first sentence), 90% exact, 7.7 ms per summary |
+| `Quantization` | `QuantizeInt8`, Float16/BFloat16 files: a trained summarizer compared with float32, and decoding speed of a 98M-parameter GPT | int8: same summaries as float32 on all 300 test reports, 99.7% same next token, ⅓ of the file; decoding 7.1 → 41.4 tokens/s on 4 CPU threads (int8 reads ¼ of the bytes; part of the gain is that the float path is not bandwidth-bound for single rows) |
 | `OnnxImport` | `OnnxImport.Load(path, device)` on a PyTorch-exported model (`tools/pytorch/xor_to_onnx.py`, `export_models.py` for a CNN or ResNet), compared with PyTorch's own outputs, then saved as .nsm and reloaded | XOR: same outputs as PyTorch on the RTX 5050 (1e-11), both PyTorch exporters |
 | `Rag` | `RetrievalIndex` (BM25 + trained bi-encoder + rank fusion), `CrossEncoder` re-ranking, `Rag.For(chat)` with a word-level ChatML model that cites passages; hashing and placeholder tokens for unseen names | unseen towns: Hit@1 27.1% (BM25), 85.8% (hybrid), 99.9% (re-ranked); answers 91.1% correct (0% closed book), 99.9% cite the right passage; 14 min training |
 
@@ -630,6 +632,25 @@ options.ToolCollection = [.. McpTools.ServerTools(registry)];                // 
 `ConnectHttpAsync(uri)` and `ConnectAsync(transport)` connect to other servers. The package depends on
 `ModelContextProtocol.Core`; the core library stays dependency-free.
 
+### Quantization: int8 weights, half-precision files
+
+```csharp
+model.QuantizeInt8();                          // every Linear: 1 byte per weight + 1 scale per output column (¼ of the memory)
+model.QuantizeInt8(l => l.OutFeatures > 64);   // or only some layers
+model.Save("model.nsw");                       // int8 stays int8; a float model built the same way loads it (and becomes int8)
+model.Save("model.f16.nsw", WeightFormat.Float16);   // or BFloat16: half-size files, float32 again after loading
+package.Weights("model", model, WeightFormat.BFloat16);
+
+model.QuantizeInt8();                          // QLoRA-style fine-tuning: frozen int8 weights,
+model.AddLora(rank: 8, alpha: 16, targets: _ => true, freezeBase: true);   // trainable float adapters on top
+model.DequantizeInt8();                        // float weights again (the rounding stays)
+```
+
+Int8 layers read their bytes directly when few rows go through them (token-by-token generation, where reading
+weights is the bottleneck), and dequantize once per call for larger batches. Gradients flow through them, so
+layers before them and LoRA adapters on them still train. ONNX export writes the dequantized weights. Biases,
+normalization, embeddings and convolutions stay float32.
+
 ### ONNX: the optional `NeuralSharp.Onnx` and `NeuralSharp.Onnx.Runtime` packages
 
 ```csharp
@@ -780,7 +801,7 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 96 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 101 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
@@ -791,12 +812,13 @@ layers, weights, data splits and training histories), together with predictors, 
 conversations, the inference engine (batching, copies, queue limits, timeouts, keep-alive with a manual
 clock) and the ASP.NET Core endpoints over a real Kestrel server. Retrieval is checked against the formulas
 (BM25 scores, masked mean pooling, reciprocal rank fusion), MCP tools round-trip through an in-process
-server, and every layer exported to ONNX gives the same output in ONNX Runtime and after importing it back. The suite runs on every available device; `NS_FILTER=text` runs only the tests whose name contains it.
+server, every layer exported to ONNX gives the same output in ONNX Runtime and after importing it back, and
+int8 products (both kernels) and half-precision files are checked against float32. The suite runs on every available device; `NS_FILTER=text` runs only the tests whose name contains it.
 
 ## Status
 
-* **Verified on real hardware.** 95 of the 96 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
-  Laptop GPU (Blackwell), 190 of 190 (the newest, graph import, passes on the CPU and still needs a GPU run), including KV-cache and batched decoding, graph replay, the
+* **Verified on real hardware.** 95 of the 101 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
+  Laptop GPU (Blackwell), 190 of 190 (the newest six, graph import and quantization, pass on the CPU and still need a GPU run), including KV-cache and batched decoding, graph replay, the
   sampler with top-p, min-p and penalties, the generation layer, the kernel-signature check, the
   simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine, retrieval,
   and ONNX export and import (imported models run on the GPU). The ASP.NET Core and MCP tests do not
@@ -804,7 +826,7 @@ server, and every layer exported to ONNX gives the same output in ONNX Runtime a
   That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.
-* Every kernel launch is checked against the kernel's declared parameter count. The 59 GPU kernels also assemble without errors for sm_50, sm_75, sm_89 and sm_120 (checked with
+* Every kernel launch is checked against the kernel's declared parameter count, and parameter names are checked for duplicates. The 61 GPU kernels also assemble without errors for sm_50, sm_75, sm_89 and sm_120 (checked with
   `ptxas` 12.9), covering Maxwell through Blackwell.
 * Everything computes in float32. Tensors hold up to 2³¹ elements, and embedding ids must be below
   2²⁴ (the largest integer a float stores exactly).

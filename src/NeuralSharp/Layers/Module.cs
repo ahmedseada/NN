@@ -12,7 +12,8 @@ namespace NeuralSharp.Layers;
 /// </summary>
 public abstract class Module : IDisposable
 {
-    private const uint FileMagic = 0x3257_534E; // "NSW2": parameters followed by buffers
+    private const uint FileMagic = 0x3257_534E; // "NSW2": parameters followed by buffers (float32)
+    private const uint FileMagic3 = 0x3357_534E; // "NSW3": int8 layers, then tensors each with an element type
 
     /// <summary>An optional name shown in summaries and telemetry.</summary>
     public string? Name { get; set; }
@@ -201,19 +202,38 @@ public abstract class Module : IDisposable
         }
     }
 
-    /// <summary>Writes all parameter values to a binary file.</summary>
-    public void Save(string path)
+    /// <summary>Writes all parameter values to a binary file (float32).</summary>
+    public void Save(string path) => Save(path, WeightFormat.Float32);
+
+    /// <summary>
+    /// Writes all parameter values to a binary file in <paramref name="format"/>: Float16 and BFloat16 halve the file
+    /// (values are rounded; they are float32 again after loading). Int8 weights are always stored as they are.
+    /// </summary>
+    public void Save(string path, WeightFormat format)
     {
         using var stream = File.Create(path);
-        Save(stream);
+        Save(stream, format);
     }
 
     /// <summary>Writes all parameter values to <paramref name="stream"/> (the same format as <see cref="Save(string)"/>); the stream stays open.</summary>
-    public void Save(Stream stream)
+    public void Save(Stream stream) => Save(stream, WeightFormat.Float32);
+
+    /// <summary>Writes all parameter values to <paramref name="stream"/> in <paramref name="format"/>; the stream stays open.</summary>
+    public void Save(Stream stream, WeightFormat format)
     {
+        // NSW3: the int8 layers (by position among the Linear layers), then each tensor with its element type.
+        var linears = this.Descendants().OfType<Linear>().ToList();
+        var int8 = linears.Select((l, i) => (l, i)).Where(p => p.l.Int8 is not null).ToList();
+        var exact = int8.SelectMany(p => new[] { p.l.Int8!.Packed, p.l.Int8.Scales }).ToHashSet(ReferenceEqualityComparer.Instance);
         using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
         var parameters = Parameters().Concat(Buffers()).ToList();
-        writer.Write(FileMagic);
+        writer.Write(FileMagic3);
+        writer.Write(int8.Count);
+        foreach (var (_, index) in int8)
+        {
+            writer.Write(index);
+        }
+
         writer.Write(parameters.Count);
         foreach (var p in parameters)
         {
@@ -223,14 +243,9 @@ public abstract class Module : IDisposable
                 writer.Write(d);
             }
 
-            var data = p.ToArray();
-            if (!BitConverter.IsLittleEndian)
-            {
-                var bits = MemoryMarshal.Cast<float, int>(data.AsSpan());
-                BinaryPrimitives.ReverseEndianness(bits, bits);
-            }
-
-            writer.Write(MemoryMarshal.AsBytes(data.AsSpan()));
+            var type = exact.Contains(p) ? WeightFormat.Float32 : format;
+            writer.Write((byte)type);
+            writer.Write(Encode(p.ToArray(), type));
         }
     }
 
@@ -247,12 +262,30 @@ public abstract class Module : IDisposable
     private void Load(Stream stream, string source)
     {
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
-        var parameters = Parameters().Concat(Buffers()).ToList();
-        if (reader.ReadUInt32() != FileMagic)
+        uint magic = reader.ReadUInt32();
+        if (magic != FileMagic && magic != FileMagic3)
         {
             throw new InvalidDataException($"{source} is not a NeuralSharp weights file.");
         }
 
+        if (magic == FileMagic3)
+        {
+            // Layers stored as int8 are quantized first, so their packed weights have somewhere to go.
+            var linears = this.Descendants().OfType<Linear>().ToList();
+            int quantized = reader.ReadInt32();
+            for (int i = 0; i < quantized; i++)
+            {
+                int index = reader.ReadInt32();
+                if (index >= linears.Count)
+                {
+                    throw new InvalidDataException($"The file quantizes Linear layer {index}, but the model has {linears.Count}.");
+                }
+
+                linears[index].QuantizeInt8();
+            }
+        }
+
+        var parameters = Parameters().Concat(Buffers()).ToList();
         int count = reader.ReadInt32();
         if (count != parameters.Count)
         {
@@ -272,16 +305,53 @@ public abstract class Module : IDisposable
                 throw new InvalidDataException($"Shape mismatch: file has {Tensor.FormatShape(shape)}, model has {Tensor.FormatShape(p.Shape)}.");
             }
 
-            var data = new float[p.Size];
-            reader.BaseStream.ReadExactly(MemoryMarshal.AsBytes(data.AsSpan()));
-            if (!BitConverter.IsLittleEndian)
-            {
-                var bits = MemoryMarshal.Cast<float, int>(data.AsSpan());
-                BinaryPrimitives.ReverseEndianness(bits, bits);
-            }
-
-            p.Load(data);
+            var type = magic == FileMagic3 ? (WeightFormat)reader.ReadByte() : WeightFormat.Float32;
+            var bytes = new byte[p.Size * (type == WeightFormat.Float32 ? 4 : 2)];
+            reader.BaseStream.ReadExactly(bytes);
+            p.Load(Decode(bytes, p.Size, type));
         }
+    }
+
+    // Little-endian bytes of the values in `format` (bfloat16 rounds to nearest even; NaN stays NaN).
+    private static byte[] Encode(float[] values, WeightFormat format)
+    {
+        var bytes = new byte[values.Length * (format == WeightFormat.Float32 ? 4 : 2)];
+        for (int i = 0; i < values.Length; i++)
+        {
+            switch (format)
+            {
+                case WeightFormat.Float32:
+                    BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(i * 4), values[i]);
+                    break;
+                case WeightFormat.Float16:
+                    BinaryPrimitives.WriteHalfLittleEndian(bytes.AsSpan(i * 2), (Half)values[i]);
+                    break;
+                default:
+                    uint bits = BitConverter.SingleToUInt32Bits(values[i]);
+                    ushort b16 = float.IsNaN(values[i]) ? (ushort)0x7FC0 : (ushort)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+                    BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(i * 2), b16);
+                    break;
+            }
+        }
+
+        return bytes;
+    }
+
+    private static float[] Decode(byte[] bytes, int count, WeightFormat format)
+    {
+        var values = new float[count];
+        for (int i = 0; i < count; i++)
+        {
+            values[i] = format switch
+            {
+                WeightFormat.Float32 => BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(i * 4)),
+                WeightFormat.Float16 => (float)BinaryPrimitives.ReadHalfLittleEndian(bytes.AsSpan(i * 2)),
+                WeightFormat.BFloat16 => BitConverter.UInt32BitsToSingle((uint)BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(i * 2)) << 16),
+                _ => throw new InvalidDataException($"Unknown weight format {(int)format}."),
+            };
+        }
+
+        return values;
     }
 
     /// <summary>Releases the device memory held by the parameters.</summary>

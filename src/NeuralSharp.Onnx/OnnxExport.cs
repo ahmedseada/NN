@@ -204,15 +204,15 @@ public sealed class OnnxExporter
 
     private static OnnxValue Linear(OnnxGraph g, Layers.Linear linear, OnnxValue x, IReadOnlyList<int>? shape)
     {
-        float[] weight;
+        var weight = linear.WeightValues();                                      // int8 weights are exported dequantized
         if (linear.Adapter is { } a)
         {
-            using var merged = linear.Weight + a.A.MatMul(a.B) * a.Scale;       // the LoRA update folded in, as MergeLora does
-            weight = merged.ToArray();
-        }
-        else
-        {
-            weight = linear.Weight.ToArray();
+            using var update = a.A.MatMul(a.B) * a.Scale;                        // the LoRA update folded in, as MergeLora does
+            var delta = update.ToArray();
+            for (int i = 0; i < weight.Length; i++)
+            {
+                weight[i] += delta[i];
+            }
         }
 
         var product = g.Node("MatMul", [x, g.Constant("weight", weight, linear.InFeatures, linear.OutFeatures)]);

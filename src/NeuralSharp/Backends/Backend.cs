@@ -229,6 +229,15 @@ internal abstract class Backend
     /// <summary>y[i] = gelu(x[i] + bias[i % cols]).</summary>
     public abstract void BiasGelu(Storage x, Storage bias, Storage y, int n, int cols);
 
+    /// <summary>
+    /// y[m, n] = x[m, k] · w, where w[k, j] = q[k, j] · scales[j] and q holds signed bytes packed four per 32-bit element
+    /// along each row (rows padded to ceil(n / 4) elements). Suited to few rows (token-by-token decoding).
+    /// </summary>
+    public abstract void Int8MatMul(Storage x, Storage q, Storage scales, Storage y, int m, int n, int k);
+
+    /// <summary>w[k, n] = q[k, n] · scales[n] (see <see cref="Int8MatMul"/> for the packing).</summary>
+    public abstract void Int8Dequantize(Storage q, Storage scales, Storage w, int k, int n);
+
     // ---------------------------------------------------------------- incremental decoding (positions live on the device)
 
     /// <summary>mask[i, j] = j ≤ position + i ? 0 : -1e9 for a [rows, capacity] mask; position is read from device memory.</summary>

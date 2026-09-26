@@ -154,7 +154,7 @@ public static class ModuleExtensions
                 throw new InvalidOperationException($"{linear} already has a LoRA adapter.");
             }
 
-            var device = linear.Weight.Device;
+            var device = linear.Device;
             float bound = 1f / MathF.Sqrt(linear.InFeatures);
             var a = new float[linear.InFeatures * rank];
             for (int i = 0; i < a.Length; i++)
@@ -170,6 +170,44 @@ public static class ModuleExtensions
         }
 
         return added;
+    }
+
+    /// <summary>
+    /// Replaces the float weights of the <see cref="Linear"/> layers chosen by <paramref name="targets"/> (all when null)
+    /// with int8 weights: one signed byte per weight and one float scale per output column (symmetric, max |w| / 127).
+    /// Those weights take a quarter of the memory and are read 4× faster when generating token by token; the outputs
+    /// change slightly (see the tests and the Quantization sample for measured differences). Biases, LoRA adapters,
+    /// normalization, embeddings and convolutions stay float32. The quantized weights are fixed (not trainable), but
+    /// gradients still flow through them, so LoRA adapters added afterwards can be trained (QLoRA-style fine-tuning).
+    /// Save and load the model as usual (quantize a freshly built model before loading a quantized file). Returns the
+    /// number of layers quantized.
+    /// </summary>
+    public static int QuantizeInt8(this Module model, Func<Linear, bool>? targets = null)
+    {
+        int count = 0;
+        foreach (var linear in model.Descendants().OfType<Linear>().Where(l => l.Int8 is null && (targets?.Invoke(l) ?? true)).ToList())
+        {
+            linear.QuantizeInt8();
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Turns int8 weights back into float32 weights (the rounding done by <see cref="QuantizeInt8"/> is not undone), for
+    /// example to fine-tune every weight or merge LoRA adapters. Returns the number of layers converted.
+    /// </summary>
+    public static int DequantizeInt8(this Module model, bool trainable = true)
+    {
+        int count = 0;
+        foreach (var linear in model.Descendants().OfType<Linear>().Where(l => l.Int8 is not null).ToList())
+        {
+            linear.DequantizeInt8(trainable);
+            count++;
+        }
+
+        return count;
     }
 
     /// <summary>Folds every LoRA adapter into its layer's weight and removes it (smaller, faster model; same outputs).</summary>

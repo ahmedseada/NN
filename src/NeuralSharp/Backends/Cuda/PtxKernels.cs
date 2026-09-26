@@ -282,6 +282,7 @@ internal static partial class PtxKernels
         MatMul(sb);
         BuildAdvanced(sb);
         BuildDecoding(sb);
+        BuildQuantized(sb);
         return sb.ToString();
     }
 
