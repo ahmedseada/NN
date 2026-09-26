@@ -77,7 +77,9 @@ internal static partial class Tests
             File.Delete(path);
         }
 
-        Check(model.ToFloat32() > 0 && model.Predict(ids).ToArray().SequenceEqual(half), "back to float32 keeps the rounded weights");
+        // (Not bit-identical on CUDA: few-row bf16 and float products add in different orders.)
+        Check(model.ToFloat32() > 0 && model.Descendants().OfType<Linear>().All(l => !l.Packed), "back to float32");
+        AssertClose(half, model.Predict(ids).ToArray(), 1e-4f, "float32 keeps the rounded weights");
     }
 
     private static void Int4Weights(Device device)
