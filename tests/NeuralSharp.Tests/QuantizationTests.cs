@@ -90,7 +90,7 @@ internal static partial class Tests
             var values = Enumerable.Range(0, k * n).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
             using var q = Int4Weight.Quantize(values, k, n, device);
 
-            // The rule: per group of 32 rows and column, d = (the value of largest magnitude) / -8, q = clamp(round(v / d), -8, 7).
+            // The plain rule: per group of 32 rows and column, d = (the value of largest magnitude) / -8, q = clamp(round(v / d), -8, 7).
             var rule = new float[k * n];
             for (int g = 0; g < (k + 31) / 32; g++)
             {
@@ -112,9 +112,12 @@ internal static partial class Tests
 
             using var expanded = q.Dequantize();
             var e = expanded.ToArray();
-            Check(e.Select((v, i) => v == rule[i]).All(x => x), $"[{k}, {n}]: expansion follows the rule");
+            // The searched scales never do worse than the plain rule (extreme / -8), group by group.
+            double searched = values.Select((v, i) => (double)(v - e[i]) * (v - e[i])).Sum();
+            double plain = values.Select((v, i) => (double)(v - rule[i]) * (v - rule[i])).Sum();
+            Check(searched <= plain * (1 + 1e-6), $"[{k}, {n}]: squared error {searched:G4} vs plain rule {plain:G4}");
             float error = values.Select((v, i) => MathF.Abs(v - e[i])).Max();
-            Check(error <= 1f / 8f + 1e-6f, $"[{k}, {n}]: error {error} within one step (max / 8)");
+            Check(error <= 0.25f, $"[{k}, {n}]: largest error {error}");
             foreach (int m in new[] { 1, 3, 8, 20 })                       // ≤ 8 rows read nibbles directly; 20 expand first
             {
                 var input = Enumerable.Range(0, m * k).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();

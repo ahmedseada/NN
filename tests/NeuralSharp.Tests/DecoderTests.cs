@@ -161,7 +161,8 @@ internal static partial class Tests
     private static void AttentionKernels(Device device)
     {
         var r = new Random(61);
-        foreach (var (heads, rowsPerHead, steps, capacity, dim, offset) in new[] { (3, 80, 40, 96, 100, 7), (2, 64, 64, 64, 128, 0), (4, 6, 3, 50, 32, 20), (2, 33, 11, 60, 6, 5) })
+        foreach (var (heads, rowsPerHead, steps, capacity, dim, offset) in new[] { (3, 80, 40, 96, 100, 7), (2, 64, 64, 64, 128, 0), (4, 6, 3, 50, 32, 20), (2, 33, 11, 60, 6, 5),
+            (2, 2, 1, 700, 128, 650), (4, 1, 1, 1000, 64, 3), (1, 4, 2, 300, 40, 150) })   // large caches: split over positions (some chunks empty)
         {
             float scale = 1f / MathF.Sqrt(dim);
             var q = Enumerable.Range(0, heads * rowsPerHead * dim).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();

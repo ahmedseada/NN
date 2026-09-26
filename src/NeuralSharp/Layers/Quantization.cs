@@ -144,7 +144,7 @@ public sealed class Int8Weight : IDisposable
 
 /// <summary>
 /// The 4-bit weights of a <see cref="Linear"/> layer: each group of 32 input rows of a column shares one float scale and
-/// every weight is a signed nibble in -8..7 (the largest magnitude of the group maps to -8, as in llama.cpp's Q4_0), about
+/// every weight is a signed nibble in -8..7 (the scale is searched per group for the least squared error), about
 /// 5 bits per weight; decoding reads 8× less than float32. Created by <see cref="ModuleExtensions.QuantizeInt4"/> or when
 /// loading with 4-bit weights; inputs, outputs, biases and LoRA adapters stay float32 (QLoRA-style fine-tuning).
 /// </summary>
@@ -203,38 +203,69 @@ public sealed class Int4Weight : IDisposable
         var packed = new uint[rows * words];
         var scales = new float[groups * words * 8];
         var source = values;
-        HostParallel.For(groups, Math.Max(1, (1 << 14) / Math.Max(1, columns)), (first, last) =>
+        HostParallel.For(groups, Math.Max(1, (1 << 12) / Math.Max(1, columns)), (first, last) =>
         {
-            var extreme = new float[columns];
+            Span<float> w = stackalloc float[GroupSize];
+            Span<sbyte> q = stackalloc sbyte[GroupSize];
+            Span<sbyte> best = stackalloc sbyte[GroupSize];
             for (int g = first; g < last; g++)
             {
-                int r0 = g * GroupSize, r1 = Math.Min(rows, r0 + GroupSize);
-                Array.Clear(extreme);
-                for (int r = r0; r < r1; r++)
-                {
-                    for (int j = 0; j < columns; j++)
-                    {
-                        float v = source[r * columns + j];
-                        if (MathF.Abs(v) > MathF.Abs(extreme[j]))
-                        {
-                            extreme[j] = v;
-                        }
-                    }
-                }
-
-                var scale = scales.AsSpan(g * words * 8, columns);
+                int r0 = g * GroupSize, count = Math.Min(rows, r0 + GroupSize) - r0;
                 for (int j = 0; j < columns; j++)
                 {
-                    scale[j] = extreme[j] / -8f;
-                }
-
-                for (int r = r0; r < r1; r++)
-                {
-                    for (int j = 0; j < columns; j++)
+                    float extreme = 0f;
+                    for (int i = 0; i < count; i++)
                     {
-                        float d = scale[j];
-                        int q = d == 0f ? 0 : Math.Clamp((int)MathF.Round(source[r * columns + j] / d), -8, 7);
-                        packed[r * words + (j >> 3)] |= (uint)(q & 15) << (4 * (j & 7));
+                        w[i] = source[(r0 + i) * columns + j];
+                        extreme = MathF.Abs(w[i]) > MathF.Abs(extreme) ? w[i] : extreme;
+                    }
+
+                    float scale = 0f;
+                    if (extreme != 0f)
+                    {
+                        // Divisors t around -8 (the group's extreme maps near -8); for each, the least-squares scale of
+                        // the rounded values; keep the smallest squared error (t = -8 is the plain rule, never worse).
+                        double bestError = double.MaxValue;
+                        for (int step = -10; step <= 10; step++)
+                        {
+                            float t = -8f + 0.1f * step, inverse = t / extreme;
+                            double wq = 0, qq = 0;
+                            for (int i = 0; i < count; i++)
+                            {
+                                q[i] = (sbyte)Math.Clamp((int)MathF.Round(w[i] * inverse), -8, 7);
+                                wq += w[i] * q[i];
+                                qq += q[i] * q[i];
+                            }
+
+                            if (qq == 0)
+                            {
+                                continue;
+                            }
+
+                            float d = (float)(wq / qq);
+                            double error = 0;
+                            for (int i = 0; i < count; i++)
+                            {
+                                double e = w[i] - d * q[i];
+                                error += e * e;
+                            }
+
+                            if (error < bestError)
+                            {
+                                (bestError, scale) = (error, d);
+                                q[..count].CopyTo(best);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        best.Clear();
+                    }
+
+                    scales[g * words * 8 + j] = scale;
+                    for (int i = 0; i < count; i++)
+                    {
+                        packed[(r0 + i) * words + (j >> 3)] |= (uint)(best[i] & 15) << (4 * (j & 7));
                     }
                 }
             }

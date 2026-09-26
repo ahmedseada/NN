@@ -161,8 +161,33 @@ internal sealed unsafe partial class CudaBackend
         }
 
         int rows = heads * rowsPerHead;
-        LaunchRows(K("attention_decode_f32"), rows, P(q), P(keys), P(values), P(position), P(y),
-            U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(rows));
+        DecodeSplit(rows, capacity, dim, y, (splits, part) => Launch(K("attention_decode_f32"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
+            P(q), P(keys), P(values), P(position), P(y), P(part), U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(rows)));
+    }
+
+    // Decoding attention has one block per query row (few rows: the heads of one token), so the cached positions are
+    // split over enough blocks to fill the GPU; each writes (max, sum, weighted values) for its chunk and
+    // attention_combine_f32 merges them. The split count depends only on the shapes, so recorded graphs stay valid as
+    // the cache fills (chunks are computed on the device from the current length).
+    private void DecodeSplit(int rows, int capacity, int dim, Storage y, Action<int, Storage> launch)
+    {
+        int splits = Math.Clamp((2 * Math.Max(1, _multiprocessors) + rows - 1) / rows, 1, Math.Clamp(capacity / 64, 1, 32));
+        if (splits == 1)
+        {
+            launch(1, y);
+            return;
+        }
+
+        var part = Allocate(rows * splits * (dim + 2), zeroed: false);
+        try
+        {
+            launch(splits, part);
+            LaunchRows(K("attention_combine_f32"), rows, P(part), P(y), U(splits), U(dim), U(rows));
+        }
+        finally
+        {
+            part.Release();
+        }
     }
 
     public override void RmsNormAffine(Storage x, Storage gain, Storage y, int rows, int cols, float eps, float offset) =>
@@ -225,8 +250,9 @@ internal sealed unsafe partial class CudaBackend
         }
 
         int rows = heads * rowsPerHead;
-        LaunchRows(K("attention_decode_int8"), rows, P(q), P(keys), P(values), P(keyScales), P(valueScales), P(position), P(y),
-            U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows));
+        DecodeSplit(rows, capacity, dim, y, (splits, part) => Launch(K("attention_decode_int8"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
+            P(q), P(keys), P(values), P(keyScales), P(valueScales), P(position), P(y), P(part),
+            U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows)));
     }
 
     public override void AddRmsNormAffine(Storage a, Storage b, Storage sum, Storage gain, Storage y, int rows, int cols, float eps, float offset) =>

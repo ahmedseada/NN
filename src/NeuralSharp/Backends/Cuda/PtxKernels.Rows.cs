@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -223,6 +223,7 @@ internal static partial class PtxKernels
         GemvNT(sb);
         AttentionDecode(sb);
         AttentionDecode(sb, int8: true);
+        AttentionCombine(sb);
         AttentionFlash(sb);
         AttentionFlash(sb, int8: true);
         AttentionBackward(sb);
@@ -1354,6 +1355,14 @@ internal static partial class PtxKernels
             sub.u32 %r11, %s_cap, 1;
             min.u32 %r10, %r10, %r11;
             add.u32 %r10, %r10, 1;
+            mov.u32 %r22, %ctaid.y;
+            mov.u32 %r23, %nctaid.y;
+            add.u32 %r24, %r10, %r23;
+            sub.u32 %r24, %r24, 1;
+            div.u32 %r24, %r24, %r23;
+            mul.lo.u32 %r25, %r22, %r24;
+            add.u32 %r26, %r25, %r24;
+            min.u32 %r10, %r26, %r10;
             mul.lo.u32 %r12, %row, %s_dim;
             mul.wide.u32 %rd1, %r12, 4;
             add.u64 %rd2, %b_q, %rd1;
@@ -1381,7 +1390,7 @@ internal static partial class PtxKernels
         b.AppendLine($"""
             mov.f32 %f20, {NegInf};
             mov.f32 %f21, {Zero};
-            mov.u32 %r15, %warp;
+            add.u32 %r15, %r25, %warp;
             DL:
             setp.ge.u32 %p9, %r15, %r10;
             @%p9 bra DL_END;
@@ -1465,6 +1474,9 @@ internal static partial class PtxKernels
             add.u32 %r18, %r18, 1;
             bra CM;
             CM_END:
+            mov.f32 %f28, %f7;
+            setp.eq.f32 %p13, %f7, {NegInf};
+            @%p13 mov.f32 %f7, {Zero};
             mov.f32 %f9, {Zero};
             mov.u32 %r18, 0;
             CL:
@@ -1481,7 +1493,18 @@ internal static partial class PtxKernels
             add.u32 %r18, %r18, 1;
             bra CL;
             CL_END:
-            rcp.rn.f32 %f9, %f9;
+            setp.gt.u32 %p14, %r23, 1;
+            mad.lo.u32 %r26, %row, %r23, %r22;
+            add.u32 %r27, %s_dim, 2;
+            mul.lo.u32 %r26, %r26, %r27;
+            mul.wide.u32 %rd10, %r26, 4;
+            add.u64 %rd10, %rd10, %b_part;
+            setp.eq.u32 %p15, %tx, 0;
+            and.pred %p15, %p15, %p14;
+            @%p15 st.global.f32 [%rd10], %f28;
+            @%p15 st.global.f32 [%rd10+4], %f9;
+            @!%p14 rcp.rn.f32 %f9, %f9;
+            @%p14 mov.f32 %f9, 0f3F800000;
             mov.u32 %r20, %tx;
             CO:
             setp.ge.u32 %p12, %r20, %s_dim;
@@ -1506,7 +1529,9 @@ internal static partial class PtxKernels
             COW_END:
             mul.f32 %f30, %f30, %f9;
             mul.wide.u32 %rd13, %r20, 4;
-            add.u64 %rd13, %rd13, %rd3;
+            @%p14 add.u64 %rd13, %rd13, %rd10;
+            @%p14 add.u64 %rd13, %rd13, 8;
+            @!%p14 add.u64 %rd13, %rd13, %rd3;
             st.global.f32 [%rd13], %f30;
             add.u32 %r20, %r20, %nt;
             bra CO;
@@ -1514,17 +1539,89 @@ internal static partial class PtxKernels
             """);
         if (int8)
         {
-            RowBlock(sb, "attention_decode_int8", ["q", "keys", "values", "kscales", "vscales", "pos", "y"],
+            RowBlock(sb, "attention_decode_int8", ["q", "keys", "values", "kscales", "vscales", "pos", "y", "part"],
                 [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale"), ("u32", "words")], b.ToString(),
                 sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
         }
         else
         {
-            RowBlock(sb, "attention_decode_f32", ["q", "keys", "values", "pos", "y"],
+            RowBlock(sb, "attention_decode_f32", ["q", "keys", "values", "pos", "y", "part"],
                 [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale")], b.ToString(),
                 sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
         }
     }
+
+    // Merges the partial results of a split decoding attention: part[row, split] = (max, sum, acc[dim]) over one chunk
+    // of cached positions (max -inf for an empty chunk); y[row] = Σ acc·e^(max - M) / Σ sum·e^(max - M), M the largest max.
+    private static void AttentionCombine(StringBuilder sb) =>
+        RowBlock(sb, "attention_combine_f32", ["part", "y"], [("u32", "splits"), ("u32", "dim")], $$"""
+            mul.lo.u32 %r5, %row, %s_splits;
+            add.u32 %r6, %s_dim, 2;
+            mul.lo.u32 %r7, %r5, %r6;
+            mul.wide.u32 %rd1, %r7, 4;
+            add.u64 %rd1, %rd1, %b_part;
+            mul.wide.u32 %rd2, %r6, 4;
+            mov.f32 %f1, {{NegInf}};
+            mov.u32 %r8, 0;
+            mov.u64 %rd3, %rd1;
+            AM:
+            setp.ge.u32 %p1, %r8, %s_splits;
+            @%p1 bra AM_END;
+            ld.global.f32 %f2, [%rd3];
+            max.f32 %f1, %f1, %f2;
+            add.u64 %rd3, %rd3, %rd2;
+            add.u32 %r8, %r8, 1;
+            bra AM;
+            AM_END:
+            mov.f32 %f3, {{Zero}};
+            mov.u32 %r8, 0;
+            mov.u64 %rd3, %rd1;
+            AS:
+            setp.ge.u32 %p1, %r8, %s_splits;
+            @%p1 bra AS_END;
+            ld.global.f32 %f2, [%rd3];
+            sub.f32 %f2, %f2, %f1;
+            mul.f32 %f2, %f2, {{Log2E}};
+            ex2.approx.ftz.f32 %f2, %f2;
+            ld.global.f32 %f4, [%rd3+4];
+            fma.rn.f32 %f3, %f4, %f2, %f3;
+            add.u64 %rd3, %rd3, %rd2;
+            add.u32 %r8, %r8, 1;
+            bra AS;
+            AS_END:
+            rcp.rn.f32 %f3, %f3;
+            mul.lo.u32 %r10, %row, %s_dim;
+            mul.wide.u32 %rd6, %r10, 4;
+            add.u64 %rd6, %rd6, %b_y;
+            mov.u32 %r9, %tx;
+            AD:
+            setp.ge.u32 %p2, %r9, %s_dim;
+            @%p2 bra AD_END;
+            mov.f32 %f5, {{Zero}};
+            mov.u32 %r8, 0;
+            mov.u64 %rd3, %rd1;
+            mul.wide.u32 %rd4, %r9, 4;
+            AL:
+            setp.ge.u32 %p1, %r8, %s_splits;
+            @%p1 bra AL_END;
+            ld.global.f32 %f2, [%rd3];
+            sub.f32 %f2, %f2, %f1;
+            mul.f32 %f2, %f2, {{Log2E}};
+            ex2.approx.ftz.f32 %f2, %f2;
+            add.u64 %rd5, %rd3, %rd4;
+            ld.global.f32 %f6, [%rd5+8];
+            fma.rn.f32 %f5, %f6, %f2, %f5;
+            add.u64 %rd3, %rd3, %rd2;
+            add.u32 %r8, %r8, 1;
+            bra AL;
+            AL_END:
+            mul.f32 %f5, %f5, %f3;
+            add.u64 %rd7, %rd6, %rd4;
+            st.global.f32 [%rd7], %f5;
+            add.u32 %r9, %r9, %nt;
+            bra AD;
+            AD_END:
+            """);
 
     /// <summary>Threads of a <c>gemv_nn_f32</c> block: 32 columns × 32 slices of k.</summary>
     public const int GemvThreads = 1024;
