@@ -1,6 +1,8 @@
 using NeuralSharp;
 using NeuralSharp.Data;
 using NeuralSharp.Diagnostics;
+using NeuralSharp.Generation;
+using NeuralSharp.Inference;
 using NeuralSharp.Layers;
 using NeuralSharp.Optimizers;
 using NeuralSharp.Training;
@@ -18,6 +20,9 @@ internal static partial class Tests
         ("fine-tuning: freeze, trainable-only save/load, grouped optimizer", FreezingAndGroups),
         ("fine-tuning: LoRA starts neutral, trains only adapters, merges exactly", Lora),
         ("telemetry: Configure().Console/JsonLines/Record.Start() subscribes, disposes and flushes", TelemetryBuilderSession),
+        ("predictor: equals the manual scale/predict/unscale steps; typed input and output", PredictorMatchesManual),
+        ("predictor: softmax and class names; save and load round trip", PredictorClassesAndPackage),
+        ("package: weights, scalers, tokenizers, JSON, text, trainable weights, text generator", PackageRoundTrip),
     ];
 
     private static Sequential ManualMlp(Device device, Random r) => new()
@@ -311,5 +316,123 @@ internal static partial class Tests
         var lines = File.ReadAllLines(path);
         File.Delete(path);
         Check(lines.Count(l => l.Contains("\"event\":\"epoch\"")) == 3, $"json lines flushed ({lines.Length} lines)");
+    }
+
+    private sealed record Point(float A, float B, float C);
+
+    private static void PredictorMatchesManual(Device device)
+    {
+        var split = SmallRegression(200, 7).Split(0.8, seed: 1).StandardizeFeatures().StandardizeTargets();
+        using var model = BuiltMlpFor3(device);
+        new TrainingRun { Model = model, Loss = Losses.MeanSquaredError, Optimizer = p => new Adam(p, 0.01f),
+            Train = split.Train.Batches(16, device: device), Epochs = 5 }.Fit();
+
+        float[,] raw = { { 1, 6, 11 }, { 9, 12, 17 }, { 4, 8, 13 } };
+        float[] flat = [.. raw.Cast<float>()];
+        split.FeatureScaler!.Transform(flat, 3);
+        using var x = Tensor.From(flat, [3, 3], device);
+        using var y = model.Predict(x);
+        float[] manual = y.ToArray();
+        split.TargetScaler!.InverseTransform(manual, 1);
+
+        var predictor = Predictor.For(model).ScaleInputs(split.FeatureScaler).UnscaleOutputs(split.TargetScaler!).Build();
+        var rows = predictor.Predict([[1f, 6, 11], [9f, 12, 17], [4f, 8, 13]]);
+        Check(rows.Select(r => r[0]).SequenceEqual(manual), "untyped rows equal the manual pipeline");
+
+        var typed = Predictor.For(model).Input<Point>(p => [p.A, p.B, p.C]).ScaleInputs(split.FeatureScaler)
+            .UnscaleOutputs(split.TargetScaler!).Output(v => v[0]).WarmUp(new Point(1, 2, 3)).BatchSize(2).Build();
+        Check(typed.Predict(new Point(9, 12, 17)) == manual[1], "typed single prediction");
+        Check(typed.Predict([new Point(1, 6, 11), new Point(9, 12, 17), new Point(4, 8, 13)]).SequenceEqual(manual), "typed batch (2 + 1 rows)");
+        Check(typed.PredictAsync(new Point(4, 8, 13)).AsTask().Result == manual[2], "async");
+
+        bool threw = false;
+        try { Predictor.For(model).Batching(8, TimeSpan.FromMilliseconds(1)).Build(); } catch (InvalidOperationException) { threw = true; }
+        Check(threw, "engine-only settings are rejected outside the engine");
+    }
+
+    private static void PredictorClassesAndPackage(Device device)
+    {
+        var network = Architectures.Mlp(3, [8], 3, Activation.Tanh).OnDevice(device).Seed(21);
+        using var model = network.Build();
+        var scaler = StandardScaler.Fit([1f, 2, 3, 4, 5, 6, 7, 8, 9], 3);
+        var classifier = Predictor.For(model).Input<Point>(p => [p.A, p.B, p.C]).ScaleInputs(scaler).Softmax()
+            .Classes(["low", "mid", "high"]).Build();
+        var answer = classifier.Predict(new Point(2, 5, 7));
+
+        float[] flat = [2, 5, 7];
+        scaler.Transform(flat, 3);
+        using var x = Tensor.From(flat, [1, 3], device);
+        using var logits = model.Predict(x);
+        using var probabilities = logits.Softmax();
+        var p = probabilities.ToArray();
+        int best = Array.IndexOf(p, p.Max());
+        Check(answer.Index == best && answer.Class == new[] { "low", "mid", "high" }[best], "argmax class");
+        Check(MathF.Abs(answer.Probability - p[best]) < 1e-6f && MathF.Abs(answer.Scores.Sum(s => s.Score) - 1f) < 1e-5f, "probabilities");
+
+        string path = Path.Combine(Path.GetTempPath(), $"predictor-{Guid.NewGuid():N}.nsm");
+        classifier.Save(path);
+        var loadedBuilder = Predictor.Load(path, device);
+        Check(loadedBuilder.StoredClasses!.SequenceEqual(["low", "mid", "high"]), "classes stored");
+        using var loaded = loadedBuilder.Input<Point>(q => [q.A, q.B, q.C]).Classes(loadedBuilder.StoredClasses!).Build();
+        var again = loaded.Predict(new Point(2, 5, 7));
+        Check(again.Class == answer.Class && again.Scores.Select(s => s.Score).SequenceEqual(answer.Scores.Select(s => s.Score)), "loaded predictor answers the same");
+
+        using var manualModel = new Sequential { new Linear(3, 8, device: device), new Tanh(), new Linear(8, 3, device: device) };
+        var intoManual = Predictor.Load(path, manualModel).Classes(["low", "mid", "high"]).Build();
+        Check(intoManual.Predict([2f, 5, 7]).Class == answer.Class, "load into a hand-built model");
+        File.Delete(path);
+    }
+
+    private static void PackageRoundTrip(Device device)
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"package-{Guid.NewGuid():N}.nsm");
+        var words = WordTokenizer.FromTexts(["the cat sat on the mat ."], ["<pad>"]);
+        var gpt = Architectures.Gpt(vocabulary: words.VocabularySize, context: 10, dim: 16, heads: 2, layers: 1, ffDim: 32, dropout: 0f).OnDevice(device).Seed(5);
+        using var model = gpt.Build();
+        var chars = new CharTokenizer("abc ", ' ');
+        var standard = StandardScaler.Fit([1f, 2, 3, 4], 2);
+        var minMax = MinMaxScaler.Fit([1f, 5, 3, 9], 2);
+        using var head = Network.Input(2).OnDevice(device).Seed(1).Linear(2).Build();
+
+        ModelPackage.Create(path)
+            .Architecture(gpt).Weights(model)
+            .Tokenizer("words", words).Tokenizer("chars", chars)
+            .Scaler("standard", standard).Scaler("minmax", minMax)
+            .Json("settings", new System.Text.Json.Nodes.JsonObject { ["threshold"] = 0.42 })
+            .Text("notes", "trained for a test")
+            .TrainableWeights("head", head)
+            .Save();
+
+        using var package = ModelPackage.Open(path);
+        Check(package.Entries.Count == 9, $"{package.Entries.Count} entries");
+        using (var rebuilt = package.BuildNetwork(device: device))
+        {
+            Check(rebuilt.Parameters().SelectMany(t => t.ToArray()).SequenceEqual(model.Parameters().SelectMany(t => t.ToArray())), "rebuilt weights");
+        }
+
+        Check(package.WordTokenizer("words").Vocabulary.SequenceEqual(words.Vocabulary), "word tokenizer");
+        Check(package.CharTokenizer("chars").Vocabulary == "abc " && package.CharTokenizer("chars").UnknownCharacter == ' ', "char tokenizer");
+        Check(package.StandardScaler("standard").Mean.SequenceEqual(standard.Mean), "standard scaler");
+        Check(package.Scaler("minmax") is MinMaxScaler m && m.Range.SequenceEqual(minMax.Range), "min-max scaler");
+        Check((double)package.Json("settings")["threshold"]! == 0.42 && package.Text("notes") == "trained for a test", "json and text");
+        using (var head2 = Network.Input(2).OnDevice(device).Seed(9).Linear(2).Build())
+        {
+            package.LoadTrainableWeights(head2, "head");
+            Check(head2.Parameters().First().ToArray().SequenceEqual(head.Parameters().First().ToArray()), "trainable weights");
+        }
+
+        var generator = package.TextGenerator("words", device: device);
+        var manual = new TextGenerator(model, words, 10);
+        model.Eval();
+        var options = new GenerationOptions { Temperature = 0f, TopK = 1, RepeatPenalty = 1f, NumPredict = 6 };
+        Check(generator.Generate("the cat", options).Text == manual.Generate("the cat", options).Text, "package text generator");
+        Check(generator.ContextLength == 10, "context from the architecture");
+        generator.Model.Dispose();
+
+        bool threw = false;
+        try { package.StandardScaler("nope"); } catch (KeyNotFoundException) { threw = true; }
+        Check(threw, "missing entries name what exists");
+        package.Dispose();
+        File.Delete(path);
     }
 }
