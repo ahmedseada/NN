@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // row padded to n4 = ceil(n / 4) words), with one float scale per column: w[k, j] = q[k, j] · scale[j].
 internal static partial class PtxKernels
 {
-    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32", "int4_gemv_f32", "int4_dequant_f32", "int8_gemv_multi_f32", "bf16_gemv_multi_f32", "int4_gemv_multi_f32"];
+    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32", "int4_gemv_f32", "int4_dequant_f32", "int8_gemv_multi_f32", "bf16_gemv_multi_f32", "int4_gemv_multi_f32", "int8_gemv_silu_f32", "bf16_gemv_silu_f32", "int4_gemv_silu_f32", "int8_gemv_gelu_f32", "bf16_gemv_gelu_f32", "int4_gemv_gelu_f32"];
 
     /// <summary>Rows of an int4 weight matrix that share one scale per column.</summary>
     public const int Int4Group = 32;
@@ -19,6 +19,13 @@ internal static partial class PtxKernels
         Int8Gemv(sb);
         Int8Gemv(sb, bf16: true);
         Int8Gemv(sb, int4: true);
+        foreach (int gated in new[] { 1, 2 })
+        {
+            Int8Gemv(sb, gated: gated);
+            Int8Gemv(sb, bf16: true, gated: gated);
+            Int8Gemv(sb, int4: true, gated: gated);
+        }
+
         Int8Gemv(sb, multi: true);
         Int8Gemv(sb, bf16: true, multi: true);
         Int8Gemv(sb, int4: true, multi: true);
@@ -369,12 +376,16 @@ internal static partial class PtxKernels
     // multi (…_gemv_multi_f32): up to three products sharing the input x (query/key/value, gate/up), grid z selecting the
     // product: product j has its own weights q_j, scales s_j, output y_j [m, n_j] and optional bias b_j (0: none); blocks
     // past a product's columns return at once, and split partials and arrival counters get a region per product.
-    private static void Int8Gemv(StringBuilder sb, bool bf16 = false, bool int4 = false, bool multi = false)
+    //
+    // gated 1 (…_gemv_silu_f32) / 2 (…_gemv_gelu_f32): the input is act(x) · up, computed as it is read (the gated
+    // feed-forward's down projection without a separate activation pass); p_up follows p_counters.
+    private static void Int8Gemv(StringBuilder sb, bool bf16 = false, bool int4 = false, bool multi = false, int gated = 0)
     {
         int cpw = bf16 ? 2 : int4 ? 8 : 4, columns = 32 * cpw;
         int acc = GemvRows * cpw, dec = Math.Max(32, acc), xr = dec + 8, sc = dec + 9, red = dec + 20;
         string part = bf16 ? "h_part" : int4 ? "i4_part" : "i8_part";
-        string name = (bf16 ? "bf16_gemv" : int4 ? "int4_gemv" : "int8_gemv") + (multi ? "_multi_f32" : "_f32");
+        string name = (bf16 ? "bf16_gemv" : int4 ? "int4_gemv" : "int8_gemv") + (multi ? "_multi_f32" : gated == 1 ? "_silu_f32" : gated == 2 ? "_gelu_f32" : "_f32");
+        int gu = red + 8, gt = red + 9;
         bool scaled = !bf16 && !int4;
         var s = new StringBuilder();
         string parameters = multi
@@ -389,7 +400,7 @@ internal static partial class PtxKernels
                 .param .u64 p_x, .param .u64 p_q, .param .u64 p_s, .param .u64 p_y, .param .u64 p_part,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_n4, .param .u32 p_chunk, .param .u32 p_splits,
                 .param .u64 p_counters
-              """;
+              """ + (gated > 0 ? ", .param .u64 p_up" : "");
         string loads = multi
             ? $$"""
                 mov.u32 %r39, %ctaid.z;
@@ -453,16 +464,16 @@ internal static partial class PtxKernels
                 ld.param.u32 %r4, [p_n4];
                 ld.param.u32 %r30, [p_chunk];
                 ld.param.u32 %r31, [p_splits];
-              """;
+              """ + (gated > 0 ? "\n    ld.param.u64 %rd29, [p_up];\n    cvta.to.global.u64 %rd29, %rd29;\n    sub.u64 %rd29, %rd29, %rd1;" : "");
         s.AppendLine($$"""
             .visible .entry {{name}}(
             {{parameters}}
             )
             {
                 .reg .pred %p<24>;
-                .reg .f32 %f<{{red + 8}}>;
+                .reg .f32 %f<{{red + 12}}>;
                 .reg .b32 %r<40>;
-                .reg .b64 %rd<28>;
+                .reg .b64 %rd<32>;
                 .shared .align 4 .f32 {{part}}[{{16 * columns}}];
             {{loads}}
                 mov.u32 %r5, %tid.x;
@@ -528,6 +539,36 @@ internal static partial class PtxKernels
             for (int r = 0; r < GemvRows; r++)
             {
                 t.AppendLine($"@%p{r} ld.global.f32 %f{xr}, [%rd12+{xOffset}];");
+                if (gated > 0)
+                {
+                    // x = act(gate) · up, with the forward formulas of gated_act_f32.
+                    t.AppendLine("add.u64 %rd28, %rd12, %rd29;");
+                    t.AppendLine($"@%p{r} ld.global.f32 %f{gu}, [%rd28+{xOffset}];");
+                    t.AppendLine(gated == 1
+                        ? $"""
+                          mul.f32 %f{gt}, %f{xr}, {F(-1.4426950408889634f)};
+                          ex2.approx.ftz.f32 %f{gt}, %f{gt};
+                          add.f32 %f{gt}, %f{gt}, {One};
+                          rcp.rn.f32 %f{gt}, %f{gt};
+                          mul.f32 %f{xr}, %f{xr}, %f{gt};
+                          """
+                        : $"""
+                          mul.f32 %f{gt}, %f{xr}, %f{xr};
+                          mul.f32 %f{gt}, %f{gt}, %f{xr};
+                          fma.rn.f32 %f{gt}, %f{gt}, {F(0.044715f)}, %f{xr};
+                          mul.f32 %f{gt}, %f{gt}, {F(0.7978845608f)};
+                          mul.f32 %f{gt}, %f{gt}, {F(2.8853900817779268f)};
+                          ex2.approx.ftz.f32 %f{gt}, %f{gt};
+                          add.f32 %f{gt}, %f{gt}, {One};
+                          rcp.rn.f32 %f{gt}, %f{gt};
+                          fma.rn.f32 %f{gt}, %f{gt}, {F(-2f)}, {One};
+                          add.f32 %f{gt}, %f{gt}, {One};
+                          mul.f32 %f{gt}, %f{gt}, %f{xr};
+                          mul.f32 %f{xr}, %f{gt}, {F(0.5f)};
+                          """);
+                    t.AppendLine($"mul.f32 %f{xr}, %f{xr}, %f{gu};");
+                }
+
                 for (int c = 0; c < cpw; c++)
                 {
                     t.AppendLine($"@%p{r} fma.rn.f32 %f{r * cpw + c}, %f{xr}, %f{dec + c}, %f{r * cpw + c};");

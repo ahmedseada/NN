@@ -59,6 +59,43 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// (act(gate) · up) · W for a packed layer W with few rows, the activation applied as the input is read (not recorded;
+    /// no bias), or null when the layer is not packed or the device has no fused version.
+    /// </summary>
+    internal static Tensor? MatMulPackedGated(Tensor gate, Tensor up, int activation, Layers.Linear layer)
+    {
+        gate.ThrowIfDisposed();
+        up.ThrowIfDisposed();
+        int kind = layer.Int8 is not null ? 0 : layer.Int4 is not null ? 1 : layer.BFloat16 is not null ? 2 : -1;
+        int k = gate._shape[^1], m = gate.Size / Math.Max(1, k);
+        if (kind < 0 || k != layer.InFeatures || up.Size != gate.Size || m > Backends.Cuda.PtxKernels.GemvRows)
+        {
+            return null;
+        }
+
+        var (packed, scales) = kind switch
+        {
+            0 => (layer.Int8!.Packed, layer.Int8.Scales),
+            1 => (layer.Int4!.Packed, layer.Int4.Scales),
+            _ => (layer.BFloat16!.Packed, (Tensor?)null),
+        };
+        if (packed.Device != gate.Device)
+        {
+            return null;
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty([.. gate._shape[..^1], layer.OutFeatures], gate.Device);
+        if (!gate.Backend.PackedMatMulGated(kind, activation, gate.Storage, up.Storage, packed.Storage, scales?.Storage, y.Storage, m, layer.OutFeatures, k))
+        {
+            y.Dispose();
+            return null;
+        }
+
+        return Traced("matmul_gated_packed", y, start);
+    }
+
+    /// <summary>
     /// The layers' packed products of one input in one device pass (few rows, not recorded), or null when the device has
     /// no single-pass version.
     /// </summary>

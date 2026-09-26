@@ -74,30 +74,50 @@ internal sealed unsafe partial class CudaBackend
     // Few rows (decoding) through packed weights: read each weight word once, with enough blocks to keep every
     // multiprocessor busy; narrow matrices split k, and the last block of each column range adds the splits in order.
     // `align`: split boundaries fall on multiples of it (int4 splits start on a 64-row block).
-    private void PackedFewRows(string kernel, Storage x, Storage q, Storage scales, Storage y, int m, int n, int k, int words, int align = 1)
+    private void PackedFewRows(string kernel, Storage x, Storage q, Storage scales, Storage y, int m, int n, int k, int words, int align = 1,
+        Storage? up = null)
     {
         int columnBlocks = (words + 31) / 32;
         int splits = Math.Clamp((4 * Math.Max(1, _multiprocessors) + columnBlocks - 1) / columnBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
         int chunk = ((k + splits - 1) / splits + align - 1) / align * align;
         splits = (k + chunk - 1) / chunk;
         var counters = SplitCounters(columnBlocks);
+        void Run(Storage partials, int count)
+        {
+            ReadOnlySpan<ulong> args = [P(x), P(q), P(scales), P(y), P(partials), U(m), U(n), U(k), U(words), U(chunk), U(count), P(counters),
+                up is null ? 0UL : P(up)];
+            Launch(K(kernel), (uint)columnBlocks, (uint)count, 1, PtxKernels.Int8GemvThreads, 1, up is null ? args[..^1] : args);
+        }
+
         if (splits == 1)
         {
-            Launch(K(kernel), (uint)columnBlocks, 1, 1, PtxKernels.Int8GemvThreads, 1,
-                P(x), P(q), P(scales), P(y), P(y), U(m), U(n), U(k), U(words), U(chunk), U(1), P(counters));
+            Run(y, 1);
             return;
         }
 
         var part = Allocate(splits * m * n, zeroed: false);
         try
         {
-            Launch(K(kernel), (uint)columnBlocks, (uint)splits, 1, PtxKernels.Int8GemvThreads, 1,
-                P(x), P(q), P(scales), P(y), P(part), U(m), U(n), U(k), U(words), U(chunk), U(splits), P(counters));
+            Run(part, splits);
         }
         finally
         {
             part.Release();
         }
+    }
+
+    public override bool PackedMatMulGated(int kind, int activation, Storage gate, Storage up, Storage packed, Storage? scales, Storage y,
+        int m, int n, int k)
+    {
+        if (m > PtxKernels.GemvRows || k == 0 || activation is not (0 or 1))
+        {
+            return false;
+        }
+
+        int cpw = kind switch { 0 => 4, 1 => 8, _ => 2 };
+        string kernel = (kind switch { 0 => "int8_gemv", 1 => "int4_gemv", _ => "bf16_gemv" }) + (activation == 0 ? "_silu_f32" : "_gelu_f32");
+        PackedFewRows(kernel, gate, packed, scales ?? packed, y, m, n, k, (n + cpw - 1) / cpw, kind == 1 ? 64 : 1, up);
+        return true;
     }
 
     public override bool PackedMatMulMany(int kind, Storage x, int m, int k,

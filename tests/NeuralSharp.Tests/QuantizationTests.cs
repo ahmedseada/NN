@@ -17,7 +17,7 @@ internal static partial class Tests
         ("int8: QLoRA — adapters train on top of frozen int8 weights", Int8Lora),
         ("bf16: rounding, direct and expanded products, gradient, model conversion, save/load, decoder build", BFloat16Weights),
         ("int4: group scales, direct and expanded products, gradient, model conversion, save/load", Int4Weights),
-        ("packed projections sharing an input (int8, int4, bf16; biases; splits) match separate layers", PackedMany),
+        ("packed projections sharing an input (int8, int4, bf16; biases; splits) and gated down projections match separate layers", PackedMany),
         ("weights: Float16 and BFloat16 files are half the size and round as expected", HalfPrecisionFiles),
         ("matmul: few rows (column-parallel path) match the reference, with beta and transposes", FewRowMatMul),
         ("int8 KV cache: write, scores and context kernels match a dequantized cache", Int8CacheKernels),
@@ -196,6 +196,22 @@ internal static partial class Tests
 
                     AssertClose(separate[1].ToArray(), pair[0].ToArray(), 1e-3f * MathF.Sqrt(k), $"pair, k {k}, m {m}");
                     AssertClose(separate[2].ToArray(), pair[1].ToArray(), 1e-3f * MathF.Sqrt(k), $"pair, k {k}, m {m}");
+
+                    // The down projection reading act(gate) · up directly (SiLU, GELU).
+                    using var gate = Tensor.From([.. Enumerable.Range(0, m * 2048).Select(_ => (float)(r.NextDouble() * 4 - 2))], [1, m, 2048], device);
+                    using var up = Tensor.From([.. Enumerable.Range(0, m * 2048).Select(_ => (float)(r.NextDouble() * 2 - 1))], [1, m, 2048], device);
+                    using var down = new Linear(2048, 700, bias: false, device, r);
+                    convert(down);
+                    foreach (int activation in new[] { 0, 1 })
+                    {
+                        var fused = Tensor.MatMulPackedGated(gate, up, activation, down);
+                        Check(fused is not null || device.Type != DeviceType.Cuda, "fused gated product on CUDA");
+                        if (fused is not null)
+                        {
+                            var reference = down.Forward(Tensor.GatedActivation(gate, up, activation));
+                            AssertClose(reference.ToArray(), fused.ToArray(), 2e-3f * MathF.Sqrt(2048), $"{down} gated {activation}, m {m}");
+                        }
+                    }
                 }
             }
         }

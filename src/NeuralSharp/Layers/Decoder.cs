@@ -543,6 +543,12 @@ public sealed class FeedForward : Module
         else
         {
             var projected = Linear.ForwardMany(input, Gate, Up);
+            if (!Autograd.IsEnabled && Down.Adapter is null && Activation is FeedForwardActivation.Silu or FeedForwardActivation.Gelu
+                && Tensor.MatMulPackedGated(projected[0], projected[1], (int)Activation, Down) is { } fused)
+            {
+                return Down.Bias is null ? fused : fused + Down.Bias;                        // activation read by the down projection
+            }
+
             hidden = Tensor.GatedActivation(projected[0], projected[1], (int)Activation);    // act(gate) · up in one kernel
         }
         return Down.Forward(hidden);

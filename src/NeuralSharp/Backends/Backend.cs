@@ -126,6 +126,14 @@ internal abstract class Backend
         BatchedMatMul(a, b, c, 1, m, n, k, transA, transB, beta);
 
     /// <summary>
+    /// y = (act(gate) · up) · w for few rows with packed weights w (<paramref name="kind"/> as in
+    /// <see cref="PackedMatMulMany"/>; activation 0 = SiLU, 1 = GELU tanh): the gated feed-forward's down projection
+    /// without a separate activation pass. Returns false when the device has no fused version.
+    /// </summary>
+    public virtual bool PackedMatMulGated(int kind, int activation, Storage gate, Storage up, Storage packed, Storage? scales, Storage y,
+        int m, int n, int k) => false;
+
+    /// <summary>
     /// Several few-row products of packed weights sharing one input x [m, k]: y_j = x · w_j (+ bias_j), with w_j int8
     /// (<paramref name="kind"/> 0, as in <see cref="Int8MatMul"/>), 4-bit (1, <see cref="Int4MatMul"/>) or bfloat16 (2,
     /// <see cref="BFloat16MatMul"/>; no scales). Returns false when the device has no single-pass version (callers then
