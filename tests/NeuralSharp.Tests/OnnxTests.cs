@@ -16,7 +16,139 @@ internal static partial class Tests
         ("onnx: LoRA merged on export, custom lambda translator, metadata, names, errors, predictor", OnnxExtras),
         ("onnx import: MLP, CNN, LSTM/GRU, transformer, GPT round-trip into NeuralSharp layers on the device", OnnxImportRoundTrip),
         ("onnx import: PyTorch-style Gemm and erf GELU; .nsm package; unsupported ops are named", OnnxImportForeign),
+        ("onnx import: ResNet blocks, concat branches and shape-arithmetic flatten become a GraphModule (weights, gradients, .nsm)", OnnxImportGraph),
     ];
+
+    // A residual block as PyTorch writes it: relu(bn2(conv2(relu(bn1(conv1(x))))) + shortcut(x)), where the shortcut is
+    // x itself or a 1×1 convolution with the same stride when the shape changes.
+    private sealed class Residual : Module
+    {
+        public Residual(int inChannels, int outChannels, int stride, Device device, Random random)
+        {
+            Conv1 = new Conv2d(inChannels, outChannels, 3, stride, 1, bias: false, device, random);
+            Norm1 = new BatchNorm(outChannels, device: device);
+            Conv2 = new Conv2d(outChannels, outChannels, 3, 1, 1, bias: false, device, random);
+            Norm2 = new BatchNorm(outChannels, device: device);
+            Shortcut = stride != 1 || inChannels != outChannels ? new Conv2d(inChannels, outChannels, 1, stride, 0, bias: true, device, random) : null;
+        }
+
+        public Conv2d Conv1 { get; }
+
+        public BatchNorm Norm1 { get; }
+
+        public Conv2d Conv2 { get; }
+
+        public BatchNorm Norm2 { get; }
+
+        public Conv2d? Shortcut { get; }
+
+        public override IEnumerable<Module> Children() => Shortcut is null ? [Conv1, Norm1, Conv2, Norm2] : [Conv1, Norm1, Conv2, Norm2, Shortcut];
+
+        protected override Tensor ForwardCore(Tensor input)
+        {
+            var y = Norm2.Forward(Conv2.Forward(Norm1.Forward(Conv1.Forward(input)).Relu()));
+            return (y + (Shortcut?.Forward(input) ?? input)).Relu();
+        }
+    }
+
+    // Two convolutions of the same input, concatenated along the channels (an Inception-style branch).
+    private sealed class Branches(Conv2d left, Conv2d right) : Module
+    {
+        public Conv2d Left { get; } = left;
+
+        public Conv2d Right { get; } = right;
+
+        public override IEnumerable<Module> Children() => [Left, Right];
+
+        protected override Tensor ForwardCore(Tensor input) => Tensor.Concat([Left.Forward(input), Right.Forward(input)], 1);
+    }
+
+    private static OnnxValue ConvNode(OnnxGraph g, Conv2d c, OnnxValue x) => g.Node("Conv",
+        [x, g.Constant("w", c.Weight.ToArray(), c.OutChannels, c.InChannels, c.KernelSize, c.KernelSize), c.Bias is null ? null : g.Constant("b", c.Bias.ToArray(), c.OutChannels)],
+        null, OnnxAttribute.Of("kernel_shape", [(long)c.KernelSize, c.KernelSize]), OnnxAttribute.Of("strides", [(long)c.Stride, c.Stride]),
+        OnnxAttribute.Of("pads", [(long)c.Padding, c.Padding, c.Padding, c.Padding]));
+
+    private static OnnxValue NormNode(OnnxGraph g, BatchNorm n, OnnxValue x) => g.Node("BatchNormalization",
+        [x, g.Constant("gamma", n.Gamma.ToArray(), n.Channels), g.Constant("beta", n.Beta.ToArray(), n.Channels),
+            g.Constant("mean", n.RunningMean.ToArray(), n.Channels), g.Constant("var", n.RunningVariance.ToArray(), n.Channels)],
+        null, OnnxAttribute.Of("epsilon", n.Epsilon));
+
+    private static OnnxExporter PyTorchStyle(OnnxExporter exporter) => exporter
+        .Module<Residual>((g, r, x, shape) =>
+        {
+            var y = NormNode(g, r.Norm2, ConvNode(g, r.Conv2, g.Node("Relu", [NormNode(g, r.Norm1, ConvNode(g, r.Conv1, x))])));
+            return g.Node("Relu", [g.Node("Add", [y, r.Shortcut is null ? x : ConvNode(g, r.Shortcut, x)])], shape);
+        })
+        .Module<Branches>((g, b, x, shape) => g.Node("Concat", [ConvNode(g, b.Left, x), ConvNode(g, b.Right, x)], shape, OnnxAttribute.Of("axis", 1L)))
+        // torch.flatten(x, 1) as the torch.export exporter writes it: reshape to [x.shape[0], -1] computed from the shape.
+        .Module<Flatten>((g, _, x, shape) =>
+        {
+            var batch = g.Node("Unsqueeze", [g.Node("Gather", [g.Node("Shape", [x]), g.Constant("zero", [0L])], null, OnnxAttribute.Of("axis", 0L)), g.Ints("axes", 0)]);
+            return g.Node("Reshape", [x, g.Node("Concat", [batch, g.Ints("rest", -1)], null, OnnxAttribute.Of("axis", 0L))], shape);
+        });
+
+    private static void OnnxImportGraph(Device device)
+    {
+        var r = new Random(30);
+        using var model = new Sequential
+        {
+            new Conv2d(3, 8, 3, 1, 1, device: device, random: r), new BatchNorm(8, device: device), new ReLU(),
+            new Residual(8, 8, 1, device, r),
+            new Residual(8, 12, 2, device, r),
+            new Branches(new Conv2d(12, 4, 1, device: device, random: r), new Conv2d(12, 4, 3, 1, 1, device: device, random: r)),
+            new MaxPool2d(2), new Flatten(), new Linear(8 * 2 * 2, 5, device: device, random: r), new Softmax(),
+        };
+        WarmBatchNorm(model, RandomInput(device, r, 16, 3, 8, 8));
+
+        using var imported = OnnxImport.Load(PyTorchStyle(OnnxExport.For(model).Input(3, 8, 8)).ToBytes(), device);
+        Check(imported.IsGraph && imported.Network is null, "a model with skip connections is imported as a graph");
+        var graph = (GraphModule)imported.Model;
+        var layerTypes = graph.Nodes.Where(n => n.Layer is not null).Select(n => n.Layer!.GetType().Name).ToList();
+        Check(layerTypes.Count(t => t == "Conv2d") == 8 && layerTypes.Count(t => t == "BatchNorm") == 5 && layerTypes.Contains("Linear") && layerTypes.Contains("MaxPool2d"),
+            string.Join(", ", layerTypes));
+        Check(graph.Nodes.Any(n => n.Op == "add") && graph.Nodes.Any(n => n.Op == "concat") && graph.Nodes.Any(n => n.Op == "shape"), "skip additions, concat and shape ops");
+
+        foreach (int batch in new[] { 1, 3 })
+        {
+            var x = RandomInput(device, r, batch, 3, 8, 8);
+            using var expected = model.Predict(x);
+            using var actual = imported.Model.Predict(x);
+            Check(actual.Shape.SequenceEqual(expected.Shape), $"batch {batch}: shape {Tensor.FormatShape(actual.Shape)}");
+            float worst = actual.ToArray().Zip(expected.ToArray(), (a, b) => MathF.Abs(a - b)).Max();
+            Check(worst < 1e-4f, $"batch {batch}: largest difference {worst}");
+        }
+
+        string path = Path.Combine(Path.GetTempPath(), $"ns-{Guid.NewGuid():N}.nsm");
+        try
+        {
+            imported.SavePackage(path);
+            using var predictor = Predictor.Load(path, device).Build();
+            var sample = Enumerable.Range(0, 3 * 8 * 8).Select(i => MathF.Sin(i * 0.37f)).ToArray();
+            var p = predictor.Predict(sample);
+            using var single = Tensor.From(sample, [1, 3, 8, 8], device);
+            using var reference = model.Predict(single);
+            Check(p.Zip(reference.ToArray(), (a, b) => MathF.Abs(a - b)).Max() < 1e-4f, "the reloaded .nsm graph predicts the same");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+
+        // Fine-tuning works on an imported graph: gradients reach the first convolution through the skip connections.
+        imported.Model.Train();
+        foreach (var p in imported.Model.Parameters())
+        {
+            p.ZeroGrad();
+        }
+
+        using (var scope = new TensorScope())
+        {
+            imported.Model.Forward(RandomInput(device, r, 2, 3, 8, 8)).Square().Sum().Backward();
+        }
+
+        var firstConv = graph.Nodes.First(n => n.Layer is Conv2d).Layer!;
+        Check(firstConv.Parameters().First().Grad!.ToArray().Any(v => v != 0f), "gradients reach the first layer");
+    }
 
     // Export → import into NeuralSharp layers (on `device`) → the same outputs as the original.
     private static void CheckImport(Module model, int[] sampleShape, Tensor input, string what, Func<OnnxExporter, OnnxExporter>? configure = null)
@@ -78,7 +210,8 @@ internal static partial class Tests
                 g.Scalar("one", 1f)])]), g.Scalar("half", 0.5f)], shape))
             .Metadata("source", "pytorch-style").ToBytes();
         using var imported = OnnxImport.Load(bytes, device);
-        Check(imported.Model.Select(m => m.GetType().Name).SequenceEqual(["Linear", "GELU", "Linear", "Softmax"]), string.Join(", ", imported.Model.Select(m => m.ToString())));
+        var layers = (Sequential)imported.Model;
+        Check(layers.Select(m => m.GetType().Name).SequenceEqual(["Linear", "GELU", "Linear", "Softmax"]), string.Join(", ", layers.Select(m => m.ToString())));
         Check(imported.Notes.Count == 1 && imported.Notes[0].Contains("erf"), "the erf → tanh approximation is reported");
         Check(imported.Metadata["source"] == "pytorch-style", "metadata");
         var x = RandomInput(device, r, 4, 5);
@@ -101,9 +234,22 @@ internal static partial class Tests
             File.Delete(path);
         }
 
+        // Arithmetic without a layer (x · 2 + 1) is imported as graph operations and computes the same.
         using var custom = new Sequential { new Linear(4, 4, device: device, random: new Random(24)), new Lambda(x => x * 2f + 1f, "Affine") };
-        var unsupported = OnnxExport.For(custom).Input(4)
+        custom.Eval();
+        var affine = OnnxExport.For(custom).Input(4)
             .Lambda("Affine", (g, _, v, shape) => g.Node("Add", [g.Node("Mul", [v, g.Scalar("two", 2f)]), g.Scalar("one", 1f)], shape)).ToBytes();
+        using (var arithmetic = OnnxImport.Load(affine, device))
+        {
+            Check(arithmetic.IsGraph, "arithmetic becomes a graph");
+            var input = RandomInput(device, r, 3, 4);
+            using var want = custom.Predict(input);
+            using var got = arithmetic.Model.Predict(input);
+            Check(got.ToArray().Zip(want.ToArray(), (a, b) => MathF.Abs(a - b)).Max() < 1e-5f, "graph arithmetic");
+        }
+
+        // An operator with no NeuralSharp equivalent is rejected by name.
+        var unsupported = OnnxExport.For(custom).Input(4).Lambda("Affine", (g, _, v, shape) => g.Node("Sin", [v], shape)).ToBytes();
         try
         {
             OnnxImport.Load(unsupported, device).Dispose();
@@ -111,7 +257,7 @@ internal static partial class Tests
         }
         catch (NotSupportedException ex)
         {
-            Check(ex.Message.Contains("Mul"), ex.Message);
+            Check(ex.Message.Contains("Sin"), ex.Message);
         }
     }
 

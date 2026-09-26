@@ -5,25 +5,33 @@ using NeuralSharp.Layers;
 namespace NeuralSharp.Onnx;
 
 /// <summary>
-/// An ONNX model rebuilt from NeuralSharp layers: the <see cref="Network"/> description, the <see cref="Model"/> with
-/// the file's weights (on the device chosen at import, so it runs on NeuralSharp's own CPU or CUDA kernels), and the
-/// file's metadata. Dispose it to release the model.
+/// An ONNX model rebuilt from NeuralSharp layers, with the file's weights, on the device chosen at import (so it runs
+/// on NeuralSharp's own CPU or CUDA kernels). A chain of layers becomes a <see cref="Sequential"/> with its
+/// <see cref="Network"/> description; a graph with skip connections or branches becomes a <see cref="GraphModule"/>.
+/// Dispose it to release the model.
 /// </summary>
 public sealed class ImportedNetwork : IDisposable
 {
-    internal ImportedNetwork(NetworkBuilder network, Sequential model, IReadOnlyDictionary<string, string> metadata, IReadOnlyList<string> notes)
+    internal ImportedNetwork(NetworkBuilder? network, Module model, IReadOnlyDictionary<string, string> metadata, IReadOnlyList<string> notes, int[]? inputShape)
     {
+        InputShape = inputShape;
         Network = network;
         Model = model;
         Metadata = metadata;
         Notes = notes;
     }
 
-    /// <summary>The layers as builder steps (can be written to JSON and rebuilt).</summary>
-    public NetworkBuilder Network { get; }
+    /// <summary>The layers as builder steps when the model is a chain (a <see cref="Sequential"/>); null for a graph.</summary>
+    public NetworkBuilder? Network { get; }
 
-    /// <summary>The network with the file's weights.</summary>
-    public Sequential Model { get; }
+    /// <summary>The network with the file's weights: a <see cref="Sequential"/> for a chain, a <see cref="GraphModule"/> for a graph.</summary>
+    public Module Model { get; }
+
+    /// <summary>The shape of one input sample from the file (without the batch dimension), or null when it has dynamic dimensions.</summary>
+    public IReadOnlyList<int>? InputShape { get; }
+
+    /// <summary>True when the model is a <see cref="GraphModule"/> (it has skip connections, branches or shape arithmetic).</summary>
+    public bool IsGraph => Model is GraphModule;
 
     /// <summary>The ONNX file's metadata (custom key/value pairs).</summary>
     public IReadOnlyDictionary<string, string> Metadata { get; }
@@ -32,8 +40,8 @@ public sealed class ImportedNetwork : IDisposable
     public IReadOnlyList<string> Notes { get; }
 
     /// <summary>
-    /// Saves a NeuralSharp package (.nsm): the architecture, the weights and the ONNX metadata (as the JSON entry
-    /// "onnx-metadata"). Load it with <c>ModelPackage.Open(path).BuildNetwork(device)</c> or <c>Predictor.Load(path, device)</c>.
+    /// Saves a NeuralSharp package (.nsm): the architecture, the weights, the ONNX metadata (as the JSON entry
+    /// "onnx-metadata") and the input shape. Load it with <c>ModelPackage.Open(path).BuildNetwork(device)</c> or <c>Predictor.Load(path, device)</c>.
     /// </summary>
     public void SavePackage(string path)
     {
@@ -43,7 +51,16 @@ public sealed class ImportedNetwork : IDisposable
             metadata[key] = value;
         }
 
-        ModelPackage.Create(path).Architecture(Network).Weights(ModelPackage.DefaultModelName, Model).Json("onnx-metadata", metadata).Save();
+        var writer = ModelPackage.Create(path);
+        writer = Network is not null ? writer.Architecture(Network) : writer.Architecture(ModelPackage.DefaultModelName, ((GraphModule)Model).ToJson());
+        writer.Weights(ModelPackage.DefaultModelName, Model).Json("onnx-metadata", metadata);
+        if (InputShape is { } shape)
+        {
+            // Read by Predictor.Load, so a flat float[] sample is reshaped to the model's input (for example [3, 224, 224]).
+            writer.Json("predictor", new JsonObject { ["inputShape"] = new JsonArray([.. shape.Select(d => (JsonNode)d)]) });
+        }
+
+        writer.Save();
     }
 
     /// <inheritdoc />
@@ -69,8 +86,19 @@ public static class OnnxImport
         Load(File.ReadAllBytes(path), device, sampleShape);
 
     /// <summary>Imports a model from the bytes of an .onnx file.</summary>
-    public static ImportedNetwork Load(byte[] model, Device? device = null, int[]? sampleShape = null) =>
-        new Importer(OnnxModel.Read(model), device ?? Device.Default, sampleShape).Run();
+    public static ImportedNetwork Load(byte[] model, Device? device = null, int[]? sampleShape = null)
+    {
+        var onnx = OnnxModel.Read(model);
+        try
+        {
+            return new Importer(onnx, device ?? Device.Default, sampleShape).Run();
+        }
+        catch (NotSupportedException)
+        {
+            // Not a chain of layers (skip connections, branches, shape arithmetic): import it as a graph instead.
+            return new Importer(onnx, device ?? Device.Default, sampleShape).RunGraph();
+        }
+    }
 }
 
 internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShape)
@@ -140,7 +168,7 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
             throw;
         }
 
-        return new ImportedNetwork(_network, built, model.Metadata, _notes);
+        return new ImportedNetwork(_network, built, model.Metadata, _notes, shape);
     }
 
     // ------------------------------------------------------------------ the chain
@@ -153,32 +181,10 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
             throw new NotSupportedException($"The value '{x}' is not used by any node and is not the graph output.");
         }
 
-        if (TryTransformer(x) is { } t)
+        if ((MatchTransformer(x) ?? MatchRecurrent(x) ?? AttentionLayer(ParseAttention(x)) ?? GeluLayer(ParseGelu(x)) ?? LinearLayer(ParseLinear(x))) is { } match)
         {
-            return t;
-        }
-
-        if (ParseAttention(x) is { } attention)
-        {
-            Consume(attention.Nodes);
-            return Push(b => b.MultiHeadAttention(attention.Heads, attention.Causal), m => LoadAttention(m, attention), attention.Output);
-        }
-
-        if (TryRecurrent(x) is { } r)
-        {
-            return r;
-        }
-
-        if (ParseGelu(x) is { } gelu)
-        {
-            Consume(gelu.Nodes);
-            return Push(b => b.GELU(), null, gelu.Output);
-        }
-
-        if (ParseLinear(x) is { } linear)
-        {
-            Consume(linear.Nodes);
-            return Push(b => b.Linear(linear.Out, bias: linear.Bias is not null), m => LoadLinear((Linear)m, linear), linear.Output);
+            Consume(match.Nodes);
+            return Push(match.Step, match.Load, match.Output);
         }
 
         if (users.Count != 1)
@@ -209,44 +215,18 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
 
                 return Push(b => b.Softmax(), null, Out());
             case "BatchNormalization":
-                var (gamma, beta, mean, variance) = (Input(1), Input(2), Input(3), Input(4));
-                if (gamma is null || beta is null || mean is null || variance is null)
-                {
-                    throw Unsupported(node, "batch normalization with computed statistics");
-                }
-
-                float momentum = 1f - node.Float("momentum", 0.9f);
-                return Push(b => b.BatchNorm(momentum, node.Float("epsilon", 1e-5f)), m =>
-                {
-                    var bn = (BatchNorm)m;
-                    bn.Gamma.Load(gamma.AsFloats());
-                    bn.Beta.Load(beta.AsFloats());
-                    bn.RunningMean.Load(mean.AsFloats());
-                    bn.RunningVariance.Load(variance.AsFloats());
-                }, Out());
+                return PushMatch(BatchNormLayer(node));
             case "LayerNormalization":
                 if (node.Int("axis", -1) is not (-1) && node.Int("axis", -1) != _network.CurrentShape.Count)
                 {
                     throw Unsupported(node, "layer normalization over more than the last axis");
                 }
 
-                var (scale, shift) = (Input(1) ?? throw Unsupported(node, "computed scale"), Input(2));
-                return Push(b => b.LayerNorm(node.Float("epsilon", 1e-5f)), m =>
-                {
-                    var ln = (LayerNorm)m;
-                    ln.Gamma.Load(scale.AsFloats());
-                    ln.Beta.Load(shift?.AsFloats() ?? new float[ln.Features]);
-                }, Out());
+                return PushMatch(LayerNormLayer(node));
             case "Conv":
-                return Conv(node, Input(1) ?? throw Unsupported(node, "computed weights"), Input(2));
+                return PushMatch(ConvLayer(node));
             case "MaxPool":
-                var (k, stride, padding) = Window(node);
-                if (node.Int("ceil_mode", 0) != 0 || node.Outputs.Count > 1 && node.Outputs[1].Length > 0 && Users(node.Outputs[1]).Count > 0)
-                {
-                    throw Unsupported(node, "ceil_mode or indices output");
-                }
-
-                return Push(b => b.MaxPool2d(k, stride, padding), null, Out());
+                return PushMatch(MaxPoolLayer(node));
             case "GlobalAveragePool":
                 var next = Users(Out()) is [var flatten] && (flatten.Op == "Flatten" && flatten.Int("axis", 1) == 1
                     || flatten.Op == "Reshape" && Const(flatten.Inputs[1]) is { } target && target.AsLongs() is [-1 or 0, _]
@@ -258,10 +238,10 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
             case "Flatten":
                 return node.Int("axis", 1) == 1 ? Push(b => b.Flatten(), null, Out()) : throw Unsupported(node, "flatten from an axis other than 1");
             case "Cast":
-                if (Users(Out()) is [{ Op: "Gather" } gather] && Const(gather.Inputs[0]) is { Dims.Length: 2 } table && gather.Inputs[1] == Out())
+                if (Users(Out()) is [{ Op: "Gather" } gather] && EmbeddingLayer(gather, Out()) is { } embedding)
                 {
                     Consume(gather);
-                    return Push(b => b.Embedding(table.Dims[0], table.Dims[1]), m => ((Embedding)m).Weight.Load(table.AsFloats()), gather.Outputs[0]);
+                    return PushMatch(embedding);
                 }
 
                 throw Unsupported(node, "a cast that does not feed an embedding lookup");
@@ -289,6 +269,8 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
                 throw Unsupported(node, $"the {node.Op} operator");
         }
     }
+
+    private string PushMatch(LayerMatch match) => Push(match.Step, match.Load, match.Output);
 
     private string Push(Func<NetworkBuilder, NetworkBuilder> step, Action<Module>? load, string output)
     {
@@ -319,6 +301,157 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
     // The other input of a binary node whose one input is `x`.
     private static string? Other(OnnxNode node, string x) =>
         node.Inputs.Count == 2 && node.Inputs[0] == x ? node.Inputs[1] : node.Inputs.Count == 2 && node.Inputs[1] == x ? node.Inputs[0] : null;
+
+    // ------------------------------------------------------------------ graphs
+
+    private static readonly Dictionary<string, string> Primitives = new()
+    {
+        ["Add"] = "add", ["Sub"] = "sub", ["Mul"] = "mul", ["Div"] = "div", ["MatMul"] = "matmul",
+        ["Relu"] = "relu", ["Tanh"] = "tanh", ["Sigmoid"] = "sigmoid", ["Exp"] = "exp", ["Log"] = "log", ["Abs"] = "abs",
+        ["Softmax"] = "softmax", ["Flatten"] = "flatten", ["Reshape"] = "reshape", ["Transpose"] = "transpose", ["Concat"] = "concat",
+        ["Shape"] = "shape", ["Gather"] = "gather", ["Slice"] = "slice", ["Unsqueeze"] = "unsqueeze", ["Squeeze"] = "squeeze",
+        ["Identity"] = "identity", ["Cast"] = "cast", ["Dropout"] = "identity", ["ReduceMean"] = "reduce_mean",
+        ["GlobalAveragePool"] = "global_average_pool",
+    };
+
+    public ImportedNetwork RunGraph()
+    {
+        if (model.Inputs.Count != 1 || model.Outputs.Count != 1)
+        {
+            throw new NotSupportedException($"The importer needs one input and one output; the model has {model.Inputs.Count} and {model.Outputs.Count}.");
+        }
+
+        var nodes = new List<GraphNode>();
+        var constants = new List<(string, Tensor)>();
+        var integers = new List<(string, long[], int[])>();
+        var registered = new HashSet<string>();
+        var layers = new List<Module>();
+        try
+        {
+            foreach (var node in model.Nodes)
+            {
+                if (_consumed.Contains(node))
+                {
+                    continue;
+                }
+
+                string? x = node.Inputs.FirstOrDefault(i => i.Length > 0 && Const(i) is null);
+                if (x is not null && MatchLayer(node, x) is { } match)
+                {
+                    Consume(match.Nodes);
+                    var layer = match.Create();
+                    layers.Add(layer);
+                    using (Autograd.NoGrad())
+                    {
+                        match.Load?.Invoke(layer);
+                    }
+
+                    nodes.Add(new GraphNode("layer", [x], match.Output, Layer: layer));
+                    continue;
+                }
+
+                Consume(node);
+                nodes.Add(Primitive(node, constants, integers, registered));
+            }
+
+            var graph = new GraphModule(model.Inputs[0].Name, model.Outputs[0].Name, nodes, constants, integers)
+            {
+                Name = string.IsNullOrEmpty(model.GraphName) ? "onnx" : model.GraphName,
+            };
+            int[]? shape = sampleShape ?? (model.Inputs[0].Shape is { Length: > 1 } s && s[1..].All(d => d > 0) ? s[1..] : null);
+            return new ImportedNetwork(null, graph, model.Metadata, _notes, shape);
+        }
+        catch
+        {
+            layers.ForEach(l => l.Dispose());
+            constants.ForEach(c => c.Item2.Dispose());
+            throw;
+        }
+    }
+
+    // The layer pattern that starts at `node` (whose data input is `x`), if any.
+    private LayerMatch? MatchLayer(OnnxNode node, string x)
+    {
+        var match = node.Op switch
+        {
+            "LayerNormalization" => MatchTransformer(x) ?? (node.Int("axis", -1) == -1 && node.Inputs[0] == x ? LayerNormLayer(node) : null),
+            "Transpose" => MatchRecurrent(x),
+            "MatMul" or "Gemm" => AttentionLayer(ParseAttention(x)) ?? LinearLayer(ParseLinear(x)),
+            "Mul" or "Div" or "Gelu" => GeluLayer(ParseGelu(x)),
+            "BatchNormalization" when node.Inputs[0] == x => BatchNormLayer(node),
+            "Conv" when node.Inputs[0] == x => ConvLayer(node),
+            "MaxPool" => MaxPoolLayer(node),
+            "Gather" => EmbeddingLayer(node, x),
+            _ => null,
+        };
+        return match is not null && match.Nodes.Contains(node) ? match : null;
+    }
+
+    private GraphNode Primitive(OnnxNode node, List<(string, Tensor)> constants, List<(string, long[], int[])> integers, HashSet<string> registered)
+    {
+        if (!Primitives.TryGetValue(node.Op, out var op) || node.Domain is not ("" or "ai.onnx"))
+        {
+            throw Unsupported(node, $"the {node.Op} operator");
+        }
+
+        if (node.Outputs.Skip(1).Any(o => o.Length > 0 && Users(o).Count > 0))
+        {
+            throw Unsupported(node, "a node whose extra outputs are used");
+        }
+
+        var attributes = new JsonObject();
+        foreach (var (name, value) in node.Attributes)
+        {
+            if (value.Int is { } i)
+            {
+                attributes[name] = i;
+            }
+            else if (value.Ints is { } ints)
+            {
+                attributes[name] = new JsonArray([.. ints.Select(v => (JsonNode)v)]);
+            }
+        }
+
+        List<string> inputs = node.Op == "Dropout" ? [node.Inputs[0]] : [.. node.Inputs];
+        if (node.Op == "Softmax" && !node.Attributes.ContainsKey("axis") && model.Opset < 13)
+        {
+            attributes["axis"] = 1;
+        }
+
+        if (node.Op == "Slice" && node.Ints("starts") is { } starts)
+        {
+            // Opset < 10: starts, ends and axes are attributes; make them inputs like later opsets.
+            string Add(string what, long[] values)
+            {
+                string name = $"{node.Outputs[0]}_{what}";
+                integers.Add((name, values, [values.Length]));
+                registered.Add(name);
+                return name;
+            }
+
+            inputs = [node.Inputs[0], Add("starts", starts), Add("ends", node.Ints("ends")!), .. node.Ints("axes") is { } axes ? [Add("axes", axes)] : new List<string>()];
+        }
+
+        foreach (var input in inputs.Where(i => i.Length > 0 && !registered.Contains(i)))
+        {
+            if (Const(input) is not { } constant)
+            {
+                continue;
+            }
+
+            registered.Add(input);
+            if (constant.Floats is { } floats)
+            {
+                constants.Add((input, Tensor.Persistent(floats, constant.Dims, device, requiresGrad: false)));
+            }
+            else
+            {
+                integers.Add((input, constant.Longs!, constant.Dims));
+            }
+        }
+
+        return new GraphNode(op, inputs, node.Outputs[0], attributes.Count > 0 ? attributes : null);
+    }
 
     // ------------------------------------------------------------------ Linear: MatMul (+ Add) or Gemm
 
@@ -499,7 +632,7 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
         LoadLinear((Linear)children[1], match.Projection);
     }
 
-    private string? TryTransformer(string x)
+    private LayerMatch? MatchTransformer(string x)
     {
         var users = Users(x);
         if (users.Count != 2 || users.FirstOrDefault(n => n.Op == "LayerNormalization" && n.Inputs[0] == x) is not { } norm1
@@ -513,29 +646,25 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
         var after = Users(a);
         if (after.Count != 2 || after.FirstOrDefault(n => n.Op == "LayerNormalization" && n.Inputs[0] == a) is not { } norm2
             || after.FirstOrDefault(n => n.Op == "Add") is not { } residual2
-            || ParseLinear(norm2.Outputs[0]) is not { } ff1)
+            || ParseLinear(norm2.Outputs[0]) is not { } ff1
+            || ParseGelu(ff1.Output) is not { } gelu || ParseLinear(gelu.Output) is not { } ff2 || Other(residual2, a) != ff2.Output)
         {
             return null;
         }
 
-        // Claim the first part so the GELU and second projection are matched on what remains.
-        Consume([norm1, residual1, norm2, .. attention.Nodes, .. ff1.Nodes]);
-        if (ParseGelu(ff1.Output) is not { } gelu || ParseLinear(gelu.Output) is not { } ff2 || Other(residual2, a) != ff2.Output)
-        {
-            throw new NotSupportedException($"Cannot import the transformer layer at {norm1}: its feed-forward block is not Linear → GELU → Linear.");
-        }
-
-        Consume([residual2, .. gelu.Nodes, .. ff2.Nodes]);
-        var (first, second) = (norm1, norm2);
-        return Push(b => b.TransformerEncoderLayer(attention.Heads, ff1.Out, dropout: 0f, attention.Causal), m =>
-        {
-            var c = m.Children().ToList();
-            LoadNorm((LayerNorm)c[0], first);
-            LoadAttention(c[1], attention);
-            LoadNorm((LayerNorm)c[2], second);
-            LoadLinear((Linear)c[3], ff1);
-            LoadLinear((Linear)c[4], ff2);
-        }, residual2.Outputs[0]);
+        int dim = attention.Qkv.In;
+        return new([norm1, residual1, norm2, residual2, .. attention.Nodes, .. ff1.Nodes, .. gelu.Nodes, .. ff2.Nodes], residual2.Outputs[0],
+            b => b.TransformerEncoderLayer(attention.Heads, ff1.Out, dropout: 0f, attention.Causal),
+            () => new TransformerEncoderLayer(dim, attention.Heads, ff1.Out, 0f, attention.Causal, device),
+            m =>
+            {
+                var c = m.Children().ToList();
+                LoadNorm((LayerNorm)c[0], norm1);
+                LoadAttention(c[1], attention);
+                LoadNorm((LayerNorm)c[2], norm2);
+                LoadLinear((Linear)c[3], ff1);
+                LoadLinear((Linear)c[4], ff2);
+            });
     }
 
     private void LoadNorm(LayerNorm norm, OnnxNode node)
@@ -546,7 +675,7 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
 
     // ------------------------------------------------------------------ recurrent layers
 
-    private string? TryRecurrent(string x)
+    private LayerMatch? MatchRecurrent(string x)
     {
         if (Only(x, "Transpose") is not { } timeMajor || timeMajor.Ints("perm") is not [1, 0, 2]
             || Users(timeMajor.Outputs[0]) is not [{ Op: "LSTM" or "GRU" } rnn] || rnn.Inputs[0] != timeMajor.Outputs[0])
@@ -624,38 +753,94 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
             throw Unsupported(rnn, "a recurrent layer whose outputs are not used as [batch, time, hidden] or the last state");
         }
 
-        Consume(nodes);
-        return Push(builder => lstm ? builder.LSTM(h, sequences) : builder.GRU(h, sequences), m =>
-        {
-            var module = (RecurrentModule)m;
-            module.InputWeight.Load(inputWeight);
-            module.HiddenWeight.Load(hiddenWeight);
-            module.Bias.Load(bias);
-        }, output);
+        return new([.. nodes], output,
+            builder => lstm ? builder.LSTM(h, sequences) : builder.GRU(h, sequences),
+            () => lstm ? new LSTM(inputs, h, sequences, device) : new GRU(inputs, h, sequences, device),
+            m =>
+            {
+                var module = (RecurrentModule)m;
+                module.InputWeight.Load(inputWeight);
+                module.HiddenWeight.Load(hiddenWeight);
+                module.Bias.Load(bias);
+            });
     }
 
     private long[]? SqueezeAxes(OnnxNode squeeze) => squeeze.Ints("axes") ?? (squeeze.Inputs.Count > 1 ? Const(squeeze.Inputs[1])?.AsLongs() : null);
 
     // ------------------------------------------------------------------ the rest
 
-    private string Conv(OnnxNode node, OnnxTensor weight, OnnxTensor? bias)
+    private sealed record LayerMatch(OnnxNode[] Nodes, string Output, Func<NetworkBuilder, NetworkBuilder> Step, Func<Module> Create, Action<Module>? Load);
+
+    private LayerMatch? LinearLayer(LinearMatch? l) => l is null ? null
+        : new(l.Nodes, l.Output, b => b.Linear(l.Out, bias: l.Bias is not null), () => new Linear(l.In, l.Out, l.Bias is not null, device), m => LoadLinear((Linear)m, l));
+
+    private LayerMatch? GeluLayer(GeluMatch? g) => g is null ? null : new(g.Nodes, g.Output, b => b.GELU(), () => new GELU(), null);
+
+    private LayerMatch? AttentionLayer(AttentionMatch? a) => a is null ? null
+        : new(a.Nodes, a.Output, b => b.MultiHeadAttention(a.Heads, a.Causal), () => new MultiHeadAttention(a.Qkv.In, a.Heads, a.Causal, 0f, device), m => LoadAttention(m, a));
+
+    private OnnxTensor Required(OnnxNode node, int index) =>
+        index < node.Inputs.Count && Const(node.Inputs[index]) is { } t ? t : throw Unsupported(node, $"a computed input {index} (weights must be constants)");
+
+    private LayerMatch BatchNormLayer(OnnxNode node)
     {
+        var (gamma, beta, mean, variance) = (Required(node, 1), Required(node, 2), Required(node, 3), Required(node, 4));
+        float momentum = 1f - node.Float("momentum", 0.9f), epsilon = node.Float("epsilon", 1e-5f);
+        return new([node], node.Outputs[0], b => b.BatchNorm(momentum, epsilon), () => new BatchNorm(gamma.Size, momentum, epsilon, device), m =>
+        {
+            var bn = (BatchNorm)m;
+            bn.Gamma.Load(gamma.AsFloats());
+            bn.Beta.Load(beta.AsFloats());
+            bn.RunningMean.Load(mean.AsFloats());
+            bn.RunningVariance.Load(variance.AsFloats());
+        });
+    }
+
+    private LayerMatch LayerNormLayer(OnnxNode node)
+    {
+        var scale = Required(node, 1);
+        float epsilon = node.Float("epsilon", 1e-5f);
+        return new([node], node.Outputs[0], b => b.LayerNorm(epsilon), () => new LayerNorm(scale.Size, epsilon, device), m => LoadNorm((LayerNorm)m, node));
+    }
+
+    private LayerMatch ConvLayer(OnnxNode node)
+    {
+        var weight = Required(node, 1);
+        var bias = node.Inputs.Count > 2 && node.Inputs[2].Length > 0 ? Required(node, 2) : null;
         var (k, stride, padding) = Window(node);
-        if (node.Int("group", 1) != 1 || weight.Dims is not [var outC, _, var kh, var kw] || kh != kw || kh != k)
+        if (node.Int("group", 1) != 1 || weight.Dims is not [var outC, var inC, var kh, var kw] || kh != kw || kh != k)
         {
             throw Unsupported(node, "grouped or non-square convolution");
         }
 
-        return Push(b => b.Conv2d(outC, k, stride, padding, bias is not null), m =>
-        {
-            var conv = (Conv2d)m;
-            conv.Weight.Load(weight.AsFloats());                                       // [out, in, k, k] = [out, in·k·k]
-            if (bias is not null)
+        return new([node], node.Outputs[0], b => b.Conv2d(outC, k, stride, padding, bias is not null),
+            () => new Conv2d(inC, outC, k, stride, padding, bias is not null, device), m =>
             {
-                conv.Bias!.Load(bias.AsFloats());
-            }
-        }, node.Outputs[0]);
+                var conv = (Conv2d)m;
+                conv.Weight.Load(weight.AsFloats());                                   // [out, in, k, k] = [out, in·k·k]
+                if (bias is not null)
+                {
+                    conv.Bias!.Load(bias.AsFloats());
+                }
+            });
     }
+
+    private LayerMatch MaxPoolLayer(OnnxNode node)
+    {
+        var (k, stride, padding) = Window(node);
+        if (node.Int("ceil_mode", 0) != 0 || node.Outputs.Count > 1 && node.Outputs[1].Length > 0 && Users(node.Outputs[1]).Count > 0)
+        {
+            throw Unsupported(node, "ceil_mode or indices output");
+        }
+
+        return new([node], node.Outputs[0], b => b.MaxPool2d(k, stride, padding), () => new MaxPool2d(k, stride, padding), null);
+    }
+
+    private LayerMatch? EmbeddingLayer(OnnxNode gather, string ids) =>
+        gather.Op == "Gather" && gather.Inputs.Count == 2 && gather.Inputs[1] == ids && gather.Int("axis", 0) == 0 && Const(gather.Inputs[0]) is { Dims.Length: 2 } table
+            ? new([gather], gather.Outputs[0], b => b.Embedding(table.Dims[0], table.Dims[1]), () => new Embedding(table.Dims[0], table.Dims[1], device),
+                m => ((Embedding)m).Weight.Load(table.AsFloats()))
+            : null;
 
     private static (int Kernel, int Stride, int Padding) Window(OnnxNode node)
     {
@@ -674,9 +859,9 @@ internal sealed class Importer(OnnxModel model, Device device, int[]? sampleShap
 
     private string Gather(OnnxNode node, string x)
     {
-        if (node.Inputs[1] == x && Const(node.Inputs[0]) is { Dims.Length: 2 } table)
+        if (EmbeddingLayer(node, x) is { } embedding)
         {
-            return Push(b => b.Embedding(table.Dims[0], table.Dims[1]), m => ((Embedding)m).Weight.Load(table.AsFloats()), node.Outputs[0]);
+            return PushMatch(embedding);
         }
 
         if (node.Inputs[0] == x && node.Int("axis", 0) == 1 && Const(node.Inputs[1]) is { Dims.Length: 0 } index && _network.CurrentShape.Count == 2)

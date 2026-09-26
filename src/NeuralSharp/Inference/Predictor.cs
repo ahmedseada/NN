@@ -48,7 +48,7 @@ public static class Predictor
             throw new InvalidOperationException($"{path} has no architecture (the model was not made with the network builder); use Predictor.Load(path, model) with a model you build.");
         }
 
-        var model = package.BuildNetwork(device: device);
+        var model = package.BuildModel(device: device);
         return Restore(package, new PredictorSettings(model, ownsModel: true));
     }
 
@@ -414,6 +414,10 @@ public sealed class Predictor<TIn, TOut> : IPredictor<TIn, TOut>, IDisposable
         if (Network.ArchitectureOf(Model) is { } architecture)
         {
             writer.Architecture(ModelPackage.DefaultModelName, architecture);
+        }
+        else if (Model is GraphModule graph)
+        {
+            writer.Architecture(ModelPackage.DefaultModelName, graph.ToJson());
         }
 
         if (_settings.FeatureScaler is { } features)

@@ -278,6 +278,31 @@ public sealed class ModelPackageReader : IDisposable
         }
     }
 
+    /// <summary>
+    /// Rebuilds the model named <paramref name="name"/> on <paramref name="device"/> and loads its weights, whether its
+    /// architecture was written by the network builder (a <see cref="Sequential"/>) or is a <see cref="GraphModule"/>.
+    /// </summary>
+    public Module BuildModel(string name = ModelPackage.DefaultModelName, Device? device = null)
+    {
+        var architecture = Architecture(name);
+        if (!GraphModule.IsDescription(architecture))
+        {
+            return BuildNetwork(name, device);
+        }
+
+        var graph = GraphModule.FromJson(architecture, device);
+        try
+        {
+            LoadWeights(graph, name);
+            return graph;
+        }
+        catch
+        {
+            graph.Dispose();
+            throw;
+        }
+    }
+
     /// <summary>The <see cref="Data.StandardScaler"/> named <paramref name="name"/>.</summary>
     public StandardScaler StandardScaler(string name)
     {

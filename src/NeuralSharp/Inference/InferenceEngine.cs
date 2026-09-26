@@ -286,7 +286,7 @@ public sealed class InferenceEngineBuilder
         return AddPredictor(name, typed, reloadable: true, () =>
         {
             using var package = ModelPackage.Open(packagePath);
-            return package.BuildNetwork(device: typed.Settings.Device);
+            return package.BuildModel(device: typed.Settings.Device);
         }, ownsModel: true);
     }
 

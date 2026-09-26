@@ -26,7 +26,8 @@ src/NeuralSharp/
                                     BatchNorm, LayerNorm, Embedding, LSTM, GRU,
                                     MultiHeadAttention, TransformerEncoderLayer, PositionalEncoding,
                                     ReLU, Tanh, Sigmoid, GELU, Softmax, Dropout, Lambda, Sequential;
-                                    Network builder, Blocks, Architectures; freezing, LoRA (ModuleExtensions)
+                                    Network builder, Blocks, Architectures; GraphModule (layers in a graph: skip
+                                    connections, branches); freezing, LoRA (ModuleExtensions)
   Optimizers/                       Sgd, Adam, AdamW, GroupedOptimizer, schedulers (step, exponential, cosine + warm-up)
   Data/                             Dataset (CSV, class labels, feature shapes), scalers, DataLoader, DataExtensions
   Training/                         Trainer, TrainingRun, Metric (MAE, RMSE, Accuracy), RegressionReport
@@ -56,6 +57,7 @@ samples/
   NeuralSharp.Samples.Rag             retrieval-augmented generation: hybrid search, re-ranking, a chat model that cites passages
   NeuralSharp.Samples.OnnxImport      imports another framework's .onnx model, runs it on NeuralSharp (CPU/CUDA), checks its outputs
 tools/pytorch/xor_to_onnx.py        trains XOR in PyTorch and exports it to ONNX with PyTorch's outputs, for OnnxImport
+tools/pytorch/export_models.py      exports a PyTorch CNN or ResNet (skip connections) to ONNX with PyTorch's outputs
   Shared/SampleOptions.cs             command-line options shared by the samples (train / predict modes)
   Shared/Gpt/                         GPT model, generation with metrics, training (console + Web API)
 tests/NeuralSharp.Tests             self-contained test runner (runs on every available device)
@@ -76,7 +78,7 @@ tests/NeuralSharp.Tests             self-contained test runner (runs on every av
 | `ReRanker` | two-stage search: BM25 + cross-encoder, hard negatives, listwise loss, placeholder tokens for unseen names | Hit@1 on unseen towns 27.1% (BM25) → 86.6% re-ranked, 6.9 ms per question, 180 s training |
 | `HouseApi` | `AddNeuralSharp().AddPredictor(...)` + `MapPredictor`: the HousePrices package served over HTTP with micro-batching | same prices as `HousePrices --predict` |
 | `Summarizer` | word-level decoder-only transformer, loss masking, greedy generation with a stop token, ROUGE | ROUGE-1 0.999 vs 0.503 (first sentence), 90% exact, 7.7 ms per summary |
-| `OnnxImport` | `OnnxImport.Load(path, device)` on a PyTorch-exported model (`tools/pytorch/xor_to_onnx.py`), compared with PyTorch's own outputs, then saved as .nsm and reloaded | same outputs as PyTorch (checked to 1e-5) |
+| `OnnxImport` | `OnnxImport.Load(path, device)` on a PyTorch-exported model (`tools/pytorch/xor_to_onnx.py`, `export_models.py` for a CNN or ResNet), compared with PyTorch's own outputs, then saved as .nsm and reloaded | XOR: same outputs as PyTorch on the RTX 5050 (1e-11), both PyTorch exporters |
 | `Rag` | `RetrievalIndex` (BM25 + trained bi-encoder + rank fusion), `CrossEncoder` re-ranking, `Rag.For(chat)` with a word-level ChatML model that cites passages; hashing and placeholder tokens for unseen names | unseen towns: Hit@1 27.1% (BM25), 85.8% (hybrid), 99.9% (re-ranked); answers 91.1% correct (0% closed book), 99.9% cite the right passage; 14 min training |
 
 ### Train and predict modes
@@ -647,10 +649,14 @@ using var onnx = OnnxModule.Load("model.onnx");                          // or r
 
 `NeuralSharp.Onnx` has no dependencies: it reads and writes the protobuf itself. **Export** covers Linear (LoRA
 adapters merged), activations, Softmax, BatchNorm, LayerNorm, Conv2d, pooling, Flatten, Embedding,
-PositionalEncoding, attention, transformer layers, LSTM, GRU and the builder's shape helpers. **Import** rebuilds a
-chain of those layers from an .onnx file, including PyTorch-style graphs (Gemm with transposed weights, exact GELU,
-which becomes the tanh approximation and is listed in `Notes`); an operator without a NeuralSharp layer is reported
-by name. Imported models are ordinary NeuralSharp models, so they run on NeuralSharp's own CPU and CUDA backends.
+PositionalEncoding, attention, transformer layers, LSTM, GRU and the builder's shape helpers. **Import** turns a
+chain of those layers into a `Sequential` (with its `Network` builder), and anything else into a `GraphModule`:
+layers where the importer recognizes them (Conv, BatchNorm, MatMul/Gemm → Linear, attention, LSTM/GRU, …) and graph
+operations for the rest (skip-connection Add, Concat, Mul, Reshape, Transpose, Squeeze/Unsqueeze, Slice, Gather,
+ReduceMean, and shape arithmetic such as PyTorch's flatten, computed for any batch size). So ResNet-style models
+with skip connections and branches import too. Exact GELU becomes the tanh approximation and is listed in
+`Notes`; an operator with no NeuralSharp equivalent is reported by name. Imported models are ordinary NeuralSharp
+models: they run on NeuralSharp's own CPU and CUDA backends, can be fine-tuned, and save as `.nsm` (graphs included).
 
 `NeuralSharp.Onnx.Runtime` references `Microsoft.ML.OnnxRuntime`, which is ONNX Runtime's **CPU** build; running
 ONNX Runtime on a GPU needs its `.Gpu` (CUDA) or `.DirectML` package instead. `OnnxModule` works with predictors,
@@ -774,7 +780,7 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 95 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 96 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
@@ -789,8 +795,8 @@ server, and every layer exported to ONNX gives the same output in ONNX Runtime a
 
 ## Status
 
-* **Verified on real hardware.** All 95 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
-  Laptop GPU (Blackwell), 190 of 190, including KV-cache and batched decoding, graph replay, the
+* **Verified on real hardware.** 95 of the 96 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
+  Laptop GPU (Blackwell), 190 of 190 (the newest, graph import, passes on the CPU and still needs a GPU run), including KV-cache and batched decoding, graph replay, the
   sampler with top-p, min-p and penalties, the generation layer, the kernel-signature check, the
   simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine, retrieval,
   and ONNX export and import (imported models run on the GPU). The ASP.NET Core and MCP tests do not
