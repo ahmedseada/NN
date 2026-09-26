@@ -21,6 +21,12 @@ public enum KeyValueFormat
     /// memory, so longer contexts or larger batches fit; attention reads the bytes directly.
     /// </summary>
     Int8,
+
+    /// <summary>
+    /// bfloat16 values (float32's range, about 3 significant digits): half the memory of <see cref="Float32"/> and nearly
+    /// the same results; attention reads the halves directly. Decoder models (<see cref="DecoderSpec"/>) only.
+    /// </summary>
+    BFloat16,
 }
 
 /// <summary>
@@ -36,7 +42,12 @@ public sealed class KeyValueCache : IDisposable
         // Created outside any TensorScope: caches are usually created lazily inside a scoped prefill step.
         Format = format;
         HeadDim = headDim;
-        int width = format == KeyValueFormat.Int8 ? (headDim + 3) / 4 : headDim;
+        int width = format switch
+        {
+            KeyValueFormat.Int8 => (headDim + 3) / 4,
+            KeyValueFormat.BFloat16 => (headDim + 1) / 2,
+            _ => headDim,
+        };
         Keys = Tensor.Empty([rows, capacity, width], device, zeroed: true, track: false);
         Values = Tensor.Empty([rows, capacity, width], device, zeroed: true, track: false);
         if (format == KeyValueFormat.Int8)
@@ -52,7 +63,7 @@ public sealed class KeyValueCache : IDisposable
     /// <summary>Values per head.</summary>
     public int HeadDim { get; }
 
-    /// <summary>Cached keys, [batch·heads, capacity, headDim] (packed bytes for int8).</summary>
+    /// <summary>Cached keys, [batch·heads, capacity, headDim] (packed bytes for int8, bfloat16 pairs for bfloat16).</summary>
     public Tensor Keys { get; }
 
     /// <summary>Cached values, [batch·heads, capacity, headDim] (packed bytes for int8).</summary>

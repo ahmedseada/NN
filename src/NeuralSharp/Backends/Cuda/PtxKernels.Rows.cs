@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "attention_decode_bf16", "attention_flash_bf16", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -223,9 +223,11 @@ internal static partial class PtxKernels
         GemvNT(sb);
         AttentionDecode(sb);
         AttentionDecode(sb, int8: true);
+        AttentionDecode(sb, bf16: true);
         AttentionCombine(sb);
         AttentionFlash(sb);
         AttentionFlash(sb, int8: true);
+        AttentionFlash(sb, bf16: true);
         AttentionBackward(sb);
         Gemm(sb, "gemm128_f32", 128, 8);
         Gemm(sb, "gemm64_f32", 64, 4);
@@ -251,14 +253,15 @@ internal static partial class PtxKernels
     // log-sum-exp (for a backward pass). Grid: x = ⌈rowsPerHead / 32⌉, y = heads.
     // int8: keys and values come from an int8 cache (see AttentionDecode) with per-row scales, dequantized as the tiles
     // are loaded into shared memory.
-    private static void AttentionFlash(StringBuilder sb, bool int8 = false)
+    // bf16: keys and values come from a bfloat16 cache (rows of `words` words, dimension d in half d % 2 of word d / 2).
+    private static void AttentionFlash(StringBuilder sb, bool int8 = false, bool bf16 = false)
     {
         const int T = FlashTile, D = FlashMaxDim, Rows = 8;
         var s = new StringBuilder();
         s.AppendLine($$"""
-            .visible .entry {{(int8 ? "attention_flash_int8" : "attention_flash_f32")}}(
+            .visible .entry {{(int8 ? "attention_flash_int8" : bf16 ? "attention_flash_bf16" : "attention_flash_f32")}}(
                 .param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_pos, .param .u64 p_o, .param .u64 p_lse,
-                .param .u32 p_rph, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_dim, .param .f32 p_scale{{(int8 ? ",\n    .param .u64 p_ks, .param .u64 p_vs, .param .u32 p_words" : "")}}
+                .param .u32 p_rph, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_dim, .param .f32 p_scale{{(int8 ? ",\n    .param .u64 p_ks, .param .u64 p_vs, .param .u32 p_words" : bf16 ? ",\n    .param .u32 p_words" : "")}}
             )
             {
                 .reg .pred %p<16>;
@@ -308,7 +311,7 @@ internal static partial class PtxKernels
                 add.u64 %rd10, %rd1, %rd9;
                 add.u64 %rd11, %rd5, %rd9;
                 cvt.u64.u32 %rd7, %r12;
-                {{(int8 ? "ld.param.u32 %r23, [p_words];\n    cvt.u64.u32 %rd20, %r23;\n    mul.lo.u64 %rd12, %rd7, %rd20;" : "mul.lo.u64 %rd12, %rd7, %rd8;")}}
+                {{(int8 || bf16 ? "ld.param.u32 %r23, [p_words];\n    cvt.u64.u32 %rd20, %r23;\n    mul.lo.u64 %rd12, %rd7, %rd20;" : "mul.lo.u64 %rd12, %rd7, %rd8;")}}
                 shl.b64 %rd12, %rd12, 2;
                 add.u64 %rd13, %rd2, %rd12;
                 add.u64 %rd14, %rd3, %rd12;
@@ -405,7 +408,29 @@ internal static partial class PtxKernels
                 mov.f32 %f2, 0f00000000;
                 mov.f32 %f3, 0f00000000;
             """);
-        if (int8)
+        if (bf16)
+        {
+            // Word dim / 2 of the cached row, its half dim % 2 shifted to the top of a float.
+            s.AppendLine("""
+                    shr.u32 %r18, %r16, 1;
+                    mad.lo.u32 %r18, %r17, %r23, %r18;
+                    mul.wide.u32 %rd15, %r18, 4;
+                    add.u64 %rd16, %rd15, %rd13;
+                    add.u64 %rd17, %rd15, %rd14;
+                    and.b32 %r22, %r16, 1;
+                    xor.b32 %r22, %r22, 1;
+                    shl.b32 %r22, %r22, 4;
+                    @%p2 ld.global.u32 %r20, [%rd16];
+                    @%p2 shl.b32 %r20, %r20, %r22;
+                    @%p2 and.b32 %r20, %r20, 0xFFFF0000;
+                    @%p2 mov.b32 %f2, %r20;
+                    @%p2 ld.global.u32 %r20, [%rd17];
+                    @%p2 shl.b32 %r20, %r20, %r22;
+                    @%p2 and.b32 %r20, %r20, 0xFFFF0000;
+                    @%p2 mov.b32 %f3, %r20;
+                """);
+        }
+        else if (int8)
         {
             // Word dim / 4 of the cached row, byte dim % 4, times the row's scale.
             s.AppendLine("""
@@ -1396,11 +1421,21 @@ internal static partial class PtxKernels
     // combined in shared memory: part[w] = (max, sum, acc[256]).
     // int8: keys and values are an int8 cache (rows of `words` packed words, 4 bytes each, byte d % 4 of word d / 4 for
     // dimension d) with one scale per cached row in kscales/vscales; a lane reads its dimension's byte and scales it.
-    private static void AttentionDecode(StringBuilder sb, bool int8 = false)
+    // bf16: keys and values are bfloat16 pairs (dimension d is half d % 2 of word d / 2, rows of `words` words); a lane
+    // shifts its half into the top of a float.
+    private static void AttentionDecode(StringBuilder sb, bool int8 = false, bool bf16 = false)
     {
         const int Stride = (2 + DecodeMaxDim) * 4;
-        string stride = int8 ? "%s_words" : "%s_dim";
-        string laneOffset = int8
+        string stride = int8 || bf16 ? "%s_words" : "%s_dim";
+        string laneOffset = bf16
+            ? """
+              shr.u32 %r17, %lane, 1;
+              mul.wide.u32 %rd7, %r17, 4;
+              and.b32 %r17, %lane, 1;
+              xor.b32 %r17, %r17, 1;
+              shl.b32 %r17, %r17, 4;
+              """
+            : int8
             ? """
               shr.u32 %r17, %lane, 2;
               mul.wide.u32 %rd7, %r17, 4;
@@ -1411,10 +1446,17 @@ internal static partial class PtxKernels
               add.u64 %rd15, %b_vscales, %rd13;
               """
             : "mov.u64 %rd7, %rd8;";
-        int step = int8 ? 32 : 128;
+        int step = int8 ? 32 : bf16 ? 64 : 128;
 
         // Element i of this lane (dimension lane + 32·i) of the cached row at %rd{base}, as a float in %f3.
-        string Load(int i, string baseRegister, string scaleRegister) => int8
+        string Load(int i, string baseRegister, string scaleRegister) => bf16
+            ? $"""
+              @%p{1 + i} ld.global.u32 %r16, [{baseRegister}+{step * i}];
+              @%p{1 + i} shl.b32 %r16, %r16, %r17;
+              @%p{1 + i} and.b32 %r16, %r16, 0xFFFF0000;
+              @%p{1 + i} mov.b32 %f3, %r16;
+              """
+            : int8
             ? $"""
               @%p{1 + i} ld.global.u32 %r16, [{baseRegister}+{step * i}];
               @%p{1 + i} bfe.s32 %r16, %r16, %r17, 8;
@@ -1615,7 +1657,13 @@ internal static partial class PtxKernels
             bra CO;
             CO_END:
             """);
-        if (int8)
+        if (bf16)
+        {
+            RowBlock(sb, "attention_decode_bf16", ["q", "keys", "values", "pos", "y", "part"],
+                [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale"), ("u32", "words")], b.ToString(),
+                sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
+        }
+        else if (int8)
         {
             RowBlock(sb, "attention_decode_int8", ["q", "keys", "values", "kscales", "vscales", "pos", "y", "part"],
                 [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale"), ("u32", "words")], b.ToString(),

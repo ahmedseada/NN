@@ -143,6 +143,24 @@ public sealed partial class Tensor
         return Traced("attention_int8", y, start);
     }
 
+    /// <summary>Writes [heads, steps, dim] keys or values into a bfloat16 cache at the device-side position.</summary>
+    internal static void WriteKeyValuesBFloat16(Tensor source, Tensor cache, Tensor position, int dim)
+    {
+        int heads = source._shape[0], steps = source._shape[1];
+        source.Backend.KeyValueWriteBFloat16(source.Storage, cache.Storage, position.Storage, heads, steps, cache._shape[1], dim);
+    }
+
+    /// <summary>Attention of q [heads, rows, dim] over the filled part of a bfloat16 cache.</summary>
+    internal static Tensor AttentionBFloat16(Tensor q, Layers.KeyValueCache cache, Tensor position, int steps, float scale, bool tiled)
+    {
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int heads = q._shape[0], rowsPerHead = q._shape[1], dim = q._shape[2];
+        var y = Empty([heads, rowsPerHead, dim], q.Device);
+        q.Backend.AttentionBFloat16(q.Storage, cache.Keys.Storage, cache.Values.Storage, position.Storage, y.Storage, heads, rowsPerHead, steps,
+            cache.Keys._shape[1], dim, scale, tiled);
+        return Traced("attention_bf16", y, start);
+    }
+
     /// <summary>q [rows, steps, dim] · int8 keysᵀ → [rows, steps, capacity].</summary>
     internal static Tensor AttentionScoresInt8(Tensor q, Layers.KeyValueCache cache)
     {

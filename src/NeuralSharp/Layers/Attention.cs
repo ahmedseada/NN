@@ -107,6 +107,11 @@ public sealed class MultiHeadAttention : Module, ICachedModule
 
         var q = SplitHeads(0);
         Tensor output;
+        if (cache.Format == KeyValueFormat.BFloat16)
+        {
+            throw new NotSupportedException("A bfloat16 KV cache is supported by decoder models (DecoderSpec); use Float32 or Int8 here.");
+        }
+
         if (cache.Format == KeyValueFormat.Int8)
         {
             Tensor.WriteKeyValuesInt8(SplitHeads(1), cache.Keys, cache.KeyScales!, context.Position);

@@ -221,6 +221,17 @@ internal static partial class Tests
             var previous = Tensor.AttentionContextInt8(weights, cache8).ToArray();
             AssertClose(previous, Tensor.AttentionInt8(tq, cache8, position, steps, scale, tiled: false).ToArray(), 2e-4f, "int8 decoding: " + name);
             AssertClose(previous, Tensor.AttentionInt8(tq, cache8, position, steps, scale, tiled: true).ToArray(), 2e-4f, "int8 tiled: " + name);
+
+            // bfloat16 cache: the same as float attention over the rounded keys and values.
+            float Bf(float x) => BitConverter.Int32BitsToSingle(BFloat16Weight.Round(x) << 16);
+            using var rk = Tensor.From([.. k.Select(Bf)], [heads, capacity, dim], device);
+            using var rv = Tensor.From([.. v.Select(Bf)], [heads, capacity, dim], device);
+            var rounded = Tensor.AttentionTiled(tq, rk, rv, position, steps, scale).ToArray();
+            using var cache16 = new KeyValueCache(heads, capacity, dim, device, KeyValueFormat.BFloat16);
+            Tensor.WriteKeyValuesBFloat16(tk, cache16.Keys, zero, dim);
+            Tensor.WriteKeyValuesBFloat16(tv, cache16.Values, zero, dim);
+            AssertClose(rounded, Tensor.AttentionBFloat16(tq, cache16, position, steps, scale, tiled: false).ToArray(), 2e-4f, "bf16 decoding: " + name);
+            AssertClose(rounded, Tensor.AttentionBFloat16(tq, cache16, position, steps, scale, tiled: true).ToArray(), 2e-4f, "bf16 tiled: " + name);
         }
     }
 
@@ -539,9 +550,9 @@ internal static partial class Tests
         using var sequence = Tensor.From([.. ids.Select(i => (float)i)], [1, T], device);
         var full = model.Predict(sequence).ToArray();
         float range = full.Max(MathF.Abs);
-        foreach (var format in new[] { KeyValueFormat.Float32, KeyValueFormat.Int8 })
+        foreach (var format in new[] { KeyValueFormat.Float32, KeyValueFormat.Int8, KeyValueFormat.BFloat16 })
         {
-            float tolerance = format == KeyValueFormat.Float32 ? 1e-4f : 0.03f * range;
+            float tolerance = format switch { KeyValueFormat.Float32 => 1e-4f, KeyValueFormat.BFloat16 => 0.01f * range, _ => 0.03f * range };
             using var context = new DecodingContext(device, 1, 16, format);
             using (Autograd.NoGrad())
             {

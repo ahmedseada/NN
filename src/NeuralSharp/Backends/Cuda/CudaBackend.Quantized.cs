@@ -134,7 +134,9 @@ internal sealed unsafe partial class CudaBackend
     public override bool PackedMatMulGated(int kind, int activation, Storage gate, Storage up, Storage packed, Storage? scales, Storage y,
         int m, int n, int k)
     {
-        if (m > PtxKernels.GemvRows || k == 0 || activation is not (0 or 1))
+        // Measured on an RTX 5070 Ti: the activation per input value pays off only with eight columns per word (int4);
+        // int8 and bfloat16 decode faster with the separate activation pass.
+        if (kind != 1 || m > PtxKernels.GemvRows || k == 0 || activation is not (0 or 1))
         {
             return false;
         }
@@ -354,6 +356,33 @@ internal sealed unsafe partial class CudaBackend
         DecodeSplit(rows, capacity, dim, y, (splits, part) => Launch(K("attention_decode_int8"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
             P(q), P(keys), P(values), P(keyScales), P(valueScales), P(position), P(y), P(part),
             U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows)));
+    }
+
+    public override void AttentionBFloat16(Storage q, Storage keys, Storage values, Storage position, Storage y, int heads, int rowsPerHead,
+        int steps, int capacity, int dim, float scale, bool tiled)
+    {
+        int words = (dim + 1) / 2;
+        if (tiled && dim <= PtxKernels.FlashMaxDim)
+        {
+            Launch(K("attention_flash_bf16"), (uint)((rowsPerHead + PtxKernels.FlashTile - 1) / PtxKernels.FlashTile), (uint)heads, 1, 128, 1,
+                P(q), P(keys), P(values), P(position), P(y), 0UL, U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words));
+            return;
+        }
+
+        if (dim > PtxKernels.DecodeMaxDim)
+        {
+            throw new NotSupportedException($"bfloat16 cache attention supports head sizes up to {PtxKernels.DecodeMaxDim} on CUDA.");
+        }
+
+        int rows = heads * rowsPerHead;
+        DecodeSplit(rows, capacity, dim, y, (splits, part) => Launch(K("attention_decode_bf16"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
+            P(q), P(keys), P(values), P(position), P(y), P(part), U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows)));
+    }
+
+    public override void KeyValueWriteBFloat16(Storage source, Storage cache, Storage position, int heads, int steps, int capacity, int dim)
+    {
+        int words = (dim + 1) / 2, n = heads * steps * words;
+        Launch1D(K("kv_write_bf16"), n, P(source), P(cache), P(position), U(steps), U(capacity), U(dim), U(words), U(n));
     }
 
     public override void AddRmsNormAffine(Storage a, Storage b, Storage sum, Storage gain, Storage y, int rows, int cols, float eps, float offset) =>

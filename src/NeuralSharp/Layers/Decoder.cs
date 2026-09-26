@@ -326,7 +326,13 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         var (q, k, v) = Project(input, positions);
         float scale = 1f / MathF.Sqrt(HeadDim);
         Tensor context8;
-        if (cache.Format == KeyValueFormat.Int8)
+        if (cache.Format == KeyValueFormat.BFloat16)
+        {
+            Tensor.WriteKeyValuesBFloat16(k, cache.Keys, context.Position, HeadDim);
+            Tensor.WriteKeyValuesBFloat16(v, cache.Values, context.Position, HeadDim);
+            context8 = Tensor.AttentionBFloat16(q, cache, context.Position, t, scale, tiled: t >= 8);   // only the filled positions
+        }
+        else if (cache.Format == KeyValueFormat.Int8)
         {
             Tensor.WriteKeyValuesInt8(k, cache.Keys, cache.KeyScales!, context.Position);
             Tensor.WriteKeyValuesInt8(v, cache.Values, cache.ValueScales!, context.Position);

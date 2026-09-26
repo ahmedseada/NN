@@ -215,7 +215,7 @@ internal static partial class Tests
                     foreach (int activation in new[] { 0, 1 })
                     {
                         var fused = Tensor.MatMulPackedGated(gate, up, activation, down);
-                        Check(fused is not null || device.Type != DeviceType.Cuda, "fused gated product on CUDA");
+                        Check(fused is not null || device.Type != DeviceType.Cuda || down.Int4 is null, "fused gated product on CUDA (int4)");
                         if (fused is not null)
                         {
                             var reference = down.Forward(Tensor.GatedActivation(gate, up, activation));

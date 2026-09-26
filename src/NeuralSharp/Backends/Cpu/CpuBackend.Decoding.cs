@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+
 namespace NeuralSharp.Backends.Cpu;
 
 // Fused inference kernels and incremental-decoding primitives (KV cache, masks, on-device sampling).
@@ -97,6 +99,59 @@ internal sealed partial class CpuBackend
         for (int h = 0; h < heads; h++)
         {
             sv.AsSpan(h * steps * dim, steps * dim).CopyTo(cv.AsSpan((h * capacity + pos) * dim, steps * dim));
+        }
+    }
+
+    public override void KeyValueWriteBFloat16(Storage source, Storage cache, Storage position, int heads, int steps, int capacity, int dim)
+    {
+        int pos = (int)D(position)[0], stride = (dim + 1) / 2 * 2;
+        float[] sv = D(source);
+        var halves = MemoryMarshal.Cast<float, ushort>(D(cache).AsSpan());
+        for (int h = 0; h < heads; h++)
+        {
+            for (int t = 0; t < steps; t++)
+            {
+                var row = halves.Slice(((h * capacity) + pos + t) * stride, stride);
+                row.Clear();
+                for (int d = 0; d < dim; d++)
+                {
+                    row[d] = Layers.BFloat16Weight.Round(sv[(h * steps + t) * dim + d]);
+                }
+            }
+        }
+    }
+
+    public override void AttentionBFloat16(Storage q, Storage keys, Storage values, Storage position, Storage y, int heads, int rowsPerHead,
+        int steps, int capacity, int dim, float scale, bool tiled)
+    {
+        // The filled rows as floats ([heads, filled, dim]), then the float kernel.
+        int filled = Math.Min(capacity, (int)D(position)[0] + steps), stride = (dim + 1) / 2 * 2;
+        var k = Allocate(heads * filled * dim, zeroed: false);
+        var v = Allocate(heads * filled * dim, zeroed: false);
+        try
+        {
+            var kh = MemoryMarshal.Cast<float, ushort>(D(keys).AsSpan());
+            var vh = MemoryMarshal.Cast<float, ushort>(D(values).AsSpan());
+            float[] kv = D(k), vv = D(v);
+            for (int h = 0; h < heads; h++)
+            {
+                for (int c = 0; c < filled; c++)
+                {
+                    int from = (h * capacity + c) * stride, to = (h * filled + c) * dim;
+                    for (int d = 0; d < dim; d++)
+                    {
+                        kv[to + d] = BitConverter.Int32BitsToSingle(kh[from + d] << 16);
+                        vv[to + d] = BitConverter.Int32BitsToSingle(vh[from + d] << 16);
+                    }
+                }
+            }
+
+            AttentionTiled(q, k, v, position, y, null, heads, rowsPerHead, steps, filled, dim, scale);
+        }
+        finally
+        {
+            k.Release();
+            v.Release();
         }
     }
 
