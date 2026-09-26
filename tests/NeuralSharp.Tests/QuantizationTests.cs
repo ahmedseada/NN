@@ -181,6 +181,16 @@ internal static partial class Tests
                     convert(layer);
                 }
 
+                // Prompts (many rows): packed weights expanded as the tiles load, against a float product with the expanded weights.
+                foreach (int m in new[] { 100, 300 })
+                {
+                    using var noGrad = Autograd.NoGrad();
+                    using var scope = new TensorScope();
+                    using var x = Tensor.From([.. Enumerable.Range(0, m * k).Select(_ => (float)(r.NextDouble() * 2 - 1))], [m, k], device);
+                    using var w = Tensor.From(a.WeightValues(), [k, 2048], device);
+                    AssertClose(x.MatMul(w).ToArray(), a.Forward(x).ToArray(), 1e-3f * MathF.Sqrt(k), $"{a} prompt product, k {k}, m {m}");
+                }
+
                 foreach (int m in new[] { 1, 3, 8 })
                 {
                     using var noGrad = Autograd.NoGrad();

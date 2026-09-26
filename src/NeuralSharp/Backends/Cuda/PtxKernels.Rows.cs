@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -229,6 +229,11 @@ internal static partial class PtxKernels
         AttentionBackward(sb);
         Gemm(sb, "gemm128_f32", 128, 8);
         Gemm(sb, "gemm64_f32", 64, 4);
+        foreach (var (format, packed) in new[] { ("int8", 1), ("int4", 2), ("bf16", 3) })
+        {
+            Gemm(sb, $"gemm128_{format}_f32", 128, 8, packed);
+            Gemm(sb, $"gemm64_{format}_f32", 64, 4, packed);
+        }
     }
 
     /// <summary>Largest head size <c>attention_flash_f32</c> handles (4 dimensions per lane).</summary>
@@ -1101,7 +1106,11 @@ internal static partial class PtxKernels
     // fused multiply-adds, as the 16 × 16 kernel does, so results do not depend on which kernel ran.
     // Parameters as matmul_f32: a, b, c, m, n, k, transA, transB, beta, batch strides. Grid: x = ⌈n / tile⌉,
     // y = ⌈m / tile⌉, z = batch.
-    private static void Gemm(StringBuilder sb, string name, int tile, int per)
+    //
+    // packed 1 / 2 / 3: B is int8 (per-column scales), 4-bit (a scale per 32 rows and column) or bfloat16 weights [k, n]
+    // packed as for Int8MatMul / Int4MatMul / BFloat16MatMul, expanded as the tile is loaded (prompts through quantized
+    // layers without a float copy of the weights); not transposed. p_scales follows p_sc.
+    private static void Gemm(StringBuilder sb, string name, int tile, int per, int packed = 0)
     {
         const int K = 8;
         int log = (int)Math.Log2(tile), loads = tile * K / GemmThreads, threadsPerRow = tile / per;
@@ -1110,7 +1119,7 @@ internal static partial class PtxKernels
             .visible .entry {{name}}(
                 .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_ta, .param .u32 p_tb, .param .f32 p_beta,
-                .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc
+                .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc{{(packed > 0 ? ", .param .u64 p_scales" : "")}}
             )
             {
                 .reg .pred %p<16>;
@@ -1138,6 +1147,8 @@ internal static partial class PtxKernels
                 ld.param.u64 %rd4, [p_sa];
                 ld.param.u64 %rd5, [p_sb];
                 ld.param.u64 %rd6, [p_sc];
+                {{(packed > 0 ? "ld.param.u64 %rd29, [p_scales];\n    cvta.to.global.u64 %rd29, %rd29;" : "")}}
+                {{(packed switch { 1 => "add.u32 %r41, %r2, 3;\n    shr.u32 %r41, %r41, 2;", 2 => "add.u32 %r41, %r2, 7;\n    shr.u32 %r41, %r41, 3;", 3 => "add.u32 %r41, %r2, 1;\n    shr.u32 %r41, %r41, 1;", _ => "" })}}
                 mov.u32 %r40, %ctaid.z;
                 cvt.u64.u32 %rd7, %r40;
                 mul.lo.u64 %rd8, %rd7, %rd4;
@@ -1213,7 +1224,74 @@ internal static partial class PtxKernels
                 """);
         }
 
-        for (int r = 0; r < loads; r++)
+        for (int r = 0; r < loads && packed > 0; r++)
+        {
+            // Packed B (kk = e / tile, j = e % tile): the word holding b[k, j], its byte / nibble / half, times the scale.
+            int shift = packed switch { 1 => 2, 2 => 3, _ => 1 };
+            string expand = packed switch
+            {
+                1 => """
+                    and.b32 %r43, %r27, 3;
+                    shl.b32 %r43, %r43, 3;
+                    bfe.s32 %r42, %r42, %r43, 8;
+                    cvt.rn.f32.s32 %f2, %r42;
+                    mul.wide.u32 %rd30, %r27, 4;
+                    add.u64 %rd30, %rd30, %rd29;
+                    @%p3 ld.global.f32 %f3, [%rd30];
+                    mul.f32 %f2, %f2, %f3;
+                    """,
+                2 => """
+                    and.b32 %r43, %r27, 7;
+                    shl.b32 %r43, %r43, 2;
+                    bfe.s32 %r42, %r42, %r43, 4;
+                    cvt.rn.f32.s32 %f2, %r42;
+                    shr.u32 %r44, %r28, 5;
+                    shl.b32 %r45, %r41, 3;
+                    mad.lo.u32 %r44, %r44, %r45, %r27;
+                    mul.wide.u32 %rd30, %r44, 4;
+                    add.u64 %rd30, %rd30, %rd29;
+                    @%p3 ld.global.f32 %f3, [%rd30];
+                    mul.f32 %f2, %f2, %f3;
+                    """,
+                _ => """
+                    and.b32 %r43, %r27, 1;
+                    setp.eq.u32 %p12, %r43, 0;
+                    shl.b32 %r44, %r42, 16;
+                    and.b32 %r45, %r42, 0xFFFF0000;
+                    selp.b32 %r42, %r44, %r45, %p12;
+                    mov.b32 %f2, %r42;
+                    """,
+            };
+            s.AppendLine($$"""
+                    add.u32 %r20, %r6, {{GemmThreads * r}};
+                    shr.u32 %r21, %r20, {{log}};
+                    and.b32 %r22, %r20, {{tile - 1}};
+                    add.u32 %r27, %r10, %r22;
+                    add.u32 %r28, %r11, %r21;
+                    setp.lt.u32 %p3, %r27, %r2;
+                    setp.lt.u32 %p4, %r28, %r3;
+                    and.pred %p3, %p3, %p4;
+                    mul.wide.u32 %rd10, %r28, %r41;
+                    shr.u32 %r46, %r27, {{shift}};
+                    cvt.u64.u32 %rd11, %r46;
+                    add.u64 %rd10, %rd10, %rd11;
+                    shl.b64 %rd10, %rd10, 2;
+                    add.u64 %rd14, %rd10, %rd2;
+                    mov.u32 %r42, 0;
+                    mov.f32 %f3, 0f3F800000;
+                    @%p3 ld.global.u32 %r42, [%rd14];
+                    {{expand}}
+                    mov.f32 %f1, 0f00000000;
+                    @%p3 mov.f32 %f1, %f2;
+                    shl.b32 %r29, %r21, {{log}};
+                    add.u32 %r29, %r29, %r22;
+                    shl.b32 %r29, %r29, 2;
+                    add.u32 %r29, %r29, %r13;
+                    st.shared.f32 [%r29], %f1;
+                """);
+        }
+
+        for (int r = 0; r < loads && packed == 0; r++)
         {
             // B: not transposed: (kk = e / tile, j = e % tile) with b[k, j] at k·n + j; transposed: (j = e / 8, kk = e % 8)
             // with b stored [n, K]. Stored as bs[kk, j].

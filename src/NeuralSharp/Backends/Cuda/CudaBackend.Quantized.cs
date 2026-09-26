@@ -18,6 +18,11 @@ internal sealed unsafe partial class CudaBackend
     public override void BFloat16MatMul(Storage x, Storage packed, Storage y, int m, int n, int k)
     {
         int words = (n + 1) / 2;
+        if (m > PtxKernels.GemvRows && PackedMatMulLarge(2, x, packed, null, y, m, n, k))
+        {
+            return;
+        }
+
         if (m > PtxKernels.GemvRows || k == 0)
         {
             var w = Allocate(k * n, zeroed: false);
@@ -40,6 +45,11 @@ internal sealed unsafe partial class CudaBackend
     public override void Int4MatMul(Storage x, Storage q, Storage scales, Storage y, int m, int n, int k)
     {
         int words = (n + 7) / 8;
+        if (m > PtxKernels.GemvRows && PackedMatMulLarge(1, x, q, scales, y, m, n, k))
+        {
+            return;
+        }
+
         if (m > PtxKernels.GemvRows || k == 0)
         {
             var w = Allocate(k * n, zeroed: false);
@@ -104,6 +114,21 @@ internal sealed unsafe partial class CudaBackend
         {
             part.Release();
         }
+    }
+
+    public override bool PackedMatMulLarge(int kind, Storage x, Storage packed, Storage? scales, Storage y, int m, int n, int k)
+    {
+        if (m < 64 || n < 64 || k < 8)
+        {
+            return false;
+        }
+
+        string format = kind switch { 0 => "int8", 1 => "int4", _ => "bf16" };
+        long tiles128 = (long)((m + 127) / 128) * ((n + 127) / 128);
+        int tile = tiles128 >= Math.Max(1, _multiprocessors) ? 128 : 64;
+        Launch(K($"gemm{tile}_{format}_f32"), (uint)((n + tile - 1) / tile), (uint)((m + tile - 1) / tile), 1, PtxKernels.GemmThreads, 1,
+            P(x), P(packed), P(y), U(m), U(n), U(k), U(0), U(0), F(0f), 0UL, 0UL, 0UL, P(scales ?? packed));
+        return true;
     }
 
     public override bool PackedMatMulGated(int kind, int activation, Storage gate, Storage up, Storage packed, Storage? scales, Storage y,

@@ -36,7 +36,7 @@ public sealed partial class Tensor
         {
             Backend.Int8MatMul(flat.Storage, weight.Packed.Storage, weight.Scales.Storage, y.Storage, m, n, k);
         }
-        else
+        else if (!Backend.PackedMatMulLarge(0, flat.Storage, weight.Packed.Storage, weight.Scales.Storage, y.Storage, m, n, k))
         {
             using var w = Dequantized(weight);
             Backend.MatMul(flat.Storage, w.Storage, y.Storage, m, n, k, false, false, 0f);

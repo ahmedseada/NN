@@ -126,6 +126,13 @@ internal abstract class Backend
         BatchedMatMul(a, b, c, 1, m, n, k, transA, transB, beta);
 
     /// <summary>
+    /// y = x · w for many rows (prompts) with packed weights w (<paramref name="kind"/> as in
+    /// <see cref="PackedMatMulMany"/>), expanding w as it is read instead of into a float copy. Returns false when the
+    /// device has no such kernel or the shape is too small for it (callers then expand w first).
+    /// </summary>
+    public virtual bool PackedMatMulLarge(int kind, Storage x, Storage packed, Storage? scales, Storage y, int m, int n, int k) => false;
+
+    /// <summary>
     /// y = (act(gate) · up) · w for few rows with packed weights w (<paramref name="kind"/> as in
     /// <see cref="PackedMatMulMany"/>; activation 0 = SiLU, 1 = GELU tanh): the gated feed-forward's down projection
     /// without a separate activation pass. Returns false when the device has no fused version.
