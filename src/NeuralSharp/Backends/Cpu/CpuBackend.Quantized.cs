@@ -296,6 +296,35 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override void AddRmsNormAffine(Storage a, Storage b, Storage sum, Storage gain, Storage y, int rows, int cols, float eps, float offset)
+    {
+        float[] av = D(a), bv = D(b), sv = D(sum);
+        For(rows * cols, (long)rows * cols, (first, last) =>
+        {
+            for (int i = first; i < last; i++)
+            {
+                sv[i] = av[i] + bv[i];
+            }
+        });
+        RmsNormAffine(sum, gain, y, rows, cols, eps, offset);
+    }
+
+    public override void RmsNormRope(Storage x, Storage gain, Storage cos, Storage sin, Storage positions, Storage y, int rows, int cols,
+        float eps, float offset, int heads, int steps, int half, bool interleaved)
+    {
+        var normalized = Allocate(rows * cols, zeroed: false);
+        try
+        {
+            RmsNormAffine(x, gain, normalized, rows, cols, eps, offset);
+            Copy(normalized, y, rows * cols);
+            Rope(normalized, y, cos, sin, positions, rows, heads, steps, cols, half, interleaved, 1f);
+        }
+        finally
+        {
+            normalized.Release();
+        }
+    }
+
     public override void RmsNormAffine(Storage x, Storage gain, Storage y, int rows, int cols, float eps, float offset)
     {
         float[] xv = D(x), gv = D(gain), yv = D(y);

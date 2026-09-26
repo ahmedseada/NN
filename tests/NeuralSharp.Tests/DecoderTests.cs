@@ -80,6 +80,26 @@ internal static partial class Tests
             var g = gain.ToArray();
             var expected = normalized.Select((v, i) => v * (g[i % 6] + offset)).ToArray();
             AssertClose(expected, rows.RmsNormAffine(gain, 1e-6f, offset).ToArray(), 1e-5f, $"fused RMS norm, offset {offset}");
+
+            // Residual addition and normalization in one pass.
+            using var other2 = Tensor.From([.. Enumerable.Range(0, 18).Select(i => MathF.Cos(i * 0.3f))], [3, 6], device);
+            var (sum, normalizedSum) = Tensor.AddRmsNormAffine(rows, other2, gain, 1e-6f, offset);
+            using var plainSum = rows + other2;
+            AssertClose(plainSum.ToArray(), sum.ToArray(), 1e-6f, "fused residual sum");
+            AssertClose(plainSum.RmsNormAffine(gain, 1e-6f, offset).ToArray(), normalizedSum.ToArray(), 1e-5f, $"fused add + RMS norm, offset {offset}");
+        }
+
+        // Per-head normalization and rotation in one pass, partial and full rotation, interleaved or not.
+        using var headGain = Tensor.From([.. Enumerable.Range(0, 8).Select(i => 0.7f + i * 0.05f)], [8], device);
+        using var heads = Tensor.From([.. Enumerable.Range(0, 2 * 3 * 2 * 8).Select(i => MathF.Sin(i * 0.37f))], [2, 3, 2, 8], device);
+        foreach (var (half, tcos, tsin) in new[] { (3, tc, ts), (4, tc4, ts4) })
+        {
+            foreach (bool interleaved in new[] { false, true })
+            {
+                var separate = heads.RmsNormAffine(headGain, 1e-6f, 0f).Rope(tcos, tsin, positions, half, interleaved).ToArray();
+                var fused = heads.RmsNormRope(headGain, 1e-6f, 0f, tcos, tsin, positions, half, interleaved).ToArray();
+                AssertClose(separate, fused, 1e-5f, $"fused norm + rope, half {half}, interleaved {interleaved}");
+            }
         }
     }
 

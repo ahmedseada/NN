@@ -354,21 +354,31 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         var q = projected[0].Reshape(n, t, Heads, d);
         var k = projected[1].Reshape(n, t, KvHeads, d);
         var v = projected[2].Reshape(n, t, KvHeads, d);
-        if (QueryNorm is not null)
+        if (Rope is not null && QueryNorm is not null && KeyNorm is not null && !Autograd.IsEnabled)
         {
-            q = QueryNorm.Forward(q);
-        }
-
-        if (KeyNorm is not null)
-        {
-            k = KeyNorm.Forward(k);
-        }
-
-        if (Rope is not null)
-        {
+            // Inference: each head's normalization and rotation in one pass.
             int half = _cos.Shape[1];
-            q = q.Rope(_cos, _sin, positions, half, Rope.Interleaved);
-            k = k.Rope(_cos, _sin, positions, half, Rope.Interleaved);
+            q = q.RmsNormRope(QueryNorm.Gain, QueryNorm.Epsilon, QueryNorm.Offset, _cos, _sin, positions, half, Rope.Interleaved);
+            k = k.RmsNormRope(KeyNorm.Gain, KeyNorm.Epsilon, KeyNorm.Offset, _cos, _sin, positions, half, Rope.Interleaved);
+        }
+        else
+        {
+            if (QueryNorm is not null)
+            {
+                q = QueryNorm.Forward(q);
+            }
+
+            if (KeyNorm is not null)
+            {
+                k = KeyNorm.Forward(k);
+            }
+
+            if (Rope is not null)
+            {
+                int half = _cos.Shape[1];
+                q = q.Rope(_cos, _sin, positions, half, Rope.Interleaved);
+                k = k.Rope(_cos, _sin, positions, half, Rope.Interleaved);
+            }
         }
 
         var queries = q.Reshape(n, t, KvHeads, Group, d).Permute(0, 2, 3, 1, 4).Reshape(n * KvHeads, Group * t, d);
@@ -615,8 +625,19 @@ public sealed class DecoderBlock : Module, ICachedModule
             return input + attended + FeedForward.Forward(normalized);
         }
 
-        var x = input + attended;
-        var fed = FeedForward.Forward(FeedForwardNorm!.Forward(x));
+        Tensor x, fed;
+        if (FeedForwardNorm is RMSNorm norm && !Autograd.IsEnabled)
+        {
+            var (sum, fedInput) = Tensor.AddRmsNormAffine(input, attended, norm.Gain, norm.Epsilon, norm.Offset);   // one pass
+            x = sum;
+            fed = FeedForward.Forward(fedInput);
+        }
+        else
+        {
+            x = input + attended;
+            fed = FeedForward.Forward(FeedForwardNorm!.Forward(x));
+        }
+
         if (PostFeedForwardNorm is not null)
         {
             fed = PostFeedForwardNorm.Forward(fed);

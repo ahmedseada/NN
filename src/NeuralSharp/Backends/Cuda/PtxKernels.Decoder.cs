@@ -5,7 +5,7 @@ namespace NeuralSharp.Backends.Cuda;
 // PTX for decoder-only language model layers: RMS normalization and rotary position embeddings.
 internal static partial class PtxKernels
 {
-    public static readonly string[] DecoderNames = ["rms_norm_f32", "rms_norm_backward_f32", "rope_f32", "rms_norm_affine_f32", "gated_act_f32", "gated_act_bwd_f32"];
+    public static readonly string[] DecoderNames = ["rms_norm_f32", "rms_norm_backward_f32", "rope_f32", "rms_norm_affine_f32", "gated_act_f32", "gated_act_bwd_f32", "add_rms_norm_affine_f32", "rms_norm_rope_f32"];
 
     private static void BuildDecoder(StringBuilder sb)
     {
@@ -89,6 +89,128 @@ internal static partial class PtxKernels
             add.u64 %rd7, %rd5, %rd6;
             st.global.f32 [%rd7], %f2;
             """));
+
+        // sum = a + b (the residual addition, kept), y = sum · inv · (gain + offset): one block per row.
+        RowBlock(sb, "add_rms_norm_affine_f32", ["a", "b", "sum", "gain", "y"], [("u32", "cols"), ("f32", "eps"), ("f32", "offset")],
+            RowStart + $"""
+            add.u64 %rd2, %b_a, %rd1;
+            add.u64 %rd3, %b_b, %rd1;
+            add.u64 %rd4, %b_sum, %rd1;
+            add.u64 %rd9, %b_y, %rd1;
+            sub.u64 %rd6, %rd3, %rd2;
+            sub.u64 %rd10, %rd4, %rd2;
+            sub.u64 %rd11, %rd9, %rd2;
+            cvt.rn.f32.u32 %f10, %s_cols;
+            mov.f32 %f1, {Zero};
+            """ + "\n" + StridedLoop("AS", "%rd2", "%s_cols", """
+            add.u64 %rd7, %rd5, %rd6;
+            ld.global.f32 %f3, [%rd7];
+            add.f32 %f2, %f2, %f3;
+            add.u64 %rd7, %rd5, %rd10;
+            st.global.f32 [%rd7], %f2;
+            fma.rn.f32 %f1, %f2, %f2, %f1;
+            """) + "\n" + BlockReduce("RSUM", "%f1", "add", Zero) + "\n" + """
+            div.rn.f32 %f1, %f1, %f10;
+            add.f32 %f1, %f1, %s_eps;
+            sqrt.rn.f32 %f1, %f1;
+            rcp.rn.f32 %f1, %f1;
+            """ + "\n" + StridedLoop("AW", "%rd4", "%s_cols", """
+            mul.wide.u32 %rd8, %r6, 4;
+            add.u64 %rd8, %rd8, %b_gain;
+            ld.global.f32 %f3, [%rd8];
+            add.f32 %f3, %f3, %s_offset;
+            mul.f32 %f2, %f2, %f1;
+            mul.f32 %f2, %f2, %f3;
+            sub.u64 %rd7, %rd5, %rd4;
+            add.u64 %rd7, %rd7, %rd9;
+            st.global.f32 [%rd7], %f2;
+            """));
+
+        // RMS normalization with gain of each head's vector, then the rotary embedding (as rope_f32) in one pass: rows
+        // are batch·steps·heads vectors of cols values; the row's position is positions[(row / heads) % steps].
+        RowBlock(sb, "rms_norm_rope_f32", ["x", "gain", "cos", "sin", "positions", "y"],
+            [("u32", "cols"), ("f32", "eps"), ("f32", "offset"), ("u32", "heads"), ("u32", "steps"), ("u32", "half"), ("u32", "interleaved")],
+            RowStart + $"""
+            add.u64 %rd2, %b_x, %rd1;
+            add.u64 %rd3, %b_y, %rd1;
+            cvt.rn.f32.u32 %f10, %s_cols;
+            mov.f32 %f1, {Zero};
+            """ + "\n" + StridedLoop("RS", "%rd2", "%s_cols", "fma.rn.f32 %f1, %f2, %f2, %f1;") + "\n"
+            + BlockReduce("RSUM", "%f1", "add", Zero) + "\n" + """
+            div.rn.f32 %f1, %f1, %f10;
+            add.f32 %f1, %f1, %s_eps;
+            sqrt.rn.f32 %f1, %f1;
+            rcp.rn.f32 %f1, %f1;
+            div.u32 %r7, %row, %s_heads;
+            rem.u32 %r7, %r7, %s_steps;
+            mul.wide.u32 %rd4, %r7, 4;
+            add.u64 %rd4, %rd4, %b_positions;
+            ld.global.f32 %f4, [%rd4];
+            cvt.rzi.u32.f32 %r8, %f4;
+            mul.lo.u32 %r8, %r8, %s_half;
+            setp.ne.u32 %p6, %s_interleaved, 0;
+            mov.u32 %r9, %tx;
+            RP:
+            setp.ge.u32 %p7, %r9, %s_half;
+            @%p7 bra RP_END;
+            shl.b32 %r10, %r9, 1;
+            add.u32 %r11, %r9, %s_half;
+            add.u32 %r12, %r10, 1;
+            selp.b32 %r13, %r10, %r9, %p6;
+            selp.b32 %r14, %r12, %r11, %p6;
+            mul.wide.u32 %rd5, %r13, 4;
+            mul.wide.u32 %rd6, %r14, 4;
+            add.u64 %rd7, %rd5, %rd2;
+            ld.global.f32 %f2, [%rd7];
+            add.u64 %rd7, %rd6, %rd2;
+            ld.global.f32 %f3, [%rd7];
+            add.u64 %rd7, %rd5, %b_gain;
+            ld.global.f32 %f5, [%rd7];
+            add.f32 %f5, %f5, %s_offset;
+            add.u64 %rd7, %rd6, %b_gain;
+            ld.global.f32 %f6, [%rd7];
+            add.f32 %f6, %f6, %s_offset;
+            mul.f32 %f2, %f2, %f1;
+            mul.f32 %f2, %f2, %f5;
+            mul.f32 %f3, %f3, %f1;
+            mul.f32 %f3, %f3, %f6;
+            add.u32 %r15, %r8, %r9;
+            mul.wide.u32 %rd8, %r15, 4;
+            add.u64 %rd9, %rd8, %b_cos;
+            ld.global.f32 %f7, [%rd9];
+            add.u64 %rd9, %rd8, %b_sin;
+            ld.global.f32 %f8, [%rd9];
+            mul.f32 %f9, %f3, %f8;
+            neg.f32 %f9, %f9;
+            fma.rn.f32 %f11, %f2, %f7, %f9;
+            mul.f32 %f12, %f2, %f8;
+            fma.rn.f32 %f13, %f3, %f7, %f12;
+            add.u64 %rd7, %rd5, %rd3;
+            st.global.f32 [%rd7], %f11;
+            add.u64 %rd7, %rd6, %rd3;
+            st.global.f32 [%rd7], %f13;
+            add.u32 %r9, %r9, %nt;
+            bra RP;
+            RP_END:
+            shl.b32 %r9, %s_half, 1;
+            add.u32 %r9, %r9, %tx;
+            PT:
+            setp.ge.u32 %p7, %r9, %s_cols;
+            @%p7 bra PT_END;
+            mul.wide.u32 %rd5, %r9, 4;
+            add.u64 %rd7, %rd5, %rd2;
+            ld.global.f32 %f2, [%rd7];
+            add.u64 %rd7, %rd5, %b_gain;
+            ld.global.f32 %f5, [%rd7];
+            add.f32 %f5, %f5, %s_offset;
+            mul.f32 %f2, %f2, %f1;
+            mul.f32 %f2, %f2, %f5;
+            add.u64 %rd7, %rd5, %rd3;
+            st.global.f32 [%rd7], %f2;
+            add.u32 %r9, %r9, %nt;
+            bra PT;
+            PT_END:
+            """);
 
         // act(gate) and act'(gate) into %f5 and %f6 (kind 0 SiLU, 1 GELU tanh, 2 ReLU) from %f1.
         string activation = $"""

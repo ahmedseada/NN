@@ -621,85 +621,82 @@ internal static partial class PtxKernels
 
     private static void PenaltyKernels(StringBuilder sb)
     {
-        // Repetition penalties: copy the row to work[r, :], then penalize each distinct token of the last n history entries once.
-        Elementwise(sb, "penalize_rows_f32", ["logits", "work", "history", "len"],
+        // Repetition penalties, one block per row: copy the row to work[r, :]; then each thread takes history entries
+        // k (newest first) of the last n and, when k is the token's most recent occurrence, penalizes it once using its
+        // count in the window (as CpuBackend.PenalizeRows).
+        RowBlock(sb, "penalize_rows_f32", ["logits", "work", "history", "len"],
             [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("u32", "cap"), ("u32", "lastn"), ("f32", "repeat"), ("f32", "presence"), ("f32", "frequency"), ("u32", "rows")],
             $"""
-            mad.lo.u32 %r5, %i, %s_rowstride, %s_rowoffset;
+            mad.lo.u32 %r5, %row, %s_rowstride, %s_rowoffset;
             mul.wide.u32 %rd1, %r5, 4;
             add.u64 %rd2, %b_logits, %rd1;
-            mul.lo.u32 %r6, %i, %s_vocab;
+            mul.lo.u32 %r6, %row, %s_vocab;
             mul.wide.u32 %rd1, %r6, 4;
             add.u64 %rd3, %b_work, %rd1;
-            mov.u32 %r7, 0;
-            COPY:
-            setp.ge.u32 %p1, %r7, %s_vocab;
-            @%p1 bra COPY_END;
-            mul.wide.u32 %rd4, %r7, 4;
-            add.u64 %rd5, %rd2, %rd4;
-            ld.global.f32 %f1, [%rd5];
-            add.u64 %rd5, %rd3, %rd4;
-            st.global.f32 [%rd5], %f1;
-            add.u32 %r7, %r7, 1;
-            bra COPY;
-            COPY_END:
-            ld.global.f32 %f2, [%b_len];
-            cvt.rzi.u32.f32 %r8, %f2;
-            min.u32 %r9, %r8, %s_lastn;
-            mul.lo.u32 %r10, %i, %s_cap;
-            mov.u32 %r11, 0;
+            sub.u64 %rd6, %rd3, %rd2;
+            """ + "\n" + StridedLoop("PC", "%rd2", "%s_vocab", """
+            add.u64 %rd7, %rd5, %rd6;
+            st.global.f32 [%rd7], %f2;
+            """) + "\n" + $"""
+            bar.sync 0;
+            ld.global.f32 %f1, [%b_len];
+            cvt.rzi.u32.f32 %r7, %f1;
+            min.u32 %r8, %s_lastn, %s_cap;
+            min.u32 %r8, %r8, %r7;
+            mul.lo.u32 %r9, %row, %s_cap;
+            mul.wide.u32 %rd1, %r9, 4;
+            add.u64 %rd4, %b_history, %rd1;
+            mov.u32 %r10, %tx;
             PK:
-            setp.ge.u32 %p1, %r11, %r9;
+            setp.ge.u32 %p1, %r10, %r8;
             @%p1 bra PK_END;
-            sub.u32 %r12, %r8, 1;
-            sub.u32 %r12, %r12, %r11;
-            rem.u32 %r12, %r12, %s_cap;
-            add.u32 %r12, %r12, %r10;
-            mul.wide.u32 %rd4, %r12, 4;
-            add.u64 %rd4, %b_history, %rd4;
-            ld.global.f32 %f3, [%rd4];
-            cvt.rzi.u32.f32 %r13, %f3;
+            sub.u32 %r11, %r7, 1;
+            sub.u32 %r11, %r11, %r10;
+            rem.u32 %r11, %r11, %s_cap;
+            mul.wide.u32 %rd8, %r11, 4;
+            add.u64 %rd8, %rd8, %rd4;
+            ld.global.f32 %f2, [%rd8];
+            cvt.rzi.u32.f32 %r12, %f2;
+            mov.u32 %r13, 0;
             mov.u32 %r14, 0;
             mov.u32 %r15, 0;
-            mov.u32 %r16, 0;
             PQ:
-            setp.ge.u32 %p2, %r14, %r9;
+            setp.ge.u32 %p2, %r15, %r8;
             @%p2 bra PQ_END;
-            sub.u32 %r12, %r8, 1;
-            sub.u32 %r12, %r12, %r14;
-            rem.u32 %r12, %r12, %s_cap;
-            add.u32 %r12, %r12, %r10;
-            mul.wide.u32 %rd4, %r12, 4;
-            add.u64 %rd4, %b_history, %rd4;
-            ld.global.f32 %f4, [%rd4];
-            cvt.rzi.u32.f32 %r17, %f4;
-            setp.eq.u32 %p3, %r17, %r13;
-            @!%p3 bra PQ_NEXT;
+            sub.u32 %r16, %r7, 1;
+            sub.u32 %r16, %r16, %r15;
+            rem.u32 %r16, %r16, %s_cap;
+            mul.wide.u32 %rd9, %r16, 4;
+            add.u64 %rd9, %rd9, %rd4;
+            ld.global.f32 %f3, [%rd9];
+            cvt.rzi.u32.f32 %r17, %f3;
+            setp.eq.u32 %p3, %r17, %r12;
+            selp.u32 %r18, 1, 0, %p3;
+            add.u32 %r13, %r13, %r18;
+            setp.lt.u32 %p4, %r15, %r10;
+            and.pred %p4, %p4, %p3;
+            selp.u32 %r18, 1, 0, %p4;
+            or.b32 %r14, %r14, %r18;
             add.u32 %r15, %r15, 1;
-            setp.lt.u32 %p4, %r14, %r11;
-            @%p4 mov.u32 %r16, 1;
-            PQ_NEXT:
-            add.u32 %r14, %r14, 1;
             bra PQ;
             PQ_END:
-            setp.ne.u32 %p5, %r16, 0;
+            setp.ne.u32 %p5, %r14, 0;
+            setp.ge.or.u32 %p5, %r12, %s_vocab, %p5;
             @%p5 bra PK_NEXT;
-            setp.ge.u32 %p5, %r13, %s_vocab;
-            @%p5 bra PK_NEXT;
-            mul.wide.u32 %rd4, %r13, 4;
-            add.u64 %rd5, %rd3, %rd4;
-            ld.global.f32 %f5, [%rd5];
+            mul.wide.u32 %rd10, %r12, 4;
+            add.u64 %rd10, %rd10, %rd3;
+            ld.global.f32 %f5, [%rd10];
             setp.gt.f32 %p6, %f5, {Zero};
             div.rn.f32 %f6, %f5, %s_repeat;
             mul.f32 %f7, %f5, %s_repeat;
             selp.f32 %f5, %f6, %f7, %p6;
             sub.f32 %f5, %f5, %s_presence;
-            cvt.rn.f32.u32 %f8, %r15;
+            cvt.rn.f32.u32 %f8, %r13;
             mul.f32 %f8, %f8, %s_frequency;
             sub.f32 %f5, %f5, %f8;
-            st.global.f32 [%rd5], %f5;
+            st.global.f32 [%rd10], %f5;
             PK_NEXT:
-            add.u32 %r11, %r11, 1;
+            add.u32 %r10, %r10, %nt;
             bra PK;
             PK_END:
             """);

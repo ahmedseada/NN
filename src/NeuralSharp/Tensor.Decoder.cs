@@ -69,6 +69,35 @@ public sealed partial class Tensor
         return Traced("rms_norm_affine", y, start);
     }
 
+    /// <summary>a + b (a residual addition) and its RMS normalization with gain, in one pass (inference: not recorded).</summary>
+    internal static (Tensor Sum, Tensor Normalized) AddRmsNormAffine(Tensor a, Tensor b, Tensor gain, float eps, float offset)
+    {
+        a.ThrowIfDisposed();
+        b.ThrowIfDisposed();
+        CheckSameDevice(a, b);
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int cols = a._shape[^1], rows = a.Size / cols;
+        var sum = Empty(a._shape, a.Device);
+        var y = Empty(a._shape, a.Device);
+        a.Backend.AddRmsNormAffine(a.Storage, b.Storage, sum.Storage, gain.Storage, y.Storage, rows, cols, eps, offset);
+        return (sum, Traced("add_rms_norm", y, start));
+    }
+
+    /// <summary>
+    /// RMS normalization with gain of each head's vector of this [batch, steps, heads, dim] tensor, then the rotary
+    /// embedding (see <see cref="Rope"/>), in one pass (inference: not recorded).
+    /// </summary>
+    internal Tensor RmsNormRope(Tensor gain, float eps, float offset, Tensor cos, Tensor sin, Tensor positions, int half, bool interleaved)
+    {
+        ThrowIfDisposed();
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int steps = _shape[1], heads = _shape[2], dim = _shape[3], rows = Size / dim;
+        var y = Empty(_shape, Device);
+        Backend.RmsNormRope(Storage, gain.Storage, cos.Storage, sin.Storage, positions.Storage, y.Storage, rows, dim, eps, offset, heads, steps,
+            half, interleaved);
+        return Traced("rms_norm_rope", y, start);
+    }
+
     /// <summary>act(gate) · up element-wise (kind 0 = SiLU, 1 = GELU, 2 = ReLU), with its gradient: one pass either way.</summary>
     internal static Tensor GatedActivation(Tensor gate, Tensor up, int kind)
     {

@@ -273,6 +273,16 @@ internal abstract class Backend
     /// <summary>y = x · inv · (gain[c] + offset) per row with inv = 1 / sqrt(mean(x²) + eps): normalization and gain in one pass (inference).</summary>
     public abstract void RmsNormAffine(Storage x, Storage gain, Storage y, int rows, int cols, float eps, float offset);
 
+    /// <summary>sum = a + b and y = RMS-normalized sum · (gain[c] + offset) per row, in one pass (inference).</summary>
+    public abstract void AddRmsNormAffine(Storage a, Storage b, Storage sum, Storage gain, Storage y, int rows, int cols, float eps, float offset);
+
+    /// <summary>
+    /// RMS normalization with gain of each row (a head's vector), then the rotary embedding as <see cref="Rope"/> with
+    /// sign 1 (rows are batch·steps·heads; dimensions beyond 2·half are only normalized). Inference.
+    /// </summary>
+    public abstract void RmsNormRope(Storage x, Storage gain, Storage cos, Storage sin, Storage positions, Storage y, int rows, int cols,
+        float eps, float offset, int heads, int steps, int half, bool interleaved);
+
     /// <summary>y = act(gate) · up element-wise; kind 0 = SiLU, 1 = GELU (tanh approximation), 2 = ReLU.</summary>
     public abstract void GatedActivation(Storage gate, Storage up, Storage y, int n, int kind);
 

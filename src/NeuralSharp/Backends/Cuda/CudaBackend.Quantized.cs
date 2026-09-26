@@ -18,10 +18,11 @@ internal sealed unsafe partial class CudaBackend
         int splits = Math.Clamp((4 * Math.Max(1, _multiprocessors) + columnBlocks - 1) / columnBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
         int chunk = (k + splits - 1) / splits;
         splits = (k + chunk - 1) / chunk;
+        var counters = SplitCounters(columnBlocks);
         if (splits == 1)
         {
             Launch(K("int8_gemv_f32"), (uint)columnBlocks, 1, 1, PtxKernels.Int8GemvThreads, 1,
-                P(x), P(q), P(scales), P(y), P(y), U(m), U(n), U(k), U(words), U(chunk), U(1));
+                P(x), P(q), P(scales), P(y), P(y), U(m), U(n), U(k), U(words), U(chunk), U(1), P(counters));
             return;
         }
 
@@ -29,13 +30,28 @@ internal sealed unsafe partial class CudaBackend
         try
         {
             Launch(K("int8_gemv_f32"), (uint)columnBlocks, (uint)splits, 1, PtxKernels.Int8GemvThreads, 1,
-                P(x), P(q), P(scales), P(y), P(part), U(m), U(n), U(k), U(words), U(chunk), U(splits));
-            Launch1D(K("int8_gemv_finish_f32"), m * n, P(part), P(scales), P(y), U(n), U(m * n), U(splits), U(m * n));
+                P(x), P(q), P(scales), P(y), P(part), U(m), U(n), U(k), U(words), U(chunk), U(splits), P(counters));
         }
         finally
         {
             part.Release();
         }
+    }
+
+    private Storage? _splitCounters;
+
+    // Zeroed arrival counters for split products, one per column block; the last block of a range resets its counter.
+    private Storage SplitCounters(int blocks)
+    {
+        // A larger buffer replaces a smaller one without freeing it: recorded graphs may still use the old one.
+        var current = Volatile.Read(ref _splitCounters);
+        if (current is null || current.Length < blocks)
+        {
+            current = Allocate(Math.Max(blocks, 4096), zeroed: true);
+            Volatile.Write(ref _splitCounters, current);
+        }
+
+        return current;
     }
 
     public override void Int8Dequantize(Storage q, Storage scales, Storage w, int k, int n)
@@ -150,4 +166,12 @@ internal sealed unsafe partial class CudaBackend
         LaunchRows(K("attention_decode_int8"), rows, P(q), P(keys), P(values), P(keyScales), P(valueScales), P(position), P(y),
             U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows));
     }
+
+    public override void AddRmsNormAffine(Storage a, Storage b, Storage sum, Storage gain, Storage y, int rows, int cols, float eps, float offset) =>
+        LaunchRows(K("add_rms_norm_affine_f32"), rows, P(a), P(b), P(sum), P(gain), P(y), U(cols), F(eps), F(offset), U(rows));
+
+    public override void RmsNormRope(Storage x, Storage gain, Storage cos, Storage sin, Storage positions, Storage y, int rows, int cols,
+        float eps, float offset, int heads, int steps, int half, bool interleaved) =>
+        LaunchRows(K("rms_norm_rope_f32"), rows, P(x), P(gain), P(cos), P(sin), P(positions), P(y),
+            U(cols), F(eps), F(offset), U(heads), U(steps), U(half), U(interleaved ? 1 : 0), U(rows));
 }

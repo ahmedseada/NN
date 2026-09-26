@@ -309,7 +309,8 @@ internal static partial class PtxKernels
         s.AppendLine("""
             .visible .entry int8_gemv_f32(
                 .param .u64 p_x, .param .u64 p_q, .param .u64 p_s, .param .u64 p_y, .param .u64 p_part,
-                .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_n4, .param .u32 p_chunk, .param .u32 p_splits
+                .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_n4, .param .u32 p_chunk, .param .u32 p_splits,
+                .param .u64 p_counters
             )
             {
                 .reg .pred %p<24>;
@@ -451,7 +452,7 @@ internal static partial class PtxKernels
         for (int r = 0; r < GemvRows; r++)
         {
             // part[slice][lane·4 + c] = acc[r][c]; then threads 0..127 add the 16 slices of their column.
-            s.AppendLine($"    @!%p{r} bra DONE;");
+            s.AppendLine($"    @!%p{r} bra ROWS_DONE;");
             for (int c = 0; c < 4; c++)
             {
                 s.AppendLine($"    st.shared.f32 [%r15+{4 * c}], %f{r * 4 + c};");
@@ -487,7 +488,59 @@ internal static partial class PtxKernels
                 """);
         }
 
+        // With several splits, the last block of this column range to finish (counted per range, reset afterwards) adds
+        // the splits' partial sums in split order and writes the scaled result: one launch, deterministic sums.
         s.AppendLine("""
+            ROWS_DONE:
+                @%p13 bra DONE;
+                membar.gl;
+                bar.sync 0;
+                ld.param.u64 %rd17, [p_counters];
+                cvta.to.global.u64 %rd17, %rd17;
+                mov.u32 %r26, %ctaid.x;
+                mul.wide.u32 %rd18, %r26, 4;
+                add.u64 %rd17, %rd17, %rd18;
+                setp.eq.u32 %p14, %r5, 0;
+                mov.u32 %r27, 0;
+                @%p14 atom.global.add.u32 %r27, [%rd17], 1;
+                sub.u32 %r28, %r31, 1;
+                setp.eq.u32 %p15, %r27, %r28;
+                selp.u32 %r29, 1, 0, %p15;
+                @%p14 st.shared.u32 [%r14], %r29;
+                bar.sync 0;
+                ld.shared.u32 %r29, [%r14];
+                setp.eq.u32 %p15, %r29, 0;
+                @%p15 bra DONE;
+                membar.gl;
+                @%p14 st.global.u32 [%rd17], 0;
+                @!%p11 bra DONE;
+                mul.wide.u32 %rd19, %r1, %r2;
+                shl.b64 %rd19, %rd19, 2;
+                mov.u32 %r32, 0;
+            FIN_ROW:
+                setp.ge.u32 %p16, %r32, %r1;
+                @%p16 bra DONE;
+                mul.wide.u32 %rd21, %r32, %r2;
+                shl.b64 %rd21, %rd21, 2;
+                add.u64 %rd21, %rd21, %rd13;
+                add.u64 %rd22, %rd21, %rd5;
+                mov.f32 %f43, 0f00000000;
+                mov.u32 %r33, 0;
+            FIN_SPLIT:
+                setp.ge.u32 %p17, %r33, %r31;
+                @%p17 bra FIN_SPLIT_END;
+                ld.global.cg.f32 %f44, [%rd22];
+                add.f32 %f43, %f43, %f44;
+                add.u64 %rd22, %rd22, %rd19;
+                add.u32 %r33, %r33, 1;
+                bra FIN_SPLIT;
+            FIN_SPLIT_END:
+                ld.global.f32 %f45, [%rd14];
+                mul.f32 %f43, %f43, %f45;
+                add.u64 %rd23, %rd21, %rd4;
+                st.global.f32 [%rd23], %f43;
+                add.u32 %r32, %r32, 1;
+                bra FIN_ROW;
             DONE:
                 ret;
             }
