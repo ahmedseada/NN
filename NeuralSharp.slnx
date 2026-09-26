@@ -6,6 +6,7 @@
     <Project Path="samples/NeuralSharp.Samples.HousePrices/NeuralSharp.Samples.HousePrices.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Images/NeuralSharp.Samples.Images.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Ocr/NeuralSharp.Samples.Ocr.csproj" />
+    <Project Path="samples/NeuralSharp.Samples.OnnxImport/NeuralSharp.Samples.OnnxImport.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Rag/NeuralSharp.Samples.Rag.csproj" />
     <Project Path="samples/NeuralSharp.Samples.ReRanker/NeuralSharp.Samples.ReRanker.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Sequences/NeuralSharp.Samples.Sequences.csproj" />

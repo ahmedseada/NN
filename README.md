@@ -54,6 +54,8 @@ samples/
   NeuralSharp.Samples.ReRanker        search re-ranking: BM25 first stage + transformer cross-encoder, listwise training
   NeuralSharp.Samples.Summarizer      summarization: extractive baselines vs a word-level transformer (WordTokenizer + TextGenerator)
   NeuralSharp.Samples.Rag             retrieval-augmented generation: hybrid search, re-ranking, a chat model that cites passages
+  NeuralSharp.Samples.OnnxImport      imports another framework's .onnx model, runs it on NeuralSharp (CPU/CUDA), checks its outputs
+tools/pytorch/xor_to_onnx.py        trains XOR in PyTorch and exports it to ONNX with PyTorch's outputs, for OnnxImport
   Shared/SampleOptions.cs             command-line options shared by the samples (train / predict modes)
   Shared/Gpt/                         GPT model, generation with metrics, training (console + Web API)
 tests/NeuralSharp.Tests             self-contained test runner (runs on every available device)
@@ -74,6 +76,7 @@ tests/NeuralSharp.Tests             self-contained test runner (runs on every av
 | `ReRanker` | two-stage search: BM25 + cross-encoder, hard negatives, listwise loss, placeholder tokens for unseen names | Hit@1 on unseen towns 27.1% (BM25) → 86.6% re-ranked, 6.9 ms per question, 180 s training |
 | `HouseApi` | `AddNeuralSharp().AddPredictor(...)` + `MapPredictor`: the HousePrices package served over HTTP with micro-batching | same prices as `HousePrices --predict` |
 | `Summarizer` | word-level decoder-only transformer, loss masking, greedy generation with a stop token, ROUGE | ROUGE-1 0.999 vs 0.503 (first sentence), 90% exact, 7.7 ms per summary |
+| `OnnxImport` | `OnnxImport.Load(path, device)` on a PyTorch-exported model (`tools/pytorch/xor_to_onnx.py`), compared with PyTorch's own outputs, then saved as .nsm and reloaded | same outputs as PyTorch (checked to 1e-5) |
 | `Rag` | `RetrievalIndex` (BM25 + trained bi-encoder + rank fusion), `CrossEncoder` re-ranking, `Rag.For(chat)` with a word-level ChatML model that cites passages; hashing and placeholder tokens for unseen names | unseen towns: Hit@1 27.1% (BM25), 85.8% (hybrid), 99.9% (re-ranked); answers 91.1% correct (0% closed book), 99.9% cite the right passage; 14 min training |
 
 ### Train and predict modes
