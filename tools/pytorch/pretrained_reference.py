@@ -6,7 +6,8 @@ next-token logits and greedy continuations), so NeuralSharp's own loader can be 
     dotnet run -c Release --project samples/NeuralSharp.Samples.Pretrained -- check qwen3.json --cuda
 
 --model is a Hugging Face model id (downloaded to the local cache) or a local folder. The reference file names the
-folder, so the check reads exactly the files transformers used. Any Llama-style model works the same way, for
+folder, so the check reads exactly the files transformers used. --adapter applies a PEFT LoRA adapter (for example one
+written by the sample's finetune command; pip install peft); the check then loads the same adapter. Any Llama-style model works the same way, for
 example Qwen/Qwen2.5-Coder-1.5B-Instruct, meta-llama/Llama-3.2-1B-Instruct or mistralai/Mistral-7B-Instruct-v0.3.
 """
 import argparse
@@ -21,6 +22,7 @@ parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
 parser.add_argument("--out", default="reference.json")
 parser.add_argument("--generate", type=int, default=24, help="greedy tokens to record per prompt")
 parser.add_argument("--cpu", action="store_true", help="run transformers on the CPU even when a GPU is available")
+parser.add_argument("--adapter", help="a PEFT LoRA adapter folder to apply to the model")
 args = parser.parse_args()
 
 folder = args.model
@@ -31,6 +33,9 @@ if not os.path.isdir(folder):
 device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
 tokenizer = AutoTokenizer.from_pretrained(folder)
 model = AutoModelForCausalLM.from_pretrained(folder, torch_dtype=torch.float32).to(device).eval()
+if args.adapter:
+    from peft import PeftModel
+    model = PeftModel.from_pretrained(model, args.adapter).to(device).eval()
 
 texts = [
     "def fibonacci(n):\n    return n if n < 2 else fibonacci(n - 1) + fibonacci(n - 2)\n",
@@ -119,6 +124,7 @@ with torch.no_grad():
 
 reference = {
     "model": args.model, "folder": os.path.abspath(folder), "transformers_device": device,
+    "adapter": os.path.abspath(args.adapter) if args.adapter else None,
     "texts": [{"text": t, "ids": (i := tokenizer(t, add_special_tokens=False).input_ids), "decoded": tokenizer.decode(i)} for t in texts],
     "tools": tools, "chats": chats, "runs": runs,
 }

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using NeuralSharp;
 using NeuralSharp.Diagnostics;
@@ -15,12 +16,22 @@ using NeuralSharp.Pretrained;
 //   check <reference.json>          compare with transformers: token ids, chat templates, logits, greedy output
 //                                   (make the reference with tools/pytorch/pretrained_reference.py)
 //
-// Options: --cuda / --cpu, --int8 (int8 weights), --int4 (4-bit weights), --bf16 (bfloat16 weights), --kv8 (int8 KV cache), --kv16 (bfloat16 KV cache), --context N (default 4096),
+//   finetune <folder> <train.jsonl> --out <dir>
+//                                   LoRA / QLoRA on chat transcripts (JSON Lines: {"messages": [...], "tools": [...]});
+//                                   only the assistant's turns are trained; writes a PEFT adapter to <dir>
+//                                   (--eval F, --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048,
+//                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
+//                                   --eval-every N; with --int4 / --int8 / --bf16 the base stays quantized)
+//   export <folder> <adapter> --out <dir>
+//                                   merges a PEFT adapter into the float weights and writes a Hugging Face checkpoint
+//
+// Options: --adapter <dir> (chat, check, profile: load a PEFT adapter), --cuda / --cpu, --int8 (int8 weights), --int4 (4-bit weights), --bf16 (bfloat16 weights), --kv8 (int8 KV cache), --kv16 (bfloat16 KV cache), --context N (default 4096),
 //          --folder F (check: read the model from F instead of the folder named in the reference), --no-think.
 var positional = new List<string>();
 bool int8 = false, bf16 = false, int4 = false, kv8 = false, kv16 = false, noThink = false;
 int context = 4096;
-string? folderOverride = null;
+string? folderOverride = null, output = null, evalFile = null, adapterFolder = null;
+var tuning = new FineTuningOptions();
 Device device = Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu;
 for (int i = 0; i < args.Length; i++)
 {
@@ -36,6 +47,19 @@ for (int i = 0; i < args.Length; i++)
         case "--no-think": noThink = true; break;
         case "--context": context = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--folder": folderOverride = args[++i]; break;
+        case "--out": output = args[++i]; break;
+        case "--eval": evalFile = args[++i]; break;
+        case "--adapter": adapterFolder = args[++i]; break;
+        case "--rank": tuning = tuning with { Rank = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--alpha": tuning = tuning with { Alpha = float.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--lr": tuning = tuning with { LearningRate = float.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--epochs": tuning = tuning with { Epochs = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--max-length": tuning = tuning with { MaxLength = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--batch-tokens": tuning = tuning with { BatchTokens = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--accumulate": tuning = tuning with { GradientAccumulation = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--save-every": tuning = tuning with { SaveEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
         case ['-', '-', ..]:
             Console.Error.WriteLine($"Unknown option {args[i]}.");
             return 1;
@@ -43,9 +67,11 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile"))
+if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export")
+    || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
 {
-    Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json>   [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--folder F] [--no-think]");
+    Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir>");
+    Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] (fine-tuning options: see the top of Program.cs)");
     return 1;
 }
 
@@ -64,11 +90,90 @@ PretrainedModel Load(string folder)
         Console.WriteLine($"  note: {note}");
     }
 
+    if (adapterFolder is not null)
+    {
+        Console.WriteLine($"  adapter: {model.LoadAdapter(adapterFolder)} layers from {adapterFolder}");
+    }
+
     return model;
 }
 
 switch (positional[0])
 {
+    case "finetune":
+    {
+        using var model = Load(positional[1]);
+        var encoder = new ChatTranscriptEncoder(model.ChatTemplate ?? throw new InvalidOperationException("The model has no chat template."),
+            model.Tokenizer ?? throw new InvalidOperationException("The model has no tokenizer."));
+        List<TrainingSequence> Read(string path, string what)
+        {
+            var sequences = new List<TrainingSequence>();
+            int skipped = 0, cut = 0;
+            foreach (var transcript in ChatTranscript.ReadJsonLines(path))
+            {
+                var sequence = encoder.Encode(transcript, tuning.MaxLength);
+                if (sequence is null)
+                {
+                    skipped++;
+                    continue;
+                }
+
+                cut += sequence.Tokens.Length > tuning.MaxLength ? 1 : 0;
+                sequences.Add(sequence);
+            }
+
+            Console.WriteLine($"{what}: {sequences.Count} transcripts, {sequences.Sum(q => (long)q.Tokens.Length)} tokens, "
+                              + $"{sequences.Sum(q => (long)q.TrainedTokens)} trained (assistant) tokens; {cut} cut to {tuning.MaxLength} tokens, {skipped} without assistant tokens skipped");
+            return sequences;
+        }
+
+        var train = Read(positional[2], "training");
+        var evaluation = evalFile is null ? null : Read(evalFile, "evaluation");
+        Console.WriteLine($"assistant turns start with {JsonSerializer.Serialize(encoder.AssistantHeader)} and end with {JsonSerializer.Serialize(encoder.AssistantEnd)}");
+        if (evaluation is { Count: > 0 })
+        {
+            Console.WriteLine($"evaluation loss before training: {FineTuner.Evaluate(model, evaluation, tuning.BatchTokens, tuning.LossChunkRows):F4}");
+        }
+
+        using var cancel = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            cancel.Cancel();
+        };
+        var watch = Stopwatch.StartNew();
+        var progress = new Progress<FineTuningProgress>(p => Console.WriteLine(
+            $"step {p.Step}/{p.TotalSteps} (epoch {p.Epoch}): loss {p.Loss:F4}, lr {p.LearningRate:G3}, {p.TokensPerSecond:F0} tok/s"
+            + (p.EvaluationLoss is { } e ? $", evaluation loss {e:F4}" : "") + $", {watch.Elapsed.TotalMinutes:F1} min"));
+        try
+        {
+            FineTuner.Train(model, train, evaluation, tuning, output, progress, cancel.Token);
+            Console.WriteLine($"adapter written to {output}");
+        }
+        catch (OperationCanceledException)
+        {
+            model.SaveAdapter(output!);
+            Console.WriteLine($"stopped; adapter so far written to {output}");
+        }
+
+        return 0;
+    }
+
+    case "export":
+    {
+        adapterFolder = positional[2];
+        if (int8 || int4 || bf16)
+        {
+            Console.Error.WriteLine("export merges into float weights: leave out --int8, --int4 and --bf16.");
+            return 1;
+        }
+
+        using var model = Load(positional[1]);
+        model.SaveHuggingFace(output!);
+        Console.WriteLine($"merged model written to {output} (bfloat16 safetensors, config and tokenizer files)");
+        return 0;
+    }
+
     case "info":
     {
         using var model = Load(positional[1]);
@@ -199,6 +304,7 @@ int Profile(PretrainedModel model)
 int Check(string referencePath)
 {
     var reference = JsonNode.Parse(File.ReadAllText(referencePath))!.AsObject();
+    adapterFolder ??= (string?)reference["adapter"];
     using var model = Load(folderOverride ?? (string)reference["folder"]!);
     var tokenizer = (BpeTokenizer)(model.Tokenizer ?? throw new InvalidOperationException("The model has no tokenizer.json."));
     int failures = 0;
