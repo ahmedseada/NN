@@ -39,6 +39,46 @@ internal static partial class Tests
         {
             GradCheck(device, [2, 3, 2, 8], x => (x.Rope(tc, ts, positions, 3, interleaved) * weights).Sum());
         }
+
+        // Every dimension rotated (no pass-through copy).
+        var cos4 = new float[8 * 4];
+        var sin4 = new float[8 * 4];
+        for (int p = 0; p < 8; p++)
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                cos4[p * 4 + i] = (float)Math.Cos(p * (i + 1) * 0.3);
+                sin4[p * 4 + i] = (float)Math.Sin(p * (i + 1) * 0.3);
+            }
+        }
+
+        using var tc4 = Tensor.From(cos4, [8, 4], device);
+        using var ts4 = Tensor.From(sin4, [8, 4], device);
+        GradCheck(device, [2, 3, 2, 8], x => (x.Rope(tc4, ts4, positions, 4, false) * weights).Sum());
+
+        // Fused act(gate) · up: gradients through both inputs, and the same values as the separate operations.
+        using var other = Tensor.From([.. Enumerable.Range(0, 15).Select(_ => (float)(r.NextDouble() * 2 - 1))], [3, 5], device);
+        using var mix = Tensor.From([.. Enumerable.Range(0, 15).Select(_ => (float)r.NextDouble())], [3, 5], device);
+        for (int kind = 0; kind < 3; kind++)
+        {
+            int k = kind;
+            GradCheck(device, [3, 5], x => (Tensor.GatedActivation(x, other, k) * mix).Sum(), avoidZero: k == 2);
+            GradCheck(device, [3, 5], x => (Tensor.GatedActivation(other, x, k) * mix).Sum());
+            using var g = Tensor.From([.. Enumerable.Range(0, 15).Select(i => (i - 7) * 0.4f)], [3, 5], device);
+            var separate = (k switch { 0 => g * g.Sigmoid(), 1 => g.Gelu(), _ => g.Relu() }) * other;
+            AssertClose(separate.ToArray(), Tensor.GatedActivation(g, other, k).ToArray(), 1e-5f, $"gated activation {k}");
+        }
+
+        // Fused RMS normalization with a gain (and an offset, as Gemma stores it).
+        using var gain = Tensor.From([.. Enumerable.Range(0, 6).Select(i => 0.5f + i * 0.1f)], [6], device);
+        using var rows = Tensor.From([.. Enumerable.Range(0, 18).Select(i => MathF.Sin(i * 0.7f))], [3, 6], device);
+        foreach (float offset in new[] { 0f, 1f })
+        {
+            var normalized = rows.RmsNormalize(1e-6f).ToArray();
+            var g = gain.ToArray();
+            var expected = normalized.Select((v, i) => v * (g[i % 6] + offset)).ToArray();
+            AssertClose(expected, rows.RmsNormAffine(gain, 1e-6f, offset).ToArray(), 1e-5f, $"fused RMS norm, offset {offset}");
+        }
     }
 
     // Random named weights in NeuralSharp's layout, shared by DecoderSpec.Build and the reference implementation.

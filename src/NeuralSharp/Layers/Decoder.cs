@@ -42,6 +42,11 @@ public sealed class RMSNorm : Module
             throw new ArgumentException($"RMSNorm({Features}) expects [..., {Features}], got {Tensor.FormatShape(input.Shape)}.");
         }
 
+        if (!Autograd.IsEnabled || !input.RequiresGrad && !Gain.RequiresGrad)
+        {
+            return input.RmsNormAffine(Gain, Epsilon, Offset);                // one kernel when nothing needs gradients
+        }
+
         var scale = Offset == 0f ? Gain : Gain + Offset;
         return input.RmsNormalize(Epsilon).GroupAffine(scale, null, Features, 1);
     }
@@ -485,7 +490,8 @@ public sealed class FeedForward : Module
     /// <inheritdoc />
     protected override Tensor ForwardCore(Tensor input)
     {
-        var hidden = Gate is null ? Activate(Up.Forward(input)) : Activate(Gate.Forward(input)) * Up.Forward(input);
+        var hidden = Gate is null ? Activate(Up.Forward(input))
+            : Tensor.GatedActivation(Gate.Forward(input), Up.Forward(input), (int)Activation);   // act(gate) · up in one kernel
         return Down.Forward(hidden);
     }
 

@@ -233,6 +233,25 @@ public sealed partial class Tensor
 
         var strides = Strides(_shape);
         int[] outShape = [.. perm.Select(p => _shape[p])];
+
+        // Moving only size-1 dimensions keeps the memory order: a reshape (a view) instead of a copy. Common when
+        // decoding one token at a time, where the step and batch dimensions have size 1.
+        int previous = -1;
+        bool sameOrder = true;
+        foreach (int p in perm)
+        {
+            if (_shape[p] != 1)
+            {
+                sameOrder &= p > previous;
+                previous = p;
+            }
+        }
+
+        if (sameOrder)
+        {
+            return Reshape(outShape);
+        }
+
         int[] inStrides = [.. perm.Select(p => strides[p])];
         long start = Telemetry.Start(TelemetryLevel.Operations);
         var y = Empty(outShape, Device);

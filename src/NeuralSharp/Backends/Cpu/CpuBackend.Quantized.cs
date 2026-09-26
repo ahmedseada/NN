@@ -193,6 +193,86 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override void RmsNormAffine(Storage x, Storage gain, Storage y, int rows, int cols, float eps, float offset)
+    {
+        float[] xv = D(x), gv = D(gain), yv = D(y);
+        For(rows, (long)rows * cols * 2, (first, last) =>
+        {
+            for (int r = first; r < last; r++)
+            {
+                var row = xv.AsSpan(r * cols, cols);
+                float sum = 0f;
+                foreach (float v in row)
+                {
+                    sum = MathF.FusedMultiplyAdd(v, v, sum);
+                }
+
+                float scale = 1f / MathF.Sqrt(sum / cols + eps);
+                var output = yv.AsSpan(r * cols, cols);
+                for (int j = 0; j < cols; j++)
+                {
+                    output[j] = row[j] * scale * (gv[j] + offset);
+                }
+            }
+        });
+    }
+
+    // act(g) and act'(g) for the gated feed-forward activations.
+    private static (float Value, float Slope) Activation(float g, int kind)
+    {
+        switch (kind)
+        {
+            case 0:
+            {
+                float s = 1f / (1f + MathF.Exp(-g));
+                return (g * s, s * (1f + g * (1f - s)));
+            }
+
+            case 1:
+            {
+                const float K = 0.7978845608f, C = 0.044715f;
+                float t = MathF.Tanh(K * (g + C * g * g * g));
+                return (0.5f * g * (1f + t), 0.5f * (1f + t) + 0.5f * g * (1f - t * t) * K * (1f + 3f * C * g * g));
+            }
+
+            default:
+                return (g > 0f ? g : 0f, g > 0f ? 1f : 0f);
+        }
+    }
+
+    public override void GatedActivation(Storage gate, Storage up, Storage y, int n, int kind)
+    {
+        float[] gv = D(gate), uv = D(up), yv = D(y);
+        For(n, (long)n * 8, (first, last) =>
+        {
+            for (int i = first; i < last; i++)
+            {
+                yv[i] = Activation(gv[i], kind).Value * uv[i];
+            }
+        });
+    }
+
+    public override void GatedActivationBackward(Storage gate, Storage up, Storage dy, Storage dgate, Storage dup, int n, int kind, int flags)
+    {
+        float[] gv = D(gate), uv = D(up), dv = D(dy), dg = D(dgate), du = D(dup);
+        For(n, (long)n * 8, (first, last) =>
+        {
+            for (int i = first; i < last; i++)
+            {
+                var (value, slope) = Activation(gv[i], kind);
+                if ((flags & 1) != 0)
+                {
+                    dg[i] += dv[i] * uv[i] * slope;
+                }
+
+                if ((flags & 2) != 0)
+                {
+                    du[i] += dv[i] * value;
+                }
+            }
+        });
+    }
+
     public override void RmsNorm(Storage x, Storage y, Storage inv, int rows, int cols, float eps)
     {
         float[] xv = D(x), yv = D(y), iv = D(inv);

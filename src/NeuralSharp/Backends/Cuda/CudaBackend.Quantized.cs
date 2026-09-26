@@ -86,4 +86,13 @@ internal sealed unsafe partial class CudaBackend
         LaunchRows(K("attention_decode_f32"), rows, P(q), P(keys), P(values), P(position), P(y),
             U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(rows));
     }
+
+    public override void RmsNormAffine(Storage x, Storage gain, Storage y, int rows, int cols, float eps, float offset) =>
+        LaunchRows(K("rms_norm_affine_f32"), rows, P(x), P(gain), P(y), U(cols), F(eps), F(offset), U(rows));
+
+    public override void GatedActivation(Storage gate, Storage up, Storage y, int n, int kind) =>
+        Launch1D(K("gated_act_f32"), n, P(gate), P(up), P(y), U(kind), U(n));
+
+    public override void GatedActivationBackward(Storage gate, Storage up, Storage dy, Storage dgate, Storage dup, int n, int kind, int flags) =>
+        Launch1D(K("gated_act_bwd_f32"), n, P(gate), P(up), P(dy), P(dgate), P(dup), U(kind), U(flags), U(n));
 }
