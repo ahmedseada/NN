@@ -20,8 +20,15 @@ public sealed class BpeTokenizer : ITokenizer
 
     private readonly Dictionary<string, int> _vocabulary;
     private static readonly UTF8Encoding StrictUtf8 = new(false, throwOnInvalidBytes: true);
+    // Tokenizer patterns run on every encode: compiled to IL where the runtime allows it (interpreted under native AOT).
+    private const RegexOptions Fast = RegexOptions.Compiled | RegexOptions.CultureInvariant;
+
     private string[] _tokens;
     private readonly Dictionary<(string, string), int> _ranks;
+
+    // The merges by token ids: (left id << 32 | right id) → (rank, merged id); null when some merge's parts or result
+    // are not tokens (then merges run on strings).
+    private readonly Dictionary<long, (int Rank, int Merged)>? _pairs;
     private readonly List<(string Content, int Id)> _added;
     private readonly HashSet<int> _special;
     private readonly HashSet<int> _addedIds;
@@ -70,9 +77,21 @@ public sealed class BpeTokenizer : ITokenizer
             _tokens[id] = token;
         }
 
+        _pairs = [];
+        foreach (var ((left, right), r) in _ranks)
+        {
+            if (!_vocabulary.TryGetValue(left, out int a) || !_vocabulary.TryGetValue(right, out int b) || !_vocabulary.TryGetValue(left + right, out int merged))
+            {
+                _pairs = null;
+                break;
+            }
+
+            _pairs[((long)a << 32) | (uint)b] = (r, merged);
+        }
+
         if (_added.Count > 0)
         {
-            _addedPattern = new Regex(string.Join('|', _added.Select(a => a.Content).OrderByDescending(c => c.Length).Select(Regex.Escape)));
+            _addedPattern = new Regex(string.Join('|', _added.Select(a => a.Content).OrderByDescending(c => c.Length).Select(Regex.Escape)), Fast);
         }
 
         AddNormalizer(json["normalizer"]);
@@ -201,7 +220,7 @@ public sealed class BpeTokenizer : ITokenizer
             if (!_cache.TryGetValue(piece, out var cached))
             {
                 cached = [.. Bpe(piece)];
-                if (_cache.Count < 100_000)
+                if (_cache.Count < 100_000 && piece.Length <= 256)          // long pieces (unsplit SentencePiece text) rarely repeat
                 {
                     _cache[piece] = cached;
                 }
@@ -211,12 +230,122 @@ public sealed class BpeTokenizer : ITokenizer
         }
     }
 
+    // The same merges on token ids (integer keys instead of string pairs), or null when a character is not a token.
+    private List<int>? MergeIds(string piece)
+    {
+        var ids = new List<int>(piece.Length);
+        for (int i = 0; i < piece.Length; i += char.IsSurrogatePair(piece, i) ? 2 : 1)
+        {
+            string symbol = char.IsSurrogatePair(piece, i) ? piece.Substring(i, 2) : piece[i].ToString();
+            if (!_vocabulary.TryGetValue(symbol, out int id))
+            {
+                return null;
+            }
+
+            ids.Add(id);
+        }
+
+        return ids.Count <= 32 ? MergeShort(ids) : MergeLong(ids);
+    }
+
+    // Short pieces: repeatedly merge the lowest-rank adjacent pair (leftmost among equals).
+    private List<int> MergeShort(List<int> ids)
+    {
+        while (ids.Count > 1)
+        {
+            int best = -1, bestRank = int.MaxValue, bestMerged = 0;
+            for (int i = 0; i < ids.Count - 1; i++)
+            {
+                if (_pairs!.TryGetValue(((long)ids[i] << 32) | (uint)ids[i + 1], out var pair) && pair.Rank < bestRank)
+                {
+                    (best, bestRank, bestMerged) = (i, pair.Rank, pair.Merged);
+                }
+            }
+
+            if (best < 0)
+            {
+                break;
+            }
+
+            ids[best] = bestMerged;
+            ids.RemoveAt(best + 1);
+        }
+
+        return ids;
+    }
+
+    // Long pieces (SentencePiece-style tokenizers do not split text first): the same merges in the same order in
+    // O(n log n), with the symbols in a linked list and candidate pairs in a heap ordered by (rank, position); a popped
+    // pair whose symbols changed since it was queued is skipped.
+    private List<int> MergeLong(List<int> ids)
+    {
+        int n = ids.Count;
+        var symbol = ids.ToArray();
+        var next = new int[n];
+        var previous = new int[n];
+        var alive = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            next[i] = i + 1 < n ? i + 1 : -1;
+            previous[i] = i - 1;
+            alive[i] = true;
+        }
+
+        var queue = new PriorityQueue<(int Left, int LeftId, int RightId, int Merged), (int Rank, int Position)>();
+        void Offer(int left)
+        {
+            int right = left < 0 ? -1 : next[left];
+            if (right >= 0 && _pairs!.TryGetValue(((long)symbol[left] << 32) | (uint)symbol[right], out var pair))
+            {
+                queue.Enqueue((left, symbol[left], symbol[right], pair.Merged), (pair.Rank, left));
+            }
+        }
+
+        for (int i = 0; i < n - 1; i++)
+        {
+            Offer(i);
+        }
+
+        while (queue.TryDequeue(out var candidate, out _))
+        {
+            int left = candidate.Left, right = next[left];
+            if (!alive[left] || right < 0 || symbol[left] != candidate.LeftId || symbol[right] != candidate.RightId)
+            {
+                continue;
+            }
+
+            symbol[left] = candidate.Merged;
+            alive[right] = false;
+            next[left] = next[right];
+            if (next[right] >= 0)
+            {
+                previous[next[right]] = left;
+            }
+
+            Offer(previous[left]);
+            Offer(left);
+        }
+
+        var result = new List<int>(n);
+        for (int i = 0; i >= 0; i = next[i])
+        {
+            result.Add(symbol[i]);
+        }
+
+        return result;
+    }
+
     // Byte-pair merges over one piece, best (lowest-rank) pair first, leftmost among equals.
     private IEnumerable<int> Bpe(string piece)
     {
         if (_ignoreMerges && _vocabulary.TryGetValue(piece, out int whole))
         {
             return [whole];
+        }
+
+        if (_pairs is not null && MergeIds(piece) is { } merged)
+        {
+            return merged;
         }
 
         var symbols = new List<string>();
@@ -308,7 +437,7 @@ public sealed class BpeTokenizer : ITokenizer
             return s => s.Replace(from, content, StringComparison.Ordinal);
         }
 
-        var regex = new Regex((string)n["pattern"]!["Regex"]!);
+        var regex = new Regex((string)n["pattern"]!["Regex"]!, Fast);
         return s => regex.Replace(s, content);
     }
 
@@ -332,14 +461,14 @@ public sealed class BpeTokenizer : ITokenizer
 
                 return byteLevel;
             case "Split":
-                var pattern = p["pattern"]!["Regex"] is { } r ? new Regex((string)r!) : new Regex(Regex.Escape((string)p["pattern"]!["String"]!));
+                var pattern = p["pattern"]!["Regex"] is { } r ? new Regex((string)r!, Fast) : new Regex(Regex.Escape((string)p["pattern"]!["String"]!), Fast);
                 string behavior = (string?)p["behavior"] ?? "Isolated";
                 bool invert = (bool?)p["invert"] ?? false;
                 _preTokenizers.Add((pieces, atStart) => [.. pieces.SelectMany(piece => SplitPiece(piece, pattern, behavior, invert))]);
                 return false;
             case "ByteLevel":
                 bool prefix = (bool?)p["add_prefix_space"] ?? false, useRegex = (bool?)p["use_regex"] ?? true;
-                var gpt2 = new Regex(Gpt2Pattern);
+                var gpt2 = new Regex(Gpt2Pattern, Fast);
                 _preTokenizers.Add((pieces, atStart) => [.. pieces.SelectMany(piece =>
                 {
                     if (prefix && !piece.StartsWith(' '))
@@ -388,11 +517,11 @@ public sealed class BpeTokenizer : ITokenizer
                 return false;
             case "Digits":
                 bool individual = (bool?)p["individual_digits"] ?? false;
-                var digits = new Regex(individual ? @"\p{Nd}" : @"\p{Nd}+");
+                var digits = new Regex(individual ? @"\p{Nd}" : @"\p{Nd}+", Fast);
                 _preTokenizers.Add((pieces, atStart) => [.. pieces.SelectMany(piece => SplitPiece(piece, digits, "Isolated", false))]);
                 return false;
             case "Whitespace":
-                var words = new Regex(@"\w+|[^\w\s]+");
+                var words = new Regex(@"\w+|[^\w\s]+", Fast);
                 _preTokenizers.Add((pieces, atStart) => [.. pieces.SelectMany(piece => words.Matches(piece).Select(m => m.Value))]);
                 return false;
             default:

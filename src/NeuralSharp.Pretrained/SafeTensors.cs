@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -150,25 +151,36 @@ public sealed class SafeTensorsReader : IDisposable
         switch (type)
         {
             case SafeTensorType.F32:
-                for (int i = 0; i < count; i++)
+                MemoryMarshal.Cast<byte, float>(bytes.AsSpan(0, count * 4)).CopyTo(values);         // little-endian hosts
+                if (!BitConverter.IsLittleEndian)
                 {
-                    values[i] = BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(i * 4));
+                    for (int i = 0; i < count; i++)
+                    {
+                        values[i] = BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(i * 4));
+                    }
                 }
 
                 break;
             case SafeTensorType.F16:
-                for (int i = 0; i < count; i++)
+                NeuralSharp.HostParallel.For(count, 1 << 16, (first, last) =>
                 {
-                    values[i] = (float)BinaryPrimitives.ReadHalfLittleEndian(bytes.AsSpan(i * 2));
-                }
-
+                    for (int i = first; i < last; i++)
+                    {
+                        values[i] = (float)BinaryPrimitives.ReadHalfLittleEndian(bytes.AsSpan(i * 2));
+                    }
+                });
                 break;
             default:
-                for (int i = 0; i < count; i++)
+                // bfloat16 is the top half of a float32.
+                NeuralSharp.HostParallel.For(count, 1 << 16, (first, last) =>
                 {
-                    values[i] = BitConverter.UInt32BitsToSingle((uint)BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(i * 2)) << 16);
-                }
-
+                    var halves = MemoryMarshal.Cast<byte, ushort>(bytes.AsSpan(first * 2, (last - first) * 2));
+                    var bits = MemoryMarshal.Cast<float, uint>(values.AsSpan(first, last - first));
+                    for (int i = 0; i < halves.Length; i++)
+                    {
+                        bits[i] = (uint)(BitConverter.IsLittleEndian ? halves[i] : BinaryPrimitives.ReverseEndianness(halves[i])) << 16;
+                    }
+                });
                 break;
         }
 

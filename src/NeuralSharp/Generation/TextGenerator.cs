@@ -163,7 +163,10 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
             int end = text.Length;
             foreach (var stop in stops)
             {
-                int at = text.ToString().IndexOf(stop, Math.Max(0, emitted - stop.Length + 1), StringComparison.Ordinal);
+                // Only the text not yet searched (plus a stop's length of overlap) can hold a new match.
+                int from = Math.Max(0, emitted - stop.Length + 1);
+                int at = from < end ? text.ToString(from, end - from).IndexOf(stop, StringComparison.Ordinal) : -1;
+                at = at < 0 ? -1 : at + from;
                 if (at >= 0 && at < end)
                 {
                     end = at;

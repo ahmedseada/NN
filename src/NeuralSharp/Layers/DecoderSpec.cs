@@ -247,19 +247,7 @@ public sealed record DecoderSpec
     /// <summary>The spec a model was built from with <see cref="Build"/>, or null.</summary>
     public static DecoderSpec? Of(Module model) => Specs.TryGetValue(model, out var spec) ? spec : null;
 
-    private static float[] Transpose(float[] values, int rows, int columns)
-    {
-        var result = new float[values.Length];
-        for (int r = 0; r < rows; r++)
-        {
-            for (int c = 0; c < columns; c++)
-            {
-                result[c * rows + r] = values[r * columns + c];
-            }
-        }
-
-        return result;
-    }
+    private static float[] Transpose(float[] values, int rows, int columns) => HostParallel.Transpose(values, rows, columns);
 
     /// <summary>The spec as JSON (format "neuralsharp-decoder/1"), for packages.</summary>
     public JsonObject ToJson()

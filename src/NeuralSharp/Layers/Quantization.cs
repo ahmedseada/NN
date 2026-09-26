@@ -60,7 +60,11 @@ public sealed class Int8Weight : IDisposable
     /// Quantizes weights given as host values [rows, columns] and uploads only the bytes to <paramref name="device"/>
     /// (large models never exist as float32 on the device).
     /// </summary>
-    public static Int8Weight Quantize(ReadOnlySpan<float> values, int rows, int columns, Device device)
+    public static Int8Weight Quantize(ReadOnlySpan<float> values, int rows, int columns, Device device) =>
+        Quantize(values.ToArray(), rows, columns, device);
+
+    /// <summary><see cref="Quantize(ReadOnlySpan{float}, int, int, Device)"/> without copying the values first.</summary>
+    internal static Int8Weight Quantize(float[] values, int rows, int columns, Device device)
     {
         if (values.Length != rows * columns)
         {
@@ -68,28 +72,46 @@ public sealed class Int8Weight : IDisposable
         }
 
         int stride = (columns + 3) / 4 * 4;
-        var scales = new float[columns];
-        for (int r = 0; r < rows; r++)
-        {
-            for (int j = 0; j < columns; j++)
-            {
-                scales[j] = MathF.Max(scales[j], MathF.Abs(values[r * columns + j]));
-            }
-        }
+        var source = values;
 
+        // Column maxima per chunk of rows (all cores), then combined.
+        var scales = new float[columns];
+        var gate = new Lock();
+        HostParallel.For(rows, Math.Max(1, (1 << 16) / Math.Max(1, columns)), (first, last) =>
+        {
+            var local = new float[columns];
+            for (int r = first; r < last; r++)
+            {
+                for (int j = 0; j < columns; j++)
+                {
+                    local[j] = MathF.Max(local[j], MathF.Abs(source[r * columns + j]));
+                }
+            }
+
+            lock (gate)
+            {
+                for (int j = 0; j < columns; j++)
+                {
+                    scales[j] = MathF.Max(scales[j], local[j]);
+                }
+            }
+        });
         for (int j = 0; j < columns; j++)
         {
             scales[j] = scales[j] > 0f ? scales[j] / 127f : 1f;
         }
 
         var bytes = new sbyte[rows * stride];
-        for (int r = 0; r < rows; r++)
+        HostParallel.For(rows, Math.Max(1, (1 << 16) / Math.Max(1, columns)), (first, last) =>
         {
-            for (int j = 0; j < columns; j++)
+            for (int r = first; r < last; r++)
             {
-                bytes[r * stride + j] = (sbyte)Math.Clamp(MathF.Round(values[r * columns + j] / scales[j]), -127f, 127f);
+                for (int j = 0; j < columns; j++)
+                {
+                    bytes[r * stride + j] = (sbyte)Math.Clamp(MathF.Round(source[r * columns + j] / scales[j]), -127f, 127f);
+                }
             }
-        }
+        });
 
         var packed = MemoryMarshal.Cast<sbyte, float>(bytes).ToArray();
         return new Int8Weight(
@@ -159,7 +181,11 @@ public sealed class BFloat16Weight : IDisposable
     }
 
     /// <summary>Rounds host values [rows, columns] to bfloat16 (to nearest, ties to even) and uploads only those.</summary>
-    public static BFloat16Weight FromValues(ReadOnlySpan<float> values, int rows, int columns, Device device)
+    public static BFloat16Weight FromValues(ReadOnlySpan<float> values, int rows, int columns, Device device) =>
+        FromValues(values.ToArray(), rows, columns, device);
+
+    /// <summary><see cref="FromValues(ReadOnlySpan{float}, int, int, Device)"/> without copying the values first.</summary>
+    internal static BFloat16Weight FromValues(float[] values, int rows, int columns, Device device)
     {
         if (values.Length != rows * columns)
         {
@@ -168,13 +194,17 @@ public sealed class BFloat16Weight : IDisposable
 
         int stride = (columns + 1) / 2 * 2;
         var halves = new ushort[rows * stride];
-        for (int r = 0; r < rows; r++)
+        var source = values;
+        HostParallel.For(rows, Math.Max(1, (1 << 16) / Math.Max(1, columns)), (first, last) =>
         {
-            for (int j = 0; j < columns; j++)
+            for (int r = first; r < last; r++)
             {
-                halves[r * stride + j] = Round(values[r * columns + j]);
+                for (int j = 0; j < columns; j++)
+                {
+                    halves[r * stride + j] = Round(source[r * columns + j]);
+                }
             }
-        }
+        });
 
         var packed = MemoryMarshal.Cast<ushort, float>(halves).ToArray();
         return new BFloat16Weight(Tensor.Persistent(packed, [packed.Length], device, requiresGrad: false), rows, columns);

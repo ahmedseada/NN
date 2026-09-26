@@ -213,16 +213,6 @@ internal sealed class CheckpointWeights(SafeTensorsReader reader, PretrainedArch
             return values;
         }
 
-        int rows = info.Shape[0], columns = info.Shape[1];
-        var result = new float[values.Length];
-        for (int r = 0; r < rows; r++)
-        {
-            for (int c = 0; c < columns; c++)
-            {
-                result[c * rows + r] = values[r * columns + c];
-            }
-        }
-
-        return result;
+        return NeuralSharp.HostParallel.Transpose(values, info.Shape[0], info.Shape[1]);
     }
 }
