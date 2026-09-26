@@ -35,6 +35,9 @@ for (int i = 0; i < args.Length; i++)
         case "--no-think": noThink = true; break;
         case "--context": context = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--folder": folderOverride = args[++i]; break;
+        case ['-', '-', ..]:
+            Console.Error.WriteLine($"Unknown option {args[i]}.");
+            return 1;
         default: positional.Add(args[i]); break;
     }
 }
