@@ -39,23 +39,76 @@ public sealed class Linear : Module
     /// <summary>The [outFeatures] bias, or null when created with <c>bias: false</c>.</summary>
     public Tensor? Bias { get; private set; }
 
+    /// <summary>
+    /// A low-rank adapter (LoRA) added to this layer by <see cref="ModuleExtensions.AddLora"/>, or null. When present the
+    /// output is <c>x·W + b + (x·A·B)·scale</c>; its A and B come after W and b in <see cref="Parameters"/>.
+    /// </summary>
+    public LoraAdapter? Adapter { get; internal set; }
+
     /// <inheritdoc />
     protected override Tensor ForwardCore(Tensor input)
     {
-        var product = input.MatMul(Weight);
+        var product = ProjectWithoutBias(input);
         return Bias is null ? product : product + Bias;
     }
 
+    /// <summary>x·W, plus the adapter's low-rank term when an adapter is attached.</summary>
+    internal Tensor ProjectWithoutBias(Tensor input)
+    {
+        var product = input.MatMul(Weight);
+        return Adapter is { } a ? product + input.MatMul(a.A).MatMul(a.B) * a.Scale : product;
+    }
+
     /// <inheritdoc />
-    public override IEnumerable<Tensor> Parameters() => Bias is null ? [Weight] : [Weight, Bias];
+    public override IEnumerable<Tensor> Parameters()
+    {
+        IEnumerable<Tensor> own = Bias is null ? [Weight] : [Weight, Bias];
+        return Adapter is { } a ? own.Concat([a.A, a.B]) : own;
+    }
+
+    /// <summary>Folds the adapter into the weight (<c>W += A·B·scale</c>) and removes it; the outputs stay the same.</summary>
+    internal void MergeAdapter()
+    {
+        if (Adapter is not { } a)
+        {
+            return;
+        }
+
+        using (Autograd.NoGrad())
+        using (var scope = new TensorScope())
+        {
+            var merged = Weight + a.A.MatMul(a.B) * a.Scale;
+            Weight.Load(merged.ToArray());
+        }
+
+        Adapter = null;
+        a.A.Dispose();
+        a.B.Dispose();
+    }
 
     /// <inheritdoc />
     protected internal override void MoveTo(Device device)
     {
         Weight = MoveTensor(Weight, device);
         Bias = Bias is null ? null : MoveTensor(Bias, device);
+        if (Adapter is { } a)
+        {
+            Adapter = a with { A = MoveTensor(a.A, device), B = MoveTensor(a.B, device) };
+        }
     }
 
     /// <inheritdoc />
-    public override string ToString() => $"Linear({InFeatures} -> {OutFeatures}{(Bias is null ? ", no bias" : "")})";
+    public override string ToString() =>
+        $"Linear({InFeatures} -> {OutFeatures}{(Bias is null ? ", no bias" : "")}{(Adapter is { } a ? $", LoRA rank {a.Rank}" : "")})";
 }
+
+/// <summary>
+/// A LoRA adapter: two small trainable matrices A [in, rank] and B [rank, out] whose product, times
+/// <see cref="Scale"/> = alpha / rank, is added to a <see cref="Linear"/> layer's weight. B starts at zero, so adding
+/// an adapter does not change the model's outputs until it is trained.
+/// </summary>
+/// <param name="A">[inFeatures, rank], small random values.</param>
+/// <param name="B">[rank, outFeatures], zeros at creation.</param>
+/// <param name="Rank">The rank r.</param>
+/// <param name="Scale">alpha / r.</param>
+public sealed record LoraAdapter(Tensor A, Tensor B, int Rank, float Scale);

@@ -207,7 +207,7 @@ public sealed class TransformerEncoderLayer : Module, ICachedModule
     /// <summary>GELU(x·W1 + b1); fused into one kernel (plus the product) during inference.</summary>
     private Tensor FeedForwardHidden(Tensor x) =>
         !Autograd.IsEnabled && _feedForward1.Bias is { } bias
-            ? x.MatMul(_feedForward1.Weight).BiasGelu(bias)
+            ? _feedForward1.ProjectWithoutBias(x).BiasGelu(bias)
             : _feedForward1.Forward(x).Gelu();
 
     /// <inheritdoc />

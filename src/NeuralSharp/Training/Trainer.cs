@@ -78,8 +78,40 @@ public sealed class TrainingHistory
 /// var history = trainer.Fit(trainLoader, epochs: 300, validation: testLoader);
 /// </code>
 /// </example>
-public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tensor, Tensor> loss)
+public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tensor, Tensor> loss) : IDisposable
 {
+    private readonly bool _ownsOptimizer;
+
+    /// <summary>
+    /// Creates the trainer from factories instead of ready-made objects: <paramref name="optimizer"/> receives the
+    /// model's trainable parameters (those with <see cref="Tensor.RequiresGrad"/>; all of them unless some were frozen),
+    /// and <paramref name="scheduler"/>, when given, receives the created optimizer. The trainer owns the optimizer it
+    /// created and disposes it in <see cref="Dispose"/>.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// using var trainer = new Trainer(model, Losses.CrossEntropy,
+    ///     optimizer: p => new AdamW(p, 0.003f, weightDecay: 1e-4f),
+    ///     scheduler: o => new CosineAnnealing(o, epochs, warmupEpochs: 1));
+    /// </code>
+    /// </example>
+    public Trainer(Module model, Func<Tensor, Tensor, Tensor> loss, Func<IEnumerable<Tensor>, Optimizer> optimizer,
+        Func<Optimizer, LearningRateScheduler>? scheduler = null)
+        : this(model, CreateOptimizer(model, optimizer), loss)
+    {
+        _ownsOptimizer = true;
+        Scheduler = scheduler?.Invoke(Optimizer);
+    }
+
+    private static Optimizer CreateOptimizer(Module model, Func<IEnumerable<Tensor>, Optimizer> factory)
+    {
+        ArgumentNullException.ThrowIfNull(factory);
+        return factory(model.Parameters().Where(p => p.RequiresGrad).ToList());
+    }
+
+    /// <summary>Called on the training thread after every epoch, with the same summary telemetry publishes.</summary>
+    public Action<EpochCompleted>? OnEpoch { get; init; }
+
     /// <summary>The model being trained.</summary>
     public Module Model { get; } = model;
 
@@ -207,6 +239,9 @@ public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tens
                 Telemetry.EpochCompleted(summary);
             }
 
+            OnEpoch?.Invoke(summary);
+            _epochCallback?.Invoke(summary);
+
             Scheduler?.Step();
             if (EarlyStoppingPatience is { } patience && epochsWithoutImprovement >= patience)
             {
@@ -231,6 +266,84 @@ public sealed class Trainer(Module model, Optimizer optimizer, Func<Tensor, Tens
 
         cancellationToken.ThrowIfCancellationRequested();
         return history;
+    }
+
+    private Action<EpochCompleted>? _epochCallback;
+
+    /// <summary>
+    /// Runs <see cref="Fit"/> on a thread-pool thread, so UI and server threads stay free. <paramref name="progress"/>
+    /// receives every epoch summary (on the captured synchronization context, as <see cref="Progress{T}"/> does).
+    /// </summary>
+    public Task<TrainingHistory> FitAsync(DataLoader train, int epochs, DataLoader? validation = null,
+        IProgress<EpochCompleted>? progress = null, CancellationToken cancellationToken = default)
+    {
+        return Task.Run(() =>
+        {
+            _epochCallback = progress is null ? null : progress.Report;
+            try
+            {
+                return Fit(train, epochs, validation, cancellationToken);
+            }
+            finally
+            {
+                _epochCallback = null;
+            }
+        }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Trains on a thread-pool thread and yields every epoch summary as it completes. Leaving the <c>await foreach</c>
+    /// early (break, exception) stops training before the next epoch and waits for it to end.
+    /// </summary>
+    public async IAsyncEnumerable<EpochCompleted> TrainAsync(DataLoader train, int epochs, DataLoader? validation = null,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var channel = System.Threading.Channels.Channel.CreateUnbounded<EpochCompleted>(
+            new System.Threading.Channels.UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+        var training = Task.Run(() =>
+        {
+            _epochCallback = e => channel.Writer.TryWrite(e);
+            try
+            {
+                Fit(train, epochs, validation, stop.Token);
+                channel.Writer.TryComplete();
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                channel.Writer.TryComplete();
+            }
+            catch (Exception ex)
+            {
+                channel.Writer.TryComplete(ex);
+            }
+            finally
+            {
+                _epochCallback = null;
+            }
+        }, CancellationToken.None);
+
+        try
+        {
+            await foreach (var epoch in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                yield return epoch;
+            }
+        }
+        finally
+        {
+            stop.Cancel();
+            await training.ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Disposes the optimizer when this trainer created it (the factory constructor); otherwise does nothing.</summary>
+    public void Dispose()
+    {
+        if (_ownsOptimizer)
+        {
+            Optimizer.Dispose();
+        }
     }
 
     /// <summary>Computes the loss and metrics on <paramref name="data"/> in evaluation mode.</summary>
