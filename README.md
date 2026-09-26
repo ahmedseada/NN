@@ -25,13 +25,17 @@ src/NeuralSharp/
   Layers/                           Linear, Conv2d, MaxPool2d, GlobalAveragePool2d, Flatten,
                                     BatchNorm, LayerNorm, Embedding, LSTM, GRU,
                                     MultiHeadAttention, TransformerEncoderLayer, PositionalEncoding,
-                                    ReLU, Tanh, Sigmoid, GELU, Softmax, Dropout, Lambda, Sequential
-  Optimizers/                       Sgd, Adam, AdamW, schedulers (step, exponential, cosine + warm-up)
-  Data/                             Dataset (CSV, class labels, feature shapes), scalers, DataLoader
-  Training/                         Trainer, Metric (MAE, RMSE, Accuracy), RegressionReport
+                                    ReLU, Tanh, Sigmoid, GELU, Softmax, Dropout, Lambda, Sequential;
+                                    Network builder, Blocks, Architectures; freezing, LoRA (ModuleExtensions)
+  Optimizers/                       Sgd, Adam, AdamW, GroupedOptimizer, schedulers (step, exponential, cosine + warm-up)
+  Data/                             Dataset (CSV, class labels, feature shapes), scalers, DataLoader, DataExtensions
+  Training/                         Trainer, TrainingRun, Metric (MAE, RMSE, Accuracy), RegressionReport
+  Generation/                       tokenizers, TextGenerator, chat, Conversation, tools (ToolRegistry), ModelHost
+  Inference/                        Predictor, ModelPackage (.nsm), InferenceEngine
   Diagnostics/                      Telemetry hub, events, ConsoleLogger, MetricsRecorder,
                                     ChannelTelemetry, JsonLinesLogger
   Backends/Cpu, Backends/Cuda       device implementations (CPU SIMD kernels, PTX kernels)
+src/NeuralSharp.AspNetCore/         optional package: AddNeuralSharp(), MapPredictor, MapGenerate, MapOllamaApi, MapNeuralSharpStatus
 samples/
   NeuralSharp.Samples.Xor             the classic XOR problem
   NeuralSharp.Samples.HousePrices     regression: predict house prices from a CSV file
@@ -41,6 +45,7 @@ samples/
   NeuralSharp.Samples.Ocr             OCR: CNN character recognizer + line segmentation, reads PGM images
   NeuralSharp.Samples.Transformer     small GPT: character-level causal transformer that generates text
   NeuralSharp.Samples.GptApi          ASP.NET Core Web API + browser UI serving the GPT (Scalar docs, streaming, Ollama-style /api/chat)
+  NeuralSharp.Samples.HouseApi        house-price Web API in a few lines (NeuralSharp.AspNetCore + the HousePrices package)
   NeuralSharp.Samples.ReRanker        search re-ranking: BM25 first stage + transformer cross-encoder, listwise training
   NeuralSharp.Samples.Summarizer      summarization: extractive baselines vs a word-level transformer (WordTokenizer + TextGenerator)
   Shared/SampleOptions.cs             command-line options shared by the samples (train / predict modes)
@@ -61,6 +66,7 @@ tests/NeuralSharp.Tests             self-contained test runner (runs on every av
 | `Transformer` | decoder-only GPT: causal attention, sparse cross-entropy, sampling | 89% next-character accuracy, 100% real words generated |
 | `GptApi` | serving a model: REST + server-sent events, Scalar, browser UI, Ollama-compatible `/api/chat` | about 600 characters/s on 4 CPU cores |
 | `ReRanker` | two-stage search: BM25 + cross-encoder, hard negatives, listwise loss, placeholder tokens for unseen names | Hit@1 on unseen towns 27.1% (BM25) → 86.6% re-ranked, 6.9 ms per question, 180 s training |
+| `HouseApi` | `AddNeuralSharp().AddPredictor(...)` + `MapPredictor`: the HousePrices package served over HTTP with micro-batching | same prices as `HousePrices --predict` |
 | `Summarizer` | word-level decoder-only transformer, loss masking, greedy generation with a stop token, ROUGE | ROUGE-1 0.999 vs 0.503 (first sentence), 90% exact, 7.7 ms per summary |
 
 ### Train and predict modes
@@ -362,7 +368,9 @@ curl http://localhost:5080/api/chat -d '{"model":"any","stream":true,"think":tru
   "tools":[{"type":"function","function":{"name":"web_fetch","parameters":{"type":"object","properties":{"url":{"type":"string"}}}}}]}'
 ```
 
-The endpoint serves `Gpt:ChatModelPath` if that file exists, otherwise `Gpt:ModelPath`. A model trained on
+The GptApi sample maps these endpoints with `app.MapOllamaApi(...)` from `NeuralSharp.AspNetCore` (see
+below); the request body is read as JSON whatever its Content-Type, as Ollama does. The endpoint serves
+`Gpt:ChatModelPath` if that file exists, otherwise `Gpt:ModelPath`. A model trained on
 plain text only continues text. To see reasoning and tool calls, train the small chat model on synthetic
 ChatML transcripts (reasoning, `web_fetch` calls, answers citing tool results):
 
@@ -376,6 +384,209 @@ dotnet run -c Release --project samples/NeuralSharp.Samples.Transformer -- --cha
 available, together with the `StepDecay`, `ExponentialDecay`, `CosineAnnealing(warmupEpochs)` and
 `LambdaSchedule` schedulers. `optimizer.ClipGradientNorm(max)` and `optimizer.GradientNorm()` work
 in hand-written loops too.
+
+## Two ways to write it: the original API and the simplified API
+
+Everything above keeps working exactly as shown. The simplified API is a second way to write the same
+things with less code: each builder step or extension method makes the same calls you would write by
+hand, with the same parameters and the same defaults. Nothing is chosen for you, and whatever the
+original API requires is still required. The tests check that both ways give identical weights,
+outputs and training histories.
+
+### Networks: a fluent builder (the input size of each layer comes from the previous layer)
+
+```csharp
+// original
+var model = new Sequential
+{
+    new Linear(9, 64, random: r), new ReLU(), new Dropout(0.05f, r),
+    new Linear(64, 32, random: r), new ReLU(),
+    new Linear(32, 1, random: r),
+};
+
+// simplified: same layers, same weights with the same seed
+var model = Network.Input(9).Seed(1).Linear(64).ReLU().Dropout(0.05f).Linear(32).ReLU().Linear(1).Build();
+
+var cnn = Network.Image(1, 16, 16)
+    .Conv2d(16, kernelSize: 3, padding: 1).BatchNorm().ReLU().MaxPool2d(2)
+    .Conv2d(32, kernelSize: 3, padding: 1).BatchNorm().ReLU().MaxPool2d(2)
+    .Flatten().Linear(4)                                   // 32·4·4 inputs worked out for you
+    .Build();
+
+var gpt = Architectures.Gpt(vocabulary: 76, context: 64, dim: 96, heads: 4, layers: 3, ffDim: 384, dropout: 0.1f).Build();
+var layers = Blocks.Repeat(3, () => new TransformerEncoderLayer(96, 4, 384, 0.1f, causal: true));   // in a new Sequential { ... }
+```
+
+`Network.Input / Image / Tokens / Sequence` start a builder; every layer has a method (`Linear`, `Conv2d`,
+`LSTM`, `GRU`, `TransformerEncoderLayer`, `Embedding`, `PositionalEncoding`, `LayerNorm`, …) plus
+`MeanOverTime`, `LastStep`, `FirstStep`, `Reshape`, `Lambda(fn, name, outputShape)` and `Add(module, outputShape)`.
+Shape mistakes fail while building, with a clear message. `ToJson()` / `Network.FromJson(...)` describe and
+replay a network; packages use this to store the architecture.
+
+### Data: extension methods
+
+```csharp
+// original
+var (train, test) = data.Split(0.8, seed: 1);
+var fs = StandardScaler.FitFeatures(train);
+var ts = StandardScaler.FitTargets(train);
+var trainLoader = new DataLoader(train.Scale(fs, ts), 64, shuffle: true);
+
+// simplified: fitted on the training part, applied to both parts
+var split = data.Split(0.8, seed: 1).StandardizeFeatures().StandardizeTargets();   // or NormalizeFeatures()
+var trainLoader = split.Train.Batches(64, shuffle: true);                          // = new DataLoader(...)
+// split.Train, split.Test, split.FeatureScaler, split.TargetScaler
+```
+
+### Training: factories for the wiring, and one settings object
+
+```csharp
+// the trainer creates the optimizer and schedule from factories, and disposes them
+using var trainer = new Trainer(model, Losses.CrossEntropy,
+    optimizer: p => new AdamW(p, 0.003f, weightDecay: 1e-4f),
+    scheduler: o => new CosineAnnealing(o, 40, warmupEpochs: 1));
+
+// or everything as one record; the required members are what Trainer and Fit require
+var run = new TrainingRun
+{
+    Model = model, Loss = Losses.CrossEntropy, Optimizer = p => new AdamW(p, 0.003f),
+    Train = split.Train.Batches(64, shuffle: true), Validation = split.Test.Batches(500), Epochs = 40,
+    Metrics = [Metric.Accuracy], MaxGradientNorm = 1f,
+};
+TrainingHistory history = run.Fit();
+var clipped = run with { MaxGradientNorm = 0.5f };                    // a variant (give it a fresh Model)
+
+await run.FitAsync(new Progress<EpochCompleted>(e => label.Text = $"epoch {e.Epoch}: {e.Loss:F4}"), token);
+await foreach (var e in run.TrainAsync()) { if (e.ValidationLoss < 0.01) break; }   // leaving the loop stops training
+```
+
+### Telemetry: one builder, one disposable
+
+```csharp
+await using var telemetry = Telemetry.Configure()
+    .Console(TelemetryLevel.Training, epochInterval: 10)                 // = new ConsoleLogger(...)
+    .JsonLines("run.jsonl", TelemetryLevel.All & ~TelemetryLevel.Operations)
+    .Record(out var recorder)                                            // = new MetricsRecorder()
+    .Start();
+```
+
+### Predicting: a predictor instead of scale → tensor → predict → unscale
+
+```csharp
+var predictor = Predictor.For(model)
+    .Input<House>(h => [h.Area, h.Beds, h.Baths, h.Age, h.Distance, h.Quality, h.Garage, h.Pool, h.Lot])
+    .ScaleInputs(featureScaler)
+    .UnscaleOutputs(priceScaler)
+    .Output(v => v[0])
+    .Build();
+float price = predictor.Predict(house);                      // or Predict(listOfHouses): one batched call
+
+var classifier = Predictor.For(model).Input<string>(Encode).Softmax().Classes(["negative", "positive"]).Build();
+ClassPrediction answer = classifier.Predict("not bad at all");   // .Class, .Probability, .Scores
+
+predictor.Save("house-price.nsm");                            // weights, architecture (if built with Network), scalers, settings
+```
+
+### Model packages: one file instead of several
+
+```csharp
+ModelPackage.Create("model.nsm")
+    .Architecture(network).Weights(model)                    // the existing formats, zipped together
+    .Scaler("features", featureScaler).Tokenizer("words", tokenizer).Json("settings", settings)
+    .Save();
+
+using var package = ModelPackage.Open("model.nsm");
+using var model = package.BuildNetwork();                   // no layer code needed
+var generator = package.TextGenerator("words");              // model + tokenizer + context from one file
+```
+
+`MinMaxScaler`, `CharTokenizer` and `WordTokenizer` now have `Save` / `Load` too.
+
+### The inference engine: one reusable place for loading, batching and serving
+
+```csharp
+await using var engine = await InferenceEngine.Create()
+    .Predictor<House, float>("house-price", "models/house-price.nsm", p => p
+        .Input<House>(h => [h.Area, h.Beds, h.Baths, h.Age, h.Distance, h.Quality, h.Garage, h.Pool, h.Lot])
+        .Output(v => v[0])
+        .WarmUp(sampleHouse)                                           // each feature is off unless set
+        .Batching(maxBatch: 256, maxWait: TimeSpan.FromMilliseconds(5)))
+    .ChatModel("my-gpt", "models/chat.nsm", "chars", c => c
+        .Instances(2)                                                  // two generations at once
+        .KeepAlive(TimeSpan.FromMinutes(5)).QueueLimit(32).Timeout(TimeSpan.FromSeconds(30)))
+    .Telemetry()
+    .BuildAsync();                                                     // or .LoadOnFirstUse()
+
+float p = await engine.PredictAsync<House, float>("house-price", house);
+await foreach (var chunk in engine.StreamAsync("my-gpt", "Once upon a time", options)) Console.Write(chunk.Text);
+await foreach (var result in engine.PredictManyAsync<House, float>("house-price", millionsOfHouses, batchSize: 1024)) { … }
+var models = engine.Models;                                            // loaded state, running and queued requests, expiry
+var stats = engine.Stats("house-price");                               // requests, latency (average, p95), rows/s, batch size
+```
+
+Predictors run concurrently (they are thread-safe); a text or chat copy runs one generation at a time
+(it owns its KV cache). Models come from a package, a factory, a model object or a network builder
+plus a weights file.
+
+### Chat: conversations and tools
+
+```csharp
+public sealed class ReleaseTools(HttpClient http)
+{
+    [Tool("latest_release", "Fetch the release notes page of a product.")]
+    public Task<string> LatestAsync([Description("Product name, e.g. ollama.")] string product) =>
+        http.GetStringAsync($"https://{product}.com/releases");
+}
+
+var tools = ToolRegistry.Create()
+    .Add(new ReleaseTools(http))                                        // every [Tool] method; schema from the parameters
+    .Add(WebTools.Fetch(http, allow: u => u.Host == "ollama.com", maxCharacters: 4000))   // built-in, allowlist required
+    .Allow("web_fetch", args => ((string)args["url"]!).StartsWith("https://ollama.com"))
+    .RequireApproval("delete_file", (call, token) => AskUserAsync(call, token))
+    .Timeout(TimeSpan.FromSeconds(10)).Parallel()
+    .Build();
+
+var conversation = Conversation.For(chatGenerator)       // or engine.Conversation("my-gpt", c => ...)
+    .System("You are a helpful assistant. Cite sources as [1], [2].")
+    .Think(true).Tools(tools).MaxToolRounds(5)             // MaxToolRounds is required when tools are added
+    .Build();
+var reply = await conversation.SendAsync("What is the latest Ollama version?");   // runs the tool loop
+```
+
+Arguments are validated against each tool's schema before the tool runs; mistakes go back to the model as
+an error it can correct. `FakeChatModel.Script(...)` replays scripted replies for testing tool code, and
+`TextGenerator.StreamAsync` / `ChatGenerator.StreamAsync` stream with `await foreach`.
+
+### ASP.NET Core: the optional `NeuralSharp.AspNetCore` package
+
+```csharp
+builder.Services.AddNeuralSharp()
+    .AddPredictor<House, float>("house-price", "models/house-price.nsm", p => p.Input<House>(h => [...]).Output(v => v[0]))
+    .AddChatModel("my-gpt", "models/chat.nsm", "chars", c => c.KeepAlive(TimeSpan.FromMinutes(5)));
+
+app.MapPredictor<House, float>("/predict/house-price", "house-price");      // POST a House (or /batch an array)
+app.MapGenerate("/api/generate", "my-gpt");                                 // JSON, or server-sent events with "stream": true
+app.MapOllamaApi("/api", "my-gpt", o => o.Tools(ToolExecution.Client));    // or ToolExecution.Server with maxRounds
+app.MapNeuralSharpStatus("/status");
+```
+
+The endpoints are ordinary ASP.NET Core endpoints (`.RequireAuthorization()`, rate limiting and OpenAPI work
+as usual), and `IPredictor<TIn, TOut>` can be injected (keyed by model name). The GptApi sample serves its
+Ollama-compatible API this way, and the HouseApi sample is a complete prediction API in about ten lines.
+
+### Fine-tuning: freezing, a learning rate per group, saving only what changed, LoRA
+
+```csharp
+model.Freeze(0..^1);                                           // every layer but the last (= RequiresGrad = false)
+using var trainer = new Trainer(model, Losses.MeanSquaredError, p => new Adam(p, 1e-3f));   // p = trainable parameters only
+model.SaveTrainable("head.nsp");                               // only the head; LoadTrainable restores it
+
+var grouped = new GroupedOptimizer(new AdamW(body.Parameters(), 1e-4f), new AdamW(head.Parameters(), 1e-3f));
+
+gpt.AddLora(rank: 8, alpha: 16, targets: layer => true, freezeBase: true);   // adapters on every Linear, outputs unchanged at start
+// ... train: only the adapters change; SaveTrainable stores just them ...
+gpt.MergeLora();                                                // fold them into the weights
+```
 
 ## Telemetry: logging and tracking
 
@@ -480,19 +691,24 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 64 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 82 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
 data loading, telemetry, memory limits and thread budgets, the sampler's filters and penalties, and the
 generation layer (stop sequences, context sliding, cache/graph/recompute agreement, template rendering,
-streaming parser, keep-alive expiry). The suite runs on every available device.
+streaming parser, keep-alive expiry). The simplified API is tested against the original one (identical
+layers, weights, data splits and training histories), together with predictors, packages, tools,
+conversations, the inference engine (batching, copies, queue limits, timeouts, keep-alive with a manual
+clock) and the ASP.NET Core endpoints over a real Kestrel server. The suite runs on every available device.
 
 ## Status
 
-* **Verified on real hardware.** All 64 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
+* **Verified on real hardware.** The first 64 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
   Laptop GPU (Blackwell), 128 of 128, including KV-cache and batched decoding, graph replay, the
-  sampler with top-p, min-p and penalties, the generation layer and the kernel-signature check.
+  sampler with top-p, min-p and penalties, the generation layer and the kernel-signature check. The
+  18 newest ones (simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine,
+  ASP.NET Core) pass on the CPU and still need a run on a GPU.
   That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.
