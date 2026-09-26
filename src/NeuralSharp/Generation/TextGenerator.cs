@@ -6,7 +6,7 @@ namespace NeuralSharp.Generation;
 /// <summary>Timing and token counts of one generation (durations as in common LLM server APIs).</summary>
 /// <param name="PromptTokens">Tokens of the (possibly truncated) prompt that were processed.</param>
 /// <param name="PromptDuration">Time to process the prompt (prefill), including the first sampled token.</param>
-/// <param name="GeneratedTokens">Tokens generated (stop text excluded).</param>
+/// <param name="GeneratedTokens">Tokens sampled (including any that form a stop sequence).</param>
 /// <param name="GenerationDuration">Time spent generating after the prompt.</param>
 /// <param name="TotalDuration">Wall time of the whole call.</param>
 /// <param name="ContextResets">Times the context window filled up and was re-read from its last half.</param>
@@ -372,7 +372,7 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
 
         doneReason ??= "length";
         Device.Synchronize();
-        var stats = new GenerationStats(promptTokens, promptDuration, Tokenizer.Encode(text.ToString(0, emitted)).Count, total.Elapsed - promptDuration,
+        var stats = new GenerationStats(promptTokens, promptDuration, generated.Count, total.Elapsed - promptDuration,
             total.Elapsed, resets);
         yield return new GenerationChunk("", Done: true, DoneReason: doneReason, Stats: stats);
     }

@@ -227,11 +227,29 @@ public static class ModuleExtensions
         return count;
     }
 
-    /// <summary>Turns bfloat16 weights back into float32 weights (the rounding stays). Returns how many layers changed.</summary>
+    /// <summary>
+    /// Stores the weights of every <see cref="Linear"/> layer (or those <paramref name="targets"/> selects) as 4-bit values
+    /// with one scale per 32 rows and column (see <see cref="Int4Weight"/>): about 5 bits per weight, and token-by-token
+    /// decoding reads 8× less than float32. The weights become fixed; LoRA adapters on them still train (QLoRA). Returns
+    /// how many layers changed.
+    /// </summary>
+    public static int QuantizeInt4(this Module model, Func<Linear, bool>? targets = null)
+    {
+        int count = 0;
+        foreach (var linear in model.Descendants().OfType<Linear>().Where(l => l.Int4 is null && (targets?.Invoke(l) ?? true)).ToList())
+        {
+            linear.QuantizeInt4();
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>Turns bfloat16 and 4-bit weights back into float32 weights (the rounding stays). Returns how many layers changed.</summary>
     public static int ToFloat32(this Module model, bool trainable = true)
     {
         int count = 0;
-        foreach (var linear in model.Descendants().OfType<Linear>().Where(l => l.BFloat16 is not null).ToList())
+        foreach (var linear in model.Descendants().OfType<Linear>().Where(l => l.BFloat16 is not null || l.Int4 is not null).ToList())
         {
             linear.ToFloat32(trainable);
             count++;

@@ -143,6 +143,132 @@ public sealed class Int8Weight : IDisposable
 }
 
 /// <summary>
+/// The 4-bit weights of a <see cref="Linear"/> layer: each group of 32 input rows of a column shares one float scale and
+/// every weight is a signed nibble in -8..7 (the largest magnitude of the group maps to -8, as in llama.cpp's Q4_0), about
+/// 5 bits per weight; decoding reads 8× less than float32. Created by <see cref="ModuleExtensions.QuantizeInt4"/> or when
+/// loading with 4-bit weights; inputs, outputs, biases and LoRA adapters stay float32 (QLoRA-style fine-tuning).
+/// </summary>
+public sealed class Int4Weight : IDisposable
+{
+    /// <summary>Weight rows that share one scale per column.</summary>
+    public const int GroupSize = 32;
+
+    private Int4Weight(Tensor packed, Tensor scales, int rows, int columns)
+    {
+        Packed = packed;
+        Scales = scales;
+        Rows = rows;
+        Columns = columns;
+    }
+
+    /// <summary>Input features (rows of the weight matrix).</summary>
+    public int Rows { get; }
+
+    /// <summary>Output features (columns).</summary>
+    public int Columns { get; }
+
+    /// <summary>Device memory used, in bytes (weights and scales).</summary>
+    public long Bytes => 4L * (Packed.Size + Scales.Size);
+
+    /// <summary>The nibbles, eight per element along each row (nibble c of element w is column 8w + c).</summary>
+    internal Tensor Packed { get; private set; }
+
+    /// <summary>One scale per group of <see cref="GroupSize"/> rows and column: [⌈rows / 32⌉, 8·⌈columns / 8⌉].</summary>
+    internal Tensor Scales { get; private set; }
+
+    /// <summary>Quantizes a float weight matrix [rows, columns] (on its device).</summary>
+    public static Int4Weight Quantize(Tensor weight)
+    {
+        if (weight.Rank != 2)
+        {
+            throw new ArgumentException($"Int4 quantization needs a matrix, got {Tensor.FormatShape(weight.Shape)}.", nameof(weight));
+        }
+
+        return Quantize(weight.ToArray(), weight.Shape[0], weight.Shape[1], weight.Device);
+    }
+
+    /// <summary>Quantizes host values [rows, columns] and uploads only the nibbles and scales to <paramref name="device"/>.</summary>
+    public static Int4Weight Quantize(ReadOnlySpan<float> values, int rows, int columns, Device device) =>
+        Quantize(values.ToArray(), rows, columns, device);
+
+    /// <summary><see cref="Quantize(ReadOnlySpan{float}, int, int, Device)"/> without copying the values first.</summary>
+    internal static Int4Weight Quantize(float[] values, int rows, int columns, Device device)
+    {
+        if (values.Length != rows * columns)
+        {
+            throw new ArgumentException($"{values.Length} values do not fill [{rows}, {columns}].", nameof(values));
+        }
+
+        int words = (columns + 7) / 8, groups = (rows + GroupSize - 1) / GroupSize;
+        var packed = new uint[rows * words];
+        var scales = new float[groups * words * 8];
+        var source = values;
+        HostParallel.For(groups, Math.Max(1, (1 << 14) / Math.Max(1, columns)), (first, last) =>
+        {
+            var extreme = new float[columns];
+            for (int g = first; g < last; g++)
+            {
+                int r0 = g * GroupSize, r1 = Math.Min(rows, r0 + GroupSize);
+                Array.Clear(extreme);
+                for (int r = r0; r < r1; r++)
+                {
+                    for (int j = 0; j < columns; j++)
+                    {
+                        float v = source[r * columns + j];
+                        if (MathF.Abs(v) > MathF.Abs(extreme[j]))
+                        {
+                            extreme[j] = v;
+                        }
+                    }
+                }
+
+                var scale = scales.AsSpan(g * words * 8, columns);
+                for (int j = 0; j < columns; j++)
+                {
+                    scale[j] = extreme[j] / -8f;
+                }
+
+                for (int r = r0; r < r1; r++)
+                {
+                    for (int j = 0; j < columns; j++)
+                    {
+                        float d = scale[j];
+                        int q = d == 0f ? 0 : Math.Clamp((int)MathF.Round(source[r * columns + j] / d), -8, 7);
+                        packed[r * words + (j >> 3)] |= (uint)(q & 15) << (4 * (j & 7));
+                    }
+                }
+            }
+        });
+
+        return new Int4Weight(
+            Tensor.Persistent(MemoryMarshal.Cast<uint, float>(packed).ToArray(), [packed.Length], device, requiresGrad: false),
+            Tensor.Persistent(scales, [scales.Length], device, requiresGrad: false),
+            rows, columns);
+    }
+
+    /// <summary>The float weights these nibbles stand for, [rows, columns], on the same device.</summary>
+    public Tensor Dequantize()
+    {
+        var w = Tensor.Persistent(new float[Rows * Columns], [Rows, Columns], Packed.Device, requiresGrad: false);
+        Packed.Backend.Int4Dequantize(Packed.Storage, Scales.Storage, w.Storage, Rows, Columns);
+        return w;
+    }
+
+    internal void MoveTo(Device device, Func<Tensor, Device, Tensor> move)
+    {
+        Packed = move(Packed, device);
+        Scales = move(Scales, device);
+    }
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        Packed.Dispose();
+        Scales.Dispose();
+    }
+}
+
+/// <summary>
 /// The bfloat16 weights of a <see cref="Linear"/> layer: each weight keeps float32's range with an 8-bit mantissa (about
 /// 3 significant digits), in half the memory; decoding reads half the bytes of float32. Hugging Face checkpoints are
 /// usually stored this way, so loading them as bfloat16 is exact. Created by <see cref="ModuleExtensions.ToBFloat16"/>

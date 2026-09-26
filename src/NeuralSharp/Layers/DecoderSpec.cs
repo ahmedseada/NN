@@ -41,6 +41,12 @@ public sealed record DecoderBuildOptions
     /// </summary>
     public bool BFloat16 { get; init; }
 
+    /// <summary>
+    /// Store the projections as 4-bit weights (see <see cref="Int4Weight"/>): about 5 bits per weight, quantized on the host
+    /// as they are read. <see cref="Int8"/> takes precedence; this over <see cref="BFloat16"/>.
+    /// </summary>
+    public bool Int4 { get; init; }
+
     /// <summary>Longest sequence the model will see (the rotary tables' size); the spec's <see cref="DecoderSpec.MaxPositions"/> when null.</summary>
     public int? MaxPositions { get; init; }
 
@@ -179,6 +185,7 @@ public sealed record DecoderSpec
                         : throw new InvalidDataException($"The weights have no '{name}.weight' [{inputs}, {outputs}]."));
                 var b = bias ? Tensor($"{name}.bias", [outputs], () => new float[outputs]) : null;
                 return options.Int8 ? Linear.FromInt8(Int8Weight.Quantize(Values(), inputs, outputs, device), b)
+                    : options.Int4 ? Linear.FromInt4(Int4Weight.Quantize(Values(), inputs, outputs, device), b)
                     : options.BFloat16 ? Linear.FromBFloat16(BFloat16Weight.FromValues(Values(), inputs, outputs, device), b)
                     : Linear.FromWeights(NeuralSharp.Tensor.Persistent(Values(), shape, device, requiresGrad: true), b);
             }

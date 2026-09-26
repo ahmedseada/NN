@@ -263,6 +263,16 @@ internal abstract class Backend
     /// <summary>w[k, n] = q[k, n] · scales[n] (see <see cref="Int8MatMul"/> for the packing).</summary>
     public abstract void Int8Dequantize(Storage q, Storage scales, Storage w, int k, int n);
 
+    /// <summary>
+    /// y[m, n] = x[m, k] · w with 4-bit weights: w[r, j] = q[r, j] · scales[r / 32, j], where q holds signed nibbles packed
+    /// eight per 32-bit word along each row (nibble c of word w is column 8w + c; rows have ⌈n / 8⌉ words) and scales has
+    /// one row of 8·⌈n / 8⌉ values per group of 32 weight rows.
+    /// </summary>
+    public abstract void Int4MatMul(Storage x, Storage q, Storage scales, Storage y, int m, int n, int k);
+
+    /// <summary>w[k, n] = the float values of 4-bit weights packed as in <see cref="Int4MatMul"/>.</summary>
+    public abstract void Int4Dequantize(Storage q, Storage scales, Storage w, int k, int n);
+
     // Int8 KV cache: each cached row (one head, one position) is dim bytes packed four per element, words = ceil(dim / 4)
     // elements, with one scale per row in scales[head, position].
 

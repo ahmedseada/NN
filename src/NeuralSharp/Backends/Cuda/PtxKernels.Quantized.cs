@@ -6,7 +6,10 @@ namespace NeuralSharp.Backends.Cuda;
 // row padded to n4 = ceil(n / 4) words), with one float scale per column: w[k, j] = q[k, j] · scale[j].
 internal static partial class PtxKernels
 {
-    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32"];
+    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32", "int4_gemv_f32", "int4_dequant_f32"];
+
+    /// <summary>Rows of an int4 weight matrix that share one scale per column.</summary>
+    public const int Int4Group = 32;
 
     /// <summary>Threads of an <c>int8_gemv_f32</c> block: 32 packed words (128 columns) × 16 slices of k.</summary>
     public const int Int8GemvThreads = 512;
@@ -15,6 +18,38 @@ internal static partial class PtxKernels
     {
         Int8Gemv(sb);
         Int8Gemv(sb, bf16: true);
+        Int8Gemv(sb, int4: true);
+
+        // w[r, 8c + j] = nibble j of packed word (r, c) · s[r / Int4Group, 8c + j]: one thread per word.
+        var dequant = new StringBuilder("""
+            ld.global.u32 %r5, [%a_q];
+            div.u32 %r6, %i, %s_words;
+            rem.u32 %r7, %i, %s_words;
+            shl.b32 %r8, %r7, 3;
+            shr.u32 %r9, %r6, 5;
+            shl.b32 %r10, %s_words, 3;
+            mad.lo.u32 %r9, %r9, %r10, %r8;
+            mul.wide.u32 %rd2, %r9, 4;
+            add.u64 %rd2, %rd2, %b_s;
+            mad.lo.u32 %r11, %r6, %s_cols, %r8;
+            mul.wide.u32 %rd1, %r11, 4;
+            add.u64 %rd1, %rd1, %b_w;
+            """);
+        for (int c = 0; c < 8; c++)
+        {
+            dequant.AppendLine($"""
+                add.u32 %r12, %r8, {c};
+                setp.ge.u32 %p1, %r12, %s_cols;
+                @%p1 bra DONE;
+                bfe.s32 %r13, %r5, {4 * c}, 4;
+                cvt.rn.f32.s32 %f1, %r13;
+                ld.global.f32 %f2, [%rd2+{4 * c}];
+                mul.f32 %f1, %f1, %f2;
+                st.global.f32 [%rd1+{4 * c}], %f1;
+                """);
+        }
+
+        Elementwise(sb, "int4_dequant_f32", ["q", "s", "w"], [("u32", "words"), ("u32", "cols")], dequant.ToString());
 
         // w[r, 2c], w[r, 2c + 1] = the bfloat16 pair in packed word (r, c) (words = ⌈cols / 2⌉ per row): one thread per word.
         Elementwise(sb, "bf16_dequant_f32", ["q", "w"], [("u32", "words"), ("u32", "cols")], """
@@ -325,20 +360,25 @@ internal static partial class PtxKernels
     // narrow). Slices are added in shared memory; with one split the result is scaled and stored, otherwise each
     // split's partial sums go to part[split, r, j] and the last block of the column range adds them in split order.
     // bf16: bf16_gemv_f32, the same for bfloat16 weights packed two per word (low half = the even column), no scales.
-    private static void Int8Gemv(StringBuilder sb, bool bf16 = false)
+    // int4: int4_gemv_f32, signed nibbles packed eight per word (nibble c = column 8w + c) with a scale per group of
+    // Int4Group rows and column, s[g, j] (rows of 8·words scales); a slice takes four consecutive rows (one group).
+    private static void Int8Gemv(StringBuilder sb, bool bf16 = false, bool int4 = false)
     {
-        int cpw = bf16 ? 2 : 4, columns = 32 * cpw;
-        string part = bf16 ? "h_part" : "i8_part";
+        int cpw = bf16 ? 2 : int4 ? 8 : 4, columns = 32 * cpw;
+        int acc = GemvRows * cpw, dec = Math.Max(32, acc), xr = dec + 8, sc = dec + 9, red = dec + 20;
+        string part = bf16 ? "h_part" : int4 ? "i4_part" : "i8_part";
+        string name = bf16 ? "bf16_gemv_f32" : int4 ? "int4_gemv_f32" : "int8_gemv_f32";
+        bool scaled = !bf16 && !int4;
         var s = new StringBuilder();
         s.AppendLine($$"""
-            .visible .entry {{(bf16 ? "bf16_gemv_f32" : "int8_gemv_f32")}}(
+            .visible .entry {{name}}(
                 .param .u64 p_x, .param .u64 p_q, .param .u64 p_s, .param .u64 p_y, .param .u64 p_part,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_n4, .param .u32 p_chunk, .param .u32 p_splits,
                 .param .u64 p_counters
             )
             {
                 .reg .pred %p<24>;
-                .reg .f32 %f<48>;
+                .reg .f32 %f<{{red + 8}}>;
                 .reg .b32 %r<40>;
                 .reg .b64 %rd<24>;
                 .shared .align 4 .f32 {{part}}[{{16 * columns}}];
@@ -371,6 +411,8 @@ internal static partial class PtxKernels
                 min.u32 %r11, %r11, %r3;
                 mul.wide.u32 %rd6, %r4, 64;
                 mul.wide.u32 %rd7, %r3, 4;
+                mul.wide.u32 %rd8, %r4, 4;
+                shl.b32 %r36, %r4, 3;
             """);
         for (int r = 0; r < GemvRows; r++)
         {
@@ -381,7 +423,15 @@ internal static partial class PtxKernels
             }
         }
 
-        // One k step: word %r{word} holds 4 columns; x[r, kk] is at %rd{xaddr} + {offset} + r·k·4.
+        if (int4)
+        {
+            for (int c = 0; c < 8; c++)
+            {
+                s.AppendLine($"    mov.f32 %f{sc + c}, 0f00000000;");
+            }
+        }
+
+        // One k step: word %r{word} holds cpw columns; x[r, kk] is at %rd11 + {offset} + r·k·4.
         string Step(string wordReg, string xOffset)
         {
             var t = new StringBuilder();
@@ -389,26 +439,31 @@ internal static partial class PtxKernels
             {
                 // bfloat16 is the top half of a float32: shift the even column up, mask the odd one.
                 t.AppendLine($"shl.b32 %r20, {wordReg}, 16;");
-                t.AppendLine("mov.b32 %f32, %r20;");
+                t.AppendLine($"mov.b32 %f{dec}, %r20;");
                 t.AppendLine($"and.b32 %r20, {wordReg}, 0xFFFF0000;");
-                t.AppendLine("mov.b32 %f33, %r20;");
+                t.AppendLine($"mov.b32 %f{dec + 1}, %r20;");
             }
             else
             {
-                for (int c = 0; c < 4; c++)
+                for (int c = 0; c < cpw; c++)
                 {
-                    t.AppendLine($"bfe.s32 %r20, {wordReg}, {8 * c}, 8;");
-                    t.AppendLine($"cvt.rn.f32.s32 %f{32 + c}, %r20;");
+                    int bits = int4 ? 4 : 8;
+                    t.AppendLine($"bfe.s32 %r20, {wordReg}, {bits * c}, {bits};");
+                    t.AppendLine($"cvt.rn.f32.s32 %f{dec + c}, %r20;");
+                    if (int4)
+                    {
+                        t.AppendLine($"mul.f32 %f{dec + c}, %f{dec + c}, %f{sc + c};");
+                    }
                 }
             }
 
             t.AppendLine("mov.u64 %rd12, %rd11;");
             for (int r = 0; r < GemvRows; r++)
             {
-                t.AppendLine($"@%p{r} ld.global.f32 %f36, [%rd12+{xOffset}];");
+                t.AppendLine($"@%p{r} ld.global.f32 %f{xr}, [%rd12+{xOffset}];");
                 for (int c = 0; c < cpw; c++)
                 {
-                    t.AppendLine($"@%p{r} fma.rn.f32 %f{r * cpw + c}, %f36, %f{32 + c}, %f{r * cpw + c};");
+                    t.AppendLine($"@%p{r} fma.rn.f32 %f{r * cpw + c}, %f{xr}, %f{dec + c}, %f{r * cpw + c};");
                 }
 
                 t.AppendLine("add.u64 %rd12, %rd12, %rd7;");
@@ -417,38 +472,101 @@ internal static partial class PtxKernels
             return t.ToString();
         }
 
+        // Int4: the scales of row %r{row}'s group for this thread's eight columns (two 16-byte loads).
+        string GroupScales(string row) => $"""
+                shr.u32 %r37, {row}, {(int)Math.Log2(Int4Group)};
+                mul.wide.u32 %rd15, %r37, %r36;
+                cvt.u64.u32 %rd16, %r8;
+                shl.b64 %rd16, %rd16, 3;
+                add.u64 %rd15, %rd15, %rd16;
+                shl.b64 %rd15, %rd15, 2;
+                add.u64 %rd15, %rd15, %rd3;
+                @%p20 ld.global.v4.f32 {"{"}%f{sc}, %f{sc + 1}, %f{sc + 2}, %f{sc + 3}{"}"}, [%rd15];
+                @%p20 ld.global.v4.f32 {"{"}%f{sc + 4}, %f{sc + 5}, %f{sc + 6}, %f{sc + 7}{"}"}, [%rd15+16];
+            """;
+
+        if (int4)
+        {
+            // Slice t takes rows base + 4t .. base + 4t + 3 of each 64-row block (one group, so one set of scales).
+            s.AppendLine("""
+                    mov.u32 %r12, %r10;
+                    shl.b32 %r34, %r7, 2;
+                K4:
+                    add.u32 %r13, %r12, 64;
+                    setp.gt.u32 %p10, %r13, %r11;
+                    @%p10 bra K1S;
+                    add.u32 %r35, %r12, %r34;
+                    mul.wide.u32 %rd9, %r35, %r4;
+                    cvt.u64.u32 %rd10, %r8;
+                    add.u64 %rd9, %rd9, %rd10;
+                    shl.b64 %rd9, %rd9, 2;
+                    add.u64 %rd9, %rd9, %rd2;
+                    mov.u32 %r21, 0;
+                    mov.u32 %r22, 0;
+                    mov.u32 %r23, 0;
+                    mov.u32 %r24, 0;
+                    @%p20 ld.global.u32 %r21, [%rd9];
+                    add.u64 %rd9, %rd9, %rd8;
+                    @%p20 ld.global.u32 %r22, [%rd9];
+                    add.u64 %rd9, %rd9, %rd8;
+                    @%p20 ld.global.u32 %r23, [%rd9];
+                    add.u64 %rd9, %rd9, %rd8;
+                    @%p20 ld.global.u32 %r24, [%rd9];
+                """);
+            s.AppendLine(GroupScales("%r35"));
+            s.AppendLine("""
+                    mul.wide.u32 %rd11, %r35, 4;
+                    add.u64 %rd11, %rd11, %rd1;
+                """);
+            s.AppendLine(Step("%r21", "0"));
+            s.AppendLine(Step("%r22", "4"));
+            s.AppendLine(Step("%r23", "8"));
+            s.AppendLine(Step("%r24", "12"));
+            s.AppendLine("""
+                    add.u32 %r12, %r12, 64;
+                    bra K4;
+                K1S:
+                    add.u32 %r12, %r12, %r7;
+                """);
+        }
+        else
+        {
+            s.AppendLine("""
+                    add.u32 %r12, %r10, %r7;
+                K4:
+                    add.u32 %r13, %r12, 48;
+                    setp.ge.u32 %p10, %r13, %r11;
+                    @%p10 bra K1;
+                    mul.wide.u32 %rd9, %r12, %r4;
+                    cvt.u64.u32 %rd10, %r8;
+                    add.u64 %rd9, %rd9, %rd10;
+                    shl.b64 %rd9, %rd9, 2;
+                    add.u64 %rd9, %rd9, %rd2;
+                    mov.u32 %r21, 0;
+                    mov.u32 %r22, 0;
+                    mov.u32 %r23, 0;
+                    mov.u32 %r24, 0;
+                    @%p20 ld.global.u32 %r21, [%rd9];
+                    add.u64 %rd9, %rd9, %rd6;
+                    @%p20 ld.global.u32 %r22, [%rd9];
+                    add.u64 %rd9, %rd9, %rd6;
+                    @%p20 ld.global.u32 %r23, [%rd9];
+                    add.u64 %rd9, %rd9, %rd6;
+                    @%p20 ld.global.u32 %r24, [%rd9];
+                    mul.wide.u32 %rd11, %r12, 4;
+                    add.u64 %rd11, %rd11, %rd1;
+                """);
+            s.AppendLine(Step("%r21", "0"));
+            s.AppendLine(Step("%r22", "64"));
+            s.AppendLine(Step("%r23", "128"));
+            s.AppendLine(Step("%r24", "192"));
+            s.AppendLine("""
+                    add.u32 %r12, %r12, 64;
+                    bra K4;
+                """);
+        }
+
         s.AppendLine("""
-                add.u32 %r12, %r10, %r7;
-            K4:
-                add.u32 %r13, %r12, 48;
-                setp.ge.u32 %p10, %r13, %r11;
-                @%p10 bra K1;
-                mul.wide.u32 %rd9, %r12, %r4;
-                cvt.u64.u32 %rd10, %r8;
-                add.u64 %rd9, %rd9, %rd10;
-                shl.b64 %rd9, %rd9, 2;
-                add.u64 %rd9, %rd9, %rd2;
-                mov.u32 %r21, 0;
-                mov.u32 %r22, 0;
-                mov.u32 %r23, 0;
-                mov.u32 %r24, 0;
-                @%p20 ld.global.u32 %r21, [%rd9];
-                add.u64 %rd9, %rd9, %rd6;
-                @%p20 ld.global.u32 %r22, [%rd9];
-                add.u64 %rd9, %rd9, %rd6;
-                @%p20 ld.global.u32 %r23, [%rd9];
-                add.u64 %rd9, %rd9, %rd6;
-                @%p20 ld.global.u32 %r24, [%rd9];
-                mul.wide.u32 %rd11, %r12, 4;
-                add.u64 %rd11, %rd11, %rd1;
-            """);
-        s.AppendLine(Step("%r21", "0"));
-        s.AppendLine(Step("%r22", "64"));
-        s.AppendLine(Step("%r23", "128"));
-        s.AppendLine(Step("%r24", "192"));
-        s.AppendLine("""
-                add.u32 %r12, %r12, 64;
-                bra K4;
             K1:
                 setp.ge.u32 %p10, %r12, %r11;
                 @%p10 bra KEND;
@@ -462,6 +580,11 @@ internal static partial class PtxKernels
                 mul.wide.u32 %rd11, %r12, 4;
                 add.u64 %rd11, %rd11, %rd1;
             """);
+        if (int4)
+        {
+            s.AppendLine(GroupScales("%r12"));
+        }
+
         s.AppendLine(Step("%r21", "0"));
         s.AppendLine($$"""
                 add.u32 %r12, %r12, 16;
@@ -486,7 +609,7 @@ internal static partial class PtxKernels
             """);
         for (int r = 0; r < GemvRows; r++)
         {
-            // part[slice][lane·4 + c] = acc[r][c]; then threads 0..127 add the 16 slices of their column.
+            // part[slice][lane·cpw + c] = acc[r][c]; then one thread per column adds the 16 slices of its column.
             s.AppendLine($"    @!%p{r} bra ROWS_DONE;");
             for (int c = 0; c < cpw; c++)
             {
@@ -495,11 +618,11 @@ internal static partial class PtxKernels
 
             s.AppendLine("    bar.sync 0;");
             s.AppendLine($"    @!%p11 bra ROW{r}_DONE;");
-            s.AppendLine("    mov.f32 %f40, 0f00000000;");
+            s.AppendLine($"    mov.f32 %f{red}, 0f00000000;");
             for (int slice = 0; slice < 16; slice++)
             {
-                s.AppendLine($"    ld.shared.f32 %f41, [%r17+{slice * columns * 4}];");
-                s.AppendLine("    add.f32 %f40, %f40, %f41;");
+                s.AppendLine($"    ld.shared.f32 %f{red + 1}, [%r17+{slice * columns * 4}];");
+                s.AppendLine($"    add.f32 %f{red}, %f{red}, %f{red + 1};");
             }
 
             s.AppendLine($"""
@@ -509,14 +632,14 @@ internal static partial class PtxKernels
                     shl.b64 %rd16, %rd15, 2;
                     add.u64 %rd16, %rd16, %rd13;
                     add.u64 %rd16, %rd16, %rd5;
-                    st.global.f32 [%rd16], %f40;
+                    st.global.f32 [%rd16], %f{red};
                     bra ROW{r}_DONE;
                 ROW{r}_FINAL:
-                    {(bf16 ? "" : "ld.global.f32 %f42, [%rd14];\n    mul.f32 %f40, %f40, %f42;")}
+                    {(scaled ? $"ld.global.f32 %f{red + 2}, [%rd14];\n    mul.f32 %f{red}, %f{red}, %f{red + 2};" : "")}
                     mul.wide.u32 %rd16, %r2, {4 * r};
                     add.u64 %rd16, %rd16, %rd13;
                     add.u64 %rd16, %rd16, %rd4;
-                    st.global.f32 [%rd16], %f40;
+                    st.global.f32 [%rd16], %f{red};
                 ROW{r}_DONE:
                     bar.sync 0;
                 """);
@@ -558,20 +681,20 @@ internal static partial class PtxKernels
                 shl.b64 %rd21, %rd21, 2;
                 add.u64 %rd21, %rd21, %rd13;
                 add.u64 %rd22, %rd21, %rd5;
-                mov.f32 %f43, 0f00000000;
+                mov.f32 %f{{red + 3}}, 0f00000000;
                 mov.u32 %r33, 0;
             FIN_SPLIT:
                 setp.ge.u32 %p17, %r33, %r31;
                 @%p17 bra FIN_SPLIT_END;
-                ld.global.cg.f32 %f44, [%rd22];
-                add.f32 %f43, %f43, %f44;
+                ld.global.cg.f32 %f{{red + 4}}, [%rd22];
+                add.f32 %f{{red + 3}}, %f{{red + 3}}, %f{{red + 4}};
                 add.u64 %rd22, %rd22, %rd19;
                 add.u32 %r33, %r33, 1;
                 bra FIN_SPLIT;
             FIN_SPLIT_END:
-                {{(bf16 ? "" : "ld.global.f32 %f45, [%rd14];\n    mul.f32 %f43, %f43, %f45;")}}
+                {{(scaled ? $"ld.global.f32 %f{red + 5}, [%rd14];\n    mul.f32 %f{red + 3}, %f{red + 3}, %f{red + 5};" : "")}}
                 add.u64 %rd23, %rd21, %rd4;
-                st.global.f32 [%rd23], %f43;
+                st.global.f32 [%rd23], %f{{red + 3}};
                 add.u32 %r32, %r32, 1;
                 bra FIN_ROW;
             DONE:

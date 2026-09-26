@@ -37,6 +37,34 @@ internal sealed unsafe partial class CudaBackend
         PackedFewRows("bf16_gemv_f32", x, packed, packed, y, m, n, k, words);
     }
 
+    public override void Int4MatMul(Storage x, Storage q, Storage scales, Storage y, int m, int n, int k)
+    {
+        int words = (n + 7) / 8;
+        if (m > PtxKernels.GemvRows || k == 0)
+        {
+            var w = Allocate(k * n, zeroed: false);
+            try
+            {
+                Int4Dequantize(q, scales, w, k, n);
+                MatMul(x, w, y, m, n, k, false, false, 0f);
+            }
+            finally
+            {
+                w.Release();
+            }
+
+            return;
+        }
+
+        PackedFewRows("int4_gemv_f32", x, q, scales, y, m, n, k, words, align: 64);
+    }
+
+    public override void Int4Dequantize(Storage q, Storage scales, Storage w, int k, int n)
+    {
+        int words = (n + 7) / 8;
+        Launch1D(K("int4_dequant_f32"), k * words, P(q), P(scales), P(w), U(words), U(n), U(k * words));
+    }
+
     public override void BFloat16Dequantize(Storage packed, Storage w, int k, int n)
     {
         int words = (n + 1) / 2;
@@ -45,11 +73,12 @@ internal sealed unsafe partial class CudaBackend
 
     // Few rows (decoding) through packed weights: read each weight word once, with enough blocks to keep every
     // multiprocessor busy; narrow matrices split k, and the last block of each column range adds the splits in order.
-    private void PackedFewRows(string kernel, Storage x, Storage q, Storage scales, Storage y, int m, int n, int k, int words)
+    // `align`: split boundaries fall on multiples of it (int4 splits start on a 64-row block).
+    private void PackedFewRows(string kernel, Storage x, Storage q, Storage scales, Storage y, int m, int n, int k, int words, int align = 1)
     {
         int columnBlocks = (words + 31) / 32;
         int splits = Math.Clamp((4 * Math.Max(1, _multiprocessors) + columnBlocks - 1) / columnBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
-        int chunk = (k + splits - 1) / splits;
+        int chunk = ((k + splits - 1) / splits + align - 1) / align * align;
         splits = (k + chunk - 1) / chunk;
         var counters = SplitCounters(columnBlocks);
         if (splits == 1)

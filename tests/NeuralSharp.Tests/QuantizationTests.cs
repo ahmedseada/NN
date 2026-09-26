@@ -16,6 +16,7 @@ internal static partial class Tests
         ("int8: save/load (a float model loads a quantized file), move between devices, dequantize, memory", Int8SaveLoad),
         ("int8: QLoRA — adapters train on top of frozen int8 weights", Int8Lora),
         ("bf16: rounding, direct and expanded products, gradient, model conversion, save/load, decoder build", BFloat16Weights),
+        ("int4: group scales, direct and expanded products, gradient, model conversion, save/load", Int4Weights),
         ("weights: Float16 and BFloat16 files are half the size and round as expected", HalfPrecisionFiles),
         ("matmul: few rows (column-parallel path) match the reference, with beta and transposes", FewRowMatMul),
         ("int8 KV cache: write, scores and context kernels match a dequantized cache", Int8CacheKernels),
@@ -77,6 +78,84 @@ internal static partial class Tests
         }
 
         Check(model.ToFloat32() > 0 && model.Predict(ids).ToArray().SequenceEqual(half), "back to float32 keeps the rounded weights");
+    }
+
+    private static void Int4Weights(Device device)
+    {
+        var r = new Random(73);
+        foreach (var (k, n) in new[] { (37, 23), (1030, 301), (700, 2050), (4096, 264) })
+        {
+            var values = Enumerable.Range(0, k * n).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+            using var q = Int4Weight.Quantize(values, k, n, device);
+
+            // The rule: per group of 32 rows and column, d = (the value of largest magnitude) / -8, q = clamp(round(v / d), -8, 7).
+            var rule = new float[k * n];
+            for (int g = 0; g < (k + 31) / 32; g++)
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    float extreme = 0f;
+                    for (int row = g * 32; row < Math.Min(k, g * 32 + 32); row++)
+                    {
+                        extreme = MathF.Abs(values[row * n + j]) > MathF.Abs(extreme) ? values[row * n + j] : extreme;
+                    }
+
+                    float d = extreme / -8f;
+                    for (int row = g * 32; row < Math.Min(k, g * 32 + 32); row++)
+                    {
+                        rule[row * n + j] = d == 0f ? 0f : Math.Clamp(MathF.Round(values[row * n + j] / d), -8f, 7f) * d;
+                    }
+                }
+            }
+
+            using var expanded = q.Dequantize();
+            var e = expanded.ToArray();
+            Check(e.Select((v, i) => v == rule[i]).All(x => x), $"[{k}, {n}]: expansion follows the rule");
+            float error = values.Select((v, i) => MathF.Abs(v - e[i])).Max();
+            Check(error <= 1f / 8f + 1e-6f, $"[{k}, {n}]: error {error} within one step (max / 8)");
+            foreach (int m in new[] { 1, 3, 8, 20 })                       // ≤ 8 rows read nibbles directly; 20 expand first
+            {
+                var input = Enumerable.Range(0, m * k).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+                using var x = Tensor.From(input, [m, k], device, requiresGrad: true);
+                using var reference = Tensor.From(input, [m, k], device, requiresGrad: true);
+                var y = x.MatMulInt4(q);
+                var want = reference.MatMul(expanded);
+                AssertClose(want.ToArray(), y.ToArray(), 2e-3f * MathF.Sqrt(k), $"int4 product [{m}x{k}] × [{k}x{n}]");
+                if (k == 37)
+                {
+                    y.Sum().Backward();
+                    want.Sum().Backward();
+                    AssertClose(reference.Grad!.ToArray(), x.Grad!.ToArray(), 1e-4f, $"input gradient, {m} rows");
+                }
+            }
+        }
+
+        // A whole model: int4 predictions near float32; save/load keeps int4; back to float32 keeps the rounded weights.
+        using var model = TinyGpt(device);
+        using var ids = Tensor.From([1f, 4f, 2f, 7f, 3f], [1, 5], device);
+        var original = model.Predict(ids).ToArray();
+        Check(model.QuantizeInt4() > 0 && model.Descendants().OfType<Linear>().All(l => l.Int4 is not null), "every Linear is int4");
+        var nibbles = model.Predict(ids).ToArray();
+        AssertClose(original, nibbles, 0.25f * original.Max(MathF.Abs), "int4 model predictions");
+        long bytes = model.Descendants().OfType<Linear>().Sum(l => l.Int4!.Bytes);
+        long floats = model.Descendants().OfType<Linear>().Sum(l => 4L * l.InFeatures * l.OutFeatures);
+        Check(bytes < floats / 5, $"int4 memory {bytes} vs float32 {floats}");
+        string path = Path.GetTempFileName();
+        try
+        {
+            model.Save(path);
+            using var reloaded = TinyGpt(device);
+            reloaded.Load(path);
+            Check(reloaded.Descendants().OfType<Linear>().All(l => l.Int4 is not null), "a float model loads an int4 file as int4");
+            Check(reloaded.Predict(ids).ToArray().SequenceEqual(nibbles), "reloaded int4 predictions are identical");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+
+        Check(model.ToFloat32() > 0 && model.Descendants().OfType<Linear>().All(l => !l.Packed), "back to float32");
+        AssertClose(nibbles, model.Predict(ids).ToArray(), 1e-4f, "float32 keeps the rounded weights");
     }
 
     private static void Int8CacheKernels(Device device)

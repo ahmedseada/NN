@@ -46,6 +46,103 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override void Int4MatMul(Storage x, Storage q, Storage scales, Storage y, int m, int n, int k)
+    {
+        if (m > 8)
+        {
+            var w = Allocate(k * n, zeroed: false);
+            try
+            {
+                Int4Dequantize(q, scales, w, k, n);
+                MatMul(x, w, y, m, n, k, false, false, 0f);
+            }
+            finally
+            {
+                w.Release();
+            }
+
+            return;
+        }
+
+        // Few rows: each worker expands one weight row of its column block at a time and adds it to every input row.
+        float[] xv = D(x), yv = D(y);
+        int threads = Math.Max(1, ComputeResources.ParallelOptions.MaxDegreeOfParallelism);
+        int blockSize = Math.Max(Int8MinBlock, (n / (2 * threads) + Int8MinBlock - 1) / Int8MinBlock * Int8MinBlock);
+        int blocks = (n + blockSize - 1) / blockSize;
+        For(blocks, (long)m * n * k, (first, last) =>
+        {
+            var acc = new float[m * blockSize];
+            var row = new float[blockSize];
+            for (int block = first; block < last; block++)
+            {
+                int j0 = block * blockSize, width = Math.Min(blockSize, n - j0);
+                Array.Clear(acc);
+                for (int kk = 0; kk < k; kk++)
+                {
+                    Int4Row(q, scales, kk, n, j0, row.AsSpan(0, width));
+                    for (int r = 0; r < m; r++)
+                    {
+                        float xk = xv[r * k + kk];
+                        if (xk != 0f)
+                        {
+                            AddScaled(acc.AsSpan(r * blockSize, width), row.AsSpan(0, width), xk);
+                        }
+                    }
+                }
+
+                for (int r = 0; r < m; r++)
+                {
+                    acc.AsSpan(r * blockSize, width).CopyTo(yv.AsSpan(r * n + j0, width));
+                }
+            }
+        });
+    }
+
+    public override void Int4Dequantize(Storage q, Storage scales, Storage w, int k, int n)
+    {
+        float[] wv = D(w);
+        For(k, (long)k * n, (first, last) =>
+        {
+            for (int kk = first; kk < last; kk++)
+            {
+                Int4Row(q, scales, kk, n, 0, wv.AsSpan(kk * n, n));
+            }
+        });
+    }
+
+    // target[j] = the float value of 4-bit weight (row, j0 + j) (see Backend.Int4MatMul for the packing).
+    private static void Int4Row(Storage q, Storage scales, int row, int n, int j0, Span<float> target)
+    {
+        int words = (n + 7) / 8;
+        var packed = MemoryMarshal.Cast<float, uint>(D(q).AsSpan()).Slice(row * words, words);
+        var s = D(scales).AsSpan(row / 32 * words * 8, words * 8);
+        for (int j = 0; j < target.Length; j++)
+        {
+            int col = j0 + j;
+            int nibble = (int)(packed[col >> 3] << (28 - 4 * (col & 7))) >> 28;
+            target[j] = nibble * s[col];
+        }
+    }
+
+    // acc[j] += scale · row[j].
+    private static void AddScaled(Span<float> acc, ReadOnlySpan<float> row, float scale)
+    {
+        int j = 0;
+        if (Vector.IsHardwareAccelerated)
+        {
+            var s = new Vector<float>(scale);
+            for (; j <= row.Length - Vector<float>.Count; j += Vector<float>.Count)
+            {
+                (new Vector<float>(row[j..]) * s + new Vector<float>(acc[j..])).CopyTo(acc[j..]);
+            }
+        }
+
+        for (; j < row.Length; j++)
+        {
+            acc[j] += scale * row[j];
+        }
+    }
+
     public override void BFloat16MatMul(Storage x, Storage packed, Storage y, int m, int n, int k)
     {
         var w = Allocate(k * n, zeroed: false);
