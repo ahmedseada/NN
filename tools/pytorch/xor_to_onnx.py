@@ -39,9 +39,14 @@ for inp, out in zip(x.cpu().tolist(), outputs.tolist()):
     print(f"  {inp} -> {out[0]:.6f}")
 
 model = model.cpu()
-export_args = dict(input_names=["input"], output_names=["output"], opset_version=17,
-                   dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}})
-torch.onnx.export(model, (x.cpu(),), args.out, dynamo=args.dynamo, **export_args)
+if args.dynamo:
+    # The torch.export-based exporter (PyTorch's default since 2.9) targets opset 18 and takes dynamic_shapes.
+    batch = torch.export.Dim("batch")
+    torch.onnx.export(model, (x.cpu(),), args.out, dynamo=True, input_names=["input"], output_names=["output"],
+                      opset_version=18, dynamic_shapes=({0: batch},))
+else:
+    torch.onnx.export(model, (x.cpu(),), args.out, dynamo=False, input_names=["input"], output_names=["output"],
+                      opset_version=17, dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}})
 with open(args.out + ".expected.json", "w") as f:
     json.dump({"inputs": x.cpu().tolist(), "outputs": outputs.tolist(), "torch": torch.__version__,
                "trainedOn": device, "exporter": "dynamo" if args.dynamo else "torchscript"}, f, indent=2)
