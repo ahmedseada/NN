@@ -14,6 +14,7 @@ public abstract class Module : IDisposable
 {
     private const uint FileMagic = 0x3257_534E; // "NSW2": parameters followed by buffers (float32)
     private const uint FileMagic3 = 0x3357_534E; // "NSW3": int8 layers, then tensors each with an element type
+    private const uint FileMagic4 = 0x3457_534E; // "NSW4": int8 layers, bfloat16 layers, then tensors as in NSW3
 
     /// <summary>An optional name shown in summaries and telemetry.</summary>
     public string? Name { get; set; }
@@ -224,14 +225,25 @@ public abstract class Module : IDisposable
         // NSW3: the int8 layers (by position among the Linear layers), then each tensor with its element type.
         var linears = this.Descendants().OfType<Linear>().ToList();
         var int8 = linears.Select((l, i) => (l, i)).Where(p => p.l.Int8 is not null).ToList();
-        var exact = int8.SelectMany(p => new[] { p.l.Int8!.Packed, p.l.Int8.Scales }).ToHashSet(ReferenceEqualityComparer.Instance);
+        var half = linears.Select((l, i) => (l, i)).Where(p => p.l.BFloat16 is not null).ToList();
+        var exact = int8.SelectMany(p => new[] { p.l.Int8!.Packed, p.l.Int8.Scales }).Concat(half.Select(p => p.l.BFloat16!.Packed))
+            .ToHashSet(ReferenceEqualityComparer.Instance);
         using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
         var parameters = Parameters().Concat(Buffers()).ToList();
-        writer.Write(FileMagic3);
+        writer.Write(half.Count > 0 ? FileMagic4 : FileMagic3);
         writer.Write(int8.Count);
         foreach (var (_, index) in int8)
         {
             writer.Write(index);
+        }
+
+        if (half.Count > 0)
+        {
+            writer.Write(half.Count);
+            foreach (var (_, index) in half)
+            {
+                writer.Write(index);
+            }
         }
 
         writer.Write(parameters.Count);
@@ -263,14 +275,14 @@ public abstract class Module : IDisposable
     {
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
         uint magic = reader.ReadUInt32();
-        if (magic != FileMagic && magic != FileMagic3)
+        if (magic != FileMagic && magic != FileMagic3 && magic != FileMagic4)
         {
             throw new InvalidDataException($"{source} is not a NeuralSharp weights file.");
         }
 
-        if (magic == FileMagic3)
+        if (magic == FileMagic3 || magic == FileMagic4)
         {
-            // Layers stored as int8 are quantized first, so their packed weights have somewhere to go.
+            // Layers stored as int8 (or bfloat16) are converted first, so their packed weights have somewhere to go.
             var linears = this.Descendants().OfType<Linear>().ToList();
             int quantized = reader.ReadInt32();
             for (int i = 0; i < quantized; i++)
@@ -282,6 +294,18 @@ public abstract class Module : IDisposable
                 }
 
                 linears[index].QuantizeInt8();
+            }
+
+            int halves = magic == FileMagic4 ? reader.ReadInt32() : 0;
+            for (int i = 0; i < halves; i++)
+            {
+                int index = reader.ReadInt32();
+                if (index >= linears.Count)
+                {
+                    throw new InvalidDataException($"The file stores Linear layer {index} as bfloat16, but the model has {linears.Count}.");
+                }
+
+                linears[index].ToBFloat16();
             }
         }
 
@@ -305,7 +329,7 @@ public abstract class Module : IDisposable
                 throw new InvalidDataException($"Shape mismatch: file has {Tensor.FormatShape(shape)}, model has {Tensor.FormatShape(p.Shape)}.");
             }
 
-            var type = magic == FileMagic3 ? (WeightFormat)reader.ReadByte() : WeightFormat.Float32;
+            var type = magic is FileMagic3 or FileMagic4 ? (WeightFormat)reader.ReadByte() : WeightFormat.Float32;
             var bytes = new byte[p.Size * (type == WeightFormat.Float32 ? 4 : 2)];
             reader.BaseStream.ReadExactly(bytes);
             p.Load(Decode(bytes, p.Size, type));

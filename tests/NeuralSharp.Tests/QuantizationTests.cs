@@ -15,11 +15,69 @@ internal static partial class Tests
         ("int8: quantized GPT: cached decoding matches the full pass; small logit change; ONNX export dequantizes", Int8Gpt),
         ("int8: save/load (a float model loads a quantized file), move between devices, dequantize, memory", Int8SaveLoad),
         ("int8: QLoRA — adapters train on top of frozen int8 weights", Int8Lora),
+        ("bf16: rounding, direct and expanded products, gradient, model conversion, save/load, decoder build", BFloat16Weights),
         ("weights: Float16 and BFloat16 files are half the size and round as expected", HalfPrecisionFiles),
         ("matmul: few rows (column-parallel path) match the reference, with beta and transposes", FewRowMatMul),
         ("int8 KV cache: write, scores and context kernels match a dequantized cache", Int8CacheKernels),
         ("int8 KV cache: decoding stays close to float32 in less memory; graph replay matches direct steps", Int8CacheDecoding),
     ];
+
+    private static void BFloat16Weights(Device device)
+    {
+        // Rounding: to nearest, ties to even; exactly representable values stay exact.
+        float Bf(float v) => BitConverter.Int32BitsToSingle(BFloat16Weight.Round(v) << 16);
+        Check(Bf(1f) == 1f && Bf(-2.5f) == -2.5f && Bf(0f) == 0f, "exact values stay exact");
+        Check(Bf(1f + 1f / 256f) == 1f && Bf(1f + 3f / 256f) == 1f + 4f / 256f, "ties round to even");
+        Check(float.IsNaN(Bf(float.NaN)), "NaN stays NaN");
+
+        var r = new Random(71);
+        foreach (var (k, n) in new[] { (37, 23), (1030, 301), (700, 2050) })
+        {
+            var values = Enumerable.Range(0, k * n).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+            using var h = BFloat16Weight.FromValues(values, k, n, device);
+            using var expanded = h.Dequantize();
+            var e = expanded.ToArray();
+            Check(e.Select((v, i) => v == Bf(values[i])).All(x => x), $"[{k}, {n}]: expansion equals the rounded values");
+            foreach (int m in new[] { 1, 3, 8, 20 })                       // ≤ 8 rows read bf16 directly; 20 expand first
+            {
+                var input = Enumerable.Range(0, m * k).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+                using var x = Tensor.From(input, [m, k], device, requiresGrad: true);
+                using var reference = Tensor.From(input, [m, k], device, requiresGrad: true);
+                var y = x.MatMulBFloat16(h);
+                var want = reference.MatMul(expanded);
+                AssertClose(want.ToArray(), y.ToArray(), 2e-3f, $"bf16 product [{m}x{k}] × [{k}x{n}]");
+                if (k == 37)
+                {
+                    y.Sum().Backward();
+                    want.Sum().Backward();
+                    AssertClose(reference.Grad!.ToArray(), x.Grad!.ToArray(), 1e-4f, $"input gradient, {m} rows");
+                }
+            }
+        }
+
+        // A whole model: bf16 predictions close to float32; save/load keeps bf16; back to float32.
+        using var model = TinyGpt(device);
+        using var ids = Tensor.From([1f, 4f, 2f, 7f, 3f], [1, 5], device);
+        var original = model.Predict(ids).ToArray();
+        Check(model.ToBFloat16() > 0 && model.Descendants().OfType<Linear>().All(l => l.BFloat16 is not null), "every Linear is bf16");
+        var half = model.Predict(ids).ToArray();
+        AssertClose(original, half, 0.02f * original.Max(MathF.Abs), "bf16 model predictions");
+        string path = Path.GetTempFileName();
+        try
+        {
+            model.Save(path);
+            using var reloaded = TinyGpt(device);
+            reloaded.Load(path);
+            Check(reloaded.Descendants().OfType<Linear>().All(l => l.BFloat16 is not null), "a float model loads a bf16 file as bf16");
+            Check(reloaded.Predict(ids).ToArray().SequenceEqual(half), "reloaded bf16 predictions are identical");
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+
+        Check(model.ToFloat32() > 0 && model.Predict(ids).ToArray().SequenceEqual(half), "back to float32 keeps the rounded weights");
+    }
 
     private static void Int8CacheKernels(Device device)
     {

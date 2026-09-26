@@ -27,12 +27,13 @@ public sealed class Linear : Module
         Bias = bias ? CreateParameter(new float[outFeatures], [outFeatures], device) : null;
     }
 
-    private Linear(int inFeatures, int outFeatures, Tensor? weight, Int8Weight? int8, Tensor? bias)
+    private Linear(int inFeatures, int outFeatures, Tensor? weight, Int8Weight? int8, Tensor? bias, BFloat16Weight? half = null)
     {
         InFeatures = inFeatures;
         OutFeatures = outFeatures;
         _weight = weight;
         Int8 = int8;
+        BFloat16 = half;
         Bias = bias;
     }
 
@@ -53,6 +54,9 @@ public sealed class Linear : Module
     /// <summary>A layer around existing int8 weights (see <see cref="ModuleExtensions.QuantizeInt8"/>); the layer takes ownership.</summary>
     public static Linear FromInt8(Int8Weight weight, Tensor? bias = null) => new(weight.Rows, weight.Columns, null, weight, bias);
 
+    /// <summary>A layer around existing bfloat16 weights (see <see cref="ModuleExtensions.ToBFloat16"/>); the layer takes ownership.</summary>
+    public static Linear FromBFloat16(BFloat16Weight weight, Tensor? bias = null) => new(weight.Rows, weight.Columns, null, null, bias, weight);
+
     /// <summary>Number of input features.</summary>
     public int InFeatures { get; }
 
@@ -60,8 +64,12 @@ public sealed class Linear : Module
     public int OutFeatures { get; }
 
     /// <summary>The [inFeatures, outFeatures] weight matrix.</summary>
-    public Tensor Weight => _weight ?? throw new InvalidOperationException(
-        $"{this} holds int8 weights (see Int8); call DequantizeInt8() on the model to get float weights back.");
+    public Tensor Weight => _weight ?? throw new InvalidOperationException(Int8 is not null
+        ? $"{this} holds int8 weights (see Int8); call DequantizeInt8() on the model to get float weights back."
+        : $"{this} holds bfloat16 weights (see BFloat16); call ToFloat32() on the model to get float weights back.");
+
+    /// <summary>The bfloat16 weights when the layer holds them (see <see cref="ModuleExtensions.ToBFloat16"/>), else null.</summary>
+    public BFloat16Weight? BFloat16 { get; private set; }
 
     /// <summary>The int8 weights when the layer was quantized with <see cref="ModuleExtensions.QuantizeInt8"/>, else null.</summary>
     public Int8Weight? Int8 { get; private set; }
@@ -94,7 +102,7 @@ public sealed class Linear : Module
         int k = input.Shape[^1], rows = input.Size / Math.Max(1, k);
         bool fused = !Autograd.IsEnabled && layers.Length is > 1 and <= 3 && rows <= Backends.Cuda.PtxKernels.GemvRows
             && input.Device.Type == DeviceType.Cuda
-            && layers.All(l => l.Int8 is null && l.Adapter is null && l.InFeatures == k && (long)l.OutFeatures * k >= 1 << 16);
+            && layers.All(l => l.Int8 is null && l.BFloat16 is null && l.Adapter is null && l.InFeatures == k && (long)l.OutFeatures * k >= 1 << 16);
         return fused ? Tensor.MatMulMany(input, [.. layers.Select(l => l.Weight)], [.. layers.Select(l => l.Bias)])
             : [.. layers.Select(l => l.Forward(input))];
     }
@@ -102,7 +110,7 @@ public sealed class Linear : Module
     /// <summary>x·W, plus the adapter's low-rank term when an adapter is attached.</summary>
     internal Tensor ProjectWithoutBias(Tensor input)
     {
-        var product = Int8 is { } q ? input.MatMulInt8(q) : input.MatMul(Weight);
+        var product = Int8 is { } q ? input.MatMulInt8(q) : BFloat16 is { } h ? input.MatMulBFloat16(h) : input.MatMul(Weight);
         return Adapter is { } a ? product + input.MatMul(a.A).MatMul(a.B) * a.Scale : product;
     }
 
@@ -121,21 +129,50 @@ public sealed class Linear : Module
 
     /// <summary>Folds the adapter into the weight (<c>W += A·B·scale</c>) and removes it; the outputs stay the same.</summary>
     /// <inheritdoc />
-    public override IEnumerable<Tensor> Buffers() => Int8 is { } q ? [q.Packed, q.Scales] : [];
+    public override IEnumerable<Tensor> Buffers() => Int8 is { } q ? [q.Packed, q.Scales] : BFloat16 is { } h ? [h.Packed] : [];
 
     // The float weight values (dequantized when the layer holds int8 weights).
     internal float[] WeightValues()
     {
-        if (Int8 is null)
+        if (Int8 is null && BFloat16 is null)
         {
             return Weight.ToArray();
         }
 
-        using var w = Int8.Dequantize();
+        using var w = Int8?.Dequantize() ?? BFloat16!.Dequantize();
         return w.ToArray();
     }
 
-    internal Device Device => (_weight ?? Int8!.Packed).Device;
+    internal Device Device => (_weight ?? Int8?.Packed ?? BFloat16!.Packed).Device;
+
+    internal void ToBFloat16()
+    {
+        if (BFloat16 is not null)
+        {
+            return;
+        }
+
+        DequantizeInt8(trainable: false);
+        BFloat16 = BFloat16Weight.Convert(Weight);
+        _weight!.Dispose();
+        _weight = null;
+    }
+
+    internal void ToFloat32(bool trainable)
+    {
+        if (BFloat16 is not { } h)
+        {
+            return;
+        }
+
+        using (var w = h.Dequantize())
+        {
+            _weight = Tensor.Persistent(w.ToArray(), [InFeatures, OutFeatures], w.Device, trainable);
+        }
+
+        h.Dispose();
+        BFloat16 = null;
+    }
 
     internal void QuantizeInt8()
     {
@@ -144,6 +181,7 @@ public sealed class Linear : Module
             return;
         }
 
+        ToFloat32(trainable: false);
         Int8 = Int8Weight.Quantize(Weight);
         _weight!.Dispose();
         _weight = null;
@@ -172,9 +210,9 @@ public sealed class Linear : Module
             return;
         }
 
-        if (Int8 is not null)
+        if (Int8 is not null || BFloat16 is not null)
         {
-            throw new InvalidOperationException($"{this}: merging a LoRA adapter into int8 weights would lose precision; call DequantizeInt8() first, or keep the adapter.");
+            throw new InvalidOperationException($"{this}: merging a LoRA adapter into {(Int8 is null ? "bfloat16" : "int8")} weights would lose precision; call {(Int8 is null ? "ToFloat32()" : "DequantizeInt8()")} first, or keep the adapter.");
         }
 
         using (Autograd.NoGrad())
@@ -194,6 +232,7 @@ public sealed class Linear : Module
     {
         _weight = _weight is null ? null : MoveTensor(_weight, device);
         Int8?.MoveTo(device, MoveTensor);
+        BFloat16?.MoveTo(device, MoveTensor);
         Bias = Bias is null ? null : MoveTensor(Bias, device);
         if (Adapter is { } a)
         {
@@ -203,7 +242,7 @@ public sealed class Linear : Module
 
     /// <inheritdoc />
     public override string ToString() =>
-        $"Linear({InFeatures} -> {OutFeatures}{(Bias is null ? ", no bias" : "")}{(Int8 is null ? "" : ", int8")}{(Adapter is { } a ? $", LoRA rank {a.Rank}" : "")})";
+        $"Linear({InFeatures} -> {OutFeatures}{(Bias is null ? ", no bias" : "")}{(Int8 is null ? "" : ", int8")}{(BFloat16 is null ? "" : ", bf16")}{(Adapter is { } a ? $", LoRA rank {a.Rank}" : "")})";
 }
 
 /// <summary>

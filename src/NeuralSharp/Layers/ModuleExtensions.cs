@@ -210,6 +210,36 @@ public static class ModuleExtensions
         return count;
     }
 
+    /// <summary>
+    /// Stores the weights of every <see cref="Linear"/> layer (or those <paramref name="targets"/> selects) as bfloat16:
+    /// half the memory, and token-by-token decoding reads half the bytes; values keep about 3 significant digits. The
+    /// weights become fixed (LoRA adapters on them still train). Returns how many layers changed.
+    /// </summary>
+    public static int ToBFloat16(this Module model, Func<Linear, bool>? targets = null)
+    {
+        int count = 0;
+        foreach (var linear in model.Descendants().OfType<Linear>().Where(l => l.BFloat16 is null && (targets?.Invoke(l) ?? true)).ToList())
+        {
+            linear.ToBFloat16();
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>Turns bfloat16 weights back into float32 weights (the rounding stays). Returns how many layers changed.</summary>
+    public static int ToFloat32(this Module model, bool trainable = true)
+    {
+        int count = 0;
+        foreach (var linear in model.Descendants().OfType<Linear>().Where(l => l.BFloat16 is not null).ToList())
+        {
+            linear.ToFloat32(trainable);
+            count++;
+        }
+
+        return count;
+    }
+
     /// <summary>Folds every LoRA adapter into its layer's weight and removes it (smaller, faster model; same outputs).</summary>
     public static int MergeLora(this Module model)
     {

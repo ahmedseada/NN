@@ -138,7 +138,15 @@ internal static partial class Tests
                 Check(model.Spec == spec with { NormEpsilon = spec.NormEpsilon, QkNorm = true }, $"spec read from config.json: {model.Spec}");
                 Check(model.Notes.Count == 0, string.Join("; ", model.Notes));
                 float tolerance = type == SafeTensorType.F32 ? 1e-4f : 0.05f * expected.Max(MathF.Abs);
-                AssertClose(expected, model.Network.Predict(input).ToArray(), tolerance, $"{type}{(sharded ? " sharded" : "")}");
+                var loaded = model.Network.Predict(input).ToArray();
+                AssertClose(expected, loaded, tolerance, $"{type}{(sharded ? " sharded" : "")}");
+                if (type == SafeTensorType.BF16)
+                {
+                    // bfloat16 weights from a bfloat16 checkpoint are the checkpoint's values exactly.
+                    using var half = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, BFloat16 = true });
+                    Check(half.Network.Descendants().OfType<Linear>().All(l => l.BFloat16 is not null), "bf16 projections");
+                    AssertClose(loaded, half.Network.Predict(input).ToArray(), 1e-4f, "bf16 weights from a BF16 checkpoint");
+                }
 
                 if (type == SafeTensorType.F32 && !sharded)
                 {

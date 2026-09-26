@@ -251,6 +251,15 @@ internal abstract class Backend
     /// </summary>
     public abstract void Int8MatMul(Storage x, Storage q, Storage scales, Storage y, int m, int n, int k);
 
+    /// <summary>
+    /// y[m, n] = x[m, k] · w[k, n] with w stored as bfloat16 pairs packed into 32-bit words along each row (word c of
+    /// row r holds columns 2c in its low half and 2c + 1 in its high half; rows have ⌈n / 2⌉ words).
+    /// </summary>
+    public abstract void BFloat16MatMul(Storage x, Storage packed, Storage y, int m, int n, int k);
+
+    /// <summary>w[k, n] = the float32 values of bfloat16 weights packed as in <see cref="BFloat16MatMul"/>.</summary>
+    public abstract void BFloat16Dequantize(Storage packed, Storage w, int k, int n);
+
     /// <summary>w[k, n] = q[k, n] · scales[n] (see <see cref="Int8MatMul"/> for the packing).</summary>
     public abstract void Int8Dequantize(Storage q, Storage scales, Storage w, int k, int n);
 

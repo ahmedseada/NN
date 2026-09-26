@@ -15,10 +15,10 @@ using NeuralSharp.Pretrained;
 //   check <reference.json>          compare with transformers: token ids, chat templates, logits, greedy output
 //                                   (make the reference with tools/pytorch/pretrained_reference.py)
 //
-// Options: --cuda / --cpu, --int8 (int8 weights), --kv8 (int8 KV cache), --context N (default 4096),
+// Options: --cuda / --cpu, --int8 (int8 weights), --bf16 (bfloat16 weights), --kv8 (int8 KV cache), --context N (default 4096),
 //          --folder F (check: read the model from F instead of the folder named in the reference), --no-think.
 var positional = new List<string>();
-bool int8 = false, kv8 = false, noThink = false;
+bool int8 = false, bf16 = false, kv8 = false, noThink = false;
 int context = 4096;
 string? folderOverride = null;
 Device device = Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu;
@@ -29,6 +29,7 @@ for (int i = 0; i < args.Length; i++)
         case "--cuda" or "--gpu": device = Device.Cuda(); break;
         case "--cpu": device = Device.Cpu; break;
         case "--int8": int8 = true; break;
+        case "--bf16": bf16 = true; break;
         case "--kv8": kv8 = true; break;
         case "--no-think": noThink = true; break;
         case "--context": context = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
@@ -39,7 +40,7 @@ for (int i = 0; i < args.Length; i++)
 
 if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile"))
 {
-    Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json>   [--cuda|--cpu] [--int8] [--kv8] [--context N] [--folder F] [--no-think]");
+    Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json>   [--cuda|--cpu] [--int8|--bf16] [--kv8] [--context N] [--folder F] [--no-think]");
     return 1;
 }
 
@@ -49,8 +50,8 @@ var cacheFormat = kv8 ? KeyValueFormat.Int8 : KeyValueFormat.Float32;
 PretrainedModel Load(string folder)
 {
     var watch = Stopwatch.StartNew();
-    var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, Int8 = int8, MaxPositions = context });
-    Console.WriteLine($"Loaded {model.Config["architectures"]?[0]} from {folder} in {watch.Elapsed.TotalSeconds:F1} s on {device}{(int8 ? ", int8 weights" : "")}");
+    var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, Int8 = int8, BFloat16 = bf16, MaxPositions = context });
+    Console.WriteLine($"Loaded {model.Config["architectures"]?[0]} from {folder} in {watch.Elapsed.TotalSeconds:F1} s on {device}{(int8 ? ", int8 weights" : bf16 ? ", bf16 weights" : "")}");
     Console.WriteLine($"  {model.Spec.ParameterCount / 1e6:F0}M parameters, {model.Spec.Layers} layers, dim {model.Spec.Dim}, heads {model.Spec.Heads}/{model.Spec.KvHeads}, "
                       + $"vocabulary {model.Spec.Vocabulary}, context {model.MaxPositions}");
     foreach (var note in model.Notes)
@@ -290,7 +291,8 @@ int Check(string referencePath)
         }
 
         bool greedySame = text == expectedText;
-        bool ok = encodes && top1 && (int8 || maxDiff <= 2e-3f * Math.Max(1f, scale)) && (greedySame || int8 || kv8);
+        bool approximate = int8 || bf16 || kv8;
+        bool ok = encodes && top1 && (int8 || bf16 || maxDiff <= 2e-3f * Math.Max(1f, scale)) && (greedySame || approximate);
         failures += ok ? 0 : 1;
         Console.WriteLine($"  {(ok ? "ok  " : "DIFF")} {ids.Length,4} ids: max |Δlogit| {maxDiff:G3} (largest logit {scale:F1}), top-1 {(top1 ? "same" : "DIFFERENT")}, "
                           + $"top-10 overlap {overlap}/10, forward {watch.Elapsed.TotalMilliseconds:F0} ms; greedy {(greedySame ? "identical" : $"first {agree} of {expectedText.Length} characters agree")} "

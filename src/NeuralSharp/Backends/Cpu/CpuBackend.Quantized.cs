@@ -46,6 +46,34 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override void BFloat16MatMul(Storage x, Storage packed, Storage y, int m, int n, int k)
+    {
+        var w = Allocate(k * n, zeroed: false);
+        try
+        {
+            BFloat16Dequantize(packed, w, k, n);
+            MatMul(x, w, y, m, n, k, false, false, 0f);
+        }
+        finally
+        {
+            w.Release();
+        }
+    }
+
+    public override void BFloat16Dequantize(Storage packed, Storage w, int k, int n)
+    {
+        var halves = MemoryMarshal.Cast<float, ushort>(D(packed).AsSpan());
+        float[] wv = D(w);
+        int stride = (n + 1) / 2 * 2;
+        for (int r = 0; r < k; r++)
+        {
+            for (int j = 0; j < n; j++)
+            {
+                wv[r * n + j] = BitConverter.Int32BitsToSingle(halves[r * stride + j] << 16);
+            }
+        }
+    }
+
     public override void Int8Dequantize(Storage q, Storage scales, Storage w, int k, int n)
     {
         float[] sv = D(scales), wv = D(w);

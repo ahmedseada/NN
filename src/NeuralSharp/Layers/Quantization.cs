@@ -119,3 +119,89 @@ public sealed class Int8Weight : IDisposable
         Scales.Dispose();
     }
 }
+
+/// <summary>
+/// The bfloat16 weights of a <see cref="Linear"/> layer: each weight keeps float32's range with an 8-bit mantissa (about
+/// 3 significant digits), in half the memory; decoding reads half the bytes of float32. Hugging Face checkpoints are
+/// usually stored this way, so loading them as bfloat16 is exact. Created by <see cref="ModuleExtensions.ToBFloat16"/>
+/// or when loading with bfloat16 weights; inputs, outputs, biases and LoRA adapters stay float32.
+/// </summary>
+public sealed class BFloat16Weight : IDisposable
+{
+    private BFloat16Weight(Tensor packed, int rows, int columns)
+    {
+        Packed = packed;
+        Rows = rows;
+        Columns = columns;
+    }
+
+    /// <summary>Input features (rows of the weight matrix).</summary>
+    public int Rows { get; }
+
+    /// <summary>Output features (columns).</summary>
+    public int Columns { get; }
+
+    /// <summary>Device memory used, in bytes.</summary>
+    public long Bytes => 4L * Packed.Size;
+
+    /// <summary>The values, two per element along each row (rows padded to an even number of columns).</summary>
+    internal Tensor Packed { get; private set; }
+
+    /// <summary>Rounds a float weight matrix [rows, columns] (on its device) to bfloat16.</summary>
+    public static BFloat16Weight Convert(Tensor weight)
+    {
+        if (weight.Rank != 2)
+        {
+            throw new ArgumentException($"bfloat16 weights need a matrix, got {Tensor.FormatShape(weight.Shape)}.", nameof(weight));
+        }
+
+        return FromValues(weight.ToArray(), weight.Shape[0], weight.Shape[1], weight.Device);
+    }
+
+    /// <summary>Rounds host values [rows, columns] to bfloat16 (to nearest, ties to even) and uploads only those.</summary>
+    public static BFloat16Weight FromValues(ReadOnlySpan<float> values, int rows, int columns, Device device)
+    {
+        if (values.Length != rows * columns)
+        {
+            throw new ArgumentException($"{values.Length} values do not fill [{rows}, {columns}].", nameof(values));
+        }
+
+        int stride = (columns + 1) / 2 * 2;
+        var halves = new ushort[rows * stride];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int j = 0; j < columns; j++)
+            {
+                halves[r * stride + j] = Round(values[r * columns + j]);
+            }
+        }
+
+        var packed = MemoryMarshal.Cast<ushort, float>(halves).ToArray();
+        return new BFloat16Weight(Tensor.Persistent(packed, [packed.Length], device, requiresGrad: false), rows, columns);
+    }
+
+    /// <summary>A value's bfloat16 bits (round to nearest, ties to even; NaN stays NaN).</summary>
+    internal static ushort Round(float value)
+    {
+        uint bits = BitConverter.SingleToUInt32Bits(value);
+        if (float.IsNaN(value))
+        {
+            return (ushort)((bits >> 16) | 0x40);
+        }
+
+        return (ushort)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+    }
+
+    /// <summary>The float weights, [rows, columns], on the same device.</summary>
+    public Tensor Dequantize()
+    {
+        var w = Tensor.Persistent(new float[Rows * Columns], [Rows, Columns], Packed.Device, requiresGrad: false);
+        Packed.Backend.BFloat16Dequantize(Packed.Storage, w.Storage, Rows, Columns);
+        return w;
+    }
+
+    internal void MoveTo(Device device, Func<Tensor, Device, Tensor> move) => Packed = move(Packed, device);
+
+    /// <inheritdoc />
+    public void Dispose() => Packed.Dispose();
+}

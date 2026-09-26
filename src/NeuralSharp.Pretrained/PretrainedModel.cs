@@ -13,6 +13,9 @@ public sealed record PretrainedOptions
     /// <summary>Store the projections as int8 (quantized as they are read; about a quarter of the float32 memory).</summary>
     public bool Int8 { get; init; }
 
+    /// <summary>Store the projections as bfloat16: half the float32 memory, exact for bfloat16 checkpoints (most are).</summary>
+    public bool BFloat16 { get; init; }
+
     /// <summary>Longest sequence to support (sizes the rotary tables); the model's maximum when null.</summary>
     public int? MaxPositions { get; init; }
 
@@ -81,7 +84,7 @@ public sealed class PretrainedModel : IDisposable
         int maxPositions = Math.Min(options.MaxPositions ?? spec.MaxPositions, spec.MaxPositions);
         using var reader = SafeTensorsReader.Open(folder);
         var weights = new CheckpointWeights(reader, architecture);
-        var network = spec.Build(weights, new DecoderBuildOptions { Device = options.Device, Int8 = options.Int8, MaxPositions = maxPositions });
+        var network = spec.Build(weights, new DecoderBuildOptions { Device = options.Device, Int8 = options.Int8, BFloat16 = options.BFloat16, MaxPositions = maxPositions });
         var unused = reader.Tensors.Keys.Where(k => !weights.Used.Contains(k) && !k.EndsWith("rotary_emb.inv_freq", StringComparison.Ordinal)).ToList();
         if (unused.Count > 0)
         {

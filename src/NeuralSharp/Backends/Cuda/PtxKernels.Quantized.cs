@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // row padded to n4 = ceil(n / 4) words), with one float scale per column: w[k, j] = q[k, j] · scale[j].
 internal static partial class PtxKernels
 {
-    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32"];
+    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32"];
 
     /// <summary>Threads of an <c>int8_gemv_f32</c> block: 32 packed words (128 columns) × 16 slices of k.</summary>
     public const int Int8GemvThreads = 512;
@@ -14,6 +14,27 @@ internal static partial class PtxKernels
     private static void BuildQuantized(StringBuilder sb)
     {
         Int8Gemv(sb);
+        Int8Gemv(sb, bf16: true);
+
+        // w[r, 2c], w[r, 2c + 1] = the bfloat16 pair in packed word (r, c) (words = ⌈cols / 2⌉ per row): one thread per word.
+        Elementwise(sb, "bf16_dequant_f32", ["q", "w"], [("u32", "words"), ("u32", "cols")], """
+            ld.global.u32 %r5, [%a_q];
+            div.u32 %r6, %i, %s_words;
+            rem.u32 %r7, %i, %s_words;
+            shl.b32 %r8, %r7, 1;
+            mad.lo.u32 %r9, %r6, %s_cols, %r8;
+            mul.wide.u32 %rd1, %r9, 4;
+            add.u64 %rd1, %rd1, %b_w;
+            shl.b32 %r10, %r5, 16;
+            mov.b32 %f1, %r10;
+            st.global.f32 [%rd1], %f1;
+            add.u32 %r11, %r8, 1;
+            setp.ge.u32 %p1, %r11, %s_cols;
+            @%p1 bra DONE;
+            and.b32 %r10, %r5, 0xFFFF0000;
+            mov.b32 %f2, %r10;
+            st.global.f32 [%rd1+4], %f2;
+            """);
 
         // y[i] = scale[i % cols] · Σ_s part[s, i] over the k splits of int8_gemv_f32, in split order.
         Elementwise(sb, "int8_gemv_finish_f32", ["part", "s", "y"], [("u32", "cols"), ("u32", "size"), ("u32", "splits")], $"""
@@ -301,13 +322,16 @@ internal static partial class PtxKernels
     // y[r, j] = scale[j] · Σ_k x[r, k] · q[k, j] for m ≤ 8 rows, reading each packed weight word once. Block: 32 lanes
     // (a word = 4 columns each, so a warp reads 128 contiguous bytes) × 16 slices of k, four k per slice in flight;
     // grid: x = ⌈words / 32⌉, y = k splits of `chunk` rows each (enough blocks to fill the GPU when the matrix is
-    // narrow). Slices are added in shared memory; with one split the result is scaled and stored, otherwise the
-    // split's partial sums go to part[split, r, j] and int8_gemv_finish_f32 adds them in order.
-    private static void Int8Gemv(StringBuilder sb)
+    // narrow). Slices are added in shared memory; with one split the result is scaled and stored, otherwise each
+    // split's partial sums go to part[split, r, j] and the last block of the column range adds them in split order.
+    // bf16: bf16_gemv_f32, the same for bfloat16 weights packed two per word (low half = the even column), no scales.
+    private static void Int8Gemv(StringBuilder sb, bool bf16 = false)
     {
+        int cpw = bf16 ? 2 : 4, columns = 32 * cpw;
+        string part = bf16 ? "h_part" : "i8_part";
         var s = new StringBuilder();
-        s.AppendLine("""
-            .visible .entry int8_gemv_f32(
+        s.AppendLine($$"""
+            .visible .entry {{(bf16 ? "bf16_gemv_f32" : "int8_gemv_f32")}}(
                 .param .u64 p_x, .param .u64 p_q, .param .u64 p_s, .param .u64 p_y, .param .u64 p_part,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_n4, .param .u32 p_chunk, .param .u32 p_splits,
                 .param .u64 p_counters
@@ -317,7 +341,7 @@ internal static partial class PtxKernels
                 .reg .f32 %f<48>;
                 .reg .b32 %r<40>;
                 .reg .b64 %rd<24>;
-                .shared .align 4 .f32 i8_part[2048];
+                .shared .align 4 .f32 {{part}}[{{16 * columns}}];
                 ld.param.u64 %rd1, [p_x];
                 ld.param.u64 %rd2, [p_q];
                 ld.param.u64 %rd3, [p_s];
@@ -351,9 +375,9 @@ internal static partial class PtxKernels
         for (int r = 0; r < GemvRows; r++)
         {
             s.AppendLine($"    setp.lt.u32 %p{r}, {r}, %r1;");
-            for (int c = 0; c < 4; c++)
+            for (int c = 0; c < cpw; c++)
             {
-                s.AppendLine($"    mov.f32 %f{r * 4 + c}, 0f00000000;");
+                s.AppendLine($"    mov.f32 %f{r * cpw + c}, 0f00000000;");
             }
         }
 
@@ -361,19 +385,30 @@ internal static partial class PtxKernels
         string Step(string wordReg, string xOffset)
         {
             var t = new StringBuilder();
-            for (int c = 0; c < 4; c++)
+            if (bf16)
             {
-                t.AppendLine($"bfe.s32 %r20, {wordReg}, {8 * c}, 8;");
-                t.AppendLine($"cvt.rn.f32.s32 %f{32 + c}, %r20;");
+                // bfloat16 is the top half of a float32: shift the even column up, mask the odd one.
+                t.AppendLine($"shl.b32 %r20, {wordReg}, 16;");
+                t.AppendLine("mov.b32 %f32, %r20;");
+                t.AppendLine($"and.b32 %r20, {wordReg}, 0xFFFF0000;");
+                t.AppendLine("mov.b32 %f33, %r20;");
+            }
+            else
+            {
+                for (int c = 0; c < 4; c++)
+                {
+                    t.AppendLine($"bfe.s32 %r20, {wordReg}, {8 * c}, 8;");
+                    t.AppendLine($"cvt.rn.f32.s32 %f{32 + c}, %r20;");
+                }
             }
 
             t.AppendLine("mov.u64 %rd12, %rd11;");
             for (int r = 0; r < GemvRows; r++)
             {
                 t.AppendLine($"@%p{r} ld.global.f32 %f36, [%rd12+{xOffset}];");
-                for (int c = 0; c < 4; c++)
+                for (int c = 0; c < cpw; c++)
                 {
-                    t.AppendLine($"@%p{r} fma.rn.f32 %f{r * 4 + c}, %f36, %f{32 + c}, %f{r * 4 + c};");
+                    t.AppendLine($"@%p{r} fma.rn.f32 %f{r * cpw + c}, %f36, %f{32 + c}, %f{r * cpw + c};");
                 }
 
                 t.AppendLine("add.u64 %rd12, %rd12, %rd7;");
@@ -428,21 +463,21 @@ internal static partial class PtxKernels
                 add.u64 %rd11, %rd11, %rd1;
             """);
         s.AppendLine(Step("%r21", "0"));
-        s.AppendLine("""
+        s.AppendLine($$"""
                 add.u32 %r12, %r12, 16;
                 bra K1;
             KEND:
-                mov.u32 %r14, i8_part;
-                shl.b32 %r15, %r7, 9;
-                shl.b32 %r16, %r6, 4;
+                mov.u32 %r14, {{part}};
+                shl.b32 %r15, %r7, {{(int)Math.Log2(columns * 4)}};
+                shl.b32 %r16, %r6, {{(int)Math.Log2(cpw * 4)}};
                 add.u32 %r15, %r15, %r16;
                 add.u32 %r15, %r15, %r14;
                 shl.b32 %r17, %r5, 2;
                 add.u32 %r17, %r17, %r14;
                 mov.u32 %r18, %ctaid.x;
-                shl.b32 %r18, %r18, 7;
+                shl.b32 %r18, %r18, {{(int)Math.Log2(columns)}};
                 add.u32 %r18, %r18, %r5;
-                setp.lt.u32 %p11, %r5, 128;
+                setp.lt.u32 %p11, %r5, {{columns}};
                 setp.lt.u32 %p12, %r18, %r2;
                 and.pred %p11, %p11, %p12;
                 setp.eq.u32 %p13, %r31, 1;
@@ -453,9 +488,9 @@ internal static partial class PtxKernels
         {
             // part[slice][lane·4 + c] = acc[r][c]; then threads 0..127 add the 16 slices of their column.
             s.AppendLine($"    @!%p{r} bra ROWS_DONE;");
-            for (int c = 0; c < 4; c++)
+            for (int c = 0; c < cpw; c++)
             {
-                s.AppendLine($"    st.shared.f32 [%r15+{4 * c}], %f{r * 4 + c};");
+                s.AppendLine($"    st.shared.f32 [%r15+{4 * c}], %f{r * cpw + c};");
             }
 
             s.AppendLine("    bar.sync 0;");
@@ -463,7 +498,7 @@ internal static partial class PtxKernels
             s.AppendLine("    mov.f32 %f40, 0f00000000;");
             for (int slice = 0; slice < 16; slice++)
             {
-                s.AppendLine($"    ld.shared.f32 %f41, [%r17+{slice * 512}];");
+                s.AppendLine($"    ld.shared.f32 %f41, [%r17+{slice * columns * 4}];");
                 s.AppendLine("    add.f32 %f40, %f40, %f41;");
             }
 
@@ -477,8 +512,7 @@ internal static partial class PtxKernels
                     st.global.f32 [%rd16], %f40;
                     bra ROW{r}_DONE;
                 ROW{r}_FINAL:
-                    ld.global.f32 %f42, [%rd14];
-                    mul.f32 %f40, %f40, %f42;
+                    {(bf16 ? "" : "ld.global.f32 %f42, [%rd14];\n    mul.f32 %f40, %f40, %f42;")}
                     mul.wide.u32 %rd16, %r2, {4 * r};
                     add.u64 %rd16, %rd16, %rd13;
                     add.u64 %rd16, %rd16, %rd4;
@@ -490,7 +524,7 @@ internal static partial class PtxKernels
 
         // With several splits, the last block of this column range to finish (counted per range, reset afterwards) adds
         // the splits' partial sums in split order and writes the scaled result: one launch, deterministic sums.
-        s.AppendLine("""
+        s.AppendLine($$"""
             ROWS_DONE:
                 @%p13 bra DONE;
                 membar.gl;
@@ -535,8 +569,7 @@ internal static partial class PtxKernels
                 add.u32 %r33, %r33, 1;
                 bra FIN_SPLIT;
             FIN_SPLIT_END:
-                ld.global.f32 %f45, [%rd14];
-                mul.f32 %f43, %f43, %f45;
+                {{(bf16 ? "" : "ld.global.f32 %f45, [%rd14];\n    mul.f32 %f43, %f43, %f45;")}}
                 add.u64 %rd23, %rd21, %rd4;
                 st.global.f32 [%rd23], %f43;
                 add.u32 %r32, %r32, 1;
