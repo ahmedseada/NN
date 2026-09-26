@@ -245,6 +245,12 @@ public sealed record DecoderSpec
                 : Projection("head", Dim, Vocabulary, HeadBias, TieEmbeddings ? embeddingValues : null);
             head.Name = "head";
             created.Add(head);
+            var blocks = created.OfType<DecoderBlock>().ToList();
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                blocks[i].NextNorm = (i + 1 < blocks.Count ? blocks[i + 1].AttentionNorm : norm) as RMSNorm;
+            }
+
             var model = new Sequential(created) { Name = "decoder" };
             Specs.AddOrUpdate(model, this);
             return model;

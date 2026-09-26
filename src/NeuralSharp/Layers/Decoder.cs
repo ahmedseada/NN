@@ -34,12 +34,28 @@ public sealed class RMSNorm : Module
     /// <summary>The learned scale, [features].</summary>
     public Tensor Gain { get; private set; }
 
+    // A normalization computed ahead by the layer before (a decoder block's residual addition fused with this norm):
+    // used when this norm is next called with exactly that input on the same thread.
+    [ThreadStatic]
+    private static (RMSNorm Norm, Tensor Input, Tensor Output)? t_handoff;
+
+    internal static void HandOff(RMSNorm norm, Tensor input, Tensor output) => t_handoff = (norm, input, output);
+
     /// <inheritdoc />
     protected override Tensor ForwardCore(Tensor input)
     {
         if (input.Shape[^1] != Features)
         {
             throw new ArgumentException($"RMSNorm({Features}) expects [..., {Features}], got {Tensor.FormatShape(input.Shape)}.");
+        }
+
+        if (t_handoff is { } handoff && ReferenceEquals(handoff.Norm, this))
+        {
+            t_handoff = null;
+            if (ReferenceEquals(handoff.Input, input) && !Autograd.IsEnabled)
+            {
+                return handoff.Output;                                          // computed with the residual addition before it
+            }
         }
 
         if (!Autograd.IsEnabled || !input.RequiresGrad && !Gain.RequiresGrad)
@@ -598,6 +614,13 @@ public sealed class DecoderBlock : Module, ICachedModule
     /// <summary>Normalization after the feed-forward block, or null.</summary>
     public Module? PostFeedForwardNorm { get; }
 
+    /// <summary>
+    /// The RMS normalization that follows this block (the next block's attention norm, or the final norm), set by
+    /// <see cref="DecoderSpec"/>: when nothing records gradients, the block's last residual addition and that
+    /// normalization run as one kernel and the norm reuses the result.
+    /// </summary>
+    internal RMSNorm? NextNorm { get; set; }
+
     /// <summary>True when attention and the feed-forward block read the same normalized input and are added together.</summary>
     public bool Parallel => FeedForwardNorm is null;
 
@@ -641,6 +664,13 @@ public sealed class DecoderBlock : Module, ICachedModule
         if (PostFeedForwardNorm is not null)
         {
             fed = PostFeedForwardNorm.Forward(fed);
+        }
+
+        if (NextNorm is { } next && !Autograd.IsEnabled)
+        {
+            var (output, nextInput) = Tensor.AddRmsNormAffine(x, fed, next.Gain, next.Epsilon, next.Offset);
+            RMSNorm.HandOff(next, output, nextInput);
+            return output;
         }
 
         return x + fed;
