@@ -419,6 +419,10 @@ public sealed class Predictor<TIn, TOut> : IPredictor<TIn, TOut>, IDisposable
         {
             writer.Architecture(ModelPackage.DefaultModelName, graph.ToJson());
         }
+        else if (DecoderSpec.Of(Model) is { } decoder)
+        {
+            writer.Architecture(ModelPackage.DefaultModelName, decoder.ToJson());
+        }
 
         if (_settings.FeatureScaler is { } features)
         {

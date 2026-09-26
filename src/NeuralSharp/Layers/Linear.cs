@@ -27,6 +27,32 @@ public sealed class Linear : Module
         Bias = bias ? CreateParameter(new float[outFeatures], [outFeatures], device) : null;
     }
 
+    private Linear(int inFeatures, int outFeatures, Tensor? weight, Int8Weight? int8, Tensor? bias)
+    {
+        InFeatures = inFeatures;
+        OutFeatures = outFeatures;
+        _weight = weight;
+        Int8 = int8;
+        Bias = bias;
+    }
+
+    /// <summary>
+    /// A layer around existing weights [in, out] (and optionally a bias [out]); the layer takes ownership. Used to build
+    /// models from loaded weights without allocating random ones first.
+    /// </summary>
+    public static Linear FromWeights(Tensor weight, Tensor? bias = null)
+    {
+        if (weight.Rank != 2 || (bias is not null && (bias.Rank != 1 || bias.Shape[0] != weight.Shape[1])))
+        {
+            throw new ArgumentException($"Linear weights must be [in, out] with a bias [out]; got {Tensor.FormatShape(weight.Shape)} and {(bias is null ? "no bias" : Tensor.FormatShape(bias.Shape))}.");
+        }
+
+        return new Linear(weight.Shape[0], weight.Shape[1], weight, null, bias);
+    }
+
+    /// <summary>A layer around existing int8 weights (see <see cref="ModuleExtensions.QuantizeInt8"/>); the layer takes ownership.</summary>
+    public static Linear FromInt8(Int8Weight weight, Tensor? bias = null) => new(weight.Rows, weight.Columns, null, weight, bias);
+
     /// <summary>Number of input features.</summary>
     public int InFeatures { get; }
 

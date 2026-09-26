@@ -120,6 +120,17 @@ public sealed class LayerNorm : Module
         Beta = CreateParameter(new float[features], [features], device);
     }
 
+    private LayerNorm(Tensor gamma, Tensor beta, float epsilon)
+    {
+        Features = gamma.Size;
+        Epsilon = epsilon;
+        Gamma = gamma;
+        Beta = beta;
+    }
+
+    /// <summary>A layer around existing gain and shift vectors [features]; the layer takes ownership.</summary>
+    public static LayerNorm FromWeights(Tensor gamma, Tensor beta, float epsilon) => new(gamma, beta, epsilon);
+
     /// <summary>Size of the normalized (last) dimension.</summary>
     public int Features { get; }
 

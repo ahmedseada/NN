@@ -241,6 +241,19 @@ internal abstract class Backend
     // Int8 KV cache: each cached row (one head, one position) is dim bytes packed four per element, words = ceil(dim / 4)
     // elements, with one scale per row in scales[head, position].
 
+    /// <summary>y = x · inv per row, inv[r] = 1 / sqrt(mean(x[r]²) + eps) (stored for the backward pass).</summary>
+    public abstract void RmsNorm(Storage x, Storage y, Storage inv, int rows, int cols, float eps);
+
+    /// <summary>dx += inv[r] · (dy - y · mean(dy · y)) per row, where y is the normalized forward output.</summary>
+    public abstract void RmsNormBackward(Storage dy, Storage y, Storage inv, Storage dx, int rows, int cols);
+
+    /// <summary>
+    /// Rotary position embedding of x [rows = batch·steps·heads, dim] into y (which must already hold x): pair p of a row at
+    /// step t rotates by the angle whose cos/sin are cos/sin[positions[t], p]. Pairs are (2p, 2p+1) when interleaved,
+    /// else (p, p + half). sign = -1 rotates backwards (the gradient).
+    /// </summary>
+    public abstract void Rope(Storage x, Storage y, Storage cos, Storage sin, Storage positions, int rows, int heads, int steps, int dim, int half, bool interleaved, float sign);
+
     /// <summary>Quantizes source [heads·steps, dim] into the int8 cache at positions position[0] + step.</summary>
     public abstract void KeyValueWriteInt8(Storage source, Storage cache, Storage scales, Storage position, int heads, int steps, int capacity, int dim);
 

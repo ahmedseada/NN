@@ -25,6 +25,17 @@ public sealed class Embedding : Module
         Weight = CreateParameter(values, [vocabulary, dim], device ?? Device.Default);
     }
 
+    private Embedding(Tensor weight)
+    {
+        Vocabulary = weight.Shape[0];
+        Dim = weight.Shape[1];
+        Weight = weight;
+    }
+
+    /// <summary>A lookup table around existing weights [vocabulary, dim]; the layer takes ownership.</summary>
+    public static Embedding FromWeights(Tensor weight) =>
+        weight.Rank == 2 ? new Embedding(weight) : throw new ArgumentException($"Embedding weights must be [vocabulary, dim], got {Tensor.FormatShape(weight.Shape)}.");
+
     /// <summary>Number of distinct ids.</summary>
     public int Vocabulary { get; }
 

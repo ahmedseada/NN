@@ -145,6 +145,74 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override void RmsNorm(Storage x, Storage y, Storage inv, int rows, int cols, float eps)
+    {
+        float[] xv = D(x), yv = D(y), iv = D(inv);
+        For(rows, (long)rows * cols * 2, (first, last) =>
+        {
+            for (int r = first; r < last; r++)
+            {
+                var row = xv.AsSpan(r * cols, cols);
+                float sum = 0f;
+                foreach (float v in row)
+                {
+                    sum = MathF.FusedMultiplyAdd(v, v, sum);
+                }
+
+                float scale = 1f / MathF.Sqrt(sum / cols + eps);
+                iv[r] = scale;
+                var output = yv.AsSpan(r * cols, cols);
+                for (int j = 0; j < cols; j++)
+                {
+                    output[j] = row[j] * scale;
+                }
+            }
+        });
+    }
+
+    public override void RmsNormBackward(Storage dy, Storage y, Storage inv, Storage dx, int rows, int cols)
+    {
+        float[] gv = D(dy), yv = D(y), iv = D(inv), dv = D(dx);
+        For(rows, (long)rows * cols * 3, (first, last) =>
+        {
+            for (int r = first; r < last; r++)
+            {
+                int o = r * cols;
+                float dot = 0f;
+                for (int j = 0; j < cols; j++)
+                {
+                    dot = MathF.FusedMultiplyAdd(gv[o + j], yv[o + j], dot);
+                }
+
+                float mean = dot / cols;
+                for (int j = 0; j < cols; j++)
+                {
+                    dv[o + j] += iv[r] * (gv[o + j] - yv[o + j] * mean);
+                }
+            }
+        });
+    }
+
+    public override void Rope(Storage x, Storage y, Storage cos, Storage sin, Storage positions, int rows, int heads, int steps, int dim, int half, bool interleaved, float sign)
+    {
+        float[] xv = D(x), yv = D(y), cv = D(cos), sv = D(sin), pv = D(positions);
+        For(rows, (long)rows * half * 4, (first, last) =>
+        {
+            for (int r = first; r < last; r++)
+            {
+                int position = (int)pv[r / heads % steps], o = r * dim;
+                for (int p = 0; p < half; p++)
+                {
+                    float c = cv[position * half + p], s = sv[position * half + p] * sign;
+                    int i = o + (interleaved ? 2 * p : p), j = o + (interleaved ? 2 * p + 1 : p + half);
+                    float a = xv[i], b = xv[j];
+                    yv[i] = MathF.FusedMultiplyAdd(a, c, -(b * s));
+                    yv[j] = MathF.FusedMultiplyAdd(b, c, a * s);
+                }
+            }
+        });
+    }
+
     private static ReadOnlySpan<sbyte> Bytes(Storage q, int count) => MemoryMarshal.Cast<float, sbyte>(D(q).AsSpan())[..count];
 
     // acc[j] += scale · (float)q[j], vectorized: bytes widen to shorts, then ints, then floats.

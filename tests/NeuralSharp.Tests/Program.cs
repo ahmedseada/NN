@@ -59,7 +59,7 @@ return failed == 0 ? 0 : 1;
 
 internal static partial class Tests
 {
-    public static (string Name, Action<Device> Run)[] All => [.. Basic, .. Advanced, .. Decoding, .. Generation, .. Simplified, .. AspNetCore, .. Retrieval, .. Onnx, .. Quantization];
+    public static (string Name, Action<Device> Run)[] All => [.. Basic, .. Advanced, .. Decoding, .. Generation, .. Simplified, .. AspNetCore, .. Retrieval, .. Onnx, .. Quantization, .. Decoder];
 
     private static readonly (string Name, Action<Device> Run)[] Basic =
     [

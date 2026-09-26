@@ -283,11 +283,27 @@ public sealed class ModelPackageReader : IDisposable
 
     /// <summary>
     /// Rebuilds the model named <paramref name="name"/> on <paramref name="device"/> and loads its weights, whether its
-    /// architecture was written by the network builder (a <see cref="Sequential"/>) or is a <see cref="GraphModule"/>.
+    /// architecture was written by the network builder (a <see cref="Sequential"/>), is a <see cref="GraphModule"/> or a
+    /// <see cref="DecoderSpec"/>.
     /// </summary>
     public Module BuildModel(string name = ModelPackage.DefaultModelName, Device? device = null)
     {
         var architecture = Architecture(name);
+        if (DecoderSpec.IsDescription(architecture))
+        {
+            var decoder = DecoderSpec.FromJson(architecture).Build(options: new DecoderBuildOptions { Device = device });
+            try
+            {
+                LoadWeights(decoder, name);
+                return decoder;
+            }
+            catch
+            {
+                decoder.Dispose();
+                throw;
+            }
+        }
+
         if (!GraphModule.IsDescription(architecture))
         {
             return BuildNetwork(name, device);
@@ -374,6 +390,14 @@ public sealed class ModelPackageReader : IDisposable
     /// </summary>
     public TextGenerator TextGenerator(string tokenizer, string model = ModelPackage.DefaultModelName, Device? device = null)
     {
+        if (DecoderSpec.IsDescription(Architecture(model)))
+        {
+            var spec = DecoderSpec.FromJson(Architecture(model));
+            var decoder = (Sequential)BuildModel(model, device);
+            decoder.Eval();
+            return new TextGenerator(decoder, Tokenizer(tokenizer), spec.MaxPositions);
+        }
+
         var network = Network(model);
         if (network.InputKind != InputKind.Tokens)
         {

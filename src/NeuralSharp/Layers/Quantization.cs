@@ -53,8 +53,21 @@ public sealed class Int8Weight : IDisposable
             throw new ArgumentException($"Int8 quantization needs a matrix, got {Tensor.FormatShape(weight.Shape)}.", nameof(weight));
         }
 
-        int rows = weight.Shape[0], columns = weight.Shape[1], stride = (columns + 3) / 4 * 4;
-        var values = weight.ToArray();
+        return Quantize(weight.ToArray(), weight.Shape[0], weight.Shape[1], weight.Device);
+    }
+
+    /// <summary>
+    /// Quantizes weights given as host values [rows, columns] and uploads only the bytes to <paramref name="device"/>
+    /// (large models never exist as float32 on the device).
+    /// </summary>
+    public static Int8Weight Quantize(ReadOnlySpan<float> values, int rows, int columns, Device device)
+    {
+        if (values.Length != rows * columns)
+        {
+            throw new ArgumentException($"{values.Length} values do not fill [{rows}, {columns}].", nameof(values));
+        }
+
+        int stride = (columns + 3) / 4 * 4;
         var scales = new float[columns];
         for (int r = 0; r < rows; r++)
         {
@@ -80,8 +93,8 @@ public sealed class Int8Weight : IDisposable
 
         var packed = MemoryMarshal.Cast<sbyte, float>(bytes).ToArray();
         return new Int8Weight(
-            Tensor.Persistent(packed, [packed.Length], weight.Device, requiresGrad: false),
-            Tensor.Persistent(scales, [columns], weight.Device, requiresGrad: false),
+            Tensor.Persistent(packed, [packed.Length], device, requiresGrad: false),
+            Tensor.Persistent(scales, [columns], device, requiresGrad: false),
             rows, columns);
     }
 
