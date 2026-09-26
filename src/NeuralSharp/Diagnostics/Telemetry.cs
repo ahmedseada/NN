@@ -29,10 +29,10 @@ public enum TelemetryLevel
     /// <summary>Every <see cref="Module.Predict(Tensor)"/> call: batch size, latency and throughput.</summary>
     Inference = 1 << 5,
 
-    /// <summary>Every tool call made during a chat (<c>ToolRegistry</c>): name, duration, outcome.</summary>
+    /// <summary>Every tool call made during a chat (<see cref="Generation.ToolRegistry"/>): name, duration, outcome.</summary>
     Tools = 1 << 6,
 
-    /// <summary>Inference-engine events (<c>InferenceEngine</c>): model loaded or unloaded, request completed or rejected.</summary>
+    /// <summary>Inference-engine events (<see cref="Inference.InferenceEngine"/>): model loaded or unloaded, request completed or rejected.</summary>
     Engine = 1 << 7,
 
     /// <summary>Everything.</summary>

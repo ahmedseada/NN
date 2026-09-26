@@ -60,7 +60,7 @@ public static class Predictor
         return Restore(package, new PredictorSettings(model, ownsModel: false));
     }
 
-    private static PredictorBuilder<float[], float[]> Restore(ModelPackageReader package, PredictorSettings settings)
+    internal static PredictorBuilder<float[], float[]> Restore(ModelPackageReader package, PredictorSettings settings)
     {
         var builder = new PredictorBuilder<float[], float[]>(settings, r => r, r => r);
         if (package.Contains(PackageEntryKind.StandardScaler, "features") || package.Contains(PackageEntryKind.MinMaxScaler, "features"))
@@ -102,9 +102,10 @@ public static class Predictor
 }
 
 /// <summary>The settings shared by a predictor builder as its input and output types change.</summary>
-internal sealed class PredictorSettings(Module model, bool ownsModel)
+internal sealed class PredictorSettings(Module? model, bool ownsModel)
 {
-    public Module Model { get; } = model;
+    /// <summary>The model; null for the templates the inference engine uses to create one predictor per model copy.</summary>
+    public Module? Model { get; } = model;
     public bool OwnsModel { get; } = ownsModel;
     public IScaler? FeatureScaler { get; set; }
     public IScaler? TargetScaler { get; set; }
@@ -281,8 +282,12 @@ public sealed class PredictorBuilder<TIn, TOut>
             throw new InvalidOperationException("Batching, Instances, KeepAlive, QueueLimit and Timeout apply only when the predictor is hosted by an InferenceEngine.");
         }
 
-        return Create(Settings.Model, Settings.OwnsModel);
+        return Create(Settings.Model ?? throw new InvalidOperationException("This builder belongs to an inference engine; it has no model of its own."),
+            Settings.OwnsModel);
     }
+
+    /// <summary>A builder over a template (no model), for the inference engine.</summary>
+    internal static PredictorBuilder<float[], float[]> Template() => new(new PredictorSettings(null, ownsModel: false), r => r, r => r);
 
     internal Predictor<TIn, TOut> Create(Module model, bool ownsModel)
     {

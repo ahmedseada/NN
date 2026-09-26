@@ -26,6 +26,9 @@ internal static partial class Tests
         ("generation: StreamAsync gives the same chunks as Stream", StreamAsyncMatches),
         ("tools: schema from delegates and [Tool] methods; validation, allowlist, approval, timeout, parallel", ToolRules),
         ("conversation: history, tool loop with a scripted model, MaxToolRounds required and enforced", ConversationLoop),
+        ("engine: predictors from a factory and a package; batches, PredictManyAsync, micro-batching, warm-up, stats", EnginePredictors),
+        ("engine: instances, queue limit, timeout, keep-alive with a manual clock, load on first use, telemetry", EngineLifecycle),
+        ("engine: text generation and chat conversations through the engine", EngineGeneration),
     ];
 
     private static Sequential ManualMlp(Device device, Random r) => new()
@@ -554,5 +557,226 @@ internal static partial class Tests
         var noTools = Conversation.For(FakeChatModel.Script(FakeChatModel.ToolCall("web_fetch", []))).Build();
         var clientSide = noTools.SendAsync("hi").GetAwaiter().GetResult();
         Check(clientSide.Message.ToolCalls!.Count == 1 && !clientSide.ToolLimitReached, "without tools the calls are returned");
+    }
+
+    private static Predictor<Point, float> DirectPredictor(Sequential model, DataSplit split) =>
+        Predictor.For(model).Input<Point>(p => [p.A, p.B, p.C]).ScaleInputs(split.FeatureScaler!).UnscaleOutputs(split.TargetScaler!).Output(v => v[0]).Build();
+
+    private static void EnginePredictors(Device device)
+    {
+        var split = SmallRegression(200, 7).Split(0.8, seed: 1).StandardizeFeatures().StandardizeTargets();
+        using var model = BuiltMlpFor3(device);
+        new TrainingRun { Model = model, Loss = Losses.MeanSquaredError, Optimizer = p => new Adam(p, 0.01f),
+            Train = split.Train.Batches(16, device: device), Epochs = 3 }.Fit();
+        var direct = DirectPredictor(model, split);
+        var points = Enumerable.Range(0, 37).Select(i => new Point(i % 10, i % 7 + 5, i % 5 + 10)).ToList();
+        var expected = direct.Predict(points);
+
+        string weights = Path.GetTempFileName();
+        model.Save(weights);
+        string package = Path.Combine(Path.GetTempPath(), $"engine-{Guid.NewGuid():N}.nsm");
+        direct.Save(package);
+        int warmups = 0;
+        var engine = InferenceEngine.Create()
+            .Predictor<Point, float>("factory", () => { var m = BuiltMlpFor3(device); m.Load(weights); return m; }, p => p
+                .Input<Point>(q => { if (q.A < 0) warmups++; return [q.A, q.B, q.C]; })
+                .ScaleInputs(split.FeatureScaler!).UnscaleOutputs(split.TargetScaler!).Output(v => v[0])
+                .WarmUp(new Point(-1, 0, 0)))
+            .Predictor<Point, float>("package", package, p => p.OnDevice(device).Input<Point>(q => [q.A, q.B, q.C]).Output(v => v[0]))
+            .Predictor<Point, float>("batched", model, p => p.Input<Point>(q => [q.A, q.B, q.C])
+                .ScaleInputs(split.FeatureScaler!).UnscaleOutputs(split.TargetScaler!).Output(v => v[0])
+                .Batching(maxBatch: 8, maxWait: TimeSpan.FromMilliseconds(40)))
+            .BuildAsync().GetAwaiter().GetResult();
+        try
+        {
+            Check(warmups == 1, "warm-up ran once at load");
+            Check(engine.PredictAsync<Point, float>("factory", points[3]).AsTask().Result == expected[3], "single");
+            Check(engine.PredictAsync<Point, float>("package", points).AsTask().Result.SequenceEqual(expected), "package source, batch");
+            var many = new List<float>();
+            Task.Run(async () => { await foreach (var v in engine.PredictManyAsync<Point, float>("factory", points, batchSize: 10)) many.Add(v); }).Wait();
+            Check(many.SequenceEqual(expected), "PredictManyAsync keeps order");
+
+            var concurrent = Task.WhenAll(points.Take(24).Select(p => engine.PredictAsync<Point, float>("batched", p).AsTask())).Result;
+            Check(concurrent.SequenceEqual(expected.Take(24)), "micro-batched results");
+            var stats = engine.Stats("batched");
+            Check(stats.Requests >= 3 && stats.AverageBatchSize > 1 && stats.Rows == 24, $"batching stats: {stats}");
+            Check(engine.Stats("factory").Requests == 5, $"factory stats {engine.Stats("factory").Requests}");
+            Check(engine.Models.All(m => m.Loaded && m.Kind == EngineModelKind.Predictor), "status");
+
+            bool threw = false;
+            try { engine.PredictAsync<string, float>("factory", "x").AsTask().Wait(); } catch (InvalidOperationException) { threw = true; }
+            Check(threw, "wrong types give a clear error");
+            threw = false;
+            try { InferenceEngine.Create().Predictor<Point, float>("x", model, p => p.Input<Point>(q => [q.A]).Output(v => v[0]).Instances(2)); }
+            catch (InvalidOperationException) { threw = true; }
+            Check(threw, "copies of a fixed model object are refused");
+        }
+        finally
+        {
+            engine.DisposeAsync().AsTask().Wait();
+            File.Delete(weights);
+            File.Delete(package);
+        }
+    }
+
+    private sealed class TimerClock : TimeProvider
+    {
+        private readonly List<ManualTimer> _timers = [];
+        private DateTimeOffset _now = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+
+        public override DateTimeOffset GetUtcNow() => _now;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new ManualTimer(this, callback, state, _now + dueTime);
+            lock (_timers) _timers.Add(timer);
+            return timer;
+        }
+
+        public void Advance(TimeSpan by)
+        {
+            _now += by;
+            List<ManualTimer> due;
+            lock (_timers) due = _timers.Where(t => t.Due <= _now).ToList();
+            foreach (var t in due)
+            {
+                lock (_timers) _timers.Remove(t);
+                t.Fire();
+            }
+        }
+
+        private sealed class ManualTimer(TimerClock clock, TimerCallback callback, object? state, DateTimeOffset due) : ITimer
+        {
+            public DateTimeOffset Due { get; private set; } = due;
+            public void Fire() => callback(state);
+            public bool Change(TimeSpan dueTime, TimeSpan period) { Due = clock._now + dueTime; return true; }
+            public void Dispose() { lock (clock._timers) clock._timers.Remove(this); }
+            public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
+        }
+    }
+
+    private static void EngineLifecycle(Device device)
+    {
+        int loads = 0;
+        TextGenerator Load()
+        {
+            loads++;
+            var (m, t) = TinyLanguageModel(device);
+            return new TextGenerator(m, t, 32);
+        }
+
+        var slow = new GenerationOptions { Seed = 1, NumPredict = 200, ChunkSize = 1 };
+        var clock = new TimerClock();
+        var events = new List<EngineEvent>();
+        using var hook = Telemetry.Configure().Hook(new EngineRecorder(events)).Start();
+        var engine = InferenceEngine.Create()
+            .TextModel("one", Load, m => m.Instances(1).QueueLimit(1).Timeout(TimeSpan.FromSeconds(30)))
+            .TextModel("two", Load, m => m.Instances(2))
+            .TextModel("idle", Load, m => m.KeepAlive(TimeSpan.FromMinutes(5)))
+            .TextModel("each", Load, m => m.KeepAlive(TimeSpan.Zero))
+            .TimeProvider(clock)
+            .LoadOnFirstUse()
+            .Telemetry()
+            .BuildAsync().GetAwaiter().GetResult();
+        try
+        {
+            Check(loads == 0 && engine.Models.All(m => !m.Loaded), "nothing loaded before first use");
+
+            // One copy busy: a second request queues, a third is rejected.
+            var first = engine.StreamAsync("one", "abc", slow).GetAsyncEnumerator();
+            Check(first.MoveNextAsync().AsTask().Result, "first request running");
+            var second = engine.StreamAsync("one", "abc", slow).GetAsyncEnumerator();
+            var secondStarted = second.MoveNextAsync().AsTask();
+            SpinWait.SpinUntil(() => engine.Models.First(m => m.Name == "one").Queued == 1, 2000);
+            bool rejected = false;
+            try { engine.GenerateAsync("one", "abc", slow).Wait(); }
+            catch (AggregateException ex) when (ex.InnerException is InferenceQueueFullException) { rejected = true; }
+            Check(rejected && engine.Stats("one").Rejected == 1, "queue limit");
+            Check(!secondStarted.Wait(50), "second waits for the copy");
+            first.DisposeAsync().AsTask().Wait();
+            Check(secondStarted.Result, "second runs after the first ends");
+            second.DisposeAsync().AsTask().Wait();
+
+            // Two copies: two streams at once, none queued.
+            var a = engine.StreamAsync("two", "abc", slow).GetAsyncEnumerator();
+            var b = engine.StreamAsync("two", "abc", slow).GetAsyncEnumerator();
+            Check(a.MoveNextAsync().AsTask().Result && b.MoveNextAsync().AsTask().Wait(2000), "two copies run together");
+            a.DisposeAsync().AsTask().Wait();
+            b.DisposeAsync().AsTask().Wait();
+            Check(loads == 3, $"copies loaded on first use ({loads})");
+
+            // Keep-alive: unloaded after 5 idle minutes, reloaded on the next request.
+            engine.GenerateAsync("idle", "abc", new GenerationOptions { Seed = 1, NumPredict = 3 }).Wait();
+            var status = engine.Models.First(m => m.Name == "idle");
+            Check(status.Loaded && status.ExpiresAt == clock.GetUtcNow() + TimeSpan.FromMinutes(5), "expiry scheduled");
+            clock.Advance(TimeSpan.FromMinutes(4));
+            Check(engine.Models.First(m => m.Name == "idle").Loaded, "still loaded after 4 minutes");
+            clock.Advance(TimeSpan.FromMinutes(1));
+            SpinWait.SpinUntil(() => !engine.Models.First(m => m.Name == "idle").Loaded, 2000);
+            Check(!engine.Models.First(m => m.Name == "idle").Loaded, "unloaded after 5 minutes");
+            engine.GenerateAsync("idle", "abc", new GenerationOptions { Seed = 1, NumPredict = 3 }).Wait();
+            Check(loads == 5, $"reloaded ({loads})");
+
+            engine.GenerateAsync("each", "abc", new GenerationOptions { Seed = 1, NumPredict = 3 }).Wait();
+            SpinWait.SpinUntil(() => !engine.Models.First(m => m.Name == "each").Loaded, 2000);
+            Check(!engine.Models.First(m => m.Name == "each").Loaded, "keep-alive zero unloads at once");
+            Check(events.Any(e => e.Kind == EngineEventKind.ModelLoaded) && events.Any(e => e.Kind == EngineEventKind.ModelUnloaded)
+                  && events.Any(e => e.Kind == EngineEventKind.RequestCompleted) && events.Any(e => e.Kind == EngineEventKind.RequestRejected), "telemetry");
+        }
+        finally
+        {
+            engine.DisposeAsync().AsTask().Wait();
+        }
+
+        var timed = InferenceEngine.Create().TextModel("t", Load, m => m.Timeout(TimeSpan.FromMilliseconds(30))).BuildAsync().GetAwaiter().GetResult();
+        try
+        {
+            var holder = timed.StreamAsync("t", "abc", slow).GetAsyncEnumerator();
+            holder.MoveNextAsync().AsTask().Wait();
+            bool timedOut = false;
+            try { timed.GenerateAsync("t", "abc", slow).Wait(); }
+            catch (AggregateException ex) when (ex.InnerException is TimeoutException) { timedOut = true; }
+            Check(timedOut && timed.Stats("t").Failed == 1, "timeout while waiting for a copy");
+            holder.DisposeAsync().AsTask().Wait();
+        }
+        finally
+        {
+            timed.DisposeAsync().AsTask().Wait();
+        }
+    }
+
+    private sealed class EngineRecorder(List<EngineEvent> events) : ITelemetryHook
+    {
+        public TelemetryLevel Levels => TelemetryLevel.Engine;
+        public void OnEngine(in EngineEvent e) { lock (events) events.Add(e); }
+    }
+
+    private static void EngineGeneration(Device device)
+    {
+        var (model, tokenizer) = TinyLanguageModel(device);
+        var direct = new TextGenerator(model, tokenizer, 32);
+        var options = new GenerationOptions { Seed = 9, NumPredict = 12 };
+        string expected = direct.Generate("abc", options).Text;
+        var engine = InferenceEngine.Create()
+            .TextModel("text", direct)
+            .ChatModel("chat", () => { var (m, t) = TinyLanguageModel(device); return new TextGenerator(m, t, 32); }, c => c.WarmUp("a"))
+            .BuildAsync().GetAwaiter().GetResult();
+        try
+        {
+            Check(engine.GenerateAsync("text", "abc", options).Result.Text == expected, "engine text = direct text");
+            var reply = engine.Conversation("chat", c => c.System("be brief").Options(options)).SendAsync("hi").Result;
+            Check(reply.Rounds == 1 && reply.Message.Role == "assistant", "conversation through the engine");
+            var chunk = engine.ChatAsync("chat", new ChatRequest([new ChatMessage("user", "hi")], Options: options)).Result;
+            Check(chunk.Done && chunk.Message is not null, "chat request");
+            Check(engine.ContextLengthAsync("chat").Result == 32, "context length");
+            bool threw = false;
+            try { engine.ChatModel("text"); } catch (InvalidOperationException) { threw = true; }
+            Check(threw, "chat on a text model is refused");
+        }
+        finally
+        {
+            engine.DisposeAsync().AsTask().Wait();
+            model.Dispose();
+        }
     }
 }
