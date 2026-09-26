@@ -65,6 +65,31 @@ public sealed partial class Tensor
         source.Backend.KeyValueWrite(source.Storage, cache.Storage, position.Storage, heads, steps, cache._shape[1], dim);
     }
 
+    /// <summary>Quantizes <paramref name="source"/> [rows, steps, dim] into an int8 cache at the device position.</summary>
+    internal static void WriteKeyValuesInt8(Tensor source, Tensor cache, Tensor scales, Tensor position)
+    {
+        int heads = source._shape[0], steps = source._shape[1], dim = source._shape[2];
+        source.Backend.KeyValueWriteInt8(source.Storage, cache.Storage, scales.Storage, position.Storage, heads, steps, cache._shape[1], dim);
+    }
+
+    /// <summary>q [rows, steps, dim] · int8 keysᵀ → [rows, steps, capacity].</summary>
+    internal static Tensor AttentionScoresInt8(Tensor q, Layers.KeyValueCache cache)
+    {
+        int rows = q._shape[0], steps = q._shape[1], capacity = cache.Keys._shape[1];
+        var y = Empty([rows, steps, capacity], q.Device);
+        q.Backend.AttentionScoresInt8(q.Storage, cache.Keys.Storage, cache.KeyScales!.Storage, y.Storage, rows, steps, capacity, cache.HeadDim);
+        return y;
+    }
+
+    /// <summary>weights [rows, steps, capacity] · int8 values → [rows, steps, dim].</summary>
+    internal static Tensor AttentionContextInt8(Tensor weights, Layers.KeyValueCache cache)
+    {
+        int rows = weights._shape[0], steps = weights._shape[1], capacity = weights._shape[2];
+        var y = Empty([rows, steps, cache.HeadDim], weights.Device);
+        weights.Backend.AttentionContextInt8(weights.Storage, cache.Values.Storage, cache.ValueScales!.Storage, y.Storage, rows, steps, capacity, cache.HeadDim);
+        return y;
+    }
+
     /// <summary>Adds <paramref name="value"/> to every element in place (not recorded by autograd).</summary>
     internal void AddInPlace(float value)
     {

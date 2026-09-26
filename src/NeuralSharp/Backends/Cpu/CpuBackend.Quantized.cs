@@ -6,20 +6,23 @@ namespace NeuralSharp.Backends.Cpu;
 // Int8 weight-only quantization: signed bytes packed four per float element along each weight row.
 internal sealed partial class CpuBackend
 {
-    private const int Int8Block = 256;   // columns per parallel work item (a multiple of every SIMD width)
+    private const int Int8MinBlock = 64;   // fewest columns per parallel work item (a multiple of every SIMD width)
 
     public override void Int8MatMul(Storage x, Storage q, Storage scales, Storage y, int m, int n, int k)
     {
         float[] xv = D(x), sv = D(scales), yv = D(y);
         int stride = (n + 3) / 4 * 4;                                  // bytes per weight row
-        int blocks = (n + Int8Block - 1) / Int8Block;
+        // About two column blocks per thread, whole SIMD vectors wide.
+        int threads = Math.Max(1, ComputeResources.ParallelOptions.MaxDegreeOfParallelism);
+        int blockSize = Math.Max(Int8MinBlock, (n / (2 * threads) + Int8MinBlock - 1) / Int8MinBlock * Int8MinBlock);
+        int blocks = (n + blockSize - 1) / blockSize;
         For(blocks, (long)m * n * k, (first, last) =>
         {
             var weights = Bytes(q, k * stride);                          // spans cannot be captured; re-derive per worker
-            var acc = new float[Int8Block];
+            var acc = new float[blockSize];
             for (int block = first; block < last; block++)
             {
-                int j0 = block * Int8Block, width = Math.Min(Int8Block, n - j0);
+                int j0 = block * blockSize, width = Math.Min(blockSize, n - j0);
                 for (int r = 0; r < m; r++)
                 {
                     Array.Clear(acc);
@@ -57,6 +60,86 @@ internal sealed partial class CpuBackend
                 for (int j = 0; j < n; j++)
                 {
                     wv[o + j] = row[j] * sv[j];
+                }
+            }
+        });
+    }
+
+    public override void KeyValueWriteInt8(Storage source, Storage cache, Storage scales, Storage position, int heads, int steps, int capacity, int dim)
+    {
+        float[] src = D(source), sv = D(scales);
+        var bytes = MemoryMarshal.Cast<float, sbyte>(D(cache).AsSpan());
+        int start = (int)D(position)[0], stride = (dim + 3) / 4 * 4;
+        for (int row = 0; row < heads * steps; row++)
+        {
+            int slot = row / steps * capacity + start + row % steps;
+            var x = src.AsSpan(row * dim, dim);
+            float max = 0f;
+            foreach (float v in x)
+            {
+                max = MathF.Max(max, MathF.Abs(v));
+            }
+
+            float scale = max / 127f, inverse = max > 0f ? 1f / scale : 0f;
+            sv[slot] = scale;
+            var target = bytes.Slice(slot * stride, stride);
+            target.Clear();
+            for (int d = 0; d < dim; d++)
+            {
+                target[d] = (sbyte)Math.Clamp((int)MathF.Round(x[d] * inverse, MidpointRounding.ToEven), -127, 127);
+            }
+        }
+    }
+
+    public override void AttentionScoresInt8(Storage q, Storage cache, Storage scales, Storage y, int rows, int steps, int capacity, int dim)
+    {
+        float[] qv = D(q), sv = D(scales), yv = D(y);
+        int stride = (dim + 3) / 4 * 4;
+        For(rows, (long)rows * steps * capacity * dim, (first, last) =>
+        {
+            var keys = MemoryMarshal.Cast<float, sbyte>(D(cache).AsSpan());
+            for (int r = first; r < last; r++)
+            {
+                for (int t = 0; t < steps; t++)
+                {
+                    var qr = qv.AsSpan((r * steps + t) * dim, dim);
+                    for (int c = 0; c < capacity; c++)
+                    {
+                        var k = keys.Slice((r * capacity + c) * stride, dim);
+                        float sum = 0f;
+                        for (int d = 0; d < dim; d++)
+                        {
+                            sum += qr[d] * k[d];
+                        }
+
+                        yv[(r * steps + t) * capacity + c] = sum * sv[r * capacity + c];
+                    }
+                }
+            }
+        });
+    }
+
+    public override void AttentionContextInt8(Storage weights, Storage cache, Storage scales, Storage y, int rows, int steps, int capacity, int dim)
+    {
+        float[] wv = D(weights), sv = D(scales), yv = D(y);
+        int stride = (dim + 3) / 4 * 4;
+        For(rows, (long)rows * steps * capacity * dim, (first, last) =>
+        {
+            var values = MemoryMarshal.Cast<float, sbyte>(D(cache).AsSpan());
+            for (int r = first; r < last; r++)
+            {
+                for (int t = 0; t < steps; t++)
+                {
+                    var output = yv.AsSpan((r * steps + t) * dim, dim);
+                    output.Clear();
+                    for (int c = 0; c < capacity; c++)
+                    {
+                        float a = wv[(r * steps + t) * capacity + c] * sv[r * capacity + c];
+                        if (a != 0f)
+                        {
+                            AddScaled(output, values.Slice((r * capacity + c) * stride, dim), a);
+                        }
+                    }
                 }
             }
         });

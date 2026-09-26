@@ -39,6 +39,19 @@ internal static class CpuMatMul
         nint colStride = transA ? m : 1;
         int blocks = (m + Mr - 1) / Mr;
 
+        if (m <= SmallRows && n >= 2 * SmallColumns && (long)m * n * k >= ParallelWork && ComputeResources.AllowParallel)
+        {
+            // Few rows (token-by-token decoding): row blocks would leave most threads idle, so split the columns instead
+            // and stream B row by row (contiguous reads; each weight is read once).
+            FewRows(a, aOffset, b, bOffset, c, cOffset, m, n, k, rowStride, colStride, beta);
+            if (rented is not null)
+            {
+                ArrayPool<float>.Shared.Return(rented);
+            }
+
+            return;
+        }
+
         if ((long)m * n * k < ParallelWork || blocks == 1 || !ComputeResources.AllowParallel)
         {
             for (int block = 0; block < blocks; block++)
@@ -57,6 +70,54 @@ internal static class CpuMatMul
         {
             ArrayPool<float>.Shared.Return(rented);
         }
+    }
+
+    private const int SmallRows = 4;
+    private const int SmallColumns = 64;
+
+    private static void FewRows(float[] a, int aOffset, float[] b, int bOffset, float[] c, int cOffset, int m, int n, int k, nint rowStride, nint colStride, float beta)
+    {
+        int w = Vector<float>.Count;
+        int threads = Math.Max(1, ComputeResources.ParallelOptions.MaxDegreeOfParallelism is > 0 and var max ? max : Environment.ProcessorCount);
+        int chunk = Math.Max(SmallColumns, (n / (2 * threads) + w - 1) / w * w);   // about two chunks per thread, whole vectors
+        int chunks = (n + chunk - 1) / chunk;
+        Parallel.For(0, chunks, ComputeResources.ParallelOptions, index =>
+        {
+            int j0 = index * chunk, width = Math.Min(chunk, n - j0);
+            var acc = new float[width];
+            for (int i = 0; i < m; i++)
+            {
+                Array.Clear(acc);
+                nint ap = aOffset + i * rowStride;
+                for (int p = 0; p < k; p++, ap += colStride)
+                {
+                    float x = a[ap];
+                    if (x == 0f)
+                    {
+                        continue;
+                    }
+
+                    var xv = new Vector<float>(x);
+                    var row = b.AsSpan(bOffset + p * n + j0, width);
+                    int j = 0;
+                    for (; j <= width - w; j += w)
+                    {
+                        Vector.FusedMultiplyAdd(xv, new Vector<float>(row[j..]), new Vector<float>(acc.AsSpan(j))).CopyTo(acc.AsSpan(j));
+                    }
+
+                    for (; j < width; j++)
+                    {
+                        acc[j] = MathF.FusedMultiplyAdd(x, row[j], acc[j]);
+                    }
+                }
+
+                var dst = c.AsSpan(cOffset + i * n + j0, width);
+                for (int j = 0; j < width; j++)
+                {
+                    dst[j] = beta == 0f ? acc[j] : acc[j] + beta * dst[j];
+                }
+            }
+        });
     }
 
     private static void Transpose(float[] src, int srcOffset, float[] dst, int rows, int cols)

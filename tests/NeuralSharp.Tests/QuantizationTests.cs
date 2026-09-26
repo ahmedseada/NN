@@ -16,7 +16,219 @@ internal static partial class Tests
         ("int8: save/load (a float model loads a quantized file), move between devices, dequantize, memory", Int8SaveLoad),
         ("int8: QLoRA — adapters train on top of frozen int8 weights", Int8Lora),
         ("weights: Float16 and BFloat16 files are half the size and round as expected", HalfPrecisionFiles),
+        ("matmul: few rows (column-parallel path) match the reference, with beta and transposes", FewRowMatMul),
+        ("int8 KV cache: write, scores and context kernels match a dequantized cache", Int8CacheKernels),
+        ("int8 KV cache: decoding stays close to float32 in less memory; graph replay matches direct steps", Int8CacheDecoding),
     ];
+
+    private static void Int8CacheKernels(Device device)
+    {
+        const int Rows = 3, Steps = 2, Capacity = 5, Dim = 10, Start = 1;           // Dim not a multiple of 4
+        var r = new Random(49);
+        float[] Random(int n) => [.. Enumerable.Range(0, n).Select(_ => (float)(r.NextDouble() * 2 - 1))];
+        using var cache = new KeyValueCache(Rows, Capacity, Dim, device, KeyValueFormat.Int8);
+        var source = Random(Rows * Steps * Dim);
+        using (var src = Tensor.From(source, [Rows, Steps, Dim], device))
+        using (var position = Tensor.From([(float)Start], [1], device))
+        {
+            Tensor.WriteKeyValuesInt8(src, cache.Keys, cache.KeyScales!, position);
+            Tensor.WriteKeyValuesInt8(src, cache.Values, cache.ValueScales!, position);
+        }
+
+        // The cache as floats, from the rule: scale = max |row| / 127, byte = round-half-even(x / scale).
+        var expected = new float[Rows * Capacity * Dim];
+        for (int row = 0; row < Rows; row++)
+        {
+            for (int t = 0; t < Steps; t++)
+            {
+                var x = source.AsSpan((row * Steps + t) * Dim, Dim);
+                float max = 0f;
+                foreach (float v in x)
+                {
+                    max = MathF.Max(max, MathF.Abs(v));
+                }
+
+                float scale = max / 127f;
+                for (int d = 0; d < Dim; d++)
+                {
+                    expected[(row * Capacity + Start + t) * Dim + d] = MathF.Round(x[d] * (1f / scale), MidpointRounding.ToEven) * scale;
+                }
+            }
+        }
+
+        var bytes = System.Runtime.InteropServices.MemoryMarshal.Cast<float, sbyte>(cache.Keys.ToArray()).ToArray();
+        var scales = cache.KeyScales!.ToArray();
+        int stride = (Dim + 3) / 4 * 4;
+        var stored = new float[expected.Length];
+        for (int slot = 0; slot < Rows * Capacity; slot++)
+        {
+            for (int d = 0; d < Dim; d++)
+            {
+                stored[slot * Dim + d] = bytes[slot * stride + d] * scales[slot];
+            }
+        }
+
+        AssertClose(expected, stored, 1e-6f, "quantized cache contents");
+
+        var q = Random(Rows * Steps * Dim);
+        using var tq = Tensor.From(q, [Rows, Steps, Dim], device);
+        var scores = Tensor.AttentionScoresInt8(tq, cache).ToArray();
+        var weights = Random(Rows * Steps * Capacity);
+        using var tw = Tensor.From(weights, [Rows, Steps, Capacity], device);
+        var context = Tensor.AttentionContextInt8(tw, cache).ToArray();
+        var wantScores = new float[Rows * Steps * Capacity];
+        var wantContext = new float[Rows * Steps * Dim];
+        for (int row = 0; row < Rows; row++)
+        {
+            for (int t = 0; t < Steps; t++)
+            {
+                for (int c = 0; c < Capacity; c++)
+                {
+                    float sum = 0f;
+                    for (int d = 0; d < Dim; d++)
+                    {
+                        sum += q[(row * Steps + t) * Dim + d] * expected[(row * Capacity + c) * Dim + d];
+                        wantContext[(row * Steps + t) * Dim + d] += weights[(row * Steps + t) * Capacity + c] * expected[(row * Capacity + c) * Dim + d];
+                    }
+
+                    wantScores[(row * Steps + t) * Capacity + c] = sum;
+                }
+            }
+        }
+
+        AssertClose(wantScores, scores, 1e-5f, "q · int8 keys");
+        AssertClose(wantContext, context, 1e-5f, "weights · int8 values");
+    }
+
+    private static void Int8CacheDecoding(Device device)
+    {
+        const int T = 10, V = 11;
+        using var model = TinyGpt(device);
+        var random = new Random(50);
+        var ids = Enumerable.Range(0, T).Select(_ => (float)random.Next(V)).ToArray();
+        List<float[]> Decode(KeyValueFormat format, out long bytes)
+        {
+            var logits = new List<float[]>();
+            using var context = new DecodingContext(device, 1, 12, format);
+            using (Autograd.NoGrad())
+            {
+                using var prompt = Tensor.From(ids.AsSpan(0, 4), [1, 4], device);
+                logits.Add(model.ForwardCached(prompt, context).ToArray());
+                for (int t = 4; t < T; t++)
+                {
+                    using var next = Tensor.From(ids.AsSpan(t, 1), [1, 1], device);
+                    logits.Add(model.ForwardCached(next, context).ToArray());
+                }
+            }
+
+            bytes = context.CacheBytes;
+            return logits;
+        }
+
+        var exact = Decode(KeyValueFormat.Float32, out long floatBytes);
+        var int8 = Decode(KeyValueFormat.Int8, out long int8Bytes);
+        float range = exact.SelectMany(l => l).Max(MathF.Abs);
+        for (int step = 0; step < exact.Count; step++)
+        {
+            float change = exact[step].Zip(int8[step], (a, b) => MathF.Abs(a - b)).Max();
+            Check(change < 0.05f * range, $"step {step}: logit change {change} (range {range})");
+        }
+
+        // Per cached row: ceil(dh / 4) packed elements + one scale, instead of dh floats (dh = 4 here, so exactly half;
+        // at dh = 64 it is 17 / 64 of the memory).
+        int dh = model.Descendants().OfType<MultiHeadAttention>().First() is var mha ? mha.Dim / mha.Heads : 0;
+        Check(int8Bytes * dh == floatBytes * ((dh + 3) / 4 + 1), $"cache {int8Bytes:N0} bytes vs {floatBytes:N0} (head size {dh})");
+
+        // Recorded decoding steps (CUDA graphs on the GPU) give the same tokens as direct steps with an int8 cache.
+        const int B = 2, Steps = 8;
+        int[][] Run(bool useGraph)
+        {
+            using var context = new DecodingContext(device, B, 12, KeyValueFormat.Int8);
+            using var sampler = new TokenSampler(device, B, V, Steps + 1) { Temperature = 0.9f, Seed = 7 };
+            using (Autograd.NoGrad())
+            {
+                using (var scope = new TensorScope())
+                {
+                    sampler.Sample(model.ForwardCached(Tensor.From([1f, 2f, 3f, 4f], [B, 2], device), context));
+                }
+
+                void Step() => sampler.Sample(model.ForwardCached(sampler.Ids.Reshape(B, 1), context));
+                using var graph = useGraph ? context.CaptureStep(Step) : null;
+                for (int s = 0; s < Steps; s++)
+                {
+                    if (graph is not null)
+                    {
+                        context.ReplayStep(graph);
+                    }
+                    else
+                    {
+                        using var scope = new TensorScope();
+                        Step();
+                    }
+                }
+
+                if (graph is not null && device.Type == DeviceType.Cuda)
+                {
+                    Check(graph.IsRecorded, $"CUDA graph recording failed: {graph.FailureReason}");
+                }
+            }
+
+            return [.. sampler.Read(0, Steps + 1).Select(step => step.Select(t => t.Id).ToArray())];
+        }
+
+        var direct = Run(useGraph: false);
+        var replayed = Run(useGraph: true);
+        for (int s = 0; s < direct.Length; s++)
+        {
+            Check(direct[s].SequenceEqual(replayed[s]), $"step {s}: direct [{string.Join(",", direct[s])}] vs graph [{string.Join(",", replayed[s])}]");
+        }
+
+        var generator = new TextGenerator(model, new CharTokenizer("abcdefghijk"), 12) { CacheFormat = KeyValueFormat.Int8 };
+        var (text, _, stats) = generator.Generate("abc", new GenerationOptions { Temperature = 0f, TopK = 1, NumPredict = 6 });
+        Check(stats.GeneratedTokens == 6 && text.Length == 6, $"generator with an int8 cache: '{text}'");
+    }
+
+    private static void FewRowMatMul(Device device)
+    {
+        var r = new Random(48);
+        foreach (var (m, n, k) in new[] { (1, 700, 300), (3, 1030, 257), (4, 512, 512) })
+        {
+            foreach (var (transA, transB) in new[] { (false, false), (true, false), (false, true), (true, true) })
+            {
+                var a = Enumerable.Range(0, m * k).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+                var b = Enumerable.Range(0, k * n).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+                using var ta = Tensor.From(a, transA ? [k, m] : [m, k], device);
+                using var tb = Tensor.From(b, transB ? [n, k] : [k, n], device);
+                var actual = ta.MatMul(tb, transA, transB).ToArray();
+                var expected = new float[m * n];
+                for (int i = 0; i < m; i++)
+                {
+                    for (int j = 0; j < n; j++)
+                    {
+                        double sum = 0;
+                        for (int p = 0; p < k; p++)
+                        {
+                            sum += (double)a[transA ? p * m + i : i * k + p] * b[transB ? j * k + p : p * n + j];
+                        }
+
+                        expected[i * n + j] = (float)sum;
+                    }
+                }
+
+                AssertClose(expected, actual, 1e-3f, $"[{m}x{k}]{(transA ? "ᵀ" : "")} × [{k}x{n}]{(transB ? "ᵀ" : "")}");
+            }
+        }
+
+        // beta = 1 accumulates (the gradient path): dx += dy · wᵀ with one row.
+        using var w = Tensor.From([.. Enumerable.Range(0, 300 * 700).Select(i => MathF.Sin(i * 0.01f))], [300, 700], device);
+        using var x = Tensor.From([.. Enumerable.Range(0, 300).Select(i => MathF.Cos(i * 0.1f))], [1, 300], device, requiresGrad: true);
+        var y = x.MatMul(w);
+        y.Sum().Backward();
+        y = x.MatMul(w);
+        y.Sum().Backward();                                                       // accumulates a second time
+        var once = w.ToArray().Chunk(700).Select(row => row.Sum()).ToArray();
+        AssertClose([.. once.Select(v => 2 * v)], x.Grad!.ToArray(), 1e-2f, "accumulated gradient");
+    }
 
     private static void Int8Kernels(Device device)
     {

@@ -8,6 +8,7 @@
 //
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.Quantization            (add --cpu / --cuda)
 //   dotnet run -c Release --project samples/NeuralSharp.Samples.Quantization -- --size small     (a 25M-parameter GPT for part 2)
+//   dotnet run -c Release --project samples/NeuralSharp.Samples.Quantization -- --part speed     (only part 2)
 
 using System.Diagnostics;
 using NeuralSharp;
@@ -20,7 +21,8 @@ using NeuralSharp.Samples;
 using NeuralSharp.Samples.Summarizer;
 using NeuralSharp.Training;
 
-if (SampleOptions.Parse(args, ("size", "GPT for the speed test: base (≈100M parameters, default) or small (≈25M)")) is not { } options)
+if (SampleOptions.Parse(args, ("size", "GPT for the speed test: base (≈100M parameters, default) or small (≈25M)"),
+    ("part", "accuracy, speed or all (default)")) is not { } options)
 {
     return 0;
 }
@@ -31,12 +33,28 @@ using var logger = Telemetry.Subscribe(new ConsoleLogger(options.LogLevels, epoc
 string folder = Path.Combine(Path.GetTempPath(), $"neuralsharp-quantization-{Environment.ProcessId}");
 Directory.CreateDirectory(folder);
 
-// ---------------------------------------------------------------- 1. accuracy: a trained summarizer
 const int Context = 96, Dim = 96;
 var train = Reports.Generate(5000, new Random(1));
 var test = Reports.Generate(300, new Random(2));
 var tokenizer = WordTokenizer.FromTexts(train.SelectMany(r => new[] { r.Document, r.Summary }), ["<pad>", "<sum>", "<end>"]);
 var greedy = new GenerationOptions { Temperature = 0f, TopK = 1, RepeatPenalty = 1f, NumPredict = 30, Stop = ["<end>"], NumCtx = Context };
+string part = options.Get("part", "all")!;
+if (part is "all" or "accuracy")
+{
+    Accuracy();
+}
+
+if (part is "all" or "speed")
+{
+    Speed();
+}
+
+Directory.Delete(folder, recursive: true);
+return 0;
+
+// ---------------------------------------------------------------- 1. accuracy: a trained summarizer
+void Accuracy()
+{
 var builder = Architectures.Gpt(tokenizer.VocabularySize, Context, Dim, heads: 4, layers: 3, ffDim: 4 * Dim, dropout: 0.1f).OnDevice(device).Seed(2);
 using var model = builder.Build();
 int epochs = options.Epochs ?? 7;
@@ -58,13 +76,13 @@ Console.WriteLine($"Trained in {clock.Elapsed.TotalSeconds:F0} s\n");
 
 string floatPath = Path.Combine(folder, "summarizer.f32.nsw");
 model.Save(floatPath);
-var reference = Summaries(model);
+var reference = Summaries(model, KeyValueFormat.Float32);
 var referenceLogits = Logits(model);
 
 var rows = new List<(string Name, long Bytes, double Exact, double SameSummary, double SameNextToken, float LogitChange)>();
-void Measure(string name, Sequential candidate, string path)
+void Measure(string name, Sequential candidate, string path, KeyValueFormat cache = KeyValueFormat.Float32)
 {
-    var summaries = Summaries(candidate);
+    var summaries = Summaries(candidate, cache);
     var logits = Logits(candidate);
     double exact = test.Select((r, i) => WordTokenizer.Split(summaries[i]).SequenceEqual(WordTokenizer.Split(r.Summary)) ? 1.0 : 0.0).Average();
     double same = summaries.Select((s, i) => s == reference[i] ? 1.0 : 0.0).Average();
@@ -103,6 +121,7 @@ using (var quantized = builder.Build())
     string path = Path.Combine(folder, "summarizer.int8.nsw");
     quantized.Save(path);
     Measure("int8 (QuantizeInt8)", quantized, path);
+    Measure("int8 + int8 KV cache", quantized, path, KeyValueFormat.Int8);
 }
 
 Console.WriteLine($"Accuracy on {test.Count} new reports      file        exact   same summary   same next token   largest logit change");
@@ -114,7 +133,11 @@ foreach (var r in rows)
 Console.WriteLine("  (same summary / next token: agreement with the float32 model; logits span about " +
     $"{referenceLogits.Min():F0} to {referenceLogits.Max():F0})\n");
 
+}
+
 // ---------------------------------------------------------------- 2. speed and memory: a larger GPT
+void Speed()
+{
 bool small = options.Get("size", "base") == "small";
 int dim = small ? 512 : 768, layers = small ? 8 : 12, vocabularySize = 8192, context = 256;
 var words = new WordTokenizer(Enumerable.Range(0, vocabularySize).Select(i => $"w{i}"));
@@ -125,7 +148,7 @@ Console.WriteLine($"Decoding speed: GPT with dim {dim}, {layers} layers, vocabul
 using var gpt = Architectures.Gpt(words.VocabularySize, context, dim, heads: dim / 64, layers, ffDim: 4 * dim, dropout: 0f).OnDevice(device).Seed(3).Build();
 gpt.Eval();
 long parameters = gpt.Parameters().Sum(p => (long)p.Size);
-foreach (bool int8 in new[] { false, true })
+foreach (var (name, int8, cache) in new[] { ("float32", false, KeyValueFormat.Float32), ("int8", true, KeyValueFormat.Float32), ("int8 + KV", true, KeyValueFormat.Int8) })
 {
     if (int8)
     {
@@ -133,22 +156,30 @@ foreach (bool int8 in new[] { false, true })
     }
 
     long bytes = gpt.Parameters().Concat(gpt.Buffers()).Sum(p => 4L * p.Size);
-    var generator = new TextGenerator(gpt, words, context);
+    long cacheBytes;
+    using (var probe = new DecodingContext(device, 1, context, cache))
+    using (Autograd.NoGrad())
+    using (var scope = new TensorScope())
+    {
+        gpt.ForwardCached(Tensor.From([1f], [1, 1], device), probe);            // creates every layer's cache
+        cacheBytes = probe.CacheBytes;
+    }
+
+    var generator = new TextGenerator(gpt, words, context) { CacheFormat = cache };
     generator.Generate(prompt, decode with { NumPredict = 8 });                        // warm-up (kernel loading, caches)
     var results = Enumerable.Range(0, 3).Select(_ => generator.Generate(prompt, decode)).ToList();
     var best = results.MaxBy(r => r.Stats.TokensPerSecond)!;
-    Console.WriteLine($"  {(int8 ? "int8" : "float32"),-8} {parameters / 1e6,6:F1}M parameters in {bytes / 1048576.0,7:N0} MB: " +
-        $"{best.Stats.TokensPerSecond,7:F1} tokens/s ({1000 / best.Stats.TokensPerSecond,6:F1} ms per token), " +
-        $"prompt {best.Stats.PromptDuration.TotalMilliseconds,6:F0} ms");
+    Console.WriteLine($"  {name,-10} weights {bytes / 1048576.0,5:N0} MB, KV cache {cacheBytes / 1048576.0,5:F1} MB ({context} positions): " +
+        $"{best.Stats.TokensPerSecond,6:F1} tokens/s ({1000 / best.Stats.TokensPerSecond,5:F1} ms per token), prompt {best.Stats.PromptDuration.TotalMilliseconds,5:F0} ms");
 }
 
-Directory.Delete(folder, recursive: true);
-return 0;
+Console.WriteLine($"  ({parameters / 1e6:F1}M parameters; the int8 KV cache stores each head's {dim / (dim / 64)} values as bytes plus one scale)");
+}
 
 // ---------------------------------------------------------------- helpers
-List<string> Summaries(Sequential m)
+List<string> Summaries(Sequential m, KeyValueFormat cache)
 {
-    var generator = new TextGenerator(m, tokenizer, Context);
+    var generator = new TextGenerator(m, tokenizer, Context) { CacheFormat = cache };
     return [.. test.Select(r => generator.Generate(r.Document + " <sum>", greedy).Text.Trim())];
 }
 

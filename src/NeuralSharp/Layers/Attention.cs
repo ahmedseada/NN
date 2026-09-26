@@ -106,11 +106,24 @@ public sealed class MultiHeadAttention : Module, ICachedModule
             .Reshape(n * Heads, t, dh);
 
         var q = SplitHeads(0);
-        Tensor.WriteKeyValues(SplitHeads(1), cache.Keys, context.Position);
-        Tensor.WriteKeyValues(SplitHeads(2), cache.Values, context.Position);
-        var weights = q.MatMul(cache.Keys, transposeB: true)             // [N·H, t, capacity]
-            .ScaleMaskSoftmax(1f / MathF.Sqrt(dh), context.Mask);       // unwritten positions are masked out
-        var output = weights.MatMul(cache.Values)                         // [N·H, t, dh]
+        Tensor output;
+        if (cache.Format == KeyValueFormat.Int8)
+        {
+            Tensor.WriteKeyValuesInt8(SplitHeads(1), cache.Keys, cache.KeyScales!, context.Position);
+            Tensor.WriteKeyValuesInt8(SplitHeads(2), cache.Values, cache.ValueScales!, context.Position);
+            var weights8 = Tensor.AttentionScoresInt8(q, cache).ScaleMaskSoftmax(1f / MathF.Sqrt(dh), context.Mask);
+            output = Tensor.AttentionContextInt8(weights8, cache);
+        }
+        else
+        {
+            Tensor.WriteKeyValues(SplitHeads(1), cache.Keys, context.Position);
+            Tensor.WriteKeyValues(SplitHeads(2), cache.Values, context.Position);
+            var weights = q.MatMul(cache.Keys, transposeB: true)         // [N·H, t, capacity]
+                .ScaleMaskSoftmax(1f / MathF.Sqrt(dh), context.Mask);   // unwritten positions are masked out
+            output = weights.MatMul(cache.Values);                        // [N·H, t, dh]
+        }
+
+        output = output
             .Reshape(n, Heads, t, dh)
             .Permute(0, 2, 1, 3)
             .Reshape(n, t, Dim);

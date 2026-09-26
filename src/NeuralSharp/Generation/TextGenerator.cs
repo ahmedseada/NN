@@ -52,7 +52,13 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
     public int ContextLength { get; } = contextLength;
 
     /// <summary>The device the model's parameters live on.</summary>
-    public Device Device => Model.Parameters().First().Device;
+    public Device Device => Model.Parameters().Concat(Model.Buffers()).First().Device;
+
+    /// <summary>
+    /// How the KV cache stores keys and values while generating: <see cref="KeyValueFormat.Int8"/> takes about a quarter
+    /// of the memory (longer contexts, more parallel sequences) at a small cost in accuracy.
+    /// </summary>
+    public KeyValueFormat CacheFormat { get; init; } = KeyValueFormat.Float32;
 
     /// <summary>Generates the whole continuation of <paramref name="prompt"/>.</summary>
     public (string Text, string DoneReason, GenerationStats Stats) Generate(string prompt, GenerationOptions options, CancellationToken cancellationToken = default)
@@ -158,7 +164,7 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
         Model.Eval();
         {
             // NoGrad is entered per compute call, never held across a yield (it is thread-local state of the caller).
-            using var decoding = new DecodingContext(Device, 1, context);
+            using var decoding = new DecodingContext(Device, 1, context, CacheFormat);
             ComputeGraph? graph = null;
             try
             {
