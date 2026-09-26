@@ -2,6 +2,7 @@
 //   dotnet run --project tests/NeuralSharp.Tests                  run every test on every available device
 //   dotnet run --project tests/NeuralSharp.Tests -- --dump-ptx f  write the generated CUDA kernels to f
 //   NS_FILTER=retrieval dotnet run --project tests/NeuralSharp.Tests   only tests whose name contains the text
+//   NS_TIMEOUT=60 …    a test still running after this many seconds (default 300) is reported as HANG and the run stops
 
 using System.Diagnostics;
 using NeuralSharp;
@@ -30,12 +31,31 @@ else
 }
 
 int failed = 0, passed = 0;
+string? running = null;
+var runningSince = Stopwatch.StartNew();
+int timeout = int.TryParse(Environment.GetEnvironmentVariable("NS_TIMEOUT"), out int t) ? t : 300;
+var watchdog = new Thread(() =>
+{
+    while (true)
+    {
+        Thread.Sleep(1000);
+        if (Volatile.Read(ref running) is { } current && runningSince.Elapsed.TotalSeconds > timeout)
+        {
+            Console.WriteLine($"  HANG {current}: still running after {timeout} s");
+            Console.WriteLine($"{passed} passed, {failed} failed, 1 hung");
+            Environment.Exit(3);
+        }
+    }
+}) { IsBackground = true };
+watchdog.Start();
 foreach (var device in devices)
 {
     Console.WriteLine($"== {device}: {device.Name}");
     foreach (var (name, test) in Tests.All.Where(t => Environment.GetEnvironmentVariable("NS_FILTER") is not { } f || t.Name.Contains(f, StringComparison.OrdinalIgnoreCase)))
     {
         var sw = Stopwatch.StartNew();
+        runningSince.Restart();
+        Volatile.Write(ref running, $"[{device}] {name}");
         try
         {
             using (new TensorScope())
@@ -54,6 +74,7 @@ foreach (var device in devices)
     }
 }
 
+Volatile.Write(ref running, null);
 Console.WriteLine($"{passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
 

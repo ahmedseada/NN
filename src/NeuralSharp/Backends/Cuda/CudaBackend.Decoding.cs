@@ -45,54 +45,87 @@ internal sealed unsafe partial class CudaBackend
     public override void BeginCapture()
     {
         MakeCurrent();
-        lock (_pool)
-        {
-            if (_captureFree is not null)
-            {
-                throw new InvalidOperationException("A graph is already being recorded on this device.");
-            }
-
-            _captureFree = [];
-        }
-
-        int result = cuStreamBeginCapture(_stream, StreamCaptureModeRelaxed);
-        if (result != 0)
+        _streamGate.EnterWriteLock();                              // other threads' stream work waits for the recording
+        try
         {
             lock (_pool)
             {
-                _captureFree = null;
+                if (_captureFree is not null)
+                {
+                    throw new InvalidOperationException("A graph is already being recorded on this device.");
+                }
+
+                _captureFree = [];
+                _captureThread = Environment.CurrentManagedThreadId;
             }
 
-            Check(result, nameof(cuStreamBeginCapture));
+            int result = cuStreamBeginCapture(_stream, StreamCaptureModeRelaxed);
+            if (result != 0)
+            {
+                lock (_pool)
+                {
+                    _captureFree = null;
+                    _captureThread = 0;
+                }
+
+                Check(result, nameof(cuStreamBeginCapture));
+            }
+        }
+        catch
+        {
+            _streamGate.ExitWriteLock();
+            throw;
         }
     }
 
     public override (IntPtr Executable, IntPtr Graph, List<Storage> Owned) EndCapture()
     {
         MakeCurrent();
-        var owned = TakeCaptureBlocks();
-        Check(cuStreamEndCapture(_stream, out IntPtr graph), nameof(cuStreamEndCapture));
-        int result = cuGraphInstantiateWithFlags(out IntPtr executable, graph, 0);
-        if (result != 0)
+        try
         {
-            cuGraphDestroy(graph);
-            owned.ForEach(o => o.Release());
-            Check(result, nameof(cuGraphInstantiateWithFlags));
-        }
+            var owned = TakeCaptureBlocks();
+            Check(cuStreamEndCapture(_stream, out IntPtr graph), nameof(cuStreamEndCapture));
+            int result = cuGraphInstantiateWithFlags(out IntPtr executable, graph, 0);
+            if (result != 0)
+            {
+                cuGraphDestroy(graph);
+                owned.ForEach(o => o.Release());
+                Check(result, nameof(cuGraphInstantiateWithFlags));
+            }
 
-        return (executable, graph, owned);
+            return (executable, graph, owned);
+        }
+        finally
+        {
+            EndRecording();
+        }
     }
 
     public override List<Storage> AbortCapture()
     {
         MakeCurrent();
-        var owned = TakeCaptureBlocks();
-        if (cuStreamEndCapture(_stream, out IntPtr graph) == 0 && graph != IntPtr.Zero)
+        try
         {
-            cuGraphDestroy(graph);
-        }
+            var owned = TakeCaptureBlocks();
+            if (cuStreamEndCapture(_stream, out IntPtr graph) == 0 && graph != IntPtr.Zero)
+            {
+                cuGraphDestroy(graph);
+            }
 
-        return owned;
+            return owned;
+        }
+        finally
+        {
+            EndRecording();
+        }
+    }
+
+    private void EndRecording()
+    {
+        if (_streamGate.IsWriteLockHeld)
+        {
+            _streamGate.ExitWriteLock();
+        }
     }
 
     /// <summary>Ends capture-mode allocation and wraps the blocks freed during capture as storages the graph owns.</summary>
@@ -112,6 +145,7 @@ internal sealed unsafe partial class CudaBackend
             }
 
             _captureFree = null;
+            _captureThread = 0;
             return owned;
         }
     }
@@ -119,6 +153,7 @@ internal sealed unsafe partial class CudaBackend
     public override void ReplayGraph(IntPtr executable)
     {
         MakeCurrent();
+        using var use = UseStream();
         Check(cuGraphLaunch(executable, _stream), nameof(cuGraphLaunch));
     }
 

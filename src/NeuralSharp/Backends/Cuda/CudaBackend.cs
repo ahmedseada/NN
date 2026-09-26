@@ -33,6 +33,28 @@ internal sealed unsafe partial class CudaBackend : Backend
 
     /// <summary>Non-null while a graph is being recorded: blocks freed during capture, owned by the graph.</summary>
     private Dictionary<int, Stack<ulong>>? _captureFree;
+
+    /// <summary>
+    /// Work on the stream (launches, copies, allocation, synchronization) holds this for reading; recording a graph
+    /// holds it for writing from BeginCapture to EndCapture. Recording captures everything issued on the stream, and
+    /// the driver refuses synchronous copies and synchronization while it records, so other threads wait until the
+    /// recording ends rather than landing in the graph or failing. The recording thread's own work still goes through.
+    /// </summary>
+    private readonly ReaderWriterLockSlim _streamGate = new(LockRecursionPolicy.SupportsRecursion);
+
+    /// <summary>Managed thread id of the thread recording a graph (0 when none).</summary>
+    private int _captureThread;
+
+    private StreamUse UseStream()
+    {
+        _streamGate.EnterReadLock();
+        return new StreamUse(_streamGate);
+    }
+
+    private readonly struct StreamUse(ReaderWriterLockSlim gate) : IDisposable
+    {
+        public void Dispose() => gate.ExitReadLock();
+    }
     private readonly Dictionary<int, Stack<ulong>> _pool = [];
     private readonly MemoryAccountant _memory;
     private readonly int _multiprocessors;
@@ -185,6 +207,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override Storage Allocate(int length, bool zeroed)
     {
         MakeCurrent();
+        using var use = UseStream();
         long bytes = BlockBytes(length);
         bool releaseCache = _memory.MustReleaseCacheFor(bytes); // throws when over the in-use limit
         ulong pointer = 0;
@@ -267,9 +290,10 @@ internal sealed unsafe partial class CudaBackend : Backend
         var s = (CudaStorage)storage;
         lock (_pool)
         {
-            // While recording a graph, freed blocks belong to the graph: returning them to the shared pool would let
-            // unrelated tensors reuse memory the graph writes on every replay.
-            var target = _captureFree ?? _pool;
+            // While recording a graph, blocks the recording frees belong to the graph: returning them to the shared pool
+            // would let unrelated tensors reuse memory the graph writes on every replay. (Other threads' blocks,
+            // including the finalizer's, go back to the pool.)
+            var target = _captureFree is not null && Environment.CurrentManagedThreadId == _captureThread ? _captureFree : _pool;
             if (!target.TryGetValue(s.Length, out var bucket))
             {
                 target[s.Length] = bucket = new Stack<ulong>();
@@ -283,6 +307,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void Upload(ReadOnlySpan<float> source, Storage destination)
     {
         MakeCurrent();
+        using var use = UseStream();
         fixed (float* p = source)
         {
             Check(cuMemcpyHtoD(P(destination), p, (nuint)source.Length * sizeof(float)), nameof(cuMemcpyHtoD));
@@ -294,6 +319,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void DownloadRange(Storage source, int offset, Span<float> destination)
     {
         MakeCurrent();
+        using var use = UseStream();
         fixed (float* p = destination)
         {
             Check(cuMemcpyDtoH(p, P(source) + (ulong)offset * sizeof(float), (nuint)destination.Length * sizeof(float)), nameof(cuMemcpyDtoH));
@@ -305,6 +331,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void Copy(Storage x, Storage y, int n)
     {
         MakeCurrent();
+        using var use = UseStream();
         Check(cuMemcpyDtoDAsync(P(y), P(x), (nuint)n * sizeof(float), _stream), nameof(cuMemcpyDtoDAsync));
     }
 
@@ -371,7 +398,11 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void Sum(Storage x, Storage result, int n, float scale)
     {
         MakeCurrent();
-        Check(cuMemsetD32Async(P(result), 0, 1, _stream), nameof(cuMemsetD32Async));
+        using (UseStream())
+        {
+            Check(cuMemsetD32Async(P(result), 0, 1, _stream), nameof(cuMemsetD32Async));
+        }
+
         if (n == 0)
         {
             return;
@@ -442,6 +473,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void Synchronize()
     {
         MakeCurrent();
+        using var use = UseStream();
         Check(cuCtxSynchronize(), nameof(cuCtxSynchronize));
     }
 
@@ -488,6 +520,7 @@ internal sealed unsafe partial class CudaBackend : Backend
             pointers[i] = &values[i];
         }
 
+        using var use = UseStream();
         Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, 0, _stream, pointers, null), nameof(cuLaunchKernel));
     }
 
