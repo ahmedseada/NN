@@ -358,6 +358,9 @@ internal sealed unsafe partial class CudaBackend
             U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows)));
     }
 
+    public override void SoftmaxCrossEntropyRows(Storage logits, Storage targets, Storage weights, Storage losses, int rows, int vocabulary, float scale) =>
+        LaunchRows(K("softmax_ce_rows_f32"), rows, PtxKernels.RowThreads * 4, P(logits), P(targets), P(weights), P(losses), U(vocabulary), F(scale), U(rows));
+
     public override void AttentionBFloat16(Storage q, Storage keys, Storage values, Storage position, Storage y, int heads, int rowsPerHead,
         int steps, int capacity, int dim, float scale, bool tiled)
     {

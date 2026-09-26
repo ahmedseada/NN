@@ -341,6 +341,13 @@ internal abstract class Backend
         RmsNormRope(x2, gain2, cos, sin, positions, y2, rows2, cols, eps2, offset2, heads2, steps, half, interleaved);
     }
 
+    /// <summary>
+    /// Token cross-entropy for language-model training, per row r of logits [rows, vocabulary] with target class t_r and
+    /// weight w_r (0 masks the row): losses[r] = w_r · (logsumexp(x_r) - x_r[t_r]); the logits are overwritten with their
+    /// gradient scale · w_r · (softmax(x_r) - onehot(t_r)). Targets and weights are float arrays of rows.
+    /// </summary>
+    public abstract void SoftmaxCrossEntropyRows(Storage logits, Storage targets, Storage weights, Storage losses, int rows, int vocabulary, float scale);
+
     /// <summary>y = act(gate) · up element-wise; kind 0 = SiLU, 1 = GELU (tanh approximation), 2 = ReLU.</summary>
     public abstract void GatedActivation(Storage gate, Storage up, Storage y, int n, int kind);
 

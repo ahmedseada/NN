@@ -42,6 +42,17 @@ public static class Losses
     }
 
     /// <summary>
+    /// Language-model loss over token positions: the weighted cross-entropy of <paramref name="head"/>(hidden) against
+    /// <paramref name="targets"/> (token ids as floats, [rows]) with <paramref name="weights"/> [rows] (0 masks a
+    /// position, for example prompt tokens), divided by <paramref name="normalizer"/> (usually the number of weighted
+    /// tokens). The head (the output projection) runs on <paramref name="chunkRows"/> rows at a time with a fused
+    /// softmax/cross-entropy kernel, so the full [rows, vocabulary] logits are never stored: fine-tuning long sequences
+    /// over large vocabularies fits in memory. Call Backward() on the result without scaling it.
+    /// </summary>
+    public static Tensor TokenCrossEntropy(Tensor hidden, Func<Tensor, Tensor> head, Tensor targets, Tensor weights, float normalizer, int chunkRows = 1024) =>
+        Tensor.TokenCrossEntropy(hidden, head, targets, weights, normalizer, chunkRows);
+
+    /// <summary>
     /// Binary cross-entropy for probabilities in (0, 1), e.g. after a <see cref="Layers.Sigmoid"/> layer:
     /// -mean(y·log p + (1 - y)·log(1 - p)). Prefer <see cref="BinaryCrossEntropyWithLogits"/> for stability.
     /// </summary>

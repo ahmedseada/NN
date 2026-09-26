@@ -59,6 +59,70 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// Weighted token cross-entropy of a language model's output head applied to <paramref name="hidden"/> [rows, dim]:
+    /// Σ_r w_r · (logsumexp(head(h_r)) - head(h_r)[t_r]) / <paramref name="normalizer"/>. The head runs on
+    /// <paramref name="chunkRows"/> rows at a time and each chunk's gradient is back-propagated through the head at once,
+    /// so the [rows, vocabulary] logits never exist together (a 2048-token sequence over a 152k vocabulary would need
+    /// 1.2 GB for them and as much for their gradient). The result's backward pass adds the collected gradient to
+    /// <paramref name="hidden"/>; parameters inside the head (adapters) receive theirs during this call, so back-propagate
+    /// the loss unscaled (scale through <paramref name="normalizer"/> instead).
+    /// </summary>
+    internal static Tensor TokenCrossEntropy(Tensor hidden, Func<Tensor, Tensor> head, Tensor targets, Tensor weights, float normalizer, int chunkRows)
+    {
+        hidden.ThrowIfDisposed();
+        if (hidden.Rank != 2 || targets.Size != hidden._shape[0] || weights.Size != hidden._shape[0])
+        {
+            throw new ArgumentException($"TokenCrossEntropy needs hidden [rows, dim] with rows targets and weights, got {FormatShape(hidden._shape)}, {targets.Size} and {weights.Size}.");
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int rows = hidden._shape[0], dim = hidden._shape[1];
+        chunkRows = Math.Max(1, chunkRows);
+        var device = hidden.Device;
+        var backend = hidden.Backend;
+        bool record = WillRecord(hidden);
+        var gradient = record ? Empty([rows, dim], device, zeroed: true) : null;
+        var losses = Empty([rows], device);
+        for (int r0 = 0; r0 < rows; r0 += chunkRows)
+        {
+            int n = Math.Min(chunkRows, rows - r0);
+            using var scope = new TensorScope();
+            var chunk = Empty([n, dim], device);
+            backend.Copy2D(hidden.Storage, r0 * dim, n * dim, chunk.Storage, 0, n * dim, 1, n * dim, accumulate: false);
+            chunk.RequiresGrad = record;
+            var logits = head(chunk);
+            int vocabulary = logits._shape[^1];
+            if (logits.Size != n * vocabulary)
+            {
+                throw new ArgumentException($"The head must map [{n}, {dim}] to [{n}, vocabulary], got {FormatShape(logits._shape)}.");
+            }
+
+            var chunkTargets = Empty([n], device);
+            var chunkWeights = Empty([n], device);
+            var chunkLosses = Empty([n], device);
+            backend.Copy2D(targets.Storage, r0, n, chunkTargets.Storage, 0, n, 1, n, accumulate: false);
+            backend.Copy2D(weights.Storage, r0, n, chunkWeights.Storage, 0, n, 1, n, accumulate: false);
+            backend.SoftmaxCrossEntropyRows(logits.Storage, chunkTargets.Storage, chunkWeights.Storage, chunkLosses.Storage, n, vocabulary,
+                1f / normalizer);
+            backend.Copy2D(chunkLosses.Storage, 0, n, losses.Storage, r0, n, 1, n, accumulate: false);
+            if (record && logits.RequiresGrad)
+            {
+                logits.Backward(logits);                                         // the logits now hold their gradient
+                backend.Copy2D(chunk.GradStorage(), 0, n * dim, gradient!.Storage, r0 * dim, n * dim, 1, n * dim, accumulate: false);
+            }
+        }
+
+        var loss = Empty([1], device);
+        backend.Sum(losses.Storage, loss.Storage, rows, 1f / normalizer);
+        if (record)
+        {
+            loss.Record("token_cross_entropy", g => backend.Axpy(gradient!.Storage, hidden.GradStorage(), rows * dim, g.Item()), hidden);
+        }
+
+        return Traced("token_cross_entropy", loss, start);
+    }
+
+    /// <summary>
     /// (act(gate) · up) · W for a packed layer W with few rows, the activation applied as the input is read (not recorded;
     /// no bias), or null when the layer is not packed or the device has no fused version.
     /// </summary>

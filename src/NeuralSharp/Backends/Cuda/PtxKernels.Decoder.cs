@@ -5,7 +5,7 @@ namespace NeuralSharp.Backends.Cuda;
 // PTX for decoder-only language model layers: RMS normalization and rotary position embeddings.
 internal static partial class PtxKernels
 {
-    public static readonly string[] DecoderNames = ["rms_norm_f32", "rms_norm_backward_f32", "rope_f32", "rms_norm_affine_f32", "gated_act_f32", "gated_act_bwd_f32", "add_rms_norm_affine_f32", "rms_norm_rope_f32", "rms_norm_rope2_f32"];
+    public static readonly string[] DecoderNames = ["rms_norm_f32", "rms_norm_backward_f32", "rope_f32", "rms_norm_affine_f32", "gated_act_f32", "gated_act_bwd_f32", "add_rms_norm_affine_f32", "rms_norm_rope_f32", "rms_norm_rope2_f32", "softmax_ce_rows_f32"];
 
     private static void BuildDecoder(StringBuilder sb)
     {
@@ -66,6 +66,45 @@ internal static partial class PtxKernels
             """));
 
         // y = x · inv · (gain + offset): normalization and gain in one pass (inference), one block per row.
+        // Token cross-entropy per row (language-model training): loss[r] = w_r · (logsumexp(x_r) - x_r[t_r]), and x_r is
+        // replaced by its gradient scale · w_r · (softmax(x_r) - onehot(t_r)). One block per row; every thread reads the
+        // target logit before the block reductions (which synchronize) and the rewrite after them.
+        RowBlock(sb, "softmax_ce_rows_f32", ["x", "targets", "weights", "losses"], [("u32", "cols"), ("f32", "scale")],
+            RowStart + $"""
+            add.u64 %rd2, %b_x, %rd1;
+            ld.global.f32 %f20, [%a_weights];
+            ld.global.f32 %f21, [%a_targets];
+            cvt.rzi.u32.f32 %r20, %f21;
+            mul.wide.u32 %rd8, %r20, 4;
+            add.u64 %rd8, %rd8, %rd2;
+            ld.global.f32 %f22, [%rd8];
+            mov.f32 %f1, {NegInf};
+            """ + "\n" + StridedLoop("CM", "%rd2", "%s_cols", "max.f32 %f1, %f1, %f2;") + "\n"
+            + BlockReduce("CMAX", "%f1", "max", NegInf) + "\n" + $"""
+            mov.f32 %f3, {Zero};
+            """ + "\n" + StridedLoop("CS", "%rd2", "%s_cols", $"""
+            sub.f32 %f4, %f2, %f1;
+            mul.f32 %f4, %f4, {Log2E};
+            ex2.approx.ftz.f32 %f4, %f4;
+            add.f32 %f3, %f3, %f4;
+            """) + "\n" + BlockReduce("CSUM", "%f3", "add", Zero) + "\n" + $"""
+            lg2.approx.f32 %f5, %f3;
+            fma.rn.f32 %f5, %f5, {Ln2}, %f1;
+            setp.eq.u32 %p9, %tx, 0;
+            sub.f32 %f7, %f5, %f22;
+            mul.f32 %f7, %f7, %f20;
+            @%p9 st.global.f32 [%a_losses], %f7;
+            mul.f32 %f6, %f20, %s_scale;
+            """ + "\n" + StridedLoop("CW", "%rd2", "%s_cols", $"""
+            sub.f32 %f4, %f2, %f5;
+            mul.f32 %f4, %f4, {Log2E};
+            ex2.approx.ftz.f32 %f4, %f4;
+            setp.eq.u32 %p10, %r6, %r20;
+            @%p10 sub.f32 %f4, %f4, 0f3F800000;
+            mul.f32 %f4, %f4, %f6;
+            st.global.f32 [%rd5], %f4;
+            """));
+
         RowBlock(sb, "rms_norm_affine_f32", ["x", "gain", "y"], [("u32", "cols"), ("f32", "eps"), ("f32", "offset")],
             RowStart + $"""
             add.u64 %rd2, %b_x, %rd1;

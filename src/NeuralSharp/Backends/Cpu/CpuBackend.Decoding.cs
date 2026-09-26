@@ -102,6 +102,33 @@ internal sealed partial class CpuBackend
         }
     }
 
+    public override void SoftmaxCrossEntropyRows(Storage logits, Storage targets, Storage weights, Storage losses, int rows, int vocabulary, float scale)
+    {
+        float[] xv = D(logits), tv = D(targets), wv = D(weights), lv = D(losses);
+        For(rows, (long)rows * vocabulary * 4, (first, last) =>
+        {
+            for (int r = first; r < last; r++)
+            {
+                var x = xv.AsSpan(r * vocabulary, vocabulary);
+                int target = (int)tv[r];
+                float max = CpuMath.Max(x), w = wv[r];
+                double sum = 0;
+                foreach (float v in x)
+                {
+                    sum += Math.Exp(v - max);
+                }
+
+                float lse = max + (float)Math.Log(sum);
+                lv[r] = w * (lse - x[target]);
+                float g = scale * w;
+                for (int j = 0; j < x.Length; j++)
+                {
+                    x[j] = g * (MathF.Exp(x[j] - lse) - (j == target ? 1f : 0f));
+                }
+            }
+        });
+    }
+
     public override void KeyValueWriteBFloat16(Storage source, Storage cache, Storage position, int heads, int steps, int capacity, int dim)
     {
         int pos = (int)D(position)[0], stride = (dim + 1) / 2 * 2;
