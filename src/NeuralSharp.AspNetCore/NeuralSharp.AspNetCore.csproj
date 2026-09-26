@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>NeuralSharp.AspNetCore</RootNamespace>
+    <AssemblyName>NeuralSharp.AspNetCore</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageId>NeuralSharp.AspNetCore</PackageId>
+    <Description>ASP.NET Core integration for NeuralSharp: registers an InferenceEngine in dependency injection and maps prediction, generation, Ollama-compatible chat and status endpoints.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <ProjectReference Include="..\NeuralSharp\NeuralSharp.csproj" />
+  </ItemGroup>
+
+</Project>

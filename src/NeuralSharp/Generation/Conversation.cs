@@ -63,12 +63,22 @@ public sealed class Conversation
         return reply!;
     }
 
-    /// <summary>Adds <paramref name="user"/> and streams the answer's pieces (across tool rounds; tool results go into <see cref="Messages"/>).</summary>
+    /// <summary>
+    /// Adds <paramref name="user"/> and streams the answer's pieces (across tool rounds; tool results go into
+    /// <see cref="Messages"/>). When the stream ends, <see cref="LastReply"/> holds the outcome.
+    /// </summary>
     public IAsyncEnumerable<ChatDelta> StreamAsync(string user, CancellationToken cancellationToken = default)
     {
         Messages.Add(new ChatMessage("user", user));
-        return RunAsync(null, cancellationToken);
+        return RunAsync(r => LastReply = r, cancellationToken);
     }
+
+    /// <summary>Streams the answer to the history as it is; when the stream ends, <see cref="LastReply"/> holds the outcome.</summary>
+    public IAsyncEnumerable<ChatDelta> StreamContinueAsync(CancellationToken cancellationToken = default) =>
+        RunAsync(r => LastReply = r, cancellationToken);
+
+    /// <summary>The outcome of the most recent streamed answer.</summary>
+    public ConversationReply? LastReply { get; private set; }
 
     private async IAsyncEnumerable<ChatDelta> RunAsync(Action<ConversationReply>? done,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)

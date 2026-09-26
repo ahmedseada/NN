@@ -32,6 +32,14 @@ public enum EngineModelKind
 /// <param name="ExpiresAt">When the keep-alive will unload it, if it is idle and a keep-alive is set.</param>
 public sealed record ModelStatus(string Name, EngineModelKind Kind, bool Loaded, int Instances, int Running, int Queued, DateTimeOffset? ExpiresAt);
 
+/// <summary>What a loaded model is.</summary>
+/// <param name="Name">The model's name.</param>
+/// <param name="Kind">Predictor, text or chat.</param>
+/// <param name="Parameters">Trainable values in one copy.</param>
+/// <param name="Device">Where the copies run.</param>
+/// <param name="ContextLength">The context length (text and chat models), or null.</param>
+public sealed record ModelDescription(string Name, EngineModelKind Kind, long Parameters, Device Device, int? ContextLength);
+
 /// <summary>Request statistics of one model since the engine started.</summary>
 /// <param name="Requests">Completed requests.</param>
 /// <param name="Rejected">Requests refused because the queue was full.</param>
@@ -87,6 +95,12 @@ public sealed class InferenceEngine : IAsyncDisposable
 
     /// <summary>Loads <paramref name="name"/> now (if it is not loaded).</summary>
     public Task LoadAsync(string name, CancellationToken cancellationToken = default) => Model(name).EnsureLoadedAsync(cancellationToken);
+
+    /// <summary>
+    /// Changes how long <paramref name="name"/> stays loaded after its last request (null: forever; <see cref="TimeSpan.Zero"/>:
+    /// unload after each request), for example from a request's <c>keep_alive</c>. Needs a model the engine can reload.
+    /// </summary>
+    public void KeepAlive(string name, TimeSpan? idle) => Model(name).SetKeepAlive(idle);
 
     /// <summary>Unloads <paramref name="name"/> now, freeing its memory, once running requests finish; the next request loads it again.</summary>
     public Task UnloadAsync(string name) => Model(name).UnloadAsync(force: true);
@@ -194,6 +208,14 @@ public sealed class InferenceEngine : IAsyncDisposable
     /// <summary>The tools registered with the chat model named <paramref name="name"/>, or null.</summary>
     public ToolRegistry? ToolsOf(string name) => Model<GenerativeModel>(name).Tools;
 
+    /// <summary>Describes the model named <paramref name="name"/> (loads it if needed).</summary>
+    public async Task<ModelDescription> DescribeAsync(string name, CancellationToken cancellationToken = default)
+    {
+        var model = Model(name);
+        await model.EnsureLoadedAsync(cancellationToken).ConfigureAwait(false);
+        return model.Description ?? throw new InvalidOperationException($"'{name}' was unloaded while it was being described.");
+    }
+
     /// <summary>The context length of the text or chat model named <paramref name="name"/> (loads it if needed).</summary>
     public async Task<int> ContextLengthAsync(string name, CancellationToken cancellationToken = default)
     {
@@ -206,9 +228,16 @@ public sealed class InferenceEngine : IAsyncDisposable
     public Conversation Conversation(string name, Func<ConversationBuilder, ConversationBuilder> configure) =>
         configure(Generation.Conversation.For(ChatModel(name))).Build();
 
-    /// <summary>Unloads every model.</summary>
+    private int _disposed;
+
+    /// <summary>Unloads every model (safe to call more than once).</summary>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         foreach (var model in _models.Values)
         {
             await model.DisposeAsync().ConfigureAwait(false);
@@ -367,7 +396,7 @@ public sealed class InferenceEngineBuilder
         var s = builder.Settings;
         CheckName(name);
         Check(name, reloadable, s.Instances ?? 1, s.KeepAliveSet);
-        _models.Add(options => new PredictorModel<TIn, TOut>(name, options, builder, load, ownsModel));
+        _models.Add(options => new PredictorModel<TIn, TOut>(name, options, builder, load, ownsModel, reloadable));
         return this;
     }
 
@@ -382,7 +411,7 @@ public sealed class InferenceEngineBuilder
             throw new InvalidOperationException($"'{name}' is a text model; Template and Tools apply to chat models.");
         }
 
-        _models.Add(options => new GenerativeModel(name, kind, options, settings, load, owns));
+        _models.Add(options => new GenerativeModel(name, kind, options, settings, load, owns, reloadable));
         return this;
     }
 
@@ -552,8 +581,9 @@ internal abstract class EngineModel : IAsyncDisposable
     private readonly Lock _stateLock = new();
     private readonly int _instances;
     private readonly bool _shared;
-    private readonly TimeSpan? _keepAlive;
-    private readonly bool _keepAliveSet;
+    private readonly bool _reloadable;
+    private TimeSpan? _keepAlive;
+    private bool _keepAliveSet;
     private readonly int? _queueLimit;
     private readonly TimeSpan? _timeout;
     private Channel<object>? _free;
@@ -566,8 +596,9 @@ internal abstract class EngineModel : IAsyncDisposable
     private bool _disposed;
 
     protected EngineModel(string name, EngineModelKind kind, EngineOptions options, int instances, bool shared,
-        TimeSpan? keepAlive, bool keepAliveSet, int? queueLimit, TimeSpan? timeout)
+        TimeSpan? keepAlive, bool keepAliveSet, int? queueLimit, TimeSpan? timeout, bool reloadable)
     {
+        _reloadable = reloadable;
         Name = name;
         Kind = kind;
         Options = options;
@@ -587,9 +618,28 @@ internal abstract class EngineModel : IAsyncDisposable
 
     public EngineStatistics Statistics { get; } = new();
 
+    /// <summary>Set when the first copy loads.</summary>
+    public ModelDescription? Description { get; protected set; }
+
     protected abstract object CreateInstance();
 
     protected abstract void DisposeInstance(object instance);
+
+    public void SetKeepAlive(TimeSpan? idle)
+    {
+        if (!_reloadable)
+        {
+            throw new InvalidOperationException($"'{Name}' uses a model object you created, which the engine cannot reload; its keep-alive cannot be set.");
+        }
+
+        lock (_stateLock)
+        {
+            _keepAlive = idle;
+            _keepAliveSet = true;
+        }
+
+        ScheduleExpiry();
+    }
 
     public ModelStatus Status()
     {
@@ -821,9 +871,13 @@ internal abstract class EngineModel : IAsyncDisposable
 
     public virtual async ValueTask DisposeAsync()
     {
+        if (_disposed)
+        {
+            return;
+        }
+
         _disposed = true;
         await UnloadAsync(force: true).ConfigureAwait(false);
-        _loadLock.Dispose();
     }
 
     /// <summary>A copy of the model in use by one request.</summary>
@@ -876,9 +930,9 @@ internal sealed class PredictorModel<TIn, TOut> : EngineModel, IPredictor<TIn, T
     private readonly Task? _batcher;
     private readonly CancellationTokenSource _stop = new();
 
-    public PredictorModel(string name, EngineOptions options, PredictorBuilder<TIn, TOut> builder, Func<Module> load, bool ownsModel)
+    public PredictorModel(string name, EngineOptions options, PredictorBuilder<TIn, TOut> builder, Func<Module> load, bool ownsModel, bool reloadable)
         : base(name, EngineModelKind.Predictor, options, builder.Settings.Instances ?? 1, shared: true,
-            builder.Settings.KeepAlive, builder.Settings.KeepAliveSet, builder.Settings.QueueLimit, builder.Settings.Timeout)
+            builder.Settings.KeepAlive, builder.Settings.KeepAliveSet, builder.Settings.QueueLimit, builder.Settings.Timeout, reloadable)
     {
         _builder = builder;
         _load = load;
@@ -891,7 +945,12 @@ internal sealed class PredictorModel<TIn, TOut> : EngineModel, IPredictor<TIn, T
         }
     }
 
-    protected override object CreateInstance() => _builder.Create(_load(), _ownsModel);
+    protected override object CreateInstance()
+    {
+        var predictor = _builder.Create(_load(), _ownsModel);
+        Description ??= new ModelDescription(Name, Kind, predictor.Model.ParameterCount, predictor.Device, null);
+        return predictor;
+    }
 
     protected override void DisposeInstance(object instance) => ((Predictor<TIn, TOut>)instance).Dispose();
 
@@ -999,8 +1058,15 @@ internal sealed class PredictorModel<TIn, TOut> : EngineModel, IPredictor<TIn, T
         }
     }
 
+    private int _stopped;
+
     public override async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _stopped, 1) != 0)
+        {
+            return;
+        }
+
         _stop.Cancel();
         _pending?.Writer.TryComplete();
         if (_batcher is not null)
@@ -1022,9 +1088,10 @@ internal sealed class GenerativeModel : EngineModel
     private readonly Func<Device?, TextGenerator> _load;
     private readonly bool _owns;
 
-    public GenerativeModel(string name, EngineModelKind kind, EngineOptions options, GenerativeModelBuilder settings, Func<Device?, TextGenerator> load, bool owns)
+    public GenerativeModel(string name, EngineModelKind kind, EngineOptions options, GenerativeModelBuilder settings, Func<Device?, TextGenerator> load,
+        bool owns, bool reloadable)
         : base(name, kind, options, settings.InstanceCount ?? 1, shared: false, settings.KeepAliveTime, settings.KeepAliveSet,
-            settings.QueueLimitCount, settings.TimeoutLimit)
+            settings.QueueLimitCount, settings.TimeoutLimit, reloadable)
     {
         _settings = settings;
         _load = load;
@@ -1039,6 +1106,7 @@ internal sealed class GenerativeModel : EngineModel
     {
         var generator = _load(_settings.TargetDevice);
         ContextLength = generator.ContextLength;
+        Description ??= new ModelDescription(Name, Kind, generator.Model.ParameterCount, generator.Device, generator.ContextLength);
         if (_settings.WarmUpPrompt is { } prompt)
         {
             generator.Generate(prompt, new GenerationOptions { NumPredict = 1 });

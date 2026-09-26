@@ -48,7 +48,7 @@ foreach (var device in devices)
         catch (Exception ex)
         {
             failed++;
-            Console.WriteLine($"  FAIL {name}: {ex.Message}");
+            Console.WriteLine($"  FAIL {name}: {(Environment.GetEnvironmentVariable("NS_TRACE") == "1" ? ex.ToString() : ex.Message)}");
         }
     }
 }
@@ -58,7 +58,7 @@ return failed == 0 ? 0 : 1;
 
 internal static partial class Tests
 {
-    public static (string Name, Action<Device> Run)[] All => [.. Basic, .. Advanced, .. Decoding, .. Generation, .. Simplified];
+    public static (string Name, Action<Device> Run)[] All => [.. Basic, .. Advanced, .. Decoding, .. Generation, .. Simplified, .. AspNetCore];
 
     private static readonly (string Name, Action<Device> Run)[] Basic =
     [

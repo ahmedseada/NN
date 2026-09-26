@@ -11,6 +11,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.HttpResults;
+using NeuralSharp.AspNetCore;
 using NeuralSharp.Samples.Gpt;
 using NeuralSharp.Samples.GptApi;
 using Scalar.AspNetCore;
@@ -24,7 +25,9 @@ builder.Services.AddOpenApi(options => options.AddDocumentTransformer((document,
 }));
 builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton<GptService>();
-builder.Services.AddSingleton<ChatService>();
+builder.Services.AddNeuralSharp()
+    .LoadOnFirstUse()
+    .AddChatModel("chat", _ => ChatModelFile.Load(builder.Configuration), (_, c) => c.KeepAlive(TimeSpan.FromMinutes(5)));
 builder.Services.AddHostedService(services => services.GetRequiredService<GptService>());
 
 var app = builder.Build();
@@ -79,67 +82,13 @@ api.MapPost("/generate/stream", Results<ServerSentEventsResult<object>, ProblemH
     .WithSummary("Generate text as a live stream (server-sent events)")
     .WithDescription("Same as /api/generate, but emits \"token\" events (each with its sample index) every chunkSize characters as they are produced, then a \"metrics\" event.");
 
-// ---------------------------------------------------------------- Ollama-compatible endpoints
-var ollama = app.MapGroup("/api").WithTags("Ollama-compatible");
-var ndjson = new JsonSerializerOptions(JsonSerializerDefaults.Web);
-
-// The body is read as JSON whatever the Content-Type says (Ollama clients and `curl -d` often send none or form).
-ollama.MapPost("/chat", async (HttpRequest http, ChatService chat, CancellationToken cancellationToken) =>
-    {
-        OllamaChatRequest request;
-        try
-        {
-            request = await JsonSerializer.DeserializeAsync<OllamaChatRequest>(http.Body, ndjson, cancellationToken)
-                ?? throw new FormatException("empty request body");
-            ChatService.Translate(request);                                // validate before anything is streamed
-        }
-        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or FormatException or JsonException)
-        {
-            return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status400BadRequest);
-        }
-
-        if (!chat.IsAvailable)
-        {
-            return Results.Json(new { error = $"model '{request.Model}' is not available yet: no trained model file" }, statusCode: StatusCodes.Status404NotFound);
-        }
-
-        if (request.Stream == false)
-        {
-            return Results.Stream(async body =>
-            {
-                OllamaChatResponse? last = null;
-                await foreach (var item in chat.ChatAsync(request, stream: false, cancellationToken))
-                {
-                    last = item;
-                }
-
-                await JsonSerializer.SerializeAsync(body, last, ndjson, cancellationToken);
-            }, "application/json");
-        }
-
-        return Results.Stream(async body =>
-        {
-            await foreach (var item in chat.ChatAsync(request, stream: true, cancellationToken))
-            {
-                await JsonSerializer.SerializeAsync(body, item, ndjson, cancellationToken);
-                await body.WriteAsync("\n"u8.ToArray(), cancellationToken);
-                await body.FlushAsync(cancellationToken);
-            }
-        }, "application/x-ndjson");
-    })
-    .WithName("OllamaChat")
-    .WithSummary("Chat (Ollama-compatible)")
-    .WithDescription("Accepts the Ollama /api/chat body: model (any name selects the served model), messages (system, user, assistant, tool), " +
-                     "stream (NDJSON lines, default true), think (true/false or low/medium/high), keep_alive (e.g. \"30m\", 0, -1), options " +
-                     "(temperature, top_k, top_p, min_p, repeat_penalty, repeat_last_n, presence_penalty, frequency_penalty, seed, num_ctx, " +
-                     "num_predict, stop; others ignored) and tools (function definitions; calls come back in message.tool_calls).");
-
-ollama.MapGet("/tags", (ChatService chat) => Results.Ok(new { models = chat.Tags() }))
-    .WithName("OllamaTags").WithSummary("Available models (Ollama-compatible)");
-ollama.MapGet("/ps", (ChatService chat) => Results.Ok(new { models = chat.Running() }))
-    .WithName("OllamaPs").WithSummary("Loaded models and when they expire (Ollama-compatible)");
-ollama.MapGet("/version", () => Results.Ok(new { version = "0.1.0-neuralsharp" }))
-    .WithName("OllamaVersion").WithSummary("Server version (Ollama-compatible)");
+// ---------------------------------------------------------------- Ollama-compatible endpoints (NeuralSharp.AspNetCore)
+// /api/chat, /api/tags, /api/ps and /api/version, served by the inference engine: the chat model loads on the first
+// request and stays loaded for 5 minutes after the last one (or the request's keep_alive); tool calls go to the client.
+app.MapOllamaApi("/api", "chat", o => o
+        .Tools(ToolExecution.Client)
+        .ModelName(app.Configuration["Gpt:ModelName"] ?? "neuralsharp-char-gpt:latest"))
+    .WithTags("Ollama-compatible");
 
 app.Run();
 

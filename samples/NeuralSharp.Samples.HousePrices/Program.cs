@@ -13,6 +13,7 @@ using System.Diagnostics;
 using NeuralSharp;
 using NeuralSharp.Data;
 using NeuralSharp.Diagnostics;
+using NeuralSharp.Inference;
 using NeuralSharp.Layers;
 using NeuralSharp.Optimizers;
 using NeuralSharp.Samples;
@@ -144,9 +145,19 @@ for (int i = 0; i < descriptions.Length; i++)
 model.Save(modelPath);
 featureScaler.Save(featureScalerPath);
 priceScaler.Save(priceScalerPath);
+
+// The same model as one package, for the house-price Web API sample (NeuralSharp.Samples.HouseApi): the layers of
+// BuildModel described with the network builder (so the package can rebuild them), the weights and both scalers.
+string packagePath = Path.ChangeExtension(modelPath, ".nsm");
+ModelPackage.Create(packagePath)
+    .Architecture(Network.Input(FeatureCount).Linear(64).ReLU().Dropout(0.05f).Linear(32).ReLU().Linear(1).Named("house-price-mlp"))
+    .Weights(model)
+    .Scaler("features", featureScaler)
+    .Scaler("targets", priceScaler)
+    .Save();
 string historyPath = Path.Combine(Path.GetDirectoryName(modelPath)!, "house-price-history.csv");
 recorder.SaveCsv(historyPath);
-Console.WriteLine($"\nSaved the model and its scalers to {modelPath} (test it with --predict), training history to {historyPath}");
+Console.WriteLine($"\nSaved the model and its scalers to {modelPath} (test it with --predict), the package {packagePath}, training history to {historyPath}");
 Console.WriteLine($"Memory on {device}: {ComputeResources.GetMemoryUsage(device)}");
 
 return report.RSquared > 0.8 ? 0 : 1;
