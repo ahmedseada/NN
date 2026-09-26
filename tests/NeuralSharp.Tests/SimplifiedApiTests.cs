@@ -23,6 +23,9 @@ internal static partial class Tests
         ("predictor: equals the manual scale/predict/unscale steps; typed input and output", PredictorMatchesManual),
         ("predictor: softmax and class names; save and load round trip", PredictorClassesAndPackage),
         ("package: weights, scalers, tokenizers, JSON, text, trainable weights, text generator", PackageRoundTrip),
+        ("generation: StreamAsync gives the same chunks as Stream", StreamAsyncMatches),
+        ("tools: schema from delegates and [Tool] methods; validation, allowlist, approval, timeout, parallel", ToolRules),
+        ("conversation: history, tool loop with a scripted model, MaxToolRounds required and enforced", ConversationLoop),
     ];
 
     private static Sequential ManualMlp(Device device, Random r) => new()
@@ -434,5 +437,122 @@ internal static partial class Tests
         Check(threw, "missing entries name what exists");
         package.Dispose();
         File.Delete(path);
+    }
+
+    private static void StreamAsyncMatches(Device device)
+    {
+        var (model, tokenizer) = TinyLanguageModel(device);
+        using var _ = model;
+        var generator = new TextGenerator(model, tokenizer, 32);
+        var options = new GenerationOptions { Seed = 5, NumPredict = 20, ChunkSize = 4 };
+        var sync = generator.Stream("abc", options).Select(c => c.Text).ToList();
+        var async = new List<string>();
+        Task.Run(async () => { await foreach (var c in generator.StreamAsync("abc", options)) async.Add(c.Text); }).GetAwaiter().GetResult();
+        Check(sync.SequenceEqual(async), "same chunks");
+        var chat = new ChatGenerator(generator);
+        var request = new ChatRequest([new ChatMessage("user", "hi")], Options: options);
+        var final = chat.ChatAsync(request).GetAwaiter().GetResult();
+        Check(final.Done && final.Message is not null && final.Message.Content == chat.Chat(request).Message!.Content, "ChatAsync = Chat");
+    }
+
+    private sealed class Calculator
+    {
+        public int Calls;
+
+        [Tool("add", "Adds two integers.")]
+        public int Add([System.ComponentModel.Description("first")] int a, int b) { Calls++; return a + b; }
+
+        [Tool("shout", "Upper-cases text.")]
+        public static Task<string> Shout(string text, bool exclaim = false) => Task.FromResult(text.ToUpperInvariant() + (exclaim ? "!" : ""));
+    }
+
+    private static ToolCall Call(string name, string json) => new(name, System.Text.Json.Nodes.JsonNode.Parse(json)!.AsObject());
+
+    private static void ToolRules(Device device)
+    {
+        _ = device;
+        var calculator = new Calculator();
+        int slowCalls = 0;
+        var tools = ToolRegistry.Create()
+            .Add(calculator)
+            .Add("pick", "Picks a colour.", (Colour colour, CancellationToken token) => colour.ToString())
+            .Add("slow", "Takes a while.", async (CancellationToken token) => { slowCalls++; await Task.Delay(5000, token); return "late"; })
+            .Allow("add", args => (int)args["a"]! < 100)
+            .RequireApproval("shout", (call, _) => ValueTask.FromResult((string?)call.Arguments["text"] != "no"))
+            .Timeout(TimeSpan.FromMilliseconds(100))
+            .Parallel()
+            .Build();
+
+        var add = tools.Definitions.Single(d => d.Name == "add").Parameters!.ToJsonString();
+        Check(add.Contains("\"a\":{\"type\":\"integer\",\"description\":\"first\"}") && add.Contains("\"required\":[\"a\",\"b\"]"), $"schema {add}");
+        var shout = tools.Definitions.Single(d => d.Name == "shout").Parameters!.ToJsonString();
+        Check(shout.Contains("\"required\":[\"text\"]"), "defaulted parameter is optional");
+        Check(tools.Definitions.Single(d => d.Name == "pick").Parameters!.ToJsonString().Contains("\"enum\":[\"Red\",\"Green\"]"), "enum schema");
+
+        ToolResult Run(string name, string json) => tools.InvokeAsync(Call(name, json)).GetAwaiter().GetResult();
+        Check(Run("add", "{\"a\":2,\"b\":3}") is { Succeeded: true, Content: "5" }, "add runs");
+        Check(Run("add", "{\"a\":2}").Error!.Contains("'b' is required"), "missing argument");
+        Check(Run("add", "{\"a\":\"two\",\"b\":3}").Error!.Contains("'a' must be an integer"), "wrong type");
+        Check(Run("add", "{\"a\":500,\"b\":3}").Error!.Contains("not allowed"), "allowlist");
+        Check(calculator.Calls == 1, "rejected calls never reach the method");
+        Check(Run("shout", "{\"text\":\"hi\",\"exclaim\":true}").Content == "HI!", "static tool, awaited");
+        Check(Run("shout", "{\"text\":\"no\"}").Error!.Contains("not approved"), "approval");
+        Check(Run("pick", "{\"colour\":\"Blue\"}").Error!.Contains("one of Red, Green"), "enum validation");
+        Check(Run("pick", "{\"colour\":\"Green\"}").Content == "Green", "enum argument");
+        Check(Run("slow", "{}").Error!.Contains("timed out"), "timeout");
+        Check(Run("missing", "{}").Error!.Contains("unknown tool"), "unknown tool");
+        Check(Run("add", "{\"a\":1,\"b\":1}").ToMessage() is { Role: "tool", ToolName: "add", Content: "2" }, "tool message");
+
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var both = tools.InvokeAsync([Call("slow", "{}"), Call("slow", "{}")]).GetAwaiter().GetResult();
+        Check(both.Count == 2 && clock.ElapsedMilliseconds < 190 && slowCalls == 3, $"parallel ({clock.ElapsedMilliseconds} ms)");
+
+        using var http = new HttpClient(new FakeHttp("<html><script>x()</script><p>Ollama&nbsp;0.12.3   is  out</p></html>"));
+        var web = ToolRegistry.Create().Add(WebTools.Fetch(http, url => url.Host == "ollama.com", maxCharacters: 12)).Build();
+        var page = web.InvokeAsync(Call("web_fetch", "{\"url\":\"https://ollama.com/releases\"}")).GetAwaiter().GetResult();
+        Check(page.Content == "Ollama 0.12.", $"page text '{page.Content}'");
+        Check(web.InvokeAsync(Call("web_fetch", "{\"url\":\"https://evil.example/\"}")).GetAwaiter().GetResult().Error!.Contains("allowlist"), "web allowlist");
+    }
+
+    private enum Colour { Red, Green }
+
+    private sealed class FakeHttp(string body) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new StringContent(body) });
+    }
+
+    private static void ConversationLoop(Device device)
+    {
+        _ = device;
+        var fake = FakeChatModel.Script(
+            FakeChatModel.ToolCall("web_fetch", new System.Text.Json.Nodes.JsonObject { ["url"] = "https://ollama.com/releases" }),
+            FakeChatModel.Answer("The latest Ollama version is 0.12.3 [1].", thinking: "The page says 0.12.3."));
+        string? fetched = null;
+        var conversation = Conversation.For(fake)
+            .System("You are a helpful assistant.")
+            .Think(true)
+            .Tool("web_fetch", "Fetch a page.", (string url) => { fetched = url; return "[1] Ollama 0.12.3 is the latest release."; })
+            .MaxToolRounds(3)
+            .Build();
+        var reply = conversation.SendAsync("What is the latest Ollama version?").GetAwaiter().GetResult();
+        Check(reply.Message.Content.Contains("0.12.3") && reply.Rounds == 2 && !reply.ToolLimitReached, "answer after one tool round");
+        Check(fetched == "https://ollama.com/releases" && reply.ToolResults.Single().Succeeded, "tool ran");
+        Check(conversation.Messages.Select(m => m.Role).SequenceEqual(["system", "user", "assistant", "tool", "assistant"]), "history");
+        Check(fake.Requests.Count == 2 && fake.Requests[1].Messages.Count == 4 && fake.Requests[0].Think == true && fake.Requests[0].Tools!.Count == 1, "requests");
+
+        bool threw = false;
+        try { Conversation.For(fake).Tool("x", "y", () => "z").Build(); } catch (InvalidOperationException) { threw = true; }
+        Check(threw, "MaxToolRounds is required with tools");
+
+        var looping = FakeChatModel.Script(
+            FakeChatModel.ToolCall("ping", []), FakeChatModel.ToolCall("ping", []), FakeChatModel.ToolCall("ping", []));
+        var limited = Conversation.For(looping).Tool("ping", "Ping.", () => "pong").MaxToolRounds(2).Build()
+            .SendAsync("go").GetAwaiter().GetResult();
+        Check(limited.ToolLimitReached && limited.Rounds == 3 && limited.ToolResults.Count == 2, "limit enforced");
+
+        var noTools = Conversation.For(FakeChatModel.Script(FakeChatModel.ToolCall("web_fetch", []))).Build();
+        var clientSide = noTools.SendAsync("hi").GetAwaiter().GetResult();
+        Check(clientSide.Message.ToolCalls!.Count == 1 && !clientSide.ToolLimitReached, "without tools the calls are returned");
     }
 }

@@ -70,6 +70,18 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
         throw new InvalidOperationException("Generation ended without a final chunk.");
     }
 
+    /// <summary>
+    /// <see cref="Stream"/> on a background thread, as an <c>await foreach</c> stream: the same chunks, and the calling
+    /// thread (a UI or request thread) is never blocked by the model.
+    /// </summary>
+    public IAsyncEnumerable<GenerationChunk> StreamAsync(string prompt, GenerationOptions options, CancellationToken cancellationToken = default) =>
+        BackgroundStream.Run(token => Stream(prompt, options, token), cancellationToken);
+
+    /// <summary><see cref="Generate"/> on a background thread.</summary>
+    public Task<(string Text, string DoneReason, GenerationStats Stats)> GenerateAsync(string prompt, GenerationOptions options,
+        CancellationToken cancellationToken = default) =>
+        Task.Run(() => Generate(prompt, options, cancellationToken), CancellationToken.None);
+
     /// <summary>Streams the continuation of <paramref name="prompt"/> in chunks of about <see cref="GenerationOptions.ChunkSize"/> tokens.</summary>
     public IEnumerable<GenerationChunk> Stream(string prompt, GenerationOptions options, CancellationToken cancellationToken = default)
     {
@@ -258,5 +270,46 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
         var stats = new GenerationStats(promptTokens, promptDuration, Tokenizer.Encode(text.ToString(0, emitted)).Count, total.Elapsed - promptDuration,
             total.Elapsed, resets);
         yield return new GenerationChunk("", Done: true, DoneReason: doneReason, Stats: stats);
+    }
+}
+
+/// <summary>Runs a synchronous stream on a thread-pool thread and hands its items to an asynchronous reader.</summary>
+internal static class BackgroundStream
+{
+    public static async IAsyncEnumerable<T> Run<T>(Func<CancellationToken, IEnumerable<T>> source,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var channel = System.Threading.Channels.Channel.CreateUnbounded<T>(
+            new System.Threading.Channels.UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+        var producer = Task.Run(() =>
+        {
+            try
+            {
+                foreach (var item in source(stop.Token))
+                {
+                    channel.Writer.TryWrite(item);
+                }
+
+                channel.Writer.TryComplete();
+            }
+            catch (Exception ex)
+            {
+                channel.Writer.TryComplete(ex);
+            }
+        }, CancellationToken.None);
+
+        try
+        {
+            await foreach (var item in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                yield return item;
+            }
+        }
+        finally
+        {
+            stop.Cancel();
+            await producer.ConfigureAwait(false);
+        }
     }
 }

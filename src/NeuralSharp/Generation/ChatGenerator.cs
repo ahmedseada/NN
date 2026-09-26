@@ -16,11 +16,18 @@ public sealed record ChatRequest(IReadOnlyList<ChatMessage> Messages, IReadOnlyL
 /// <param name="Stats">Statistics, on the final piece.</param>
 public sealed record ChatChunk(ChatDelta Delta, bool Done = false, string? DoneReason = null, ChatMessage? Message = null, GenerationStats? Stats = null);
 
+/// <summary>Anything that answers chat requests: <see cref="ChatGenerator"/>, a model hosted by the inference engine, or <see cref="FakeChatModel"/> in tests.</summary>
+public interface IChatModel
+{
+    /// <summary>Streams the reply to <paramref name="request"/>; the last chunk has <see cref="ChatChunk.Done"/> set and carries the full message.</summary>
+    IAsyncEnumerable<ChatChunk> StreamAsync(ChatRequest request, CancellationToken cancellationToken = default);
+}
+
 /// <summary>
 /// Chat on top of a <see cref="TextGenerator"/>: renders the conversation with a <see cref="ChatTemplate"/>, generates
 /// until the end-of-turn marker, and splits the output into reasoning, answer and tool calls as it streams.
 /// </summary>
-public sealed class ChatGenerator(TextGenerator generator, ChatTemplate? template = null)
+public sealed class ChatGenerator(TextGenerator generator, ChatTemplate? template = null) : IChatModel
 {
     /// <summary>The underlying text generator.</summary>
     public TextGenerator Generator { get; } = generator;
@@ -34,6 +41,14 @@ public sealed class ChatGenerator(TextGenerator generator, ChatTemplate? templat
     /// <summary>Generates the complete reply.</summary>
     public ChatChunk Chat(ChatRequest request, CancellationToken cancellationToken = default) =>
         Stream(request, cancellationToken).Last();
+
+    /// <summary><see cref="Stream"/> on a background thread, as an <c>await foreach</c> stream.</summary>
+    public IAsyncEnumerable<ChatChunk> StreamAsync(ChatRequest request, CancellationToken cancellationToken = default) =>
+        BackgroundStream.Run(token => Stream(request, token), cancellationToken);
+
+    /// <summary><see cref="Chat"/> on a background thread.</summary>
+    public Task<ChatChunk> ChatAsync(ChatRequest request, CancellationToken cancellationToken = default) =>
+        Task.Run(() => Chat(request, cancellationToken), CancellationToken.None);
 
     /// <summary>Streams the reply.</summary>
     public IEnumerable<ChatChunk> Stream(ChatRequest request, CancellationToken cancellationToken = default)
