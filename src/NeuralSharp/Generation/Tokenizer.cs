@@ -1,3 +1,6 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
 namespace NeuralSharp.Generation;
 
 /// <summary>Turns text into token ids and back.</summary>
@@ -62,6 +65,31 @@ public sealed class CharTokenizer : ITokenizer
 
     /// <inheritdoc />
     public string Decode(IEnumerable<int> ids) => string.Concat(ids.Select(i => (uint)i < (uint)Vocabulary.Length ? Vocabulary[i] : '�'));
+
+    /// <summary>Saves the alphabet and unknown character as JSON.</summary>
+    public void Save(string path)
+    {
+        using var stream = File.Create(path);
+        Save(stream);
+    }
+
+    /// <summary>Writes the tokenizer as JSON to <paramref name="stream"/>; the stream stays open.</summary>
+    public void Save(Stream stream) => Tokenizers.Write(stream, new JsonObject
+    {
+        ["type"] = "char",
+        ["vocabulary"] = Vocabulary,
+        ["unknown"] = UnknownCharacter?.ToString(),
+    });
+
+    /// <summary>Loads a tokenizer written by <see cref="Save(string)"/>.</summary>
+    public static CharTokenizer Load(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Load(stream);
+    }
+
+    /// <summary>Reads a tokenizer written by <see cref="Save(Stream)"/>.</summary>
+    public static CharTokenizer Load(Stream stream) => (CharTokenizer)Tokenizers.Load(stream);
 }
 
 /// <summary>
@@ -146,6 +174,72 @@ public sealed partial class WordTokenizer : ITokenizer
         return text.ToString();
     }
 
+    /// <summary>Saves the vocabulary, unknown token and lower-casing setting as JSON.</summary>
+    public void Save(string path)
+    {
+        using var stream = File.Create(path);
+        Save(stream);
+    }
+
+    /// <summary>Writes the tokenizer as JSON to <paramref name="stream"/>; the stream stays open.</summary>
+    public void Save(Stream stream) => Tokenizers.Write(stream, new JsonObject
+    {
+        ["type"] = "word",
+        ["words"] = new JsonArray([.. Vocabulary.Select(w => (JsonNode)w)]),
+        ["unknown"] = UnknownToken,
+        ["lowercase"] = Lowercase,
+    });
+
+    /// <summary>Loads a tokenizer written by <see cref="Save(string)"/>.</summary>
+    public static WordTokenizer Load(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Load(stream);
+    }
+
+    /// <summary>Reads a tokenizer written by <see cref="Save(Stream)"/>.</summary>
+    public static WordTokenizer Load(Stream stream) => (WordTokenizer)Tokenizers.Load(stream);
+
     [System.Text.RegularExpressions.GeneratedRegex(@"<[\w|/]+>|\w+|[^\w\s]")]
     private static partial System.Text.RegularExpressions.Regex Pattern();
+}
+
+/// <summary>Reads either tokenizer from the JSON written by <see cref="CharTokenizer.Save(string)"/> or <see cref="WordTokenizer.Save(string)"/>.</summary>
+public static class Tokenizers
+{
+    /// <summary>Loads a character or word tokenizer from a file.</summary>
+    public static ITokenizer Load(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Load(stream);
+    }
+
+    /// <summary>Reads a character or word tokenizer from <paramref name="stream"/>.</summary>
+    public static ITokenizer Load(Stream stream)
+    {
+        var json = JsonNode.Parse(stream) as JsonObject ?? throw new InvalidDataException("A tokenizer file must contain a JSON object.");
+        return (string?)json["type"] switch
+        {
+            "char" => new CharTokenizer((string)json["vocabulary"]!, ((string?)json["unknown"]) is { Length: 1 } u ? u[0] : null),
+            "word" => new WordTokenizer([.. json["words"]!.AsArray().Select(w => (string)w!)], (string)json["unknown"]!, (bool)json["lowercase"]!),
+            var type => throw new InvalidDataException($"Unknown tokenizer type '{type}'."),
+        };
+    }
+
+    /// <summary>Saves a <see cref="CharTokenizer"/> or <see cref="WordTokenizer"/>.</summary>
+    public static void Save(ITokenizer tokenizer, Stream stream)
+    {
+        switch (tokenizer)
+        {
+            case CharTokenizer c: c.Save(stream); break;
+            case WordTokenizer w: w.Save(stream); break;
+            default: throw new NotSupportedException($"{tokenizer.GetType().Name} cannot be saved; only CharTokenizer and WordTokenizer can.");
+        }
+    }
+
+    internal static void Write(Stream stream, JsonObject json)
+    {
+        using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+        json.WriteTo(writer);
+    }
 }
