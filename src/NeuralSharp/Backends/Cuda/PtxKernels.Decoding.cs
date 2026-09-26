@@ -8,7 +8,7 @@ internal static partial class PtxKernels
     public static readonly string[] DecodingNames =
     [
         "scale_mask_softmax_f32", "layernorm_fused_f32", "bias_gelu_f32", "decoder_mask_f32", "kv_write_f32", "sample_rows_f32",
-        "penalize_rows_f32", "history_push_f32",
+        "penalize_rows_f32", "history_push_f32", "sample_candidates_f32", "topk_candidates_f32",
     ];
 
     private const string PosInf = "0f7F800000";
@@ -151,18 +151,18 @@ internal static partial class PtxKernels
     /// over the vocabulary is a block reduction). The draw: each thread sums the kept weights of a contiguous chunk,
     /// thread 0 finds the chunk where the running total passes the target, and that chunk's thread walks it.
     /// </summary>
-    private static void SampleRows(StringBuilder sb)
+    private static string SamplerBody(bool candidates)
     {
         // Strided loop over the row's vocabulary: %r6 = index, %rd3 = address, %f2 = scaled score, %f5 = kept weight.
         static string Kept(string label, string body) => $"""
             mov.u32 %r6, %tx;
             {label}:
-            setp.ge.u32 %p1, %r6, %s_vocab;
+            setp.ge.u32 %p1, %r6, %r29;
             @%p1 bra {label}_END;
             mul.wide.u32 %rd3, %r6, 4;
             add.u64 %rd3, %rd3, %rd2;
             ld.global.f32 %f2, [%rd3];
-            mul.f32 %f2, %f2, %s_invt;
+            mul.f32 %f2, %f2, %f31;
             setp.ge.f32 %p4, %f2, %f3;
             sub.f32 %f5, %f2, %f1;
             mul.f32 %f5, %f5, {Log2E};
@@ -184,7 +184,7 @@ internal static partial class PtxKernels
             mul.wide.u32 %rd3, %r6, 4;
             add.u64 %rd3, %rd3, %rd2;
             ld.global.f32 %f2, [%rd3];
-            mul.f32 %f2, %f2, %s_invt;
+            mul.f32 %f2, %f2, %f31;
             setp.ge.f32 %p4, %f2, %f3;
             sub.f32 %f5, %f2, %f1;
             mul.f32 %f5, %f5, {Log2E};
@@ -198,10 +198,38 @@ internal static partial class PtxKernels
             """;
 
         var body = new StringBuilder();
+        // %rd2 = the scores walked (the logits row, or with candidates the row's candidate scores, already divided by
+        // the temperature), %r29 = how many, %f31 = the factor applied to each, %p14 = ids map through candidate indices.
+        if (candidates)
+        {
+            body.AppendLine($"""
+                mul.wide.u32 %rd1, %row, 4;
+                add.u64 %rd6, %b_flags, %rd1;
+                ld.global.f32 %f30, [%rd6];
+                setp.eq.f32 %p14, %f30, {Zero};
+                @!%p14 bra FULL_ROW;
+                mul.lo.u32 %r5, %row, %s_slots;
+                mul.wide.u32 %rd1, %r5, 4;
+                add.u64 %rd2, %b_candv, %rd1;
+                add.u64 %rd8, %b_candi, %rd1;
+                mov.u32 %r29, %s_slots;
+                mov.f32 %f31, {One};
+                bra SOURCE_DONE;
+                FULL_ROW:
+                """);
+        }
+        else
+        {
+            body.AppendLine("setp.ne.u32 %p14, 0, 0;");
+        }
+
         body.AppendLine($"""
             mad.lo.u32 %r5, %row, %s_rowstride, %s_rowoffset;
             mul.wide.u32 %rd1, %r5, 4;
             add.u64 %rd2, %b_logits, %rd1;
+            mov.u32 %r29, %s_vocab;
+            mov.f32 %f31, %s_invt;
+            SOURCE_DONE:
             mov.f32 %f1, {NegInf};
             mov.f32 %f3, {NegInf};
             """);
@@ -211,7 +239,7 @@ internal static partial class PtxKernels
             mov.f32 %f3, {NegInf};
             setp.eq.u32 %p2, %s_topk, 0;
             @%p2 bra THR_DONE;
-            setp.ge.u32 %p2, %s_topk, %s_vocab;
+            setp.ge.u32 %p2, %s_topk, %r29;
             @%p2 bra THR_DONE;
             mov.f32 %f3, {PosInf};
             mov.u32 %r7, 0;
@@ -298,13 +326,13 @@ internal static partial class PtxKernels
             cvt.rn.f32.u32 %f8, %r10;
             mul.f32 %f8, %f8, {F(1f / 16777216f)};
             mul.f32 %f8, %f8, %f6;
-            add.u32 %r20, %s_vocab, %nt;
+            add.u32 %r20, %r29, %nt;
             sub.u32 %r20, %r20, 1;
             div.u32 %r20, %r20, %nt;
             mul.lo.u32 %r21, %tx, %r20;
-            min.u32 %r21, %r21, %s_vocab;
+            min.u32 %r21, %r21, %r29;
             add.u32 %r22, %r21, %r20;
-            min.u32 %r22, %r22, %s_vocab;
+            min.u32 %r22, %r22, %r29;
             mov.f32 %f26, {Zero};
             """);
         body.AppendLine(Chunk("PC", "add.f32 %f26, %f26, %f5;"));
@@ -383,7 +411,14 @@ internal static partial class PtxKernels
             mul.lo.u32 %r12, %r12, 13;
             mul.wide.u32 %rd4, %r12, 4;
             add.u64 %rd5, %b_stats, %rd4;
-            cvt.rn.f32.s32 %f14, %r11;
+            setp.ge.s32 %p13, %r11, 0;
+            and.pred %p13, %p13, %p14;
+            mul.wide.s32 %rd9, %r11, 4;
+            add.u64 %rd9, %rd9, %rd8;
+            mov.b32 %r26, %r11;
+            @%p13 ld.global.f32 %f30, [%rd9];
+            @%p13 cvt.rzi.s32.f32 %r26, %f30;
+            cvt.rn.f32.s32 %f14, %r26;
             @%p15 st.global.f32 [%a_ids], %f14;
             @%p15 st.global.f32 [%rd5], %f14;
             div.rn.f32 %f15, %f10, %f6;
@@ -414,17 +449,178 @@ internal static partial class PtxKernels
             body.AppendLine(BlockArgMax($"RTOP{a}", "%f16", "%r18"));
             body.AppendLine($"""
                 mov.b32 %r{13 + a}, %r18;
-                cvt.rn.f32.s32 %f17, %r18;
+                setp.ge.s32 %p13, %r18, 0;
+                and.pred %p13, %p13, %p14;
+                mul.wide.s32 %rd9, %r18, 4;
+                add.u64 %rd9, %rd9, %rd8;
+                mov.b32 %r26, %r18;
+                @%p13 ld.global.f32 %f30, [%rd9];
+                @%p13 cvt.rzi.s32.f32 %r26, %f30;
+                cvt.rn.f32.s32 %f17, %r26;
                 @%p15 st.global.f32 [%rd5+{12 + 8 * a}], %f17;
                 div.rn.f32 %f18, %f16, %f6;
                 @%p15 st.global.f32 [%rd5+{16 + 8 * a}], %f18;
                 """);
         }
 
+        return body.ToString();
+    }
+
+    private static void SampleRows(StringBuilder sb)
+    {
         RowBlock(sb, "sample_rows_f32", ["logits", "ids", "stats", "step"],
             [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("f32", "invt"), ("u32", "topk"), ("f32", "topp"), ("f32", "minp"), ("u32", "seed"), ("u32", "rows")],
-            body.ToString(), sharedFloats: SamplerThreads);
+            SamplerBody(candidates: false), sharedFloats: SamplerThreads);
+        RowBlock(sb, "sample_candidates_f32", ["logits", "ids", "stats", "step", "candv", "candi", "flags"],
+            [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("f32", "invt"), ("u32", "topk"), ("f32", "topp"), ("f32", "minp"), ("u32", "seed"), ("u32", "rows"), ("u32", "slots")],
+            SamplerBody(candidates: true), sharedFloats: SamplerThreads);
+        TopKCandidates(sb);
+        PenaltyKernels(sb);
+    }
 
+    /// <summary>Scores per <c>topk_candidates_f32</c> block (8 per thread).</summary>
+    public const int CandidateSlice = 2048;
+
+    /// <summary>Candidate slots per <c>topk_candidates_f32</c> block.</summary>
+    public const int CandidateSlots = 64;
+
+    // Stage one of top-k sampling (topk ≤ 64): block b of row r takes scores [2048·b, 2048·b + 2048), finds its k-th
+    // largest distinct scaled score and writes the scores at or above it (with their token ids, in vocabulary order)
+    // to candv/candi[(r·blocks + b)·64 …], filling unused slots with -inf. The global k-th largest distinct score is
+    // at or above every block's, so the candidates hold every token top-k keeps. A block with more than 64 (ties)
+    // sets flags[r], and sample_candidates_f32 then walks the whole row. Grid: rows · blocks, one block each.
+    private static void TopKCandidates(StringBuilder sb)
+    {
+        var b = new StringBuilder();
+        b.AppendLine($"""
+            div.u32 %r7, %row, %s_bpr;
+            rem.u32 %r8, %row, %s_bpr;
+            mad.lo.u32 %r5, %r7, %s_rowstride, %s_rowoffset;
+            mul.wide.u32 %rd1, %r5, 4;
+            add.u64 %rd2, %b_logits, %rd1;
+            shl.b32 %r9, %r8, {(int)Math.Log2(CandidateSlice)};
+            shl.b32 %r10, %tx, 3;
+            add.u32 %r10, %r10, %r9;
+            """);
+        for (int i = 0; i < 8; i++)
+        {
+            b.AppendLine($"""
+                add.u32 %r11, %r10, {i};
+                setp.lt.u32 %p{1 + i}, %r11, %s_vocab;
+                mov.f32 %f{10 + i}, {NegInf};
+                mul.wide.u32 %rd3, %r11, 4;
+                add.u64 %rd3, %rd3, %rd2;
+                @%p{1 + i} ld.global.f32 %f{10 + i}, [%rd3];
+                @%p{1 + i} mul.f32 %f{10 + i}, %f{10 + i}, %s_invt;
+                """);
+        }
+
+        b.AppendLine($"""
+            mov.f32 %f3, {PosInf};
+            mov.u32 %r12, 0;
+            TK:
+            setp.ge.u32 %p9, %r12, %s_topk;
+            @%p9 bra TK_END;
+            mov.f32 %f4, {NegInf};
+            """);
+        for (int i = 0; i < 8; i++)
+        {
+            b.AppendLine($"""
+                setp.lt.f32 %p10, %f{10 + i}, %f3;
+                setp.gt.and.f32 %p10, %f{10 + i}, %f4, %p10;
+                selp.f32 %f4, %f{10 + i}, %f4, %p10;
+                """);
+        }
+
+        b.AppendLine(BlockReduce("RTK", "%f4", "max", NegInf));
+        b.AppendLine("""
+            mov.f32 %f3, %f4;
+            add.u32 %r12, %r12, 1;
+            bra TK;
+            TK_END:
+            mov.u32 %r13, 0;
+            """);
+        string Kept(int i) => $"""
+            setp.ge.f32 %p10, %f{10 + i}, %f3;
+            setp.gt.and.f32 %p10, %f{10 + i}, {NegInf}, %p10;
+            """;
+        for (int i = 0; i < 8; i++)
+        {
+            b.AppendLine(Kept(i));
+            b.AppendLine("selp.u32 %r14, 1, 0, %p10;");
+            b.AppendLine("add.u32 %r13, %r13, %r14;");
+        }
+
+        // Exclusive prefix of the per-thread counts (thread 0, in order), so candidates keep vocabulary order.
+        b.AppendLine($"""
+            shl.b32 %r15, %tx, 2;
+            add.u32 %r15, %r15, %spart;
+            st.shared.u32 [%r15], %r13;
+            bar.sync 0;
+            setp.ne.u32 %p11, %tx, 0;
+            @%p11 bra SCAN_DONE;
+            mov.u32 %r16, 0;
+            mov.u32 %r17, 0;
+            SC:
+            setp.ge.u32 %p12, %r17, %nt;
+            @%p12 bra SC_END;
+            shl.b32 %r18, %r17, 2;
+            add.u32 %r18, %r18, %spart;
+            ld.shared.u32 %r19, [%r18];
+            st.shared.u32 [%r18], %r16;
+            add.u32 %r16, %r16, %r19;
+            add.u32 %r17, %r17, 1;
+            bra SC;
+            SC_END:
+            st.shared.u32 [%sb], %r16;
+            SCAN_DONE:
+            bar.sync 0;
+            ld.shared.u32 %r20, [%r15];
+            ld.shared.u32 %r21, [%sb];
+            shl.b32 %r22, %row, {(int)Math.Log2(CandidateSlots)};
+            mul.wide.u32 %rd4, %r22, 4;
+            add.u64 %rd5, %b_candv, %rd4;
+            add.u64 %rd6, %b_candi, %rd4;
+            """);
+        for (int i = 0; i < 8; i++)
+        {
+            b.AppendLine(Kept(i));
+            b.AppendLine($"""
+                setp.lt.u32 %p11, %r20, {CandidateSlots};
+                and.pred %p12, %p10, %p11;
+                mul.wide.u32 %rd7, %r20, 4;
+                add.u64 %rd8, %rd7, %rd5;
+                @%p12 st.global.f32 [%rd8], %f{10 + i};
+                add.u32 %r23, %r10, {i};
+                cvt.rn.f32.u32 %f5, %r23;
+                add.u64 %rd9, %rd7, %rd6;
+                @%p12 st.global.f32 [%rd9], %f5;
+                selp.u32 %r14, 1, 0, %p10;
+                add.u32 %r20, %r20, %r14;
+                """);
+        }
+
+        b.AppendLine($"""
+            setp.lt.u32 %p10, %tx, {CandidateSlots};
+            setp.ge.and.u32 %p10, %tx, %r21, %p10;
+            mul.wide.u32 %rd7, %tx, 4;
+            add.u64 %rd8, %rd7, %rd5;
+            @%p10 st.global.f32 [%rd8], {NegInf};
+            add.u64 %rd9, %rd7, %rd6;
+            @%p10 st.global.f32 [%rd9], {F(-1f)};
+            setp.gt.u32 %p10, %r21, {CandidateSlots};
+            setp.eq.and.u32 %p10, %tx, 0, %p10;
+            mul.wide.u32 %rd7, %r7, 4;
+            add.u64 %rd7, %rd7, %b_flags;
+            @%p10 st.global.f32 [%rd7], {One};
+            """);
+        RowBlock(sb, "topk_candidates_f32", ["logits", "candv", "candi", "flags"],
+            [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("f32", "invt"), ("u32", "topk"), ("u32", "bpr")],
+            b.ToString(), sharedFloats: RowThreads);
+    }
+
+    private static void PenaltyKernels(StringBuilder sb)
+    {
         // Repetition penalties: copy the row to work[r, :], then penalize each distinct token of the last n history entries once.
         Elementwise(sb, "penalize_rows_f32", ["logits", "work", "history", "len"],
             [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("u32", "cap"), ("u32", "lastn"), ("f32", "repeat"), ("f32", "presence"), ("f32", "frequency"), ("u32", "rows")],

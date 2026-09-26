@@ -247,6 +247,43 @@ internal static partial class Tests
             int differences = cpuIds.Zip(deviceIds).Count(p => p.First != p.Second);
             Check(differences <= Rows / 200, $"{differences} of {Rows} samples differ between CPU and {device} (rounding only)");
         }
+
+        // A large vocabulary with top-k: the device may pick candidates block by block first. Same tokens as the CPU
+        // sampler, including rows where every score ties (more candidates than fit: the whole row is walked).
+        const int LargeRows = 48, LargeV = 30000;
+        var random = new Random(11);
+        var large = new float[LargeRows * LargeV];
+        for (int i = 0; i < large.Length; i++)
+        {
+            large[i] = (float)(random.NextDouble() * 6 - 3);
+        }
+
+        for (int i = 0; i < LargeV; i++)
+        {
+            large[i] = 0.5f;                                                   // row 0: all tied
+        }
+
+        using var largeX = Tensor.From(large, [LargeRows, LargeV], device);
+        using var largeCpuX = Tensor.From(large, [LargeRows, LargeV], Device.Cpu);
+        foreach (var (topK, topP, minP) in new[] { (1, 1f, 0f), (5, 1f, 0f), (40, 0.9f, 0f), (64, 0.95f, 0.02f) })
+        {
+            using var onDevice = new TokenSampler(device, LargeRows, LargeV, 1) { TopK = topK, TopP = topP, MinP = minP, Seed = 5 };
+            using var onCpu = new TokenSampler(Device.Cpu, LargeRows, LargeV, 1) { TopK = topK, TopP = topP, MinP = minP, Seed = 5 };
+            onDevice.Sample(largeX);
+            onCpu.Sample(largeCpuX);
+            var got = onDevice.Read(0, 1)[0];
+            var want = onCpu.Read(0, 1)[0];
+            int differ = got.Zip(want).Count(p => p.First.Id != p.Second.Id);
+            Check(differ <= 1, $"top-k {topK}: {differ} of {LargeRows} tokens differ from the CPU sampler");
+            for (int r = 1; r < LargeRows; r++)
+            {
+                if (got[r].Id == want[r].Id)
+                {
+                    AssertClose([want[r].Probability], [got[r].Probability], 1e-3f, $"top-k {topK}, row {r}: probability");
+                    Check(got[r].Alternatives[0].Id == want[r].Alternatives[0].Id, $"top-k {topK}, row {r}: best alternative");
+                }
+            }
+        }
     }
 
     // Runs without a GPU: the PTX is generated on the host. CudaBackend.Launch compares every launch's argument count

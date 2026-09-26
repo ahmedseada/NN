@@ -28,9 +28,36 @@ internal sealed unsafe partial class CudaBackend
     }
 
     public override void SampleRows(Storage logits, Storage ids, Storage stats, Storage step, int rows, int vocabulary,
-        int rowStride, int rowOffset, float temperature, int topK, float topP, float minP, uint seed) =>
-        LaunchRows(K("sample_rows_f32"), rows, PtxKernels.SamplerThreads, P(logits), P(ids), P(stats), P(step),
-            U(vocabulary), U(rowStride), U(rowOffset), F(1f / MathF.Max(temperature, 1e-3f)), U(topK), F(topP), F(minP), seed, U(rows), U(rows));
+        int rowStride, int rowOffset, float temperature, int topK, float topP, float minP, uint seed)
+    {
+        float invT = 1f / MathF.Max(temperature, 1e-3f);
+        if (topK <= 0 || topK > PtxKernels.CandidateSlots || vocabulary <= 4 * PtxKernels.CandidateSlice)
+        {
+            LaunchRows(K("sample_rows_f32"), rows, PtxKernels.SamplerThreads, P(logits), P(ids), P(stats), P(step),
+                U(vocabulary), U(rowStride), U(rowOffset), F(invT), U(topK), F(topP), F(minP), seed, U(rows), U(rows));
+            return;
+        }
+
+        // Top-k over a large vocabulary: many blocks each keep their slice's candidates, then one block per row samples
+        // among them (every token top-k keeps is a candidate; see PtxKernels.TopKCandidates).
+        int blocks = (vocabulary + PtxKernels.CandidateSlice - 1) / PtxKernels.CandidateSlice, slots = blocks * PtxKernels.CandidateSlots;
+        var candidates = Allocate(rows * slots, zeroed: false);
+        var indices = Allocate(rows * slots, zeroed: false);
+        var flags = Allocate(rows, zeroed: true);
+        try
+        {
+            LaunchRows(K("topk_candidates_f32"), rows * blocks, P(logits), P(candidates), P(indices), P(flags),
+                U(vocabulary), U(rowStride), U(rowOffset), F(invT), U(topK), U(blocks), U(rows * blocks));
+            LaunchRows(K("sample_candidates_f32"), rows, P(logits), P(ids), P(stats), P(step), P(candidates), P(indices), P(flags),
+                U(vocabulary), U(rowStride), U(rowOffset), F(invT), U(topK), F(topP), F(minP), seed, U(rows), U(slots), U(rows));
+        }
+        finally
+        {
+            candidates.Release();
+            indices.Release();
+            flags.Release();
+        }
+    }
 
     public override void PenalizeRows(Storage logits, Storage work, Storage history, Storage length, int rows, int vocabulary,
         int rowStride, int rowOffset, int capacity, int lastN, float repeat, float presence, float frequency) =>
