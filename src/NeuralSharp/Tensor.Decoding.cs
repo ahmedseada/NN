@@ -100,6 +100,38 @@ public sealed partial class Tensor
         return Traced("attention_tiled", y, start);
     }
 
+    /// <summary>
+    /// Causal attention of q [heads, rowsPerHead, dim] over keys and values [heads, steps, dim] (row i sees positions
+    /// ≤ i % steps) with its gradient, without storing attention weights: the backward pass recomputes them from each
+    /// row's log-sum-exp (FlashAttention-style). Memory grows with the sequence length, not its square.
+    /// </summary>
+    internal static Tensor CausalAttention(Tensor q, Tensor keys, Tensor values, Tensor zero, int steps, float scale)
+    {
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int heads = q._shape[0], rowsPerHead = q._shape[1], dim = q._shape[2], capacity = keys._shape[1];
+        var y = Empty([heads, rowsPerHead, dim], q.Device);
+        bool record = Autograd.IsEnabled && (q.RequiresGrad || keys.RequiresGrad || values.RequiresGrad);
+        var lse = record ? Empty([heads, rowsPerHead], q.Device, track: false) : null;
+        q.Backend.AttentionTiled(q.Storage, keys.Storage, values.Storage, zero.Storage, y.Storage, lse?.Storage, heads, rowsPerHead, steps,
+            capacity, dim, scale);
+        if (record)
+        {
+            y.Record("attention", g =>
+            {
+                // Gradients go to scratch buffers for inputs that do not need them.
+                using var dq = q.RequiresGrad ? null : Empty(q._shape, q.Device, zeroed: true, track: false);
+                using var dk = keys.RequiresGrad ? null : Empty(keys._shape, q.Device, zeroed: true, track: false);
+                using var dv = values.RequiresGrad ? null : Empty(values._shape, q.Device, zeroed: true, track: false);
+                q.Backend.AttentionTiledBackward(q.Storage, keys.Storage, values.Storage, y.Storage, lse!.Storage, g.Storage,
+                    dq?.Storage ?? q.GradStorage(), dk?.Storage ?? keys.GradStorage(), dv?.Storage ?? values.GradStorage(),
+                    heads, rowsPerHead, steps, capacity, dim, scale);
+                lse.Dispose();
+            }, q, keys, values);
+        }
+
+        return Traced("attention", y, start);
+    }
+
     /// <summary>q [rows, steps, dim] · int8 keysᵀ → [rows, steps, capacity].</summary>
     internal static Tensor AttentionScoresInt8(Tensor q, Layers.KeyValueCache cache)
     {

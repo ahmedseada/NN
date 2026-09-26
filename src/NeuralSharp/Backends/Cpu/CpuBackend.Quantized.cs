@@ -149,6 +149,49 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override void AttentionTiledBackward(Storage q, Storage keys, Storage values, Storage output, Storage logSumExp, Storage dOutput,
+        Storage dq, Storage dkeys, Storage dvalues, int heads, int rowsPerHead, int steps, int capacity, int dim, float scale)
+    {
+        float[] qv = D(q), kv = D(keys), vv = D(values), ov = D(output), lv = D(logSumExp), gv = D(dOutput);
+        float[] dqv = D(dq), dkv = D(dkeys), dvv = D(dvalues);
+        For(heads, (long)heads * rowsPerHead * capacity * dim, (first, last) =>
+        {
+            for (int h = first; h < last; h++)
+            {
+                for (int i = 0; i < rowsPerHead; i++)
+                {
+                    int row = h * rowsPerHead + i, count = Math.Min(i % steps, capacity - 1) + 1;
+                    var query = qv.AsSpan(row * dim, dim);
+                    var gradOut = gv.AsSpan(row * dim, dim);
+                    float delta = 0f;
+                    for (int d = 0; d < dim; d++)
+                    {
+                        delta += gradOut[d] * ov[row * dim + d];
+                    }
+
+                    for (int c = 0; c < count; c++)
+                    {
+                        int key = (h * capacity + c) * dim;
+                        float dot = 0f, dp = 0f;
+                        for (int d = 0; d < dim; d++)
+                        {
+                            dot += query[d] * kv[key + d];
+                            dp += gradOut[d] * vv[key + d];
+                        }
+
+                        float p = MathF.Exp(dot * scale - lv[row]), ds = p * (dp - delta);
+                        for (int d = 0; d < dim; d++)
+                        {
+                            dqv[row * dim + d] += scale * ds * kv[key + d];
+                            dkv[key + d] += scale * ds * query[d];
+                            dvv[key + d] += p * gradOut[d];
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     public override void AttentionScoresInt8(Storage q, Storage cache, Storage scales, Storage y, int rows, int steps, int capacity, int dim)
     {
         float[] qv = D(q), sv = D(scales), yv = D(y);

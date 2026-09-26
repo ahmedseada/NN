@@ -302,6 +302,14 @@ internal abstract class Backend
     /// tiled so query rows share each key and value read; also writes each row's log-sum-exp of the scaled scores to
     /// <paramref name="logSumExp"/> [heads, rowsPerHead] when given.
     /// </summary>
+    /// <summary>
+    /// Gradient of <see cref="AttentionTiled"/> with causal offset 0 (training): given the output, each row's log-sum-exp
+    /// and dOutput, adds to dq [heads, rowsPerHead, dim] and dkeys, dvalues [heads, capacity, dim]. The attention weights
+    /// are recomputed, never stored.
+    /// </summary>
+    public abstract void AttentionTiledBackward(Storage q, Storage keys, Storage values, Storage output, Storage logSumExp, Storage dOutput,
+        Storage dq, Storage dkeys, Storage dvalues, int heads, int rowsPerHead, int steps, int capacity, int dim, float scale);
+
     public virtual void AttentionTiled(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage? logSumExp, int heads,
         int rowsPerHead, int steps, int capacity, int dim, float scale) =>
         AttentionDecode(q, keys, values, position, y, heads, rowsPerHead, steps, capacity, dim, scale);

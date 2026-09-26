@@ -109,4 +109,23 @@ internal sealed unsafe partial class CudaBackend
             P(q), P(keys), P(values), P(position), P(y), logSumExp is null ? 0UL : P(logSumExp),
             U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale));
     }
+
+    public override void AttentionTiledBackward(Storage q, Storage keys, Storage values, Storage output, Storage logSumExp, Storage dOutput,
+        Storage dq, Storage dkeys, Storage dvalues, int heads, int rowsPerHead, int steps, int capacity, int dim, float scale)
+    {
+        int rows = heads * rowsPerHead;
+        var delta = Allocate(rows, zeroed: false);
+        try
+        {
+            Launch1D(K("attn_bwd_d_f32"), rows, P(output), P(dOutput), P(delta), U(dim), U(rows));
+            ReadOnlySpan<ulong> args = [P(q), P(keys), P(values), P(dOutput), P(logSumExp), P(delta), P(dq), P(dkeys), P(dvalues),
+                U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale)];
+            Launch(K("attn_bwd_kv_f32"), (uint)((capacity + 15) / 16), (uint)heads, 1, 128, 1, args);
+            Launch(K("attn_bwd_q_f32"), (uint)((rowsPerHead + 31) / 32), (uint)heads, 1, 128, 1, args);
+        }
+        finally
+        {
+            delta.Release();
+        }
+    }
 }

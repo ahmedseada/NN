@@ -281,10 +281,10 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         var positions = Positions(t);
         var (q, k, v) = Project(input, positions);
         float scale = 1f / MathF.Sqrt(HeadDim);
-        if (!Autograd.IsEnabled && HeadDim <= Backends.Cuda.PtxKernels.FlashMaxDim)
+        if (HeadDim <= Backends.Cuda.PtxKernels.FlashMaxDim)
         {
-            // Inference: tiled attention, no [t, t] score matrix (positions[0] = 0 is the causal offset).
-            return Merge(Tensor.AttentionTiled(q, k, v, positions, t, scale), n, t);
+            // Tiled attention, forward and backward: no [t, t] weights stored (positions[0] = 0 is the causal offset).
+            return Merge(Tensor.CausalAttention(q, k, v, positions, t, scale), n, t);
         }
 
         var raw = q.MatMul(k, transposeB: true);                                  // [n·kv, group·t, t]

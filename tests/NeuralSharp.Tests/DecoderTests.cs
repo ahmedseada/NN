@@ -11,6 +11,7 @@ internal static partial class Tests
     [
         ("decoder: RMSNorm and rotary embedding gradients (finite differences)", DecoderGradients),
         ("decoder: tiled and decoding attention match a direct computation (offsets, groups, odd head sizes)", AttentionKernels),
+        ("decoder: tiled attention gradients (finite differences through queries, keys and values)", AttentionGradients),
         ("decoder: DecoderSpec variants match a plain reference implementation (GQA, q/k norm, biases, rope, tied, post-norms, parallel)", DecoderMatchesReference),
         ("decoder: cached decoding (float32 and int8 KV) and int8 weights match the full pass; generation", DecoderCachedAndInt8),
         ("decoder: LoRA by layer name trains; JSON and package round trip", DecoderLoraAndPackage),
@@ -133,6 +134,46 @@ internal static partial class Tests
             cache.Keys.Load(k);
             cache.Values.Load(v);
             AssertClose(expected, Tensor.AttentionDecode(tq, cache, position, steps, scale).ToArray(), 2e-4f, "decoding: " + name);
+        }
+    }
+
+    private static void AttentionGradients(Device device)
+    {
+        // Two heads, two query rows per key/value head and step (grouped-query layout: rows g·t + step), head size 6.
+        const int Heads = 2, Steps = 5, Rows = 2 * Steps, Dim = 6;
+        var r = new Random(62);
+        float[] Random(int n) => [.. Enumerable.Range(0, n).Select(_ => (float)(r.NextDouble() * 2 - 1))];
+        using var q = Tensor.From(Random(Heads * Rows * Dim), [Heads, Rows, Dim], device);
+        using var k = Tensor.From(Random(Heads * Steps * Dim), [Heads, Steps, Dim], device);
+        using var v = Tensor.From(Random(Heads * Steps * Dim), [Heads, Steps, Dim], device);
+        using var weights = Tensor.From(Random(Heads * Rows * Dim), [Heads, Rows, Dim], device);
+        using var zero = Tensor.From([0f], [1], device);
+        const float Scale = 0.4f;
+        GradCheck(device, [Heads, Rows, Dim], x => (Tensor.CausalAttention(x, k, v, zero, Steps, Scale) * weights).Sum());
+        GradCheck(device, [Heads, Steps, Dim], x => (Tensor.CausalAttention(q, x, v, zero, Steps, Scale) * weights).Sum());
+        GradCheck(device, [Heads, Steps, Dim], x => (Tensor.CausalAttention(q, k, x, zero, Steps, Scale) * weights).Sum());
+
+        // Several query and key tiles, a head size that is not a multiple of 32: the device gradients equal the CPU's.
+        if (device.Type != DeviceType.Cpu)
+        {
+            const int H = 2, T = 70, R = 2 * T, E = 100;
+            float[] qs = Random(H * R * E), ks = Random(H * T * E), vs = Random(H * T * E), ws = Random(H * R * E);
+            (float[] Q, float[] K, float[] V) Gradients(Device on)
+            {
+                using var tq = Tensor.From(qs, [H, R, E], on, requiresGrad: true);
+                using var tk = Tensor.From(ks, [H, T, E], on, requiresGrad: true);
+                using var tv = Tensor.From(vs, [H, T, E], on, requiresGrad: true);
+                using var tw = Tensor.From(ws, [H, R, E], on);
+                using var tz = Tensor.From([0f], [1], on);
+                (Tensor.CausalAttention(tq, tk, tv, tz, T, 0.1f) * tw).Sum().Backward();
+                return (tq.Grad!.ToArray(), tk.Grad!.ToArray(), tv.Grad!.ToArray());
+            }
+
+            var (dq, dk, dv) = Gradients(device);
+            var (cq, ck, cv) = Gradients(Device.Cpu);
+            AssertClose(cq, dq, 2e-4f, "query gradient, several tiles");
+            AssertClose(ck, dk, 2e-4f, "key gradient, several tiles");
+            AssertClose(cv, dv, 2e-4f, "value gradient, several tiles");
         }
     }
 

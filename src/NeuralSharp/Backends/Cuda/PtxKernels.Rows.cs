@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -223,6 +223,7 @@ internal static partial class PtxKernels
         GemvNT(sb);
         AttentionDecode(sb);
         AttentionFlash(sb);
+        AttentionBackward(sb);
         Gemm(sb, "gemm128_f32", 128, 8);
         Gemm(sb, "gemm64_f32", 64, 4);
     }
@@ -535,6 +536,507 @@ internal static partial class PtxKernels
                     st.global.f32 [%rd19], %f14;
                 WRITTEN{{i}}:
                 """);
+        }
+
+        s.AppendLine("""
+                ret;
+            }
+            """);
+        sb.AppendLine(s.ToString());
+    }
+
+    // Backward of attention_flash_f32 (causal offset 0, keys and values [heads, capacity, dim]), recomputing the weights
+    // from each row's log-sum-exp: P = exp(scale · q·k - lse), dS = P ∘ (dO·v - D) with D = Σ dO ∘ O per row, then
+    // dV += Pᵀ dO, dK += scale · dSᵀ Q, dQ += scale · dS K. Three kernels, no atomics (deterministic):
+    //   attn_bwd_d_f32   D per query row (one thread per row);
+    //   attn_bwd_kv_f32  a block of 4 warps owns 16 keys (4 per warp) and walks the query rows in tiles of 32 held in
+    //                    shared memory (rows padded to 129 floats, so lane-per-row and lane-per-dimension reads are
+    //                    both conflict-free); grid x = ⌈capacity / 16⌉, y = heads;
+    //   attn_bwd_q_f32   a block owns 32 query rows (8 per warp) and walks the keys in tiles of 32 held transposed in
+    //                    shared memory (padded to 33); grid x = ⌈rowsPerHead / 32⌉, y = heads.
+    private static void AttentionBackward(StringBuilder sb)
+    {
+        Elementwise(sb, "attn_bwd_d_f32", ["o", "dout", "dd"], [("u32", "dim")], $"""
+            mul.lo.u32 %r5, %i, %s_dim;
+            mul.wide.u32 %rd1, %r5, 4;
+            add.u64 %rd2, %b_o, %rd1;
+            add.u64 %rd3, %b_dout, %rd1;
+            mov.f32 %f1, {Zero};
+            mov.u32 %r6, 0;
+            DL:
+            setp.ge.u32 %p1, %r6, %s_dim;
+            @%p1 bra DL_END;
+            ld.global.f32 %f2, [%rd2];
+            ld.global.f32 %f3, [%rd3];
+            fma.rn.f32 %f1, %f2, %f3, %f1;
+            add.u64 %rd2, %rd2, 4;
+            add.u64 %rd3, %rd3, 4;
+            add.u32 %r6, %r6, 1;
+            bra DL;
+            DL_END:
+            st.global.f32 [%a_dd], %f1;
+            """);
+        AttentionBackwardKeys(sb);
+        AttentionBackwardQueries(sb);
+    }
+
+    // Common prologue: pointers of this head (q, dout, dq [heads, rph, dim]; k, v, dk, dv [heads, cap, dim]; lse, dd
+    // [heads, rph]), %r1 rph, %r2 steps, %r3 cap, %r4 dim, %f31 scale, %r6 tid, %r7 lane, %r8 warp, %r10 head.
+    private const string BackwardParameters = """
+            .param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_dout, .param .u64 p_lse, .param .u64 p_dd,
+            .param .u64 p_dq, .param .u64 p_dk, .param .u64 p_dv,
+            .param .u32 p_rph, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_dim, .param .f32 p_scale
+        """;
+
+    private static string BackwardPrologue => """
+            ld.param.u32 %r1, [p_rph];
+            ld.param.u32 %r2, [p_steps];
+            ld.param.u32 %r3, [p_cap];
+            ld.param.u32 %r4, [p_dim];
+            ld.param.f32 %f31, [p_scale];
+            mov.u32 %r6, %tid.x;
+            and.b32 %r7, %r6, 31;
+            shr.u32 %r8, %r6, 5;
+            mov.u32 %r10, %ctaid.y;
+            cvt.u64.u32 %rd30, %r4;
+            mul.lo.u32 %r11, %r10, %r1;
+            cvt.u64.u32 %rd29, %r11;
+            mul.lo.u64 %rd28, %rd29, %rd30;
+            shl.b64 %rd28, %rd28, 2;
+            mul.lo.u32 %r12, %r10, %r3;
+            cvt.u64.u32 %rd29, %r12;
+            mul.lo.u64 %rd27, %rd29, %rd30;
+            shl.b64 %rd27, %rd27, 2;
+            ld.param.u64 %rd1, [p_q];
+            cvta.to.global.u64 %rd1, %rd1;
+            add.u64 %rd1, %rd1, %rd28;
+            ld.param.u64 %rd4, [p_dout];
+            cvta.to.global.u64 %rd4, %rd4;
+            add.u64 %rd4, %rd4, %rd28;
+            ld.param.u64 %rd7, [p_dq];
+            cvta.to.global.u64 %rd7, %rd7;
+            add.u64 %rd7, %rd7, %rd28;
+            ld.param.u64 %rd2, [p_k];
+            cvta.to.global.u64 %rd2, %rd2;
+            add.u64 %rd2, %rd2, %rd27;
+            ld.param.u64 %rd3, [p_v];
+            cvta.to.global.u64 %rd3, %rd3;
+            add.u64 %rd3, %rd3, %rd27;
+            ld.param.u64 %rd8, [p_dk];
+            cvta.to.global.u64 %rd8, %rd8;
+            add.u64 %rd8, %rd8, %rd27;
+            ld.param.u64 %rd9, [p_dv];
+            cvta.to.global.u64 %rd9, %rd9;
+            add.u64 %rd9, %rd9, %rd27;
+            mul.wide.u32 %rd26, %r11, 4;
+            ld.param.u64 %rd5, [p_lse];
+            cvta.to.global.u64 %rd5, %rd5;
+            add.u64 %rd5, %rd5, %rd26;
+            ld.param.u64 %rd6, [p_dd];
+            cvta.to.global.u64 %rd6, %rd6;
+            add.u64 %rd6, %rd6, %rd26;
+        """;
+
+    private static void AttentionBackwardKeys(StringBuilder sb)
+    {
+        const int Keys = 4, Stride = 129, QT = 32;
+        var s = new StringBuilder();
+        s.AppendLine($$"""
+            .visible .entry attn_bwd_kv_f32(
+            {{BackwardParameters}}
+            )
+            {
+                .reg .pred %p<16>;
+                .reg .pred %dv<4>;
+                .reg .f32 %gk<{{Keys * 4}}>;
+                .reg .f32 %gv<{{Keys * 4}}>;
+                .reg .f32 %sp<{{Keys}}>;
+                .reg .f32 %sd<{{Keys}}>;
+                .reg .f32 %f<32>;
+                .reg .b32 %r<48>;
+                .reg .b64 %rd<32>;
+                .shared .align 4 .f32 kv_q[{{QT * Stride}}];
+                .shared .align 4 .f32 kv_do[{{QT * Stride}}];
+            {{BackwardPrologue}}
+                mov.u32 %r13, %ctaid.x;
+                shl.b32 %r13, %r13, 4;
+                shl.b32 %r14, %r8, 2;
+                add.u32 %r14, %r14, %r13;
+                mul.lo.u32 %r15, %r4, {{QT}};
+                mov.u32 %r16, kv_q;
+                mov.u32 %r17, kv_do;
+            """);
+        for (int j = 0; j < 4; j++)
+        {
+            s.AppendLine($"    add.u32 %r18, %r7, {32 * j};");
+            s.AppendLine($"    setp.lt.u32 %dv{j}, %r18, %r4;");
+        }
+
+        for (int i = 0; i < Keys * 4; i++)
+        {
+            s.AppendLine($"    mov.f32 %gk{i}, 0f00000000;");
+            s.AppendLine($"    mov.f32 %gv{i}, 0f00000000;");
+        }
+
+        // Query tiles; a tile is skipped when none of its rows reaches this block's first key.
+        s.AppendLine($$"""
+                mov.u32 %r19, 0;
+            QT:
+                setp.ge.u32 %p1, %r19, %r1;
+                @%p1 bra QT_END;
+                add.u32 %r20, %r19, {{QT - 1}};
+                sub.u32 %r21, %r1, 1;
+                min.u32 %r20, %r20, %r21;
+                div.u32 %r21, %r19, %r2;
+                div.u32 %r22, %r20, %r2;
+                rem.u32 %r23, %r20, %r2;
+                sub.u32 %r24, %r2, 1;
+                setp.ne.u32 %p2, %r21, %r22;
+                selp.b32 %r23, %r24, %r23, %p2;
+                setp.lt.u32 %p2, %r23, %r13;
+                @%p2 bra QT_NEXT;
+                bar.sync 0;
+                mov.u32 %r25, %r6;
+            QL:
+                setp.ge.u32 %p3, %r25, %r15;
+                @%p3 bra QL_END;
+                div.u32 %r26, %r25, %r4;
+                rem.u32 %r27, %r25, %r4;
+                add.u32 %r28, %r19, %r26;
+                setp.lt.u32 %p4, %r28, %r1;
+                mad.lo.u32 %r29, %r28, %r4, %r27;
+                mul.wide.u32 %rd10, %r29, 4;
+                add.u64 %rd11, %rd10, %rd1;
+                add.u64 %rd12, %rd10, %rd4;
+                mov.f32 %f1, 0f00000000;
+                mov.f32 %f2, 0f00000000;
+                @%p4 ld.global.f32 %f1, [%rd11];
+                @%p4 ld.global.f32 %f2, [%rd12];
+                mad.lo.u32 %r30, %r26, {{Stride}}, %r27;
+                shl.b32 %r30, %r30, 2;
+                add.u32 %r31, %r30, %r16;
+                st.shared.f32 [%r31], %f1;
+                add.u32 %r31, %r30, %r17;
+                st.shared.f32 [%r31], %f2;
+                add.u32 %r25, %r25, 128;
+                bra QL;
+            QL_END:
+                bar.sync 0;
+                add.u32 %r32, %r19, %r7;
+                setp.lt.u32 %p5, %r32, %r1;
+                rem.u32 %r33, %r32, %r2;
+                mul.wide.u32 %rd13, %r32, 4;
+                mov.f32 %f3, 0f00000000;
+                mov.f32 %f4, 0f00000000;
+                add.u64 %rd14, %rd13, %rd5;
+                @%p5 ld.global.f32 %f3, [%rd14];
+                add.u64 %rd14, %rd13, %rd6;
+                @%p5 ld.global.f32 %f4, [%rd14];
+                mul.lo.u32 %r34, %r7, {{Stride * 4}};
+                add.u32 %r35, %r34, %r16;
+                add.u32 %r36, %r34, %r17;
+            """);
+        for (int kk = 0; kk < Keys; kk++)
+        {
+            // Key p = %r14 + kk: s = q_lane · k_p, dp = dO_lane · v_p (k, v rows broadcast from global memory).
+            s.AppendLine($$"""
+                    add.u32 %r37, %r14, {{kk}};
+                    setp.lt.u32 %p6, %r37, %r3;
+                    min.u32 %r38, %r37, %r3;
+                    sub.u32 %r39, %r3, 1;
+                    min.u32 %r38, %r38, %r39;
+                    mul.lo.u32 %r40, %r38, %r4;
+                    mul.wide.u32 %rd15, %r40, 4;
+                    add.u64 %rd16, %rd15, %rd2;
+                    add.u64 %rd17, %rd15, %rd3;
+                    mov.f32 %f5, 0f00000000;
+                    mov.f32 %f6, 0f00000000;
+                    mov.u32 %r41, %r35;
+                    mov.u32 %r42, %r36;
+                    mov.u32 %r43, 0;
+                SD{{kk}}:
+                    setp.ge.u32 %p7, %r43, %r4;
+                    @%p7 bra SD{{kk}}_END;
+                    ld.shared.f32 %f7, [%r41];
+                    ld.global.f32 %f8, [%rd16];
+                    fma.rn.f32 %f5, %f7, %f8, %f5;
+                    ld.shared.f32 %f9, [%r42];
+                    ld.global.f32 %f10, [%rd17];
+                    fma.rn.f32 %f6, %f9, %f10, %f6;
+                    add.u32 %r41, %r41, 4;
+                    add.u32 %r42, %r42, 4;
+                    add.u64 %rd16, %rd16, 4;
+                    add.u64 %rd17, %rd17, 4;
+                    add.u32 %r43, %r43, 1;
+                    bra SD{{kk}};
+                SD{{kk}}_END:
+                    setp.le.u32 %p8, %r37, %r33;
+                    and.pred %p8, %p8, %p5;
+                    and.pred %p8, %p8, %p6;
+                    mul.f32 %f11, %f5, %f31;
+                    sub.f32 %f11, %f11, %f3;
+                    mul.f32 %f11, %f11, 0f3FB8AA3B;
+                    ex2.approx.ftz.f32 %f11, %f11;
+                    selp.f32 %sp{{kk}}, %f11, 0f00000000, %p8;
+                    sub.f32 %f12, %f6, %f4;
+                    mul.f32 %sd{{kk}}, %sp{{kk}}, %f12;
+                """);
+        }
+
+        // dV_p += Σ_r P[r, p] dO[r], dK_p += Σ_r dS[r, p] Q[r] with the lanes splitting the dimension.
+        s.AppendLine($$"""
+                mov.u32 %r44, 0;
+            RR:
+                setp.ge.u32 %p9, %r44, {{QT}};
+                @%p9 bra RR_END;
+                mul.lo.u32 %r45, %r44, {{Stride * 4}};
+                shl.b32 %r46, %r7, 2;
+                add.u32 %r45, %r45, %r46;
+                add.u32 %r46, %r45, %r16;
+                add.u32 %r47, %r45, %r17;
+            """);
+        for (int j = 0; j < 4; j++)
+        {
+            s.AppendLine($"    @%dv{j} ld.shared.f32 %f{13 + j}, [%r46+{128 * j}];");
+            s.AppendLine($"    @%dv{j} ld.shared.f32 %f{17 + j}, [%r47+{128 * j}];");
+        }
+
+        for (int kk = 0; kk < Keys; kk++)
+        {
+            s.AppendLine($"    shfl.sync.idx.b32 %f21, %sp{kk}, %r44, 31, 0xffffffff;");
+            s.AppendLine($"    shfl.sync.idx.b32 %f22, %sd{kk}, %r44, 31, 0xffffffff;");
+            for (int j = 0; j < 4; j++)
+            {
+                s.AppendLine($"    fma.rn.f32 %gv{kk * 4 + j}, %f21, %f{17 + j}, %gv{kk * 4 + j};");
+                s.AppendLine($"    fma.rn.f32 %gk{kk * 4 + j}, %f22, %f{13 + j}, %gk{kk * 4 + j};");
+            }
+        }
+
+        s.AppendLine($$"""
+                add.u32 %r44, %r44, 1;
+                bra RR;
+            RR_END:
+            QT_NEXT:
+                add.u32 %r19, %r19, {{QT}};
+                bra QT;
+            QT_END:
+            """);
+        for (int kk = 0; kk < Keys; kk++)
+        {
+            s.AppendLine($$"""
+                    add.u32 %r37, %r14, {{kk}};
+                    setp.ge.u32 %p10, %r37, %r3;
+                    @%p10 bra KW{{kk}};
+                    mad.lo.u32 %r40, %r37, %r4, %r7;
+                    mul.wide.u32 %rd18, %r40, 4;
+                    add.u64 %rd19, %rd18, %rd8;
+                    add.u64 %rd20, %rd18, %rd9;
+                """);
+            for (int j = 0; j < 4; j++)
+            {
+                s.AppendLine($$"""
+                        @%dv{{j}} ld.global.f32 %f23, [%rd19+{{128 * j}}];
+                        @%dv{{j}} fma.rn.f32 %f23, %gk{{kk * 4 + j}}, %f31, %f23;
+                        @%dv{{j}} st.global.f32 [%rd19+{{128 * j}}], %f23;
+                        @%dv{{j}} ld.global.f32 %f24, [%rd20+{{128 * j}}];
+                        @%dv{{j}} add.f32 %f24, %f24, %gv{{kk * 4 + j}};
+                        @%dv{{j}} st.global.f32 [%rd20+{{128 * j}}], %f24;
+                    """);
+            }
+
+            s.AppendLine($"KW{kk}:");
+        }
+
+        s.AppendLine("""
+                ret;
+            }
+            """);
+        sb.AppendLine(s.ToString());
+    }
+
+    private static void AttentionBackwardQueries(StringBuilder sb)
+    {
+        const int Rows = 8, KT = 32, Stride = 33, D = FlashMaxDim;
+        var s = new StringBuilder();
+        s.AppendLine($$"""
+            .visible .entry attn_bwd_q_f32(
+            {{BackwardParameters}}
+            )
+            {
+                .reg .pred %p<16>;
+                .reg .pred %dv<4>;
+                .reg .f32 %gq<{{Rows * 4}}>;
+                .reg .f32 %f<32>;
+                .reg .b32 %r<48>;
+                .reg .b64 %rd<32>;
+                .shared .align 4 .f32 bq_k[{{D * Stride}}];
+                .shared .align 4 .f32 bq_v[{{D * Stride}}];
+            {{BackwardPrologue}}
+                mov.u32 %r13, %ctaid.x;
+                shl.b32 %r13, %r13, 5;
+                mul.lo.u32 %r15, %r4, {{KT}};
+                mov.u32 %r16, bq_k;
+                mov.u32 %r17, bq_v;
+                add.u32 %r20, %r13, {{KT - 1}};
+                sub.u32 %r21, %r1, 1;
+                min.u32 %r20, %r20, %r21;
+                div.u32 %r21, %r13, %r2;
+                div.u32 %r22, %r20, %r2;
+                rem.u32 %r23, %r20, %r2;
+                sub.u32 %r24, %r2, 1;
+                setp.ne.u32 %p2, %r21, %r22;
+                selp.b32 %r23, %r24, %r23, %p2;
+                sub.u32 %r24, %r3, 1;
+                min.u32 %r23, %r23, %r24;
+            """);
+        for (int j = 0; j < 4; j++)
+        {
+            s.AppendLine($"    add.u32 %r18, %r7, {32 * j};");
+            s.AppendLine($"    setp.lt.u32 %dv{j}, %r18, %r4;");
+        }
+
+        for (int i = 0; i < Rows * 4; i++)
+        {
+            s.AppendLine($"    mov.f32 %gq{i}, 0f00000000;");
+        }
+
+        s.AppendLine($$"""
+                mov.u32 %r19, 0;
+            KT:
+                setp.gt.u32 %p1, %r19, %r23;
+                @%p1 bra KT_END;
+                bar.sync 0;
+                mov.u32 %r25, %r6;
+            KL:
+                setp.ge.u32 %p3, %r25, %r15;
+                @%p3 bra KL_END;
+                div.u32 %r26, %r25, %r4;
+                rem.u32 %r27, %r25, %r4;
+                add.u32 %r28, %r19, %r26;
+                setp.lt.u32 %p4, %r28, %r3;
+                mad.lo.u32 %r29, %r28, %r4, %r27;
+                mul.wide.u32 %rd10, %r29, 4;
+                add.u64 %rd11, %rd10, %rd2;
+                add.u64 %rd12, %rd10, %rd3;
+                mov.f32 %f1, 0f00000000;
+                mov.f32 %f2, 0f00000000;
+                @%p4 ld.global.f32 %f1, [%rd11];
+                @%p4 ld.global.f32 %f2, [%rd12];
+                mad.lo.u32 %r30, %r27, {{Stride}}, %r26;
+                shl.b32 %r30, %r30, 2;
+                add.u32 %r31, %r30, %r16;
+                st.shared.f32 [%r31], %f1;
+                add.u32 %r31, %r30, %r17;
+                st.shared.f32 [%r31], %f2;
+                add.u32 %r25, %r25, 128;
+                bra KL;
+            KL_END:
+                bar.sync 0;
+                add.u32 %r32, %r19, %r7;
+                setp.lt.u32 %p5, %r32, %r3;
+                shl.b32 %r34, %r7, 2;
+            """);
+        for (int i = 0; i < Rows; i++)
+        {
+            // Row r = block row + warp·8 + i: s = q_r · k_lane, dp = dO_r · v_lane (q, dO rows broadcast from global).
+            s.AppendLine($$"""
+                    mad.lo.u32 %r35, %r8, {{Rows}}, {{i}};
+                    add.u32 %r35, %r35, %r13;
+                    setp.lt.u32 %p6, %r35, %r1;
+                    min.u32 %r36, %r35, %r21;
+                    sub.u32 %r36, %r1, 1;
+                    min.u32 %r36, %r35, %r36;
+                    rem.u32 %r37, %r36, %r2;
+                    mul.lo.u32 %r38, %r36, %r4;
+                    mul.wide.u32 %rd13, %r38, 4;
+                    add.u64 %rd14, %rd13, %rd1;
+                    add.u64 %rd15, %rd13, %rd4;
+                    mul.wide.u32 %rd16, %r36, 4;
+                    add.u64 %rd17, %rd16, %rd5;
+                    ld.global.f32 %f3, [%rd17];
+                    add.u64 %rd17, %rd16, %rd6;
+                    ld.global.f32 %f4, [%rd17];
+                    mov.f32 %f5, 0f00000000;
+                    mov.f32 %f6, 0f00000000;
+                    add.u32 %r41, %r34, %r16;
+                    add.u32 %r42, %r34, %r17;
+                    mov.u32 %r43, 0;
+                SQ{{i}}:
+                    setp.ge.u32 %p7, %r43, %r4;
+                    @%p7 bra SQ{{i}}_END;
+                    ld.global.f32 %f7, [%rd14];
+                    ld.shared.f32 %f8, [%r41];
+                    fma.rn.f32 %f5, %f7, %f8, %f5;
+                    ld.global.f32 %f9, [%rd15];
+                    ld.shared.f32 %f10, [%r42];
+                    fma.rn.f32 %f6, %f9, %f10, %f6;
+                    add.u64 %rd14, %rd14, 4;
+                    add.u64 %rd15, %rd15, 4;
+                    add.u32 %r41, %r41, {{Stride * 4}};
+                    add.u32 %r42, %r42, {{Stride * 4}};
+                    add.u32 %r43, %r43, 1;
+                    bra SQ{{i}};
+                SQ{{i}}_END:
+                    setp.le.u32 %p8, %r32, %r37;
+                    and.pred %p8, %p8, %p5;
+                    and.pred %p8, %p8, %p6;
+                    mul.f32 %f11, %f5, %f31;
+                    sub.f32 %f11, %f11, %f3;
+                    mul.f32 %f11, %f11, 0f3FB8AA3B;
+                    ex2.approx.ftz.f32 %f11, %f11;
+                    selp.f32 %f11, %f11, 0f00000000, %p8;
+                    sub.f32 %f12, %f6, %f4;
+                    mul.f32 %f12, %f11, %f12;
+                    mov.u32 %r44, 0;
+                    mov.u32 %r45, %r34;
+                    add.u32 %r45, %r45, %r16;
+                    mul.lo.u32 %r46, %r7, {{Stride * 4}};
+                    add.u32 %r46, %r46, %r16;
+                PQ{{i}}:
+                    setp.ge.u32 %p9, %r44, {{KT}};
+                    @%p9 bra PQ{{i}}_END;
+                    shfl.sync.idx.b32 %f13, %f12, %r44, 31, 0xffffffff;
+                """);
+            for (int j = 0; j < 4; j++)
+            {
+                s.AppendLine($"    @%dv{j} ld.shared.f32 %f14, [%r46+{32 * Stride * 4 * j}];");
+                s.AppendLine($"    @%dv{j} fma.rn.f32 %gq{i * 4 + j}, %f13, %f14, %gq{i * 4 + j};");
+            }
+
+            s.AppendLine($$"""
+                    add.u32 %r46, %r46, 4;
+                    add.u32 %r44, %r44, 1;
+                    bra PQ{{i}};
+                PQ{{i}}_END:
+                """);
+        }
+
+        s.AppendLine($$"""
+                add.u32 %r19, %r19, {{KT}};
+                bra KT;
+            KT_END:
+            """);
+        for (int i = 0; i < Rows; i++)
+        {
+            s.AppendLine($$"""
+                    mad.lo.u32 %r35, %r8, {{Rows}}, {{i}};
+                    add.u32 %r35, %r35, %r13;
+                    setp.ge.u32 %p10, %r35, %r1;
+                    @%p10 bra QW{{i}};
+                    mad.lo.u32 %r38, %r35, %r4, %r7;
+                    mul.wide.u32 %rd18, %r38, 4;
+                    add.u64 %rd19, %rd18, %rd7;
+                """);
+            for (int j = 0; j < 4; j++)
+            {
+                s.AppendLine($$"""
+                        @%dv{{j}} ld.global.f32 %f23, [%rd19+{{128 * j}}];
+                        @%dv{{j}} fma.rn.f32 %f23, %gq{{i * 4 + j}}, %f31, %f23;
+                        @%dv{{j}} st.global.f32 [%rd19+{{128 * j}}], %f23;
+                    """);
+            }
+
+            s.AppendLine($"QW{i}:");
         }
 
         s.AppendLine("""
