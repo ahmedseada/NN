@@ -4,9 +4,16 @@ using static NeuralSharp.Backends.Cuda.CudaDriver;
 
 namespace NeuralSharp.Backends.Cuda;
 
-internal sealed class CudaStorage(CudaBackend backend, ulong pointer, int length) : Storage(backend, length)
+internal sealed class CudaStorage(CudaBackend backend, ulong pointer, int length, int capacity) : Storage(backend, length)
 {
     public readonly ulong Pointer = pointer;
+
+    /// <summary>Floats in the device block (at least <see cref="Storage.Length"/>: a cached block a little larger may be reused).</summary>
+    public readonly int Capacity = capacity;
+
+    public CudaStorage(CudaBackend backend, ulong pointer, int length) : this(backend, pointer, length, length)
+    {
+    }
 }
 
 /// <summary>
@@ -56,6 +63,13 @@ internal sealed unsafe partial class CudaBackend : Backend
         public void Dispose() => gate.ExitReadLock();
     }
     private readonly Dictionary<int, Stack<ulong>> _pool = [];
+
+    // Sizes with cached blocks, for best-fit reuse when no block of the exact size is cached.
+    private readonly SortedSet<int> _poolSizes = [];
+
+    // A cached block up to this fraction larger than a request (of at least BestFitMinimum floats) may serve it.
+    private const int BestFitSlack = 4;                                          // 1 / 4: at most 25% larger
+    private const int BestFitMinimum = 1024;
     private readonly MemoryAccountant _memory;
     private readonly int _multiprocessors;
 
@@ -211,6 +225,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         long bytes = BlockBytes(length);
         bool releaseCache = _memory.MustReleaseCacheFor(bytes); // throws when over the in-use limit
         ulong pointer = 0;
+        int capacity = length;
         lock (_pool)
         {
             if (_captureFree is not null && _captureFree.TryGetValue(length, out var captured) && captured.Count > 0)
@@ -219,10 +234,10 @@ internal sealed unsafe partial class CudaBackend : Backend
                 pointer = captured.Pop();
                 _memory.Reused(bytes);
             }
-            else if (_pool.TryGetValue(length, out var bucket) && bucket.Count > 0)
+            else if (TakeCached(length, out capacity) is var cached && cached != 0)
             {
-                pointer = bucket.Pop();
-                _memory.Reused(bytes);
+                pointer = cached;
+                _memory.Reused(BlockBytes(capacity));
             }
         }
 
@@ -242,7 +257,38 @@ internal sealed unsafe partial class CudaBackend : Backend
             Check(cuMemsetD32Async(pointer, 0, (nuint)length, _stream), nameof(cuMemsetD32Async));
         }
 
-        return new CudaStorage(this, pointer, length);
+        return new CudaStorage(this, pointer, length, capacity);
+    }
+
+    // A cached block for `length` floats: the exact size, else the smallest cached size at most 25% larger (varying
+    // shapes, e.g. prompt lengths, then reuse blocks instead of caching one of every size). Called under the pool lock.
+    private ulong TakeCached(int length, out int capacity)
+    {
+        capacity = length;
+        if (!_pool.TryGetValue(length, out var bucket) || bucket.Count == 0)
+        {
+            if (length < BestFitMinimum || _poolSizes.Count == 0)
+            {
+                return 0;
+            }
+
+            var fitting = _poolSizes.GetViewBetween(length + 1, length + length / BestFitSlack);
+            if (fitting.Count == 0)
+            {
+                return 0;
+            }
+
+            capacity = fitting.Min;
+            bucket = _pool[capacity];
+        }
+
+        ulong pointer = bucket.Pop();
+        if (bucket.Count == 0)
+        {
+            _poolSizes.Remove(capacity);
+        }
+
+        return pointer;
     }
 
     private ulong AllocateDevice(int length)
@@ -280,6 +326,8 @@ internal sealed unsafe partial class CudaBackend : Backend
                     _memory.Freed(BlockBytes(length));
                 }
             }
+
+            _poolSizes.Clear();
         }
     }
 
@@ -294,13 +342,18 @@ internal sealed unsafe partial class CudaBackend : Backend
             // would let unrelated tensors reuse memory the graph writes on every replay. (Other threads' blocks,
             // including the finalizer's, go back to the pool.)
             var target = _captureFree is not null && Environment.CurrentManagedThreadId == _captureThread ? _captureFree : _pool;
-            if (!target.TryGetValue(s.Length, out var bucket))
+            if (!target.TryGetValue(s.Capacity, out var bucket))
             {
-                target[s.Length] = bucket = new Stack<ulong>();
+                target[s.Capacity] = bucket = new Stack<ulong>();
             }
 
             bucket.Push(s.Pointer);
-            _memory.Returned(BlockBytes(s.Length));
+            if (ReferenceEquals(target, _pool))
+            {
+                _poolSizes.Add(s.Capacity);
+            }
+
+            _memory.Returned(BlockBytes(s.Capacity));
         }
     }
 
