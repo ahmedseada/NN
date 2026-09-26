@@ -8,6 +8,7 @@
     <Project Path="samples/NeuralSharp.Samples.Ocr/NeuralSharp.Samples.Ocr.csproj" />
     <Project Path="samples/NeuralSharp.Samples.OnnxImport/NeuralSharp.Samples.OnnxImport.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Quantization/NeuralSharp.Samples.Quantization.csproj" />
+    <Project Path="samples/NeuralSharp.Samples.Pretrained/NeuralSharp.Samples.Pretrained.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Rag/NeuralSharp.Samples.Rag.csproj" />
     <Project Path="samples/NeuralSharp.Samples.ReRanker/NeuralSharp.Samples.ReRanker.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Sequences/NeuralSharp.Samples.Sequences.csproj" />
@@ -20,6 +21,7 @@
     <Project Path="src/NeuralSharp.Mcp/NeuralSharp.Mcp.csproj" />
     <Project Path="src/NeuralSharp.Onnx.Runtime/NeuralSharp.Onnx.Runtime.csproj" />
     <Project Path="src/NeuralSharp.Onnx/NeuralSharp.Onnx.csproj" />
+    <Project Path="src/NeuralSharp.Pretrained/NeuralSharp.Pretrained.csproj" />
     <Project Path="src/NeuralSharp/NeuralSharp.csproj" />
   </Folder>
   <Folder Name="/tests/">

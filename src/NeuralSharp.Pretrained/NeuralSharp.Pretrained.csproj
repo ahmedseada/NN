@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>NeuralSharp.Pretrained</RootNamespace>
+    <AssemblyName>NeuralSharp.Pretrained</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsAotCompatible>true</IsAotCompatible>
+    <PackageId>NeuralSharp.Pretrained</PackageId>
+    <Description>Pretrained language models for NeuralSharp (no dependencies): safetensors weights, Hugging Face configurations mapped to DecoderSpec through an extensible architecture registry, BPE tokenizers from tokenizer.json, and chat templates.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NeuralSharp\NeuralSharp.csproj" />
+  </ItemGroup>
+
+</Project>

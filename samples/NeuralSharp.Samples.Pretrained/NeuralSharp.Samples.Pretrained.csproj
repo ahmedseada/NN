@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\NeuralSharp\NeuralSharp.csproj" />
+    <ProjectReference Include="..\..\src\NeuralSharp.Pretrained\NeuralSharp.Pretrained.csproj" />
+  </ItemGroup>
+
+</Project>

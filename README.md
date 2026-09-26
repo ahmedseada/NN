@@ -42,6 +42,8 @@ src/NeuralSharp.AspNetCore/         optional package: AddNeuralSharp(), MapPredi
 src/NeuralSharp.Mcp/                optional package: tools of Model Context Protocol servers, and serving tools over MCP
 src/NeuralSharp.Onnx/               optional package, no dependencies: export networks to .onnx (opset 17), import .onnx into layers
 src/NeuralSharp.Onnx.Runtime/       optional package: run .onnx models with ONNX Runtime as NeuralSharp modules
+src/NeuralSharp.Pretrained/         optional package, no dependencies: Hugging Face models (safetensors, config.json,
+                                    tokenizer.json, Jinja chat templates) as NeuralSharp decoders
 samples/
   NeuralSharp.Samples.Xor             the classic XOR problem
   NeuralSharp.Samples.HousePrices     regression: predict house prices from a CSV file
@@ -57,6 +59,7 @@ samples/
   NeuralSharp.Samples.Rag             retrieval-augmented generation: hybrid search, re-ranking, a chat model that cites passages
   NeuralSharp.Samples.OnnxImport      imports another framework's .onnx model, runs it on NeuralSharp (CPU/CUDA), checks its outputs
   NeuralSharp.Samples.Quantization    int8 weights and Float16/BFloat16 files: accuracy, size and decoding speed
+  NeuralSharp.Samples.Pretrained      loads a Hugging Face model folder: info, chat, and a check against transformers
 tools/pytorch/xor_to_onnx.py        trains XOR in PyTorch and exports it to ONNX with PyTorch's outputs, for OnnxImport
 tools/pytorch/export_models.py      exports a PyTorch CNN or ResNet (skip connections) to ONNX with PyTorch's outputs
   Shared/SampleOptions.cs             command-line options shared by the samples (train / predict modes)
@@ -82,6 +85,7 @@ tests/NeuralSharp.Tests             self-contained test runner (runs on every av
 | `Quantization` | `QuantizeInt8`, int8 KV cache, Float16/BFloat16 files: a trained summarizer compared with float32, and decoding speed and memory of a 98M-parameter GPT | int8 weights + int8 KV cache: same summaries as float32 on all 300 test reports, ⅓ of the file; on 4 CPU threads, weights 373 → 112 MB, KV cache 18 → 4.8 MB, decoding 19.8 → 45.7 tokens/s |
 | `OnnxImport` | `OnnxImport.Load(path, device)` on a PyTorch-exported model (`tools/pytorch/xor_to_onnx.py`, `export_models.py` for a CNN or ResNet), compared with PyTorch's own outputs, then saved as .nsm and reloaded | XOR: same outputs as PyTorch on the RTX 5050 (1e-11), both PyTorch exporters |
 | `Rag` | `RetrievalIndex` (BM25 + trained bi-encoder + rank fusion), `CrossEncoder` re-ranking, `Rag.For(chat)` with a word-level ChatML model that cites passages; hashing and placeholder tokens for unseen names | unseen towns: Hit@1 27.1% (BM25), 85.8% (hybrid), 99.9% (re-ranked); answers 91.1% correct (0% closed book), 99.9% cite the right passage; 14 min training |
+| `Pretrained` | `PretrainedModel.Load(folder)` on a Hugging Face model folder; `chat` in the model's own template (reasoning, tool calls); `check` against a reference from `tools/pytorch/pretrained_reference.py` (token ids, chat templates, logits, greedy output) | on small Qwen3- and Llama-layout models built here (trained `tokenizers` tokenizers, transformers' `apply_chat_template`, a NumPy port of the Hugging Face forward pass): identical ids, templates and greedy text, logits within 1e-5 (F32 and BF16 files, sharded, SentencePiece and byte-level) |
 
 ### Train and predict modes
 
@@ -688,6 +692,45 @@ models: they run on NeuralSharp's own CPU and CUDA backends, can be fine-tuned, 
 ONNX Runtime on a GPU needs its `.Gpu` (CUDA) or `.DirectML` package instead. `OnnxModule` works with predictors,
 the inference engine and the ASP.NET Core endpoints. The tests run every exported layer in ONNX Runtime and
 import it back, and both must match NeuralSharp within 1e-4.
+
+### Pretrained models: the optional `NeuralSharp.Pretrained` package
+
+```csharp
+using var model = PretrainedModel.Load("Qwen3-0.6B", new PretrainedOptions { Device = Device.Cuda(), Int8 = true, MaxPositions = 8192 });
+model.Spec;                      // the DecoderSpec read from config.json (layers, heads, GQA, RoPE, q/k norm, …)
+model.Notes;                     // anything approximated (for example sliding-window attention beyond the window)
+
+var chat = model.CreateChat(KeyValueFormat.Int8);                          // the model's own chat template and stop tokens
+var reply = chat.Chat(new ChatRequest(messages, tools, Think: false));     // reasoning and tool calls come back parsed
+
+string text = model.ChatTemplate!.Render(messages, tools, think: null, addGenerationPrompt: false);   // training text
+
+PretrainedArchitectures.Register("MyForCausalLM", PretrainedArchitectures.LlamaStyle((config, spec, notes) => spec with { QkNorm = true }));
+```
+
+A model folder in the Hugging Face layout becomes an ordinary NeuralSharp `Sequential`: `config.json` is read into a
+`DecoderSpec` by an architecture registry (Llama, Mistral, Qwen2, Qwen3 and Gemma are registered; others are one
+`Register` call, usually `LlamaStyle` with a few spec changes), and the weights are read from safetensors (F32, F16,
+BF16; single files or sharded with an index) one tensor at a time, transposed to NeuralSharp's layout and, with
+`Int8`, quantized as they are read. Nothing is built for one family: the decoder is assembled from generic blocks
+(RMSNorm, RoPE with linear/llama3 scaling, grouped-query attention, gated feed-forward, optional q/k norm, biases,
+post-norms, tied embeddings), so other models use the same code. The model runs on NeuralSharp's CPU and CUDA
+backends, and trains, takes LoRA adapters, quantizes and saves like any other.
+
+`BpeTokenizer` reads `tokenizer.json` (byte-level BPE as in Qwen, Llama 3 and GPT-2; SentencePiece-style BPE with
+byte fallback as in Llama 2 and Mistral; the normalizers, pre-tokenizers and decoders those use), and
+`JinjaChatTemplate` renders the model's own chat template with a Jinja interpreter (the subset templates use,
+with Hugging Face's settings), so prompts, tool definitions, tool calls and reasoning are laid out exactly as the
+model was trained, for any family. The tests compare the interpreter with Python's jinja2 on real templates.
+
+To check a model against transformers on your machine (it needs PyTorch and access to the Hugging Face Hub):
+
+```
+pip install torch transformers huggingface_hub
+python tools/pytorch/pretrained_reference.py --model Qwen/Qwen3-0.6B --out qwen3.json
+dotnet run -c Release --project samples/NeuralSharp.Samples.Pretrained -- check qwen3.json --cuda [--int8] [--kv8]
+dotnet run -c Release --project samples/NeuralSharp.Samples.Pretrained -- chat <model folder> --cuda
+```
 
 ### Fine-tuning: freezing, a learning rate per group, saving only what changed, LoRA
 

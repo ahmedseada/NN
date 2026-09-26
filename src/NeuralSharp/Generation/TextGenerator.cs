@@ -125,7 +125,7 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
 
         var generated = new List<int>();
         var text = new System.Text.StringBuilder();
-        int emitted = 0, read = 0, resets = 0;
+        int emitted = 0, read = 0, decoded = 0, resets = 0;
         TimeSpan promptDuration = TimeSpan.Zero;
         string? doneReason = null;
 
@@ -140,8 +140,24 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
                     history.Add(step[0].Id);
                 }
 
-                text.Append(Tokenizer.Decode(generated.Skip(read)));
                 read = produced;
+            }
+
+            // Byte-level tokenizers can split a character's UTF-8 bytes across tokens: while the new tokens decode to an
+            // incomplete character (ending in U+FFFD), wait for the next ones (at most 4, the longest UTF-8 sequence).
+            // New tokens are decoded after a few earlier ones and only the difference is kept, since decoders may treat
+            // the start of a text specially (SentencePiece decoders drop its leading space).
+            if (generated.Count > decoded)
+            {
+                int from = Math.Max(0, decoded - 4);
+                string before = Tokenizer.Decode(generated.Skip(from).Take(decoded - from));
+                string after = Tokenizer.Decode(generated.Skip(from));
+                string pieceText = after.StartsWith(before, StringComparison.Ordinal) ? after[before.Length..] : after[Math.Min(before.Length, after.Length)..];
+                if (final || !pieceText.EndsWith('\uFFFD') || generated.Count - decoded >= 4)
+                {
+                    text.Append(pieceText);
+                    decoded = generated.Count;
+                }
             }
 
             int end = text.Length;
