@@ -6,7 +6,36 @@ internal sealed unsafe partial class CudaBackend
     public override void Int8MatMul(Storage x, Storage q, Storage scales, Storage y, int m, int n, int k)
     {
         int words = (n + 3) / 4;
-        Launch1D(K("int8_matmul_f32"), m * words, P(x), P(q), P(scales), P(y), U(k), U(words), U(n), U(m * words));
+        if (m > PtxKernels.GemvRows || k == 0)
+        {
+            Launch1D(K("int8_matmul_f32"), m * words, P(x), P(q), P(scales), P(y), U(k), U(words), U(n), U(m * words));
+            return;
+        }
+
+        // Few rows (decoding): read each weight word once, with enough blocks to keep every multiprocessor busy.
+        // Narrow matrices split k into chunks whose partial sums are added in order by a second kernel.
+        int columnBlocks = (words + 31) / 32;
+        int splits = Math.Clamp((4 * Math.Max(1, _multiprocessors) + columnBlocks - 1) / columnBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
+        int chunk = (k + splits - 1) / splits;
+        splits = (k + chunk - 1) / chunk;
+        if (splits == 1)
+        {
+            Launch(K("int8_gemv_f32"), (uint)columnBlocks, 1, 1, PtxKernels.Int8GemvThreads, 1,
+                P(x), P(q), P(scales), P(y), P(y), U(m), U(n), U(k), U(words), U(chunk), U(1));
+            return;
+        }
+
+        var part = Allocate(splits * m * n, zeroed: false);
+        try
+        {
+            Launch(K("int8_gemv_f32"), (uint)columnBlocks, (uint)splits, 1, PtxKernels.Int8GemvThreads, 1,
+                P(x), P(q), P(scales), P(y), P(part), U(m), U(n), U(k), U(words), U(chunk), U(splits));
+            Launch1D(K("int8_gemv_finish_f32"), m * n, P(part), P(scales), P(y), U(n), U(m * n), U(splits), U(m * n));
+        }
+        finally
+        {
+            part.Release();
+        }
     }
 
     public override void Int8Dequantize(Storage q, Storage scales, Storage w, int k, int n)

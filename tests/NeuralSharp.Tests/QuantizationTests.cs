@@ -293,6 +293,16 @@ internal static partial class Tests
             AssertClose(reference.Grad!.ToArray(), x.Grad!.ToArray(), 1e-4f, $"input gradient, {m} rows");
         }
 
+        // Larger products: the k dimension is split across blocks (partial sums added in order) and N % 4 != 0.
+        foreach (var (m, k, n) in new[] { (1, 1030, 301), (5, 4100, 130), (8, 700, 2050) })
+        {
+            using var w = Tensor.From([.. Enumerable.Range(0, k * n).Select(_ => (float)(r.NextDouble() * 2 - 1))], [k, n], device);
+            using var wq = Int8Weight.Quantize(w);
+            using var wd = wq.Dequantize();
+            using var x = Tensor.From([.. Enumerable.Range(0, m * k).Select(_ => (float)(r.NextDouble() * 2 - 1))], [m, k], device);
+            AssertClose(x.MatMul(wd).ToArray(), x.MatMulInt8(wq).ToArray(), 2e-3f, $"int8 product [{m}x{k}] × [{k}x{n}]");
+        }
+
         using var batched = Tensor.From([.. Enumerable.Range(0, 2 * 3 * K).Select(i => MathF.Sin(i))], [2, 3, K], device);
         using var flatInput = batched.Reshape(6, K);
         AssertClose(flatInput.MatMul(dequantized).ToArray(), batched.MatMulInt8(q).ToArray(), 1e-4f, "[batch, time, k] input");
