@@ -6,7 +6,10 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "gemm128_f32", "gemm64_f32"];
+
+    /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
+    public const int GemmThreads = 256;
 
     /// <summary>Threads per row in <see cref="RowBlock"/> kernels (a multiple of 32, at most 1024).</summary>
     public const int RowThreads = 256;
@@ -218,6 +221,225 @@ internal static partial class PtxKernels
         GemvNN(sb);
         GemvNT(sb);
         AttentionDecode(sb);
+        Gemm(sb, "gemm128_f32", 128, 8);
+        Gemm(sb, "gemm64_f32", 64, 4);
+    }
+
+    // C[b] = op(A[b]) · op(B[b]) (+ beta · C) with register blocking: a block computes a tile × tile patch of C with
+    // 256 threads, each an (per × per) patch, walking k eight at a time through shared memory (A stored k-major so a
+    // thread's rows are contiguous; B likewise for its columns). Every output adds its k terms in ascending order with
+    // fused multiply-adds, as the 16 × 16 kernel does, so results do not depend on which kernel ran.
+    // Parameters as matmul_f32: a, b, c, m, n, k, transA, transB, beta, batch strides. Grid: x = ⌈n / tile⌉,
+    // y = ⌈m / tile⌉, z = batch.
+    private static void Gemm(StringBuilder sb, string name, int tile, int per)
+    {
+        const int K = 8;
+        int log = (int)Math.Log2(tile), loads = tile * K / GemmThreads, threadsPerRow = tile / per;
+        var s = new StringBuilder();
+        s.AppendLine($$"""
+            .visible .entry {{name}}(
+                .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,
+                .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_ta, .param .u32 p_tb, .param .f32 p_beta,
+                .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc
+            )
+            {
+                .reg .pred %p<16>;
+                .reg .f32 %acc<{{per * per}}>;
+                .reg .f32 %fa<{{per}}>;
+                .reg .f32 %fb<{{per}}>;
+                .reg .f32 %f<8>;
+                .reg .f32 %beta;
+                .reg .b32 %r<48>;
+                .reg .b64 %rd<32>;
+                .shared .align 16 .f32 {{name}}_as[{{K * tile}}];
+                .shared .align 16 .f32 {{name}}_bs[{{K * tile}}];
+                ld.param.u64 %rd1, [p_a];
+                ld.param.u64 %rd2, [p_b];
+                ld.param.u64 %rd3, [p_c];
+                cvta.to.global.u64 %rd1, %rd1;
+                cvta.to.global.u64 %rd2, %rd2;
+                cvta.to.global.u64 %rd3, %rd3;
+                ld.param.u32 %r1, [p_m];
+                ld.param.u32 %r2, [p_n];
+                ld.param.u32 %r3, [p_k];
+                ld.param.u32 %r4, [p_ta];
+                ld.param.u32 %r5, [p_tb];
+                ld.param.f32 %beta, [p_beta];
+                ld.param.u64 %rd4, [p_sa];
+                ld.param.u64 %rd5, [p_sb];
+                ld.param.u64 %rd6, [p_sc];
+                mov.u32 %r40, %ctaid.z;
+                cvt.u64.u32 %rd7, %r40;
+                mul.lo.u64 %rd8, %rd7, %rd4;
+                shl.b64 %rd8, %rd8, 2;
+                add.u64 %rd1, %rd1, %rd8;
+                mul.lo.u64 %rd8, %rd7, %rd5;
+                shl.b64 %rd8, %rd8, 2;
+                add.u64 %rd2, %rd2, %rd8;
+                mul.lo.u64 %rd8, %rd7, %rd6;
+                shl.b64 %rd8, %rd8, 2;
+                add.u64 %rd3, %rd3, %rd8;
+                setp.ne.u32 %p1, %r4, 0;
+                setp.ne.u32 %p2, %r5, 0;
+                setp.ne.f32 %p7, %beta, 0f00000000;
+                mov.u32 %r6, %tid.x;
+                and.b32 %r7, %r6, {{threadsPerRow - 1}};
+                shr.u32 %r8, %r6, {{(int)Math.Log2(threadsPerRow)}};
+                mov.u32 %r9, %ctaid.y;
+                shl.b32 %r9, %r9, {{log}};
+                mov.u32 %r10, %ctaid.x;
+                shl.b32 %r10, %r10, {{log}};
+                mov.u32 %r12, {{name}}_as;
+                mov.u32 %r13, {{name}}_bs;
+                shl.b32 %r31, %r8, {{(int)Math.Log2(per * 4)}};
+                add.u32 %r31, %r31, %r12;
+                shl.b32 %r32, %r7, {{(int)Math.Log2(per * 4)}};
+                add.u32 %r32, %r32, %r13;
+            """);
+        for (int i = 0; i < per * per; i++)
+        {
+            s.AppendLine($"    mov.f32 %acc{i}, 0f00000000;");
+        }
+
+        s.AppendLine("""
+                mov.u32 %r11, 0;
+            KLOOP:
+                setp.ge.u32 %p10, %r11, %r3;
+                @%p10 bra KEND;
+            """);
+        for (int r = 0; r < loads; r++)
+        {
+            // A: element e of the tile; not transposed: (i = e / 8, kk = e % 8) with a[i, k] at i·K + k; transposed:
+            // (kk = e / tile, i = e % tile) with a stored [K, m]. Stored in shared memory as as[kk, i].
+            s.AppendLine($$"""
+                    add.u32 %r20, %r6, {{GemmThreads * r}};
+                    shr.u32 %r21, %r20, 3;
+                    and.b32 %r22, %r20, 7;
+                    shr.u32 %r23, %r20, {{log}};
+                    and.b32 %r24, %r20, {{tile - 1}};
+                    selp.b32 %r25, %r24, %r21, %p1;
+                    selp.b32 %r26, %r23, %r22, %p1;
+                    add.u32 %r27, %r9, %r25;
+                    add.u32 %r28, %r11, %r26;
+                    setp.lt.u32 %p3, %r27, %r1;
+                    setp.lt.u32 %p4, %r28, %r3;
+                    and.pred %p3, %p3, %p4;
+                    mul.wide.u32 %rd10, %r27, %r3;
+                    cvt.u64.u32 %rd11, %r28;
+                    add.u64 %rd10, %rd10, %rd11;
+                    mul.wide.u32 %rd12, %r28, %r1;
+                    cvt.u64.u32 %rd13, %r27;
+                    add.u64 %rd12, %rd12, %rd13;
+                    selp.b64 %rd14, %rd12, %rd10, %p1;
+                    shl.b64 %rd14, %rd14, 2;
+                    add.u64 %rd14, %rd14, %rd1;
+                    mov.f32 %f1, 0f00000000;
+                    @%p3 ld.global.f32 %f1, [%rd14];
+                    shl.b32 %r29, %r26, {{log}};
+                    add.u32 %r29, %r29, %r25;
+                    shl.b32 %r29, %r29, 2;
+                    add.u32 %r29, %r29, %r12;
+                    st.shared.f32 [%r29], %f1;
+                """);
+        }
+
+        for (int r = 0; r < loads; r++)
+        {
+            // B: not transposed: (kk = e / tile, j = e % tile) with b[k, j] at k·n + j; transposed: (j = e / 8, kk = e % 8)
+            // with b stored [n, K]. Stored as bs[kk, j].
+            s.AppendLine($$"""
+                    add.u32 %r20, %r6, {{GemmThreads * r}};
+                    shr.u32 %r21, %r20, {{log}};
+                    and.b32 %r22, %r20, {{tile - 1}};
+                    shr.u32 %r23, %r20, 3;
+                    and.b32 %r24, %r20, 7;
+                    selp.b32 %r25, %r23, %r22, %p2;
+                    selp.b32 %r26, %r24, %r21, %p2;
+                    add.u32 %r27, %r10, %r25;
+                    add.u32 %r28, %r11, %r26;
+                    setp.lt.u32 %p3, %r27, %r2;
+                    setp.lt.u32 %p4, %r28, %r3;
+                    and.pred %p3, %p3, %p4;
+                    mul.wide.u32 %rd10, %r28, %r2;
+                    cvt.u64.u32 %rd11, %r27;
+                    add.u64 %rd10, %rd10, %rd11;
+                    mul.wide.u32 %rd12, %r27, %r3;
+                    cvt.u64.u32 %rd13, %r28;
+                    add.u64 %rd12, %rd12, %rd13;
+                    selp.b64 %rd14, %rd12, %rd10, %p2;
+                    shl.b64 %rd14, %rd14, 2;
+                    add.u64 %rd14, %rd14, %rd2;
+                    mov.f32 %f1, 0f00000000;
+                    @%p3 ld.global.f32 %f1, [%rd14];
+                    shl.b32 %r29, %r26, {{log}};
+                    add.u32 %r29, %r29, %r25;
+                    shl.b32 %r29, %r29, 2;
+                    add.u32 %r29, %r29, %r13;
+                    st.shared.f32 [%r29], %f1;
+                """);
+        }
+
+        s.AppendLine("    bar.sync 0;");
+        for (int kk = 0; kk < K; kk++)
+        {
+            for (int v = 0; v < per / 4; v++)
+            {
+                s.AppendLine($"    ld.shared.v4.f32 {{%fa{4 * v}, %fa{4 * v + 1}, %fa{4 * v + 2}, %fa{4 * v + 3}}}, [%r31+{kk * tile * 4 + 16 * v}];");
+                s.AppendLine($"    ld.shared.v4.f32 {{%fb{4 * v}, %fb{4 * v + 1}, %fb{4 * v + 2}, %fb{4 * v + 3}}}, [%r32+{kk * tile * 4 + 16 * v}];");
+            }
+
+            for (int i = 0; i < per; i++)
+            {
+                for (int j = 0; j < per; j++)
+                {
+                    s.AppendLine($"    fma.rn.f32 %acc{i * per + j}, %fa{i}, %fb{j}, %acc{i * per + j};");
+                }
+            }
+        }
+
+        s.AppendLine("""
+                bar.sync 0;
+                add.u32 %r11, %r11, 8;
+                bra KLOOP;
+            KEND:
+            """);
+        s.AppendLine($"""
+                shl.b32 %r33, %r8, {(int)Math.Log2(per)};
+                add.u32 %r33, %r33, %r9;
+                shl.b32 %r34, %r7, {(int)Math.Log2(per)};
+                add.u32 %r34, %r34, %r10;
+            """);
+        for (int i = 0; i < per; i++)
+        {
+            s.AppendLine($"""
+                    add.u32 %r35, %r33, {i};
+                    setp.ge.u32 %p5, %r35, %r1;
+                    @%p5 bra STORED;
+                    mul.wide.u32 %rd20, %r35, %r2;
+                    cvt.u64.u32 %rd21, %r34;
+                    add.u64 %rd20, %rd20, %rd21;
+                    shl.b64 %rd20, %rd20, 2;
+                    add.u64 %rd20, %rd20, %rd3;
+                """);
+            for (int j = 0; j < per; j++)
+            {
+                s.AppendLine($"""
+                        add.u32 %r36, %r34, {j};
+                        setp.lt.u32 %p6, %r36, %r2;
+                        and.pred %p8, %p6, %p7;
+                        @%p8 ld.global.f32 %f2, [%rd20+{4 * j}];
+                        @%p8 fma.rn.f32 %acc{i * per + j}, %f2, %beta, %acc{i * per + j};
+                        @%p6 st.global.f32 [%rd20+{4 * j}], %acc{i * per + j};
+                    """);
+            }
+        }
+
+        s.AppendLine("""
+            STORED:
+                ret;
+            }
+            """);
+        sb.AppendLine(s.ToString());
     }
 
     // Attention of one query row over the filled part of a key/value cache (see Backend.AttentionDecode). One block

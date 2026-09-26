@@ -220,9 +220,9 @@ internal static partial class Tests
         }
 
         // Batched, as in decoding attention: weights · values and queries · keysᵀ for 3 heads of 2 rows.
-        foreach (bool transB in new[] { false, true })
+        foreach (var (transB, M) in new[] { (false, 2), (true, 2), (false, 150), (true, 150) })
         {
-            const int B = 3, M = 2, K = 600, N = 200;
+            const int B = 3, K = 600, N = 200;
             var a = Enumerable.Range(0, B * M * K).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
             var b = Enumerable.Range(0, B * K * N).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
             using var ta = Tensor.From(a, [B, M, K], device);

@@ -431,6 +431,15 @@ internal sealed unsafe partial class CudaBackend : Backend
         // Token-by-token decoding: few rows through a large matrix read each weight once. (Smaller products keep the
         // tiled kernel, whose sums do not depend on the number of rows, so small models predict identically in any batch.)
         bool few = m <= PtxKernels.GemvRows && !transA && (long)n * k >= 1 << 16;
+
+        // Larger products: register-blocked tiles, 128 × 128 when that still gives every multiprocessor a block, else
+        // 64 × 64. (Small ones keep the 16 × 16 kernel; all add k terms in the same order, so results are identical.)
+        int gemmTile = 0;
+        if (!few && m >= 64 && n >= 64 && k >= 8)
+        {
+            long tiles128 = (long)((m + 127) / 128) * ((n + 127) / 128) * batch;
+            gemmTile = tiles128 >= Math.Max(1, _multiprocessors) ? 128 : 64;
+        }
         for (int first = 0; first < batch; first += MaxGridZ)
         {
             int count = Math.Min(MaxGridZ, batch - first);
@@ -440,6 +449,14 @@ internal sealed unsafe partial class CudaBackend : Backend
                 uint columnsPerBlock = transB ? 8u : 32u;
                 Launch(K(transB ? "gemv_nt_f32" : "gemv_nn_f32"), (uint)((n + columnsPerBlock - 1) / columnsPerBlock), 1, (uint)count,
                     (uint)(transB ? PtxKernels.RowThreads : PtxKernels.GemvThreads), 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn, U(m), U(n), U(k), F(beta), mk, kn, mn);
+                continue;
+            }
+
+            if (gemmTile > 0)
+            {
+                Launch(K(gemmTile == 128 ? "gemm128_f32" : "gemm64_f32"), (uint)((n + gemmTile - 1) / gemmTile), (uint)((m + gemmTile - 1) / gemmTile),
+                    (uint)count, PtxKernels.GemmThreads, 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn,
+                    U(m), U(n), U(k), U(transA ? 1 : 0), U(transB ? 1 : 0), F(beta), mk, kn, mn);
                 continue;
             }
 
