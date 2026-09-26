@@ -123,41 +123,10 @@ internal static partial class PtxKernels
             """);
     }
 
-    // ------------------------------------------------------------------ one thread per row
-
-    /// <summary>Loop over the columns of the row starting at byte address <paramref name="rowPtr"/>; the body sees %f2 = element, %rd5 = its address.</summary>
-    private static string RowLoop(string label, string rowPtr, string body) => $"""
-        mov.u32 %r6, 0;
-        mov.u64 %rd5, {rowPtr};
-        {label}:
-        setp.ge.u32 %p1, %r6, %s_cols;
-        @%p1 bra {label}_END;
-        ld.global.f32 %f2, [%rd5];
-        {body}
-        add.u64 %rd5, %rd5, 4;
-        add.u32 %r6, %r6, 1;
-        bra {label};
-        {label}_END:
-        """;
-
-    /// <summary>Arg-max of the row at <paramref name="rowPtr"/> into <paramref name="indexReg"/> (first maximum wins).</summary>
-    private static string ArgMaxLoop(string label, string rowPtr, string indexReg) =>
-        $"""
-        mov.f32 %f1, {NegInf};
-        mov.u32 {indexReg}, 0;
-        """ + "\n" + RowLoop(label, rowPtr, $"""
-        setp.gt.f32 %p2, %f2, %f1;
-        selp.f32 %f1, %f2, %f1, %p2;
-        selp.u32 {indexReg}, %r6, {indexReg}, %p2;
-        """);
+    // ------------------------------------------------------------------ one block per row
 
     private static void RowKernels(StringBuilder sb)
     {
-        const string RowStart = """
-            mul.lo.u32 %r5, %i, %s_cols;
-            mul.wide.u32 %rd1, %r5, 4;
-            """;
-
         const string BlockRowStart = """
             mul.lo.u32 %r5, %row, %s_cols;
             mul.wide.u32 %rd1, %r5, 4;
@@ -231,16 +200,31 @@ internal static partial class PtxKernels
             st.global.f32 [%rd9], %f4;
             """));
 
-        Elementwise(sb, "argmax_f32", ["x", "y"], [("u32", "cols")],
-            RowStart + """
+        // Index of the row's first maximum: each thread's first maximum over its columns, then the block's (ties go to the
+        // smaller index). One block per row.
+        static string RowArgMax(string label, string rowPtr, string value, string index) => $"""
+            mov.f32 {value}, {NegInf};
+            mov.u32 {index}, 0xFFFFFFFF;
+            """ + "\n" + StridedLoop(label, rowPtr, "%s_cols", $"""
+            setp.gt.f32 %p8, %f2, {value};
+            setp.eq.u32 %p9, {index}, 0xFFFFFFFF;
+            or.pred %p8, %p8, %p9;
+            selp.f32 {value}, %f2, {value}, %p8;
+            selp.b32 {index}, %r6, {index}, %p8;
+            """) + "\n" + BlockArgMax("R" + label, value, index);
+
+        RowBlock(sb, "argmax_f32", ["x", "y"], [("u32", "cols")],
+            BlockRowStart + """
             add.u64 %rd2, %b_x, %rd1;
-            """ + "\n" + ArgMaxLoop("ARG", "%rd2", "%r7") + "\n" + """
+            """ + "\n" + RowArgMax("ARG", "%rd2", "%f1", "%r7") + "\n" + """
+            setp.eq.u32 %p3, %tx, 0;
             cvt.rn.f32.u32 %f7, %r7;
-            st.global.f32 [%a_y], %f7;
+            @%p3 st.global.f32 [%a_y], %f7;
             """);
 
-        Elementwise(sb, "class_match_f32", ["p", "t", "y"], [("u32", "cols"), ("f32", "threshold")],
-            RowStart + $"""
+        RowBlock(sb, "class_match_f32", ["p", "t", "y"], [("u32", "cols"), ("f32", "threshold")],
+            BlockRowStart + $"""
+            setp.eq.u32 %p3, %tx, 0;
             setp.ne.u32 %p4, %s_cols, 1;
             @%p4 bra MULTI;
             ld.global.f32 %f8, [%a_p];
@@ -253,11 +237,11 @@ internal static partial class PtxKernels
             MULTI:
             add.u64 %rd2, %b_p, %rd1;
             add.u64 %rd3, %b_t, %rd1;
-            """ + "\n" + ArgMaxLoop("ARGP", "%rd2", "%r7") + "\n" + ArgMaxLoop("ARGT", "%rd3", "%r8") + "\n" + $"""
+            """ + "\n" + RowArgMax("ARGP", "%rd2", "%f1", "%r7") + "\n" + RowArgMax("ARGT", "%rd3", "%f3", "%r8") + "\n" + $"""
             setp.eq.u32 %p5, %r7, %r8;
             selp.f32 %f10, {One}, {Zero}, %p5;
             WRITE:
-            st.global.f32 [%a_y], %f10;
+            @%p3 st.global.f32 [%a_y], %f10;
             """);
     }
 

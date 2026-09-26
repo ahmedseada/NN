@@ -16,10 +16,10 @@ internal sealed unsafe partial class CudaBackend
         LaunchRows(K("softmax_bwd_f32"), rows, P(y), P(dy), P(dx), U(cols), U(log ? 1 : 0), U(rows));
 
     public override void ArgMax(Storage x, Storage y, int rows, int cols) =>
-        Launch1D(K("argmax_f32"), rows, P(x), P(y), U(cols), U(rows));
+        LaunchRows(K("argmax_f32"), rows, P(x), P(y), U(cols), U(rows));
 
     public override void ClassMatch(Storage predictions, Storage targets, Storage y, int rows, int cols, float threshold) =>
-        Launch1D(K("class_match_f32"), rows, P(predictions), P(targets), P(y), U(cols), F(threshold), U(rows));
+        LaunchRows(K("class_match_f32"), rows, P(predictions), P(targets), P(y), U(cols), F(threshold), U(rows));
 
     public override void NormStats(Storage x, Storage mean, Storage variance, Storage invStd, int outer, int groups, int inner, float eps)
     {
