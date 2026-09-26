@@ -250,7 +250,7 @@ public sealed class CharGpt : IDisposable
             else
             {
                 Model.Eval();
-                using var context = new DecodingContext(Device, samples, Config.Context);
+                using var context = new DecodingContext(Device, samples, Config.Context) { LastPositionOnly = true };
                 ComputeGraph? graph = null;
                 void Step()
                 {

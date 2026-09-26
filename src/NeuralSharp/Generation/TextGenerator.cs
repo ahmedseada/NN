@@ -234,6 +234,7 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
             // NoGrad is entered per compute call, never held across a yield (it is thread-local state of the caller).
             var (kept, keptIds) = options.UseCache && KeepCache ? TakeCache(context) : (null, []);
             var decoding = kept ?? new DecodingContext(Device, 1, context, CacheFormat);
+            decoding.LastPositionOnly = true;                                   // the sampler reads the last position only
             bool keep = false;
             ComputeGraph? graph = null;
             try

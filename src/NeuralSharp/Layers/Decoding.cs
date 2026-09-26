@@ -135,8 +135,24 @@ public sealed class DecodingContext : IDisposable
     /// <summary>Positions processed so far, as tracked on the host.</summary>
     public int Length { get; private set; }
 
-    /// <summary>The current step's [newSteps, capacity] causal mask (set by <see cref="BeginStep"/>).</summary>
-    public Tensor? Mask { get; private set; }
+    /// <summary>
+    /// The current step's [newSteps, capacity] causal mask, or null outside a step. Built on first use (the tiled and
+    /// decoding attention kernels never need it: for a long prompt it would be newSteps × capacity floats).
+    /// </summary>
+    public Tensor? Mask => InStep ? _mask ??= Tensor.DecoderMask(Position, _steps, Capacity, track: false) : null;
+
+    private Tensor? _mask;
+    private int _steps;
+
+    /// <summary>Whether a step is open (between <see cref="BeginStep"/> and <see cref="EndStep"/>).</summary>
+    public bool InStep { get; private set; }
+
+    /// <summary>
+    /// When set, <see cref="Sequential.ForwardCached"/> returns only the last new position's outputs: the layers after the
+    /// last cached (attention) layer — final norm and output head — run on one position instead of every prompt position
+    /// (sampling reads only the last one; a long prompt's full logits would be prompt × vocabulary floats).
+    /// </summary>
+    public bool LastPositionOnly { get; set; }
 
     /// <summary>The current step's position indices, [newSteps] (set by <see cref="BeginStep"/>).</summary>
     public Tensor? Positions { get; private set; }
@@ -149,7 +165,8 @@ public sealed class DecodingContext : IDisposable
             throw new InvalidOperationException($"Decoding past the context capacity ({Capacity}); call Reset and re-feed a shorter window.");
         }
 
-        Mask = Tensor.DecoderMask(Position, steps, Capacity);
+        _steps = steps;
+        InStep = true;
         if (steps == 1)
         {
             Positions = Position;
@@ -173,8 +190,7 @@ public sealed class DecodingContext : IDisposable
     {
         Position.AddInPlace(steps);
         Length += steps;
-        Mask = null;
-        Positions = null;
+        ClearStep();
     }
 
     /// <summary>
@@ -187,9 +203,16 @@ public sealed class DecodingContext : IDisposable
         int length = Length;
         var graph = ComputeGraph.Capture(Device, step);
         Length = length;   // recording does not execute the step
-        Mask = null;
-        Positions = null;
+        ClearStep();
         return graph;
+    }
+
+    private void ClearStep()
+    {
+        _mask?.Dispose();
+        _mask = null;
+        InStep = false;
+        Positions = null;
     }
 
     /// <summary>Replays a step recorded with <see cref="CaptureStep"/> and advances the host-side length.</summary>

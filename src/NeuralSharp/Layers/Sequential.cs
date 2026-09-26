@@ -58,17 +58,24 @@ public sealed class Sequential : Module, IEnumerable<Module>, ICachedModule
     /// </summary>
     public Tensor ForwardCached(Tensor input, DecodingContext context)
     {
-        bool outermost = context.Mask is null;
+        bool outermost = !context.InStep;
         int steps = input.Shape[1];
         if (outermost)
         {
             context.BeginStep(steps);
         }
 
+        // With LastPositionOnly, the layers after the last cached one see only the last position.
+        int lastCached = outermost && context.LastPositionOnly && steps > 1 ? _modules.FindLastIndex(m => m is ICachedModule) : -1;
         var x = input;
-        foreach (var module in _modules)
+        for (int i = 0; i < _modules.Count; i++)
         {
+            var module = _modules[i];
             x = module is ICachedModule cached ? cached.ForwardCached(x, context) : module.Forward(x);
+            if (i == lastCached && x.Rank == 3)
+            {
+                x = x.Narrow(1, x.Shape[1] - 1, 1);
+            }
         }
 
         if (outermost)

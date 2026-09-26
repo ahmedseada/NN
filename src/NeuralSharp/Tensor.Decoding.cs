@@ -51,9 +51,9 @@ public sealed partial class Tensor
     }
 
     /// <summary>[rows, capacity] causal mask for queries at positions position..position+rows-1 (position read on the device).</summary>
-    internal static Tensor DecoderMask(Tensor position, int rows, int capacity)
+    internal static Tensor DecoderMask(Tensor position, int rows, int capacity, bool track = true)
     {
-        var mask = Empty([rows, capacity], position.Device);
+        var mask = Empty([rows, capacity], position.Device, track: track);
         position.Backend.DecoderMask(position.Storage, mask.Storage, rows, capacity);
         return mask;
     }
