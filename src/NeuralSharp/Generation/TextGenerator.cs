@@ -198,8 +198,9 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
             if (generated.Count > decoded)
             {
                 int from = Math.Max(0, decoded - 4);
-                string before = Tokenizer.Decode(generated.Skip(from).Take(decoded - from));
-                string after = Tokenizer.Decode(generated.Skip(from));
+                var ids = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(generated);
+                string before = Tokenizer.Decode(ids[from..decoded]);
+                string after = Tokenizer.Decode(ids[from..]);
                 string pieceText = after.StartsWith(before, StringComparison.Ordinal) ? after[before.Length..] : after[Math.Min(before.Length, after.Length)..];
                 if (final || !pieceText.EndsWith('\uFFFD') || generated.Count - decoded >= 4)
                 {
@@ -237,7 +238,17 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
             ComputeGraph? graph = null;
             try
             {
-                Tensor Window(int keep) => Tensor.From([.. history.TakeLast(keep).Select(i => (float)i)], [1, keep], Device);
+                Tensor Window(int keep)
+                {
+                    var values = new float[keep];
+                    var ids = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(history)[^keep..];
+                    for (int i = 0; i < keep; i++)
+                    {
+                        values[i] = ids[i];
+                    }
+
+                    return Tensor.From(values, [1, keep], Device);
+                }
 
                 void Prefill(int keep)
                 {

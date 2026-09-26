@@ -14,6 +14,9 @@ public interface ITokenizer
 
     /// <summary>The text of a sequence of token ids.</summary>
     string Decode(IEnumerable<int> ids);
+
+    /// <summary>The text of a sequence of token ids given as a span (tokenizers may decode it without copying the ids).</summary>
+    string Decode(ReadOnlySpan<int> ids) => Decode((IEnumerable<int>)ids.ToArray());
 }
 
 /// <summary>
