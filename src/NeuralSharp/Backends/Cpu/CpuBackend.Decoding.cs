@@ -24,18 +24,7 @@ internal sealed partial class CpuBackend
                     max = MathF.Max(max, ys[j]);
                 }
 
-                float sum = 0f;
-                for (int j = 0; j < cols; j++)
-                {
-                    ys[j] = MathF.Exp(ys[j] - max);
-                    sum += ys[j];
-                }
-
-                float inv = 1f / sum;
-                for (int j = 0; j < cols; j++)
-                {
-                    ys[j] *= inv;
-                }
+                CpuMath.Scale(ys, 1f / CpuMath.ExpShifted(ys, max));
             }
         });
     }

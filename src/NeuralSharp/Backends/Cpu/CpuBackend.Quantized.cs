@@ -247,12 +247,7 @@ internal sealed partial class CpuBackend
                     max = MathF.Max(max, scores[c]);
                 }
 
-                float sum = 0f;
-                for (int c = 0; c < count; c++)
-                {
-                    scores[c] = MathF.Exp(scores[c] - max);
-                    sum += scores[c];
-                }
+                float sum = CpuMath.ExpShifted(scores.AsSpan(0, count), max);
 
                 if (lv is not null)
                 {
@@ -345,12 +340,7 @@ internal sealed partial class CpuBackend
                     max = MathF.Max(max, scores[c]);
                 }
 
-                float sum = 0f;
-                for (int c = 0; c < count; c++)
-                {
-                    scores[c] = MathF.Exp(scores[c] - max);
-                    sum += scores[c];
-                }
+                float sum = CpuMath.ExpShifted(scores.AsSpan(0, count), max);
 
                 var output = yv.AsSpan(row * dim, dim);
                 output.Clear();
@@ -502,10 +492,7 @@ internal sealed partial class CpuBackend
         float[] gv = D(gate), uv = D(up), yv = D(y);
         For(n, (long)n * 8, (first, last) =>
         {
-            for (int i = first; i < last; i++)
-            {
-                yv[i] = Activation(gv[i], kind).Value * uv[i];
-            }
+            CpuMath.Gated(gv.AsSpan(first, last - first), uv.AsSpan(first, last - first), yv.AsSpan(first, last - first), kind);
         });
     }
 

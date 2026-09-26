@@ -57,19 +57,9 @@ internal sealed partial class CpuBackend
             {
                 var xs = xv.AsSpan(r * cols, cols);
                 var ys = yv.AsSpan(r * cols, cols);
-                float max = float.NegativeInfinity;
-                foreach (float v in xs)
-                {
-                    max = MathF.Max(max, v);
-                }
-
-                double sum = 0;
-                for (int j = 0; j < cols; j++)
-                {
-                    float e = MathF.Exp(xs[j] - max);
-                    ys[j] = e;
-                    sum += e;
-                }
+                float max = CpuMath.Max(xs);
+                xs.CopyTo(ys);
+                double sum = CpuMath.ExpShifted(ys, max);
 
                 if (log)
                 {
@@ -81,11 +71,7 @@ internal sealed partial class CpuBackend
                 }
                 else
                 {
-                    float inv = (float)(1.0 / sum);
-                    for (int j = 0; j < cols; j++)
-                    {
-                        ys[j] *= inv;
-                    }
+                    CpuMath.Scale(ys, (float)(1.0 / sum));
                 }
             }
         });
