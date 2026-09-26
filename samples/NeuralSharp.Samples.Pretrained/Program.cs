@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json.Nodes;
 using NeuralSharp;
+using NeuralSharp.Diagnostics;
 using NeuralSharp.Generation;
 using NeuralSharp.Layers;
 using NeuralSharp.Pretrained;
@@ -10,6 +11,7 @@ using NeuralSharp.Pretrained;
 //
 //   info  <folder>                  what the loader made of the model (architecture, parameters, notes)
 //   chat  <folder>                  chat with the model in its own chat template (reasoning and tool calls shown)
+//   profile <folder>                time each operation and layer of a prompt pass and of decoding
 //   check <reference.json>          compare with transformers: token ids, chat templates, logits, greedy output
 //                                   (make the reference with tools/pytorch/pretrained_reference.py)
 //
@@ -35,9 +37,9 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check"))
+if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile"))
 {
-    Console.WriteLine("usage: info <folder> | chat <folder> | check <reference.json>   [--cuda|--cpu] [--int8] [--kv8] [--context N] [--folder F] [--no-think]");
+    Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json>   [--cuda|--cpu] [--int8] [--kv8] [--context N] [--folder F] [--no-think]");
     return 1;
 }
 
@@ -135,8 +137,57 @@ switch (positional[0])
         return 0;
     }
 
+    case "profile":
+    {
+        using var model = Load(positional[1]);
+        return Profile(model);
+    }
+
     default:
         return Check(positional[1]);
+}
+
+// Times a prompt pass and a short generation: wall time, then the operations and layers that took it.
+int Profile(PretrainedModel model)
+{
+    string prompt = string.Concat(Enumerable.Repeat("public static int Add(int a, int b) => a + b;\n", 12));
+    var ids = model.Tokenizer!.Encode(prompt);
+    using var input = Tensor.From([.. ids.Select(i => (float)i)], [1, ids.Count], device);
+    for (int i = 0; i < 2; i++)
+    {
+        var warm = Stopwatch.StartNew();
+        using (var y = model.Network.Predict(input))
+        {
+            device.Synchronize();
+        }
+
+        Console.WriteLine($"prompt pass {i + 1} ({ids.Count} tokens): {warm.Elapsed.TotalMilliseconds:F1} ms");
+    }
+
+    var generator = model.CreateGenerator(cacheFormat, context);
+    var greedy = new GenerationOptions { TopK = 1, Temperature = 1f, RepeatPenalty = 1f, NumPredict = 32, NumCtx = context, Seed = 0 };
+    var (_, _, stats) = generator.Generate(prompt, greedy);
+    Console.WriteLine($"generation: prompt {stats.PromptDuration.TotalMilliseconds:F0} ms, {stats.GeneratedTokens} tokens at {stats.TokensPerSecond:F1} tok/s");
+
+    var recorder = new ProfileRecorder();
+    Telemetry.SynchronizeForTiming = true;
+    using (Telemetry.Subscribe(recorder))
+    {
+        var watch = Stopwatch.StartNew();
+        using (var y = model.Network.Predict(input))
+        {
+            device.Synchronize();
+        }
+
+        recorder.Report($"prompt pass, {ids.Count} tokens, timed per operation: {watch.Elapsed.TotalMilliseconds:F1} ms wall");
+        recorder.Clear();
+        watch.Restart();
+        var (_, _, timed) = generator.Generate(prompt, greedy with { UseGraph = false });
+        recorder.Report($"generation of {timed.GeneratedTokens} tokens (with the prompt), timed per operation: {watch.Elapsed.TotalMilliseconds:F1} ms wall");
+    }
+
+    Telemetry.SynchronizeForTiming = false;
+    return 0;
 }
 
 int Check(string referencePath)
@@ -261,4 +312,46 @@ static string Shorten(string text)
 {
     string flat = text.Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
     return flat.Length > 100 ? flat[..100] + "…" : flat;
+}
+
+// Sums the time of each operation (by name and shape) and each layer type.
+sealed class ProfileRecorder : ITelemetryHook
+{
+    private readonly Dictionary<string, (int Count, double Ms)> _operations = [];
+    private readonly Dictionary<string, (int Count, double Ms)> _layers = [];
+
+    public TelemetryLevel Levels => TelemetryLevel.Operations | TelemetryLevel.Layers;
+
+    public void OnOperation(in OperationCompleted e) =>
+        Add(_operations, $"{e.Operation}{(e.Backward ? " (backward)" : "")} [{string.Join("x", e.Shape)}]", e.Duration);
+
+    public void OnLayerForward(in LayerForward e) => Add(_layers, $"{e.LayerType} (depth {e.Depth})", e.Duration);
+
+    private static void Add(Dictionary<string, (int Count, double Ms)> table, string key, TimeSpan duration)
+    {
+        var (count, ms) = table.GetValueOrDefault(key);
+        table[key] = (count + 1, ms + duration.TotalMilliseconds);
+    }
+
+    public void Clear()
+    {
+        _operations.Clear();
+        _layers.Clear();
+    }
+
+    public void Report(string title)
+    {
+        Console.WriteLine($"\n{title}");
+        Console.WriteLine($"  operations: {_operations.Values.Sum(v => v.Ms):F1} ms in {_operations.Values.Sum(v => v.Count)} calls; the slowest:");
+        foreach (var (name, (count, ms)) in _operations.OrderByDescending(p => p.Value.Ms).Take(20))
+        {
+            Console.WriteLine($"    {ms,9:F1} ms {count,6}×  {name}");
+        }
+
+        Console.WriteLine("  layers:");
+        foreach (var (name, (count, ms)) in _layers.OrderByDescending(p => p.Value.Ms).Take(12))
+        {
+            Console.WriteLine($"    {ms,9:F1} ms {count,6}×  {name}");
+        }
+    }
 }
