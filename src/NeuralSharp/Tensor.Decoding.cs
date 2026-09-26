@@ -86,6 +86,20 @@ public sealed partial class Tensor
         return Traced("attention_decode", y, start);
     }
 
+    /// <summary>
+    /// Attention of q [heads, rowsPerHead, dim] over keys and values [heads, capacity, dim] up to the causal limit
+    /// position[0] + (row % steps), tiled for many query rows (a prompt or a whole sequence; see Backend.AttentionTiled).
+    /// </summary>
+    internal static Tensor AttentionTiled(Tensor q, Tensor keys, Tensor values, Tensor position, int steps, float scale)
+    {
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int heads = q._shape[0], rowsPerHead = q._shape[1], dim = q._shape[2];
+        var y = Empty([heads, rowsPerHead, dim], q.Device);
+        q.Backend.AttentionTiled(q.Storage, keys.Storage, values.Storage, position.Storage, y.Storage, null, heads, rowsPerHead, steps,
+            keys._shape[1], dim, scale);
+        return Traced("attention_tiled", y, start);
+    }
+
     /// <summary>q [rows, steps, dim] · int8 keysᵀ → [rows, steps, capacity].</summary>
     internal static Tensor AttentionScoresInt8(Tensor q, Layers.KeyValueCache cache)
     {

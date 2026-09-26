@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "gemm128_f32", "gemm64_f32", "gemv_multi_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -222,8 +222,326 @@ internal static partial class PtxKernels
         GemvNN(sb, multi: true);
         GemvNT(sb);
         AttentionDecode(sb);
+        AttentionFlash(sb);
         Gemm(sb, "gemm128_f32", 128, 8);
         Gemm(sb, "gemm64_f32", 64, 4);
+    }
+
+    /// <summary>Largest head size <c>attention_flash_f32</c> handles (4 dimensions per lane).</summary>
+    public const int FlashMaxDim = 128;
+
+    /// <summary>Query rows per <c>attention_flash_f32</c> block, and key positions per tile.</summary>
+    public const int FlashTile = 32;
+
+    // Tiled attention (as in FlashAttention): o[h, i] = Σ_c softmax(scale · q[h, i] · k[h, c]) · v[h, c] over positions
+    // c ≤ position[0] + (i % steps) (and < capacity), for q [heads, rowsPerHead, dim] and k, v [heads, capacity, dim].
+    // A block of 4 warps takes 32 query rows (8 per warp) of one head and walks the keys in tiles of 32 positions held
+    // in shared memory (keys transposed): lane p scores position p against the warp's 8 rows, the running maximum and
+    // sum update per row (online softmax), and the lanes then split the head dimension to add Σ_p weight_p · v_p.
+    // Every query row reads each key and value once per block instead of once per row. Optionally stores each row's
+    // log-sum-exp (for a backward pass). Grid: x = ⌈rowsPerHead / 32⌉, y = heads.
+    private static void AttentionFlash(StringBuilder sb)
+    {
+        const int T = FlashTile, D = FlashMaxDim, Rows = 8;
+        var s = new StringBuilder();
+        s.AppendLine($$"""
+            .visible .entry attention_flash_f32(
+                .param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_pos, .param .u64 p_o, .param .u64 p_lse,
+                .param .u32 p_rph, .param .u32 p_steps, .param .u32 p_cap, .param .u32 p_dim, .param .f32 p_scale
+            )
+            {
+                .reg .pred %p<16>;
+                .reg .f32 %o<{{Rows * 4}}>;
+                .reg .f32 %m<{{Rows}}>;
+                .reg .f32 %l<{{Rows}}>;
+                .reg .f32 %s<{{Rows}}>;
+                .reg .f32 %f<16>;
+                .reg .b32 %r<48>;
+                .reg .b64 %rd<24>;
+                .reg .pred %dv<4>;
+                .shared .align 16 .f32 fa_q[{{T * D}}];
+                .shared .align 16 .f32 fa_k[{{T * D}}];
+                .shared .align 16 .f32 fa_v[{{T * D}}];
+                ld.param.u64 %rd1, [p_q];
+                ld.param.u64 %rd2, [p_k];
+                ld.param.u64 %rd3, [p_v];
+                ld.param.u64 %rd4, [p_pos];
+                ld.param.u64 %rd5, [p_o];
+                ld.param.u64 %rd6, [p_lse];
+                cvta.to.global.u64 %rd1, %rd1;
+                cvta.to.global.u64 %rd2, %rd2;
+                cvta.to.global.u64 %rd3, %rd3;
+                cvta.to.global.u64 %rd4, %rd4;
+                cvta.to.global.u64 %rd5, %rd5;
+                setp.ne.u64 %p15, %rd6, 0;
+                @%p15 cvta.to.global.u64 %rd6, %rd6;
+                ld.param.u32 %r1, [p_rph];
+                ld.param.u32 %r2, [p_steps];
+                ld.param.u32 %r3, [p_cap];
+                ld.param.u32 %r4, [p_dim];
+                ld.param.f32 %f15, [p_scale];
+                ld.global.f32 %f1, [%rd4];
+                cvt.rzi.u32.f32 %r5, %f1;
+                mov.u32 %r6, %tid.x;
+                and.b32 %r7, %r6, 31;
+                shr.u32 %r8, %r6, 5;
+                mov.u32 %r9, %ctaid.x;
+                shl.b32 %r9, %r9, {{(int)Math.Log2(T)}};
+                mov.u32 %r10, %ctaid.y;
+                mul.lo.u32 %r11, %r10, %r1;
+                mul.lo.u32 %r12, %r10, %r3;
+                cvt.u64.u32 %rd7, %r11;
+                cvt.u64.u32 %rd8, %r4;
+                mul.lo.u64 %rd9, %rd7, %rd8;
+                shl.b64 %rd9, %rd9, 2;
+                add.u64 %rd10, %rd1, %rd9;
+                add.u64 %rd11, %rd5, %rd9;
+                cvt.u64.u32 %rd7, %r12;
+                mul.lo.u64 %rd12, %rd7, %rd8;
+                shl.b64 %rd12, %rd12, 2;
+                add.u64 %rd13, %rd2, %rd12;
+                add.u64 %rd14, %rd3, %rd12;
+                mul.lo.u32 %r13, %r4, {{T}};
+            """);
+        // Query tile: fa_q[r, d] for rows row0 + r (zeros past the head's rows).
+        s.AppendLine($$"""
+                mov.u32 %r14, %r6;
+            QL:
+                setp.ge.u32 %p1, %r14, %r13;
+                @%p1 bra QL_END;
+                div.u32 %r15, %r14, %r4;
+                rem.u32 %r16, %r14, %r4;
+                add.u32 %r17, %r9, %r15;
+                setp.lt.u32 %p2, %r17, %r1;
+                mad.lo.u32 %r18, %r17, %r4, %r16;
+                mul.wide.u32 %rd15, %r18, 4;
+                add.u64 %rd15, %rd15, %rd10;
+                mov.f32 %f2, 0f00000000;
+                @%p2 ld.global.f32 %f2, [%rd15];
+                mad.lo.u32 %r19, %r15, {{D}}, %r16;
+                shl.b32 %r19, %r19, 2;
+                mov.u32 %r20, fa_q;
+                add.u32 %r19, %r19, %r20;
+                st.shared.f32 [%r19], %f2;
+                add.u32 %r14, %r14, 128;
+                bra QL;
+            QL_END:
+            """);
+        // Per-row limits (last position each row may see) and the block's last position.
+        for (int i = 0; i < Rows; i++)
+        {
+            s.AppendLine($$"""
+                    mad.lo.u32 %r21, %r8, {{Rows}}, {{i}};
+                    add.u32 %r21, %r21, %r9;
+                    rem.u32 %r22, %r21, %r2;
+                    add.u32 %r{{24 + i}}, %r5, %r22;
+                    mov.f32 %m{{i}}, 0fFF800000;
+                    mov.f32 %l{{i}}, 0f00000000;
+                """);
+            for (int j = 0; j < 4; j++)
+            {
+                s.AppendLine($"    mov.f32 %o{i * 4 + j}, 0f00000000;");
+            }
+        }
+
+        s.AppendLine($$"""
+                add.u32 %r32, %r9, {{T - 1}};
+                sub.u32 %r33, %r1, 1;
+                min.u32 %r32, %r32, %r33;
+                div.u32 %r34, %r9, %r2;
+                div.u32 %r35, %r32, %r2;
+                rem.u32 %r36, %r32, %r2;
+                sub.u32 %r37, %r2, 1;
+                setp.ne.u32 %p3, %r34, %r35;
+                selp.b32 %r36, %r37, %r36, %p3;
+                add.u32 %r36, %r36, %r5;
+                sub.u32 %r33, %r3, 1;
+                min.u32 %r36, %r36, %r33;
+            """);
+        for (int j = 0; j < 4; j++)
+        {
+            s.AppendLine($"    add.u32 %r38, %r7, {32 * j};");
+            s.AppendLine($"    setp.lt.u32 %dv{j}, %r38, %r4;");
+        }
+
+        s.AppendLine("""
+                mov.u32 %r39, 0;
+            TILE:
+                setp.gt.u32 %p4, %r39, %r36;
+                @%p4 bra TILE_END;
+                bar.sync 0;
+                mov.u32 %r14, %r6;
+            KL:
+                setp.ge.u32 %p1, %r14, %r13;
+                @%p1 bra KL_END;
+                div.u32 %r15, %r14, %r4;
+                rem.u32 %r16, %r14, %r4;
+                add.u32 %r17, %r39, %r15;
+                setp.lt.u32 %p2, %r17, %r3;
+                mad.lo.u32 %r18, %r17, %r4, %r16;
+                mul.wide.u32 %rd15, %r18, 4;
+                add.u64 %rd16, %rd15, %rd13;
+                add.u64 %rd17, %rd15, %rd14;
+                mov.f32 %f2, 0f00000000;
+                mov.f32 %f3, 0f00000000;
+                @%p2 ld.global.f32 %f2, [%rd16];
+                @%p2 ld.global.f32 %f3, [%rd17];
+            """);
+        s.AppendLine($$"""
+                    mad.lo.u32 %r19, %r16, {{T}}, %r15;
+                    shl.b32 %r19, %r19, 2;
+                    mov.u32 %r20, fa_k;
+                    add.u32 %r19, %r19, %r20;
+                    st.shared.f32 [%r19], %f2;
+                    mad.lo.u32 %r19, %r15, {{D}}, %r16;
+                    shl.b32 %r19, %r19, 2;
+                    mov.u32 %r20, fa_v;
+                    add.u32 %r19, %r19, %r20;
+                    st.shared.f32 [%r19], %f3;
+                    add.u32 %r14, %r14, 128;
+                    bra KL;
+                KL_END:
+                    bar.sync 0;
+                """);
+        for (int i = 0; i < Rows; i++)
+        {
+            s.AppendLine($"    mov.f32 %s{i}, 0f00000000;");
+        }
+
+        // Scores: lane = position; fa_k[d, lane], fa_q[warp·8 + i, d] (broadcast).
+        s.AppendLine($$"""
+                mov.u32 %r40, fa_k;
+                shl.b32 %r41, %r7, 2;
+                add.u32 %r40, %r40, %r41;
+                mov.u32 %r42, fa_q;
+                mul.lo.u32 %r43, %r8, {{Rows * D * 4}};
+                add.u32 %r42, %r42, %r43;
+                mov.u32 %r44, 0;
+            DOT:
+                setp.ge.u32 %p5, %r44, %r4;
+                @%p5 bra DOT_END;
+                ld.shared.f32 %f4, [%r40];
+            """);
+        for (int i = 0; i < Rows; i++)
+        {
+            s.AppendLine($"    ld.shared.f32 %f5, [%r42+{i * D * 4}];");
+            s.AppendLine($"    fma.rn.f32 %s{i}, %f5, %f4, %s{i};");
+        }
+
+        s.AppendLine($$"""
+                add.u32 %r40, %r40, {{T * 4}};
+                add.u32 %r42, %r42, 4;
+                add.u32 %r44, %r44, 1;
+                bra DOT;
+            DOT_END:
+                add.u32 %r45, %r39, %r7;
+                mov.u32 %r46, fa_v;
+                shl.b32 %r47, %r7, 2;
+                add.u32 %r46, %r46, %r47;
+            """);
+        for (int i = 0; i < Rows; i++)
+        {
+            // Mask, then the online softmax update for row i and its weighted values.
+            s.AppendLine($$"""
+                    setp.le.u32 %p6, %r45, %r{{24 + i}};
+                    setp.lt.and.u32 %p6, %r45, %r3, %p6;
+                    mul.f32 %s{{i}}, %s{{i}}, %f15;
+                    selp.f32 %s{{i}}, %s{{i}}, 0fFF800000, %p6;
+                    mov.f32 %f6, %s{{i}};
+                """);
+            foreach (int offset in new[] { 16, 8, 4, 2, 1 })
+            {
+                s.AppendLine($"    shfl.sync.bfly.b32 %f7, %f6, {offset}, 31, 0xffffffff;");
+                s.AppendLine("    max.f32 %f6, %f6, %f7;");
+            }
+
+            s.AppendLine($$"""
+                    max.f32 %f8, %m{{i}}, %f6;
+                    setp.eq.f32 %p7, %f8, 0fFF800000;
+                    selp.f32 %f9, 0f00000000, %f8, %p7;
+                    sub.f32 %f10, %m{{i}}, %f9;
+                    mul.f32 %f10, %f10, 0f3FB8AA3B;
+                    ex2.approx.ftz.f32 %f10, %f10;
+                    sub.f32 %f11, %s{{i}}, %f9;
+                    mul.f32 %f11, %f11, 0f3FB8AA3B;
+                    ex2.approx.ftz.f32 %f11, %f11;
+                    mov.f32 %f12, %f11;
+                """);
+            foreach (int offset in new[] { 16, 8, 4, 2, 1 })
+            {
+                s.AppendLine($"    shfl.sync.bfly.b32 %f7, %f12, {offset}, 31, 0xffffffff;");
+                s.AppendLine("    add.f32 %f12, %f12, %f7;");
+            }
+
+            s.AppendLine($"    fma.rn.f32 %l{i}, %l{i}, %f10, %f12;");
+            s.AppendLine($"    mov.f32 %m{i}, %f8;");
+            for (int j = 0; j < 4; j++)
+            {
+                s.AppendLine($"    mul.f32 %o{i * 4 + j}, %o{i * 4 + j}, %f10;");
+            }
+
+            s.AppendLine($"    mov.u32 %r47, %r46;");
+            s.AppendLine("    mov.u32 %r20, 0;");
+            s.AppendLine($"PV{i}:");
+            s.AppendLine("    setp.ge.u32 %p8, %r20, 32;");
+            s.AppendLine($"    @%p8 bra PV{i}_END;");
+            s.AppendLine("    shfl.sync.idx.b32 %f13, %f11, %r20, 31, 0xffffffff;");
+            for (int j = 0; j < 4; j++)
+            {
+                s.AppendLine($"    @%dv{j} ld.shared.f32 %f14, [%r47+{128 * j}];");
+                s.AppendLine($"    @%dv{j} fma.rn.f32 %o{i * 4 + j}, %f13, %f14, %o{i * 4 + j};");
+            }
+
+            s.AppendLine($"    add.u32 %r47, %r47, {D * 4};");
+            s.AppendLine("    add.u32 %r20, %r20, 1;");
+            s.AppendLine($"    bra PV{i};");
+            s.AppendLine($"PV{i}_END:");
+        }
+
+        s.AppendLine($$"""
+                add.u32 %r39, %r39, {{T}};
+                bra TILE;
+            TILE_END:
+            """);
+        for (int i = 0; i < Rows; i++)
+        {
+            // o /= l; lse = m + ln l. Rows past the head's rows are not written.
+            s.AppendLine($$"""
+                    mad.lo.u32 %r21, %r8, {{Rows}}, {{i}};
+                    add.u32 %r21, %r21, %r9;
+                    setp.ge.u32 %p9, %r21, %r1;
+                    @%p9 bra WRITTEN{{i}};
+                    rcp.rn.f32 %f13, %l{{i}};
+                    mul.lo.u32 %r22, %r21, %r4;
+                    add.u32 %r22, %r22, %r7;
+                    mul.wide.u32 %rd18, %r22, 4;
+                    add.u64 %rd18, %rd18, %rd11;
+                """);
+            for (int j = 0; j < 4; j++)
+            {
+                s.AppendLine($"    mul.f32 %f14, %o{i * 4 + j}, %f13;");
+                s.AppendLine($"    @%dv{j} st.global.f32 [%rd18+{128 * j}], %f14;");
+            }
+
+            s.AppendLine($$"""
+                    setp.eq.u32 %p10, %r7, 0;
+                    and.pred %p10, %p10, %p15;
+                    @!%p10 bra WRITTEN{{i}};
+                    lg2.approx.ftz.f32 %f14, %l{{i}};
+                    fma.rn.f32 %f14, %f14, 0f3F317218, %m{{i}};
+                    add.u32 %r23, %r11, %r21;
+                    mul.wide.u32 %rd19, %r23, 4;
+                    add.u64 %rd19, %rd19, %rd6;
+                    st.global.f32 [%rd19], %f14;
+                WRITTEN{{i}}:
+                """);
+        }
+
+        s.AppendLine("""
+                ret;
+            }
+            """);
+        sb.AppendLine(s.ToString());
     }
 
     // C[b] = op(A[b]) · op(B[b]) (+ beta · C) with register blocking: a block computes a tile × tile patch of C with

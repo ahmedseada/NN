@@ -95,4 +95,18 @@ internal sealed unsafe partial class CudaBackend
 
     public override void GatedActivationBackward(Storage gate, Storage up, Storage dy, Storage dgate, Storage dup, int n, int kind, int flags) =>
         Launch1D(K("gated_act_bwd_f32"), n, P(gate), P(up), P(dy), P(dgate), P(dup), U(kind), U(flags), U(n));
+
+    public override void AttentionTiled(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage? logSumExp, int heads,
+        int rowsPerHead, int steps, int capacity, int dim, float scale)
+    {
+        if (dim > PtxKernels.FlashMaxDim)
+        {
+            base.AttentionTiled(q, keys, values, position, y, logSumExp, heads, rowsPerHead, steps, capacity, dim, scale);
+            return;
+        }
+
+        Launch(K("attention_flash_f32"), (uint)((rowsPerHead + PtxKernels.FlashTile - 1) / PtxKernels.FlashTile), (uint)heads, 1, 128, 1,
+            P(q), P(keys), P(values), P(position), P(y), logSumExp is null ? 0UL : P(logSumExp),
+            U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale));
+    }
 }

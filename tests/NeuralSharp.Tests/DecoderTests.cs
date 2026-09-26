@@ -10,6 +10,7 @@ internal static partial class Tests
     private static readonly (string Name, Action<Device> Run)[] Decoder =
     [
         ("decoder: RMSNorm and rotary embedding gradients (finite differences)", DecoderGradients),
+        ("decoder: tiled and decoding attention match a direct computation (offsets, groups, odd head sizes)", AttentionKernels),
         ("decoder: DecoderSpec variants match a plain reference implementation (GQA, q/k norm, biases, rope, tied, post-norms, parallel)", DecoderMatchesReference),
         ("decoder: cached decoding (float32 and int8 KV) and int8 weights match the full pass; generation", DecoderCachedAndInt8),
         ("decoder: LoRA by layer name trains; JSON and package round trip", DecoderLoraAndPackage),
@@ -78,6 +79,60 @@ internal static partial class Tests
             var g = gain.ToArray();
             var expected = normalized.Select((v, i) => v * (g[i % 6] + offset)).ToArray();
             AssertClose(expected, rows.RmsNormAffine(gain, 1e-6f, offset).ToArray(), 1e-5f, $"fused RMS norm, offset {offset}");
+        }
+    }
+
+    private static void AttentionKernels(Device device)
+    {
+        var r = new Random(61);
+        foreach (var (heads, rowsPerHead, steps, capacity, dim, offset) in new[] { (3, 80, 40, 96, 100, 7), (2, 64, 64, 64, 128, 0), (4, 6, 3, 50, 32, 20), (2, 33, 11, 60, 6, 5) })
+        {
+            float scale = 1f / MathF.Sqrt(dim);
+            var q = Enumerable.Range(0, heads * rowsPerHead * dim).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+            var k = Enumerable.Range(0, heads * capacity * dim).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+            var v = Enumerable.Range(0, heads * capacity * dim).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+            var expected = new float[heads * rowsPerHead * dim];
+            for (int h = 0; h < heads; h++)
+            {
+                for (int i = 0; i < rowsPerHead; i++)
+                {
+                    int count = Math.Min(offset + i % steps, capacity - 1) + 1;
+                    var scores = new double[count];
+                    for (int c = 0; c < count; c++)
+                    {
+                        double dot = 0;
+                        for (int d = 0; d < dim; d++)
+                        {
+                            dot += q[(h * rowsPerHead + i) * dim + d] * k[(h * capacity + c) * dim + d];
+                        }
+
+                        scores[c] = dot * scale;
+                    }
+
+                    double max = scores.Max(), sum = scores.Sum(x => Math.Exp(x - max));
+                    for (int d = 0; d < dim; d++)
+                    {
+                        double value = 0;
+                        for (int c = 0; c < count; c++)
+                        {
+                            value += Math.Exp(scores[c] - max) / sum * v[(h * capacity + c) * dim + d];
+                        }
+
+                        expected[(h * rowsPerHead + i) * dim + d] = (float)value;
+                    }
+                }
+            }
+
+            using var tq = Tensor.From(q, [heads, rowsPerHead, dim], device);
+            using var tk = Tensor.From(k, [heads, capacity, dim], device);
+            using var tv = Tensor.From(v, [heads, capacity, dim], device);
+            using var position = Tensor.From([(float)offset], [1], device);
+            string name = $"{heads}×{rowsPerHead} rows, steps {steps}, capacity {capacity}, dim {dim}, offset {offset}";
+            AssertClose(expected, Tensor.AttentionTiled(tq, tk, tv, position, steps, scale).ToArray(), 2e-4f, "tiled: " + name);
+            using var cache = new KeyValueCache(heads, capacity, dim, device, KeyValueFormat.Float32);
+            cache.Keys.Load(k);
+            cache.Values.Load(v);
+            AssertClose(expected, Tensor.AttentionDecode(tq, cache, position, steps, scale).ToArray(), 2e-4f, "decoding: " + name);
         }
     }
 

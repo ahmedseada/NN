@@ -278,8 +278,15 @@ public sealed class CausalSelfAttention : Module, ICachedModule
             throw new ArgumentException($"{t} positions exceed the layer's maximum of {MaxPositions}.");
         }
 
-        var (q, k, v) = Project(input, Positions(t));
+        var positions = Positions(t);
+        var (q, k, v) = Project(input, positions);
         float scale = 1f / MathF.Sqrt(HeadDim);
+        if (!Autograd.IsEnabled && HeadDim <= Backends.Cuda.PtxKernels.FlashMaxDim)
+        {
+            // Inference: tiled attention, no [t, t] score matrix (positions[0] = 0 is the causal offset).
+            return Merge(Tensor.AttentionTiled(q, k, v, positions, t, scale), n, t);
+        }
+
         var raw = q.MatMul(k, transposeB: true);                                  // [n·kv, group·t, t]
         Tensor weights;
         if (!Autograd.IsEnabled)
@@ -314,7 +321,11 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         {
             Tensor.WriteKeyValues(k, cache.Keys, context.Position);
             Tensor.WriteKeyValues(v, cache.Values, context.Position);
-            if (HeadDim <= Backends.Cuda.PtxKernels.DecodeMaxDim)
+            if (t >= 8 && HeadDim <= Backends.Cuda.PtxKernels.FlashMaxDim)
+            {
+                context8 = Tensor.AttentionTiled(q, cache.Keys, cache.Values, context.Position, t, scale);   // a prompt: tiled
+            }
+            else if (HeadDim <= Backends.Cuda.PtxKernels.DecodeMaxDim)
             {
                 context8 = Tensor.AttentionDecode(q, cache, context.Position, t, scale);           // only the filled positions
             }

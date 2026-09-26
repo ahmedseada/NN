@@ -297,6 +297,15 @@ internal abstract class Backend
     public abstract void AttentionDecode(Storage q, Storage keys, Storage values, Storage position, Storage y, int heads, int rowsPerHead,
         int steps, int capacity, int dim, float scale);
 
+    /// <summary>
+    /// The same attention as <see cref="AttentionDecode"/> for many query rows at once (a prompt, a training sequence),
+    /// tiled so query rows share each key and value read; also writes each row's log-sum-exp of the scaled scores to
+    /// <paramref name="logSumExp"/> [heads, rowsPerHead] when given.
+    /// </summary>
+    public virtual void AttentionTiled(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage? logSumExp, int heads,
+        int rowsPerHead, int steps, int capacity, int dim, float scale) =>
+        AttentionDecode(q, keys, values, position, y, heads, rowsPerHead, steps, capacity, dim, scale);
+
     // ---------------------------------------------------------------- incremental decoding (positions live on the device)
 
     /// <summary>mask[i, j] = j ≤ position + i ? 0 : -1e9 for a [rows, capacity] mask; position is read from device memory.</summary>

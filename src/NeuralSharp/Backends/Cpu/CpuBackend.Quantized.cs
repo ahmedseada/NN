@@ -92,9 +92,14 @@ internal sealed partial class CpuBackend
     }
 
     public override void AttentionDecode(Storage q, Storage keys, Storage values, Storage position, Storage y, int heads, int rowsPerHead,
-        int steps, int capacity, int dim, float scale)
+        int steps, int capacity, int dim, float scale) =>
+        AttentionTiled(q, keys, values, position, y, null, heads, rowsPerHead, steps, capacity, dim, scale);
+
+    public override void AttentionTiled(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage? logSumExp, int heads,
+        int rowsPerHead, int steps, int capacity, int dim, float scale)
     {
         float[] qv = D(q), kv = D(keys), vv = D(values), yv = D(y);
+        float[]? lv = logSumExp is null ? null : D(logSumExp);
         int position0 = (int)D(position)[0];
         For(heads * rowsPerHead, (long)heads * rowsPerHead * dim * Math.Max(1, position0), (first, last) =>
         {
@@ -122,6 +127,11 @@ internal sealed partial class CpuBackend
                 {
                     scores[c] = MathF.Exp(scores[c] - max);
                     sum += scores[c];
+                }
+
+                if (lv is not null)
+                {
+                    lv[row] = max + MathF.Log(sum);
                 }
 
                 var output = yv.AsSpan(row * dim, dim);
