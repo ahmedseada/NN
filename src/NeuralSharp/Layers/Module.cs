@@ -125,7 +125,7 @@ public abstract class Module : IDisposable
 
     /// <summary>
     /// Non-trainable state of this module and its children (e.g. BatchNorm running statistics).
-    /// Buffers are saved with <see cref="Save"/> and moved by <see cref="To"/>, but not optimized.
+    /// Buffers are saved with <see cref="Save(string)"/> and moved by <see cref="To"/>, but not optimized.
     /// </summary>
     public virtual IEnumerable<Tensor> Buffers() => Children().SelectMany(c => c.Buffers());
 
@@ -205,7 +205,13 @@ public abstract class Module : IDisposable
     public void Save(string path)
     {
         using var stream = File.Create(path);
-        using var writer = new BinaryWriter(stream);
+        Save(stream);
+    }
+
+    /// <summary>Writes all parameter values to <paramref name="stream"/> (the same format as <see cref="Save(string)"/>); the stream stays open.</summary>
+    public void Save(Stream stream)
+    {
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
         var parameters = Parameters().Concat(Buffers()).ToList();
         writer.Write(FileMagic);
         writer.Write(parameters.Count);
@@ -228,15 +234,23 @@ public abstract class Module : IDisposable
         }
     }
 
-    /// <summary>Reads parameter values written by <see cref="Save"/> into this module. The architecture must match.</summary>
+    /// <summary>Reads parameter values written by <see cref="Save(string)"/> into this module. The architecture must match.</summary>
     public void Load(string path)
     {
         using var stream = File.OpenRead(path);
-        using var reader = new BinaryReader(stream);
+        Load(stream, path);
+    }
+
+    /// <summary>Reads parameter values written by <see cref="Save(Stream)"/> from <paramref name="stream"/>; the stream stays open.</summary>
+    public void Load(Stream stream) => Load(stream, "The stream");
+
+    private void Load(Stream stream, string source)
+    {
+        using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
         var parameters = Parameters().Concat(Buffers()).ToList();
         if (reader.ReadUInt32() != FileMagic)
         {
-            throw new InvalidDataException($"{path} is not a NeuralSharp weights file.");
+            throw new InvalidDataException($"{source} is not a NeuralSharp weights file.");
         }
 
         int count = reader.ReadInt32();
