@@ -786,11 +786,12 @@ server, and every layer exported to ONNX gives the same output in ONNX Runtime a
 
 ## Status
 
-* **Verified on real hardware.** The first 64 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
-  Laptop GPU (Blackwell), 128 of 128, including KV-cache and batched decoding, graph replay, the
-  sampler with top-p, min-p and penalties, the generation layer and the kernel-signature check. The
-  31 newest ones (simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine,
-  ASP.NET Core, retrieval, MCP, ONNX) pass on the CPU and still need a run on a GPU.
+* **Verified on real hardware.** All 95 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
+  Laptop GPU (Blackwell), 190 of 190, including KV-cache and batched decoding, graph replay, the
+  sampler with top-p, min-p and penalties, the generation layer, the kernel-signature check, the
+  simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine, retrieval,
+  and ONNX export and import (imported models run on the GPU). The ASP.NET Core and MCP tests do not
+  depend on the device and run once, on the CPU.
   That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.
