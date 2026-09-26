@@ -91,6 +91,54 @@ internal sealed partial class CpuBackend
         }
     }
 
+    public override void AttentionDecode(Storage q, Storage keys, Storage values, Storage position, Storage y, int heads, int rowsPerHead,
+        int steps, int capacity, int dim, float scale)
+    {
+        float[] qv = D(q), kv = D(keys), vv = D(values), yv = D(y);
+        int position0 = (int)D(position)[0];
+        For(heads * rowsPerHead, (long)heads * rowsPerHead * dim * Math.Max(1, position0), (first, last) =>
+        {
+            var scores = new float[capacity];
+            for (int row = first; row < last; row++)
+            {
+                int h = row / rowsPerHead, count = Math.Min(position0 + row % rowsPerHead % steps, capacity - 1) + 1;
+                var query = qv.AsSpan(row * dim, dim);
+                float max = float.NegativeInfinity;
+                for (int c = 0; c < count; c++)
+                {
+                    float dot = 0f;
+                    var key = kv.AsSpan((int)(((long)h * capacity + c) * dim), dim);
+                    for (int d = 0; d < dim; d++)
+                    {
+                        dot += query[d] * key[d];
+                    }
+
+                    scores[c] = dot * scale;
+                    max = MathF.Max(max, scores[c]);
+                }
+
+                float sum = 0f;
+                for (int c = 0; c < count; c++)
+                {
+                    scores[c] = MathF.Exp(scores[c] - max);
+                    sum += scores[c];
+                }
+
+                var output = yv.AsSpan(row * dim, dim);
+                output.Clear();
+                for (int c = 0; c < count; c++)
+                {
+                    float weight = scores[c] / sum;
+                    var value = vv.AsSpan((int)(((long)h * capacity + c) * dim), dim);
+                    for (int d = 0; d < dim; d++)
+                    {
+                        output[d] += weight * value[d];
+                    }
+                }
+            }
+        });
+    }
+
     public override void AttentionScoresInt8(Storage q, Storage cache, Storage scales, Storage y, int rows, int steps, int capacity, int dim)
     {
         float[] qv = D(q), sv = D(scales), yv = D(y);

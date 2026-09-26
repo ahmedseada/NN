@@ -44,4 +44,17 @@ internal sealed unsafe partial class CudaBackend
         int n = rows * half;
         Launch1D(K("rope_f32"), n, P(x), P(y), P(cos), P(sin), P(positions), U(heads), U(steps), U(dim), U(half), U(interleaved ? 1 : 0), F(sign), U(n));
     }
+
+    public override void AttentionDecode(Storage q, Storage keys, Storage values, Storage position, Storage y, int heads, int rowsPerHead,
+        int steps, int capacity, int dim, float scale)
+    {
+        if (dim > PtxKernels.DecodeMaxDim)
+        {
+            throw new NotSupportedException($"Decoding attention supports head sizes up to {PtxKernels.DecodeMaxDim} on CUDA.");
+        }
+
+        int rows = heads * rowsPerHead;
+        LaunchRows(K("attention_decode_f32"), rows, P(q), P(keys), P(values), P(position), P(y),
+            U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(rows));
+    }
 }

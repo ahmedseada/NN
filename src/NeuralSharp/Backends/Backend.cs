@@ -263,6 +263,15 @@ internal abstract class Backend
     /// <summary>y[r, t, d] = Σ_c weights[r, t, c] · scales[r, c] · values[r, c, d].</summary>
     public abstract void AttentionContextInt8(Storage weights, Storage cache, Storage scales, Storage y, int rows, int steps, int capacity, int dim);
 
+    /// <summary>
+    /// Attention over a key/value cache filled up to the device position: for head h and row i of q [heads, rowsPerHead,
+    /// dim], y[h, i] = Σ_c softmax(scale · q[h, i] · keys[h, c]) · values[h, c] over positions c = 0 … position[0] +
+    /// (i % steps) (the causal limit of that row's step). Keys and values are [heads, capacity, dim]; unfilled
+    /// positions are never read, so the cost follows the context length rather than the capacity.
+    /// </summary>
+    public abstract void AttentionDecode(Storage q, Storage keys, Storage values, Storage position, Storage y, int heads, int rowsPerHead,
+        int steps, int capacity, int dim, float scale);
+
     // ---------------------------------------------------------------- incremental decoding (positions live on the device)
 
     /// <summary>mask[i, j] = j ≤ position + i ? 0 : -1e9 for a [rows, capacity] mask; position is read from device memory.</summary>

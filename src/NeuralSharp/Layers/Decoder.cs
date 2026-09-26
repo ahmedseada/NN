@@ -309,8 +309,15 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         {
             Tensor.WriteKeyValues(k, cache.Keys, context.Position);
             Tensor.WriteKeyValues(v, cache.Values, context.Position);
-            var weights = q.MatMul(cache.Keys, transposeB: true).ScaleMaskSoftmax(scale, context.Mask);   // [n·kv, group·t, capacity]
-            context8 = weights.MatMul(cache.Values);
+            if (HeadDim <= Backends.Cuda.PtxKernels.DecodeMaxDim)
+            {
+                context8 = Tensor.AttentionDecode(q, cache, context.Position, t, scale);           // only the filled positions
+            }
+            else
+            {
+                var weights = q.MatMul(cache.Keys, transposeB: true).ScaleMaskSoftmax(scale, context.Mask);   // [n·kv, group·t, capacity]
+                context8 = weights.MatMul(cache.Values);
+            }
         }
 
         return Merge(context8, n, t);
