@@ -14,6 +14,7 @@ internal static partial class Tests
         ("generation: keep-alive durations and model host expiry", KeepAliveAndHost),
         ("generation: num_predict, stop sequences, cache/graph/recompute agree", GeneratorBehaviour),
         ("generation: chat end to end yields a final message and stats", ChatEndToEnd),
+        ("generation: a kept KV cache reuses shared prompt prefixes without changing the output", PromptCacheReuse),
     ];
 
     private static void WordTokenizerBehaviour(Device device)
@@ -155,6 +156,33 @@ internal static partial class Tests
             new Linear(16, tokenizer.VocabularySize, device: device, random: r),
         };
         return (model, tokenizer);
+    }
+
+    private static void PromptCacheReuse(Device device)
+    {
+        var (tiny, tokenizer) = TinyLanguageModel(device, context: 64);
+        var spec = new NeuralSharp.Layers.DecoderSpec
+        {
+            Vocabulary = tokenizer.VocabularySize, Dim = 16, Layers = 2, Heads = 4, KvHeads = 2, HeadDim = 6, FfDim = 24, MaxPositions = 64,
+            QkNorm = true, Rope = new NeuralSharp.Layers.RopeSettings(500f, null, false, null),
+        };
+        using var decoder = spec.Build(null, new NeuralSharp.Layers.DecoderBuildOptions { Device = device, Seed = 3 });
+        using var _ = tiny;
+        foreach (var model in new[] { tiny, decoder })
+        {
+            var options = new GenerationOptions { Seed = 5, NumPredict = 12, Temperature = 0.8f, TopK = 5, RepeatPenalty = 1.1f, ChunkSize = 3, NumCtx = 64 };
+            string[] prompts = ["the quick brown fox", "the quick brown fox", "the quick brown fox jumps over", "the lazy dog", "the quick brown fox jumps over the"];
+            var reused = new TextGenerator(model, tokenizer, 64);
+            foreach (string prompt in prompts)
+            {
+                var fresh = new TextGenerator(model, tokenizer, 64) { KeepCache = false };
+                string expected = fresh.Generate(prompt, options).Text;
+                string actual = reused.Generate(prompt, options).Text;
+                Check(actual == expected, $"{model.Name}: '{prompt}' → '{actual}' with the kept cache, '{expected}' without");
+            }
+
+            reused.ReleaseCache();
+        }
     }
 
     private static void GeneratorBehaviour(Device device)

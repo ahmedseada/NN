@@ -212,6 +212,18 @@ public sealed class DecodingContext : IDisposable
         Length = 0;
     }
 
+    /// <summary>
+    /// Keeps the first <paramref name="length"/> positions and forgets the rest (their cache entries are overwritten by
+    /// the next steps): reuses the cached keys and values of a shared prompt prefix.
+    /// </summary>
+    public void Truncate(int length)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(length, Length);
+        Position.FillInPlace(length);
+        Length = length;
+    }
+
     /// <summary>The cache for <paramref name="owner"/> (one per attention layer), created on first use.</summary>
     internal KeyValueCache CacheFor(object owner, int rows, int headDim)
     {

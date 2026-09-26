@@ -60,6 +60,54 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
     /// </summary>
     public KeyValueFormat CacheFormat { get; init; } = KeyValueFormat.Float32;
 
+    /// <summary>
+    /// Keep the KV cache after each generation, so the next prompt that starts with the same tokens (the earlier turns of
+    /// a conversation, a long system prompt or tool list) only processes what follows them. The cache stays allocated
+    /// between calls; <see cref="ReleaseCache"/> frees it. Default true.
+    /// </summary>
+    public bool KeepCache { get; set; } = true;
+
+    private readonly Lock _keptLock = new();
+    private DecodingContext? _kept;
+    private List<int> _keptIds = [];
+
+    /// <summary>Frees the KV cache kept between generations (see <see cref="KeepCache"/>).</summary>
+    public void ReleaseCache()
+    {
+        lock (_keptLock)
+        {
+            _kept?.Dispose();
+            _kept = null;
+            _keptIds = [];
+        }
+    }
+
+    // Takes the kept cache when it fits this generation (same capacity and format), with the ids it holds.
+    private (DecodingContext? Context, List<int> Ids) TakeCache(int capacity)
+    {
+        lock (_keptLock)
+        {
+            var (context, ids) = (_kept, _keptIds);
+            (_kept, _keptIds) = (null, []);
+            if (context is not null && (context.Capacity != capacity || context.Format != CacheFormat || context.Device != Device))
+            {
+                context.Dispose();
+                return (null, []);
+            }
+
+            return (context, ids);
+        }
+    }
+
+    private void KeepCacheFor(DecodingContext context, List<int> ids)
+    {
+        lock (_keptLock)
+        {
+            _kept?.Dispose();
+            (_kept, _keptIds) = (context, ids);
+        }
+    }
+
     /// <summary>Generates the whole continuation of <paramref name="prompt"/>.</summary>
     public (string Text, string DoneReason, GenerationStats Stats) Generate(string prompt, GenerationOptions options, CancellationToken cancellationToken = default)
     {
@@ -183,7 +231,9 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
         Model.Eval();
         {
             // NoGrad is entered per compute call, never held across a yield (it is thread-local state of the caller).
-            using var decoding = new DecodingContext(Device, 1, context, CacheFormat);
+            var (kept, keptIds) = options.UseCache && KeepCache ? TakeCache(context) : (null, []);
+            var decoding = kept ?? new DecodingContext(Device, 1, context, CacheFormat);
+            bool keep = false;
             ComputeGraph? graph = null;
             try
             {
@@ -213,7 +263,26 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
                     Step();
                 }
 
-                Prefill(history.Count);
+                // Reuse the kept cache for the prompt's shared prefix (at least one token is fed, for the next logits).
+                int shared = 0;
+                while (shared < keptIds.Count && shared < history.Count && keptIds[shared] == history[shared])
+                {
+                    shared++;
+                }
+
+                shared = Math.Min(shared, history.Count - 1);
+                if (kept is not null && shared > 0 && shared <= decoding.Length)
+                {
+                    using var noGrad = Autograd.NoGrad();
+                    using var scope = new TensorScope();
+                    decoding.Truncate(shared);
+                    sampler.Sample(Model.ForwardCached(Window(history.Count - shared), decoding));
+                }
+                else
+                {
+                    Prefill(history.Count);
+                }
+
                 sampler.Read(0, 1);
                 promptDuration = total.Elapsed;
                 int produced = 1;
@@ -283,10 +352,21 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
                 {
                     yield return new GenerationChunk(rest);
                 }
+
+                // The cache holds the keys and values of history[..Length] (the last sampled token was never fed).
+                if (options.UseCache && KeepCache && resets == 0 && decoding.Length <= history.Count)
+                {
+                    KeepCacheFor(decoding, history.GetRange(0, decoding.Length));
+                    keep = true;
+                }
             }
             finally
             {
                 graph?.Dispose();
+                if (!keep)
+                {
+                    decoding.Dispose();
+                }
             }
         }
 
