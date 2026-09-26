@@ -58,6 +58,53 @@ public sealed partial class Tensor
         return outputs;
     }
 
+    /// <summary>
+    /// The layers' packed products of one input in one device pass (few rows, not recorded), or null when the device has
+    /// no single-pass version.
+    /// </summary>
+    internal static Tensor[]? MatMulPackedMany(Tensor input, int kind, IReadOnlyList<Layers.Linear> layers)
+    {
+        input.ThrowIfDisposed();
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int k = input._shape[^1], m = input.Size / k;
+        var outputs = new Tensor[layers.Count];
+        var products = new (Backends.Storage, Backends.Storage?, Backends.Storage?, Backends.Storage, int)[layers.Count];
+        for (int j = 0; j < layers.Count; j++)
+        {
+            var layer = layers[j];
+            var (packed, scales) = kind switch
+            {
+                0 => (layer.Int8!.Packed, layer.Int8.Scales),
+                1 => (layer.Int4!.Packed, layer.Int4.Scales),
+                _ => (layer.BFloat16!.Packed, (Tensor?)null),
+            };
+            if (packed.Device != input.Device)
+            {
+                return null;
+            }
+
+            outputs[j] = Empty([.. input._shape[..^1], layer.OutFeatures], input.Device);
+            products[j] = (packed.Storage, scales?.Storage, layer.Bias?.Storage, outputs[j].Storage, layer.OutFeatures);
+        }
+
+        if (!input.Backend.PackedMatMulMany(kind, input.Storage, m, k, products))
+        {
+            foreach (var output in outputs)
+            {
+                output.Dispose();
+            }
+
+            return null;
+        }
+
+        foreach (var output in outputs)
+        {
+            Traced("matmul_many_packed", output, start);
+        }
+
+        return outputs;
+    }
+
     /// <summary>x / sqrt(mean(x²) + eps) · (gain + offset) over the last dimension in one pass (inference: not recorded).</summary>
     internal Tensor RmsNormAffine(Tensor gain, float eps, float offset)
     {

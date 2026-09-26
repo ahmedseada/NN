@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // row padded to n4 = ceil(n / 4) words), with one float scale per column: w[k, j] = q[k, j] · scale[j].
 internal static partial class PtxKernels
 {
-    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32", "int4_gemv_f32", "int4_dequant_f32"];
+    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32", "int4_gemv_f32", "int4_dequant_f32", "int8_gemv_multi_f32", "bf16_gemv_multi_f32", "int4_gemv_multi_f32"];
 
     /// <summary>Rows of an int4 weight matrix that share one scale per column.</summary>
     public const int Int4Group = 32;
@@ -19,6 +19,9 @@ internal static partial class PtxKernels
         Int8Gemv(sb);
         Int8Gemv(sb, bf16: true);
         Int8Gemv(sb, int4: true);
+        Int8Gemv(sb, multi: true);
+        Int8Gemv(sb, bf16: true, multi: true);
+        Int8Gemv(sb, int4: true, multi: true);
 
         // w[r, 8c + j] = nibble j of packed word (r, c) · s[r / Int4Group, 8c + j]: one thread per word.
         var dequant = new StringBuilder("""
@@ -362,26 +365,78 @@ internal static partial class PtxKernels
     // bf16: bf16_gemv_f32, the same for bfloat16 weights packed two per word (low half = the even column), no scales.
     // int4: int4_gemv_f32, signed nibbles packed eight per word (nibble c = column 8w + c) with a scale per group of
     // Int4Group rows and column, s[g, j] (rows of 8·words scales); a slice takes four consecutive rows (one group).
-    private static void Int8Gemv(StringBuilder sb, bool bf16 = false, bool int4 = false)
+    //
+    // multi (…_gemv_multi_f32): up to three products sharing the input x (query/key/value, gate/up), grid z selecting the
+    // product: product j has its own weights q_j, scales s_j, output y_j [m, n_j] and optional bias b_j (0: none); blocks
+    // past a product's columns return at once, and split partials and arrival counters get a region per product.
+    private static void Int8Gemv(StringBuilder sb, bool bf16 = false, bool int4 = false, bool multi = false)
     {
         int cpw = bf16 ? 2 : int4 ? 8 : 4, columns = 32 * cpw;
         int acc = GemvRows * cpw, dec = Math.Max(32, acc), xr = dec + 8, sc = dec + 9, red = dec + 20;
         string part = bf16 ? "h_part" : int4 ? "i4_part" : "i8_part";
-        string name = bf16 ? "bf16_gemv_f32" : int4 ? "int4_gemv_f32" : "int8_gemv_f32";
+        string name = (bf16 ? "bf16_gemv" : int4 ? "int4_gemv" : "int8_gemv") + (multi ? "_multi_f32" : "_f32");
         bool scaled = !bf16 && !int4;
         var s = new StringBuilder();
-        s.AppendLine($$"""
-            .visible .entry {{name}}(
+        string parameters = multi
+            ? """
+                .param .u64 p_x, .param .u64 p_part, .param .u32 p_m, .param .u32 p_k, .param .u32 p_chunk, .param .u32 p_splits,
+                .param .u64 p_counters, .param .u32 p_cstride, .param .u32 p_nmax,
+                .param .u64 p_q0, .param .u64 p_s0, .param .u64 p_y0, .param .u64 p_b0, .param .u32 p_n0,
+                .param .u64 p_q1, .param .u64 p_s1, .param .u64 p_y1, .param .u64 p_b1, .param .u32 p_n1,
+                .param .u64 p_q2, .param .u64 p_s2, .param .u64 p_y2, .param .u64 p_b2, .param .u32 p_n2
+              """
+            : """
                 .param .u64 p_x, .param .u64 p_q, .param .u64 p_s, .param .u64 p_y, .param .u64 p_part,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_n4, .param .u32 p_chunk, .param .u32 p_splits,
                 .param .u64 p_counters
-            )
-            {
-                .reg .pred %p<24>;
-                .reg .f32 %f<{{red + 8}}>;
-                .reg .b32 %r<40>;
-                .reg .b64 %rd<24>;
-                .shared .align 4 .f32 {{part}}[{{16 * columns}}];
+              """;
+        string loads = multi
+            ? $$"""
+                mov.u32 %r39, %ctaid.z;
+                setp.eq.u32 %p21, %r39, 1;
+                setp.eq.u32 %p22, %r39, 2;
+                ld.param.u64 %rd1, [p_x];
+                ld.param.u64 %rd2, [p_q0];
+                @%p21 ld.param.u64 %rd2, [p_q1];
+                @%p22 ld.param.u64 %rd2, [p_q2];
+                ld.param.u64 %rd3, [p_s0];
+                @%p21 ld.param.u64 %rd3, [p_s1];
+                @%p22 ld.param.u64 %rd3, [p_s2];
+                ld.param.u64 %rd4, [p_y0];
+                @%p21 ld.param.u64 %rd4, [p_y1];
+                @%p22 ld.param.u64 %rd4, [p_y2];
+                ld.param.u64 %rd25, [p_b0];
+                @%p21 ld.param.u64 %rd25, [p_b1];
+                @%p22 ld.param.u64 %rd25, [p_b2];
+                ld.param.u32 %r2, [p_n0];
+                @%p21 ld.param.u32 %r2, [p_n1];
+                @%p22 ld.param.u32 %r2, [p_n2];
+                ld.param.u64 %rd5, [p_part];
+                cvta.to.global.u64 %rd1, %rd1;
+                cvta.to.global.u64 %rd2, %rd2;
+                cvta.to.global.u64 %rd3, %rd3;
+                cvta.to.global.u64 %rd4, %rd4;
+                cvta.to.global.u64 %rd5, %rd5;
+                setp.ne.u64 %p23, %rd25, 0;
+                cvta.to.global.u64 %rd25, %rd25;
+                ld.param.u32 %r1, [p_m];
+                ld.param.u32 %r3, [p_k];
+                add.u32 %r4, %r2, {{cpw - 1}};
+                shr.u32 %r4, %r4, {{(int)Math.Log2(cpw)}};
+                ld.param.u32 %r30, [p_chunk];
+                ld.param.u32 %r31, [p_splits];
+                mov.u32 %r36, %ctaid.x;
+                shl.b32 %r36, %r36, 5;
+                setp.ge.u32 %p21, %r36, %r4;
+                @%p21 ret;
+                ld.param.u32 %r37, [p_nmax];
+                mul.lo.u32 %r37, %r37, %r1;
+                mul.lo.u32 %r37, %r37, %r31;
+                mul.wide.u32 %rd26, %r37, %r39;
+                shl.b64 %rd26, %rd26, 2;
+                add.u64 %rd5, %rd5, %rd26;
+              """
+            : """
                 ld.param.u64 %rd1, [p_x];
                 ld.param.u64 %rd2, [p_q];
                 ld.param.u64 %rd3, [p_s];
@@ -398,6 +453,18 @@ internal static partial class PtxKernels
                 ld.param.u32 %r4, [p_n4];
                 ld.param.u32 %r30, [p_chunk];
                 ld.param.u32 %r31, [p_splits];
+              """;
+        s.AppendLine($$"""
+            .visible .entry {{name}}(
+            {{parameters}}
+            )
+            {
+                .reg .pred %p<24>;
+                .reg .f32 %f<{{red + 8}}>;
+                .reg .b32 %r<40>;
+                .reg .b64 %rd<28>;
+                .shared .align 4 .f32 {{part}}[{{16 * columns}}];
+            {{loads}}
                 mov.u32 %r5, %tid.x;
                 and.b32 %r6, %r5, 31;
                 shr.u32 %r7, %r5, 5;
@@ -636,6 +703,7 @@ internal static partial class PtxKernels
                     bra ROW{r}_DONE;
                 ROW{r}_FINAL:
                     {(scaled ? $"ld.global.f32 %f{red + 2}, [%rd14];\n    mul.f32 %f{red}, %f{red}, %f{red + 2};" : "")}
+                    {(multi ? $"add.u64 %rd27, %rd25, %rd13;\n    @%p23 ld.global.f32 %f{red + 2}, [%rd27];\n    @%p23 add.f32 %f{red}, %f{red}, %f{red + 2};" : "")}
                     mul.wide.u32 %rd16, %r2, {4 * r};
                     add.u64 %rd16, %rd16, %rd13;
                     add.u64 %rd16, %rd16, %rd4;
@@ -654,6 +722,7 @@ internal static partial class PtxKernels
                 bar.sync 0;
                 ld.param.u64 %rd17, [p_counters];
                 cvta.to.global.u64 %rd17, %rd17;
+                {{(multi ? "ld.param.u32 %r38, [p_cstride];\n    mul.lo.u32 %r38, %r38, %r39;\n    mul.wide.u32 %rd18, %r38, 4;\n    add.u64 %rd17, %rd17, %rd18;" : "")}}
                 mov.u32 %r26, %ctaid.x;
                 mul.wide.u32 %rd18, %r26, 4;
                 add.u64 %rd17, %rd17, %rd18;
@@ -693,6 +762,7 @@ internal static partial class PtxKernels
                 bra FIN_SPLIT;
             FIN_SPLIT_END:
                 {{(scaled ? $"ld.global.f32 %f{red + 5}, [%rd14];\n    mul.f32 %f{red + 3}, %f{red + 3}, %f{red + 5};" : "")}}
+                {{(multi ? $"add.u64 %rd27, %rd25, %rd13;\n    @%p23 ld.global.f32 %f{red + 5}, [%rd27];\n    @%p23 add.f32 %f{red + 3}, %f{red + 3}, %f{red + 5};" : "")}}
                 add.u64 %rd23, %rd21, %rd4;
                 st.global.f32 [%rd23], %f{{red + 3}};
                 add.u32 %r32, %r32, 1;

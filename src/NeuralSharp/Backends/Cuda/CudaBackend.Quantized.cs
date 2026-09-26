@@ -100,6 +100,62 @@ internal sealed unsafe partial class CudaBackend
         }
     }
 
+    public override bool PackedMatMulMany(int kind, Storage x, int m, int k,
+        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products)
+    {
+        if (m > PtxKernels.GemvRows || k == 0 || products.Length is 0 or > 3)
+        {
+            return false;
+        }
+
+        int cpw = kind switch { 0 => 4, 1 => 8, _ => 2 };
+        string kernel = kind switch { 0 => "int8_gemv_multi_f32", 1 => "int4_gemv_multi_f32", _ => "bf16_gemv_multi_f32" };
+        int nmax = 0, totalBlocks = 0;
+        foreach (var product in products)
+        {
+            nmax = Math.Max(nmax, product.Columns);
+            totalBlocks += ((product.Columns + cpw - 1) / cpw + 31) / 32;
+        }
+
+        int columnBlocks = ((nmax + cpw - 1) / cpw + 31) / 32;
+        int splits = Math.Clamp((4 * Math.Max(1, _multiprocessors) + totalBlocks - 1) / totalBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
+        int align = kind == 1 ? 64 : 1;
+        int chunk = ((k + splits - 1) / splits + align - 1) / align * align;
+        splits = (k + chunk - 1) / chunk;
+        var counters = SplitCounters(columnBlocks * products.Length);
+        var part = splits > 1 ? Allocate(products.Length * splits * m * nmax, zeroed: false) : null;
+        try
+        {
+            Span<ulong> args = stackalloc ulong[9 + 3 * 5];
+            args[0] = P(x);
+            args[1] = part is null ? P(products[0].Output) : P(part);
+            args[2] = U(m);
+            args[3] = U(k);
+            args[4] = U(chunk);
+            args[5] = U(splits);
+            args[6] = P(counters);
+            args[7] = U(columnBlocks);
+            args[8] = U(nmax);
+            for (int j = 0; j < 3; j++)
+            {
+                var product = j < products.Length ? products[j] : products[0];
+                args[9 + 5 * j] = P(product.Packed);
+                args[10 + 5 * j] = P(product.Scales ?? product.Packed);
+                args[11 + 5 * j] = P(product.Output);
+                args[12 + 5 * j] = product.Bias is null ? 0UL : P(product.Bias);
+                args[13 + 5 * j] = U(j < products.Length ? product.Columns : 0);
+            }
+
+            Launch(K(kernel), (uint)columnBlocks, (uint)splits, (uint)products.Length, PtxKernels.Int8GemvThreads, 1, args);
+        }
+        finally
+        {
+            part?.Release();
+        }
+
+        return true;
+    }
+
     private Storage? _splitCounters;
 
     // Zeroed arrival counters for split products, one per column block; the last block of a range resets its counter.

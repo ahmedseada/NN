@@ -17,6 +17,7 @@ internal static partial class Tests
         ("int8: QLoRA — adapters train on top of frozen int8 weights", Int8Lora),
         ("bf16: rounding, direct and expanded products, gradient, model conversion, save/load, decoder build", BFloat16Weights),
         ("int4: group scales, direct and expanded products, gradient, model conversion, save/load", Int4Weights),
+        ("packed projections sharing an input (int8, int4, bf16; biases; splits) match separate layers", PackedMany),
         ("weights: Float16 and BFloat16 files are half the size and round as expected", HalfPrecisionFiles),
         ("matmul: few rows (column-parallel path) match the reference, with beta and transposes", FewRowMatMul),
         ("int8 KV cache: write, scores and context kernels match a dequantized cache", Int8CacheKernels),
@@ -161,6 +162,43 @@ internal static partial class Tests
 
         Check(model.ToFloat32() > 0 && model.Descendants().OfType<Linear>().All(l => !l.Packed), "back to float32");
         AssertClose(nibbles, model.Predict(ids).ToArray(), 1e-4f, "float32 keeps the rounded weights");
+    }
+
+    private static void PackedMany(Device device)
+    {
+        var r = new Random(75);
+        foreach (int k in new[] { 64, 1024, 3000 })
+        {
+            foreach (var convert in new Action<Linear>[] { l => l.QuantizeInt8(), l => l.QuantizeInt4(), l => l.ToBFloat16() })
+            {
+                using var a = new Linear(k, 2048, bias: false, device, r);
+                using var b = new Linear(k, 520, bias: true, device, r);
+                using var c = new Linear(k, 1030, bias: true, device, r);
+                b.Bias!.Load([.. Enumerable.Range(0, 520).Select(i => MathF.Sin(i))]);
+                c.Bias!.Load([.. Enumerable.Range(0, 1030).Select(i => MathF.Cos(i))]);
+                foreach (var layer in new[] { a, b, c })
+                {
+                    convert(layer);
+                }
+
+                foreach (int m in new[] { 1, 3, 8 })
+                {
+                    using var noGrad = Autograd.NoGrad();
+                    using var scope = new TensorScope();
+                    using var x = Tensor.From([.. Enumerable.Range(0, m * k).Select(_ => (float)(r.NextDouble() * 2 - 1))], [1, m, k], device);
+                    var together = Linear.ForwardMany(x, a, b, c);
+                    var pair = Linear.ForwardMany(x, b, c);
+                    var separate = new[] { a.Forward(x), b.Forward(x), c.Forward(x) };
+                    for (int j = 0; j < 3; j++)
+                    {
+                        AssertClose(separate[j].ToArray(), together[j].ToArray(), 1e-3f * MathF.Sqrt(k), $"{a} k {k}, m {m}, product {j}");
+                    }
+
+                    AssertClose(separate[1].ToArray(), pair[0].ToArray(), 1e-3f * MathF.Sqrt(k), $"pair, k {k}, m {m}");
+                    AssertClose(separate[2].ToArray(), pair[1].ToArray(), 1e-3f * MathF.Sqrt(k), $"pair, k {k}, m {m}");
+                }
+            }
+        }
     }
 
     private static void Int8CacheKernels(Device device)

@@ -126,6 +126,15 @@ internal abstract class Backend
         BatchedMatMul(a, b, c, 1, m, n, k, transA, transB, beta);
 
     /// <summary>
+    /// Several few-row products of packed weights sharing one input x [m, k]: y_j = x · w_j (+ bias_j), with w_j int8
+    /// (<paramref name="kind"/> 0, as in <see cref="Int8MatMul"/>), 4-bit (1, <see cref="Int4MatMul"/>) or bfloat16 (2,
+    /// <see cref="BFloat16MatMul"/>; no scales). Returns false when the device has no single-pass version (callers then
+    /// run the products one by one).
+    /// </summary>
+    public virtual bool PackedMatMulMany(int kind, Storage x, int m, int k,
+        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products) => false;
+
+    /// <summary>
     /// Several products sharing one input: y_j = a · w_j (+ bias_j) for a [m, k] and w_j [k, n_j] (the query, key and
     /// value projections, say). The default computes them one by one; devices may do them in one pass.
     /// </summary>
