@@ -17,6 +17,7 @@ internal static partial class Tests
         ("training: FitAsync progress and TrainAsync early exit", TrainingAsync),
         ("fine-tuning: freeze, trainable-only save/load, grouped optimizer", FreezingAndGroups),
         ("fine-tuning: LoRA starts neutral, trains only adapters, merges exactly", Lora),
+        ("telemetry: Configure().Console/JsonLines/Record.Start() subscribes, disposes and flushes", TelemetryBuilderSession),
     ];
 
     private static Sequential ManualMlp(Device device, Random r) => new()
@@ -283,5 +284,32 @@ internal static partial class Tests
 
         Check(model.Parameters().Count() == model.Descendants().OfType<Linear>().Sum(l => l.Bias is null ? 1 : 2)
               + model.Descendants().OfType<LayerNorm>().Count() * 2 + 1, "adapters removed");
+    }
+
+    private static void TelemetryBuilderSession(Device device)
+    {
+        var levelsBefore = Telemetry.ActiveLevels;
+        var console = new StringWriter();
+        string path = Path.GetTempFileName();
+        MetricsRecorder recorder;
+        using (var session = Telemetry.Configure()
+                   .Console(TelemetryLevel.Training, output: console)
+                   .JsonLines(path, TelemetryLevel.Training)
+                   .Record(out recorder)
+                   .Start())
+        {
+            Check(session.HookCount == 3 && Telemetry.IsEnabled(TelemetryLevel.Training), "subscribed");
+            var split = SmallRegression(64, 2).Split(0.75, seed: 1).StandardizeFeatures().StandardizeTargets();
+            using var model = BuiltMlpFor3(device);
+            new TrainingRun { Model = model, Loss = Losses.MeanSquaredError, Optimizer = p => new Adam(p, 0.01f),
+                Train = split.Train.Batches(16, device: device), Epochs = 3 }.Fit();
+        }
+
+        Check(Telemetry.ActiveLevels == levelsBefore, "unsubscribed on dispose");
+        Check(recorder.Epochs.Count == 3, "recorder got every epoch");
+        Check(console.ToString().Contains("Epoch 3/3"), "console output");
+        var lines = File.ReadAllLines(path);
+        File.Delete(path);
+        Check(lines.Count(l => l.Contains("\"event\":\"epoch\"")) == 3, $"json lines flushed ({lines.Length} lines)");
     }
 }

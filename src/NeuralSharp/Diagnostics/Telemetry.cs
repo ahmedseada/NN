@@ -29,8 +29,14 @@ public enum TelemetryLevel
     /// <summary>Every <see cref="Module.Predict(Tensor)"/> call: batch size, latency and throughput.</summary>
     Inference = 1 << 5,
 
+    /// <summary>Every tool call made during a chat (<c>ToolRegistry</c>): name, duration, outcome.</summary>
+    Tools = 1 << 6,
+
+    /// <summary>Inference-engine events (<c>InferenceEngine</c>): model loaded or unloaded, request completed or rejected.</summary>
+    Engine = 1 << 7,
+
     /// <summary>Everything.</summary>
-    All = Training | Batches | Gradients | Layers | Operations | Inference,
+    All = Training | Batches | Gradients | Layers | Operations | Inference | Tools | Engine,
 }
 
 /// <summary>
@@ -77,6 +83,16 @@ public interface ITelemetryHook
     void OnInference(in InferenceCompleted e)
     {
     }
+
+    /// <summary>A tool call finished (<see cref="TelemetryLevel.Tools"/>).</summary>
+    void OnToolCall(in ToolCallCompleted e)
+    {
+    }
+
+    /// <summary>The inference engine loaded or unloaded a model, or completed or rejected a request (<see cref="TelemetryLevel.Engine"/>).</summary>
+    void OnEngine(in EngineEvent e)
+    {
+    }
 }
 
 /// <summary>
@@ -107,6 +123,9 @@ public static class Telemetry
     /// (slower; for profiling only).
     /// </summary>
     public static bool SynchronizeForTiming { get; set; }
+
+    /// <summary>Starts a <see cref="TelemetryBuilder"/>: add hooks, then <see cref="TelemetryBuilder.Start"/> subscribes them all.</summary>
+    public static TelemetryBuilder Configure() => new();
 
     /// <summary>Starts sending events to <paramref name="hook"/>. Dispose the result to unsubscribe.</summary>
     public static IDisposable Subscribe(ITelemetryHook hook)
@@ -199,6 +218,28 @@ public static class Telemetry
             if ((h.Levels & TelemetryLevel.Training) != 0)
             {
                 h.OnTrainingCompleted(in e);
+            }
+        }
+    }
+
+    internal static void ToolCall(in ToolCallCompleted e)
+    {
+        foreach (var h in s_hooks)
+        {
+            if ((h.Levels & TelemetryLevel.Tools) != 0)
+            {
+                h.OnToolCall(in e);
+            }
+        }
+    }
+
+    internal static void Engine(in EngineEvent e)
+    {
+        foreach (var h in s_hooks)
+        {
+            if ((h.Levels & TelemetryLevel.Engine) != 0)
+            {
+                h.OnEngine(in e);
             }
         }
     }

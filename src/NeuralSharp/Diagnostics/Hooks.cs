@@ -94,6 +94,19 @@ public sealed class ConsoleLogger(TelemetryLevel levels = TelemetryLevel.Trainin
     /// <inheritdoc />
     public void OnInference(in InferenceCompleted e) =>
         _out.WriteLine($"Inference {e.Model}: {e.Samples:N0} samples on {e.Device} in {e.Latency.TotalMilliseconds:F3} ms ({e.SamplesPerSecond:N0} samples/s)");
+
+    /// <inheritdoc />
+    public void OnToolCall(in ToolCallCompleted e) =>
+        _out.WriteLine($"Tool {e.Tool}({e.Arguments}): {(e.Succeeded ? "ok" : "failed: " + e.Error)} in {e.Duration.TotalMilliseconds:F1} ms");
+
+    /// <inheritdoc />
+    public void OnEngine(in EngineEvent e) => _out.WriteLine(e.Kind switch
+    {
+        EngineEventKind.ModelLoaded => $"Engine: loaded {e.Model} in {e.Duration.TotalMilliseconds:F1} ms",
+        EngineEventKind.ModelUnloaded => $"Engine: unloaded {e.Model}",
+        EngineEventKind.RequestCompleted => $"Engine: {e.Model} request in {e.Duration.TotalMilliseconds:F2} ms (queued {e.QueueWait.TotalMilliseconds:F2} ms, batch {e.BatchSize})",
+        _ => $"Engine: {e.Model} request rejected: {e.Reason}",
+    });
 }
 
 /// <summary>Keeps every epoch (and optionally batch) event in memory, for charts, reports or CSV export.</summary>
@@ -245,6 +258,12 @@ public sealed class ChannelTelemetry : ITelemetryHook
 
     /// <inheritdoc />
     public void OnInference(in InferenceCompleted e) => Write(e);
+
+    /// <inheritdoc />
+    public void OnToolCall(in ToolCallCompleted e) => Write(e);
+
+    /// <inheritdoc />
+    public void OnEngine(in EngineEvent e) => Write(e);
 }
 
 /// <summary>
@@ -287,6 +306,12 @@ public sealed class JsonLinesLogger : ITelemetryHook, IDisposable, IAsyncDisposa
 
     /// <inheritdoc />
     public void OnInference(in InferenceCompleted e) => _channel.OnInference(in e);
+
+    /// <inheritdoc />
+    public void OnToolCall(in ToolCallCompleted e) => _channel.OnToolCall(in e);
+
+    /// <inheritdoc />
+    public void OnEngine(in EngineEvent e) => _channel.OnEngine(in e);
 
     private async Task WriteAsync(FileStream stream)
     {
@@ -411,6 +436,23 @@ public static class TelemetryJson
                 w.WriteString("device", e.Device.ToString());
                 w.WriteNumber("latency_ms", e.Latency.TotalMilliseconds);
                 Number(w, "samples_per_second", e.SamplesPerSecond);
+                break;
+            case ToolCallCompleted e:
+                w.WriteString("event", "tool_call");
+                w.WriteString("tool", e.Tool);
+                w.WriteString("arguments", e.Arguments);
+                w.WriteNumber("duration_ms", e.Duration.TotalMilliseconds);
+                w.WriteBoolean("succeeded", e.Succeeded);
+                if (e.Error is { } error) w.WriteString("error", error);
+                break;
+            case EngineEvent e:
+                w.WriteString("event", "engine");
+                w.WriteString("kind", e.Kind.ToString());
+                w.WriteString("model", e.Model);
+                w.WriteNumber("duration_ms", e.Duration.TotalMilliseconds);
+                w.WriteNumber("queue_wait_ms", e.QueueWait.TotalMilliseconds);
+                w.WriteNumber("batch_size", e.BatchSize);
+                if (e.Reason is { } reason) w.WriteString("reason", reason);
                 break;
         }
 

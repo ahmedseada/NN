@@ -142,3 +142,36 @@ public readonly record struct InferenceCompleted(
     /// <summary>Rows per second.</summary>
     public double SamplesPerSecond => Latency.TotalSeconds > 0 ? Samples / Latency.TotalSeconds : double.PositiveInfinity;
 }
+
+/// <summary>Published after each tool call when <see cref="TelemetryLevel.Tools"/> is enabled.</summary>
+/// <param name="Tool">The tool's name.</param>
+/// <param name="Arguments">The arguments as JSON text.</param>
+/// <param name="Duration">Time spent in the tool.</param>
+/// <param name="Succeeded">False when the tool threw, timed out, was denied or got invalid arguments.</param>
+/// <param name="Error">What went wrong, or null.</param>
+public readonly record struct ToolCallCompleted(string Tool, string Arguments, TimeSpan Duration, bool Succeeded, string? Error);
+
+/// <summary>What happened in the inference engine.</summary>
+public enum EngineEventKind
+{
+    /// <summary>A model finished loading (and warming up, if set).</summary>
+    ModelLoaded,
+
+    /// <summary>A model was unloaded (keep-alive expired, or on request).</summary>
+    ModelUnloaded,
+
+    /// <summary>A request completed successfully.</summary>
+    RequestCompleted,
+
+    /// <summary>A request was rejected (queue full), timed out or failed.</summary>
+    RequestRejected,
+}
+
+/// <summary>Published by the inference engine when <see cref="TelemetryLevel.Engine"/> is enabled.</summary>
+/// <param name="Kind">What happened.</param>
+/// <param name="Model">The model's name in the engine.</param>
+/// <param name="Duration">Load time, or request latency (including queue wait).</param>
+/// <param name="QueueWait">Time the request waited before running (requests only).</param>
+/// <param name="BatchSize">Rows processed together with this request (predictor requests only; 0 otherwise).</param>
+/// <param name="Reason">Why a request was rejected, or null.</param>
+public readonly record struct EngineEvent(EngineEventKind Kind, string Model, TimeSpan Duration, TimeSpan QueueWait, int BatchSize, string? Reason);
