@@ -10,10 +10,10 @@ internal sealed unsafe partial class CudaBackend
     private static ulong Pn(Storage? s) => s is null ? 0UL : P(s);
 
     public override void Softmax(Storage x, Storage y, int rows, int cols, bool log) =>
-        Launch1D(K("softmax_f32"), rows, P(x), P(y), U(cols), U(log ? 1 : 0), U(rows));
+        LaunchRows(K("softmax_f32"), rows, P(x), P(y), U(cols), U(log ? 1 : 0), U(rows));
 
     public override void SoftmaxBackward(Storage y, Storage dy, Storage dx, int rows, int cols, bool log) =>
-        Launch1D(K("softmax_bwd_f32"), rows, P(y), P(dy), P(dx), U(cols), U(log ? 1 : 0), U(rows));
+        LaunchRows(K("softmax_bwd_f32"), rows, P(y), P(dy), P(dx), U(cols), U(log ? 1 : 0), U(rows));
 
     public override void ArgMax(Storage x, Storage y, int rows, int cols) =>
         Launch1D(K("argmax_f32"), rows, P(x), P(y), U(cols), U(rows));

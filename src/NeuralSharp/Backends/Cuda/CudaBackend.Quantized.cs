@@ -34,10 +34,10 @@ internal sealed unsafe partial class CudaBackend
     }
 
     public override void RmsNorm(Storage x, Storage y, Storage inv, int rows, int cols, float eps) =>
-        Launch1D(K("rms_norm_f32"), rows, P(x), P(y), P(inv), U(cols), F(eps), U(rows));
+        LaunchRows(K("rms_norm_f32"), rows, P(x), P(y), P(inv), U(cols), F(eps), U(rows));
 
     public override void RmsNormBackward(Storage dy, Storage y, Storage inv, Storage dx, int rows, int cols) =>
-        Launch1D(K("rms_norm_backward_f32"), rows, P(dy), P(y), P(inv), P(dx), U(cols), U(rows));
+        LaunchRows(K("rms_norm_backward_f32"), rows, P(dy), P(y), P(inv), P(dx), U(cols), U(rows));
 
     public override void Rope(Storage x, Storage y, Storage cos, Storage sin, Storage positions, int rows, int heads, int steps, int dim, int half, bool interleaved, float sign)
     {

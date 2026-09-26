@@ -15,25 +15,25 @@ internal static partial class PtxKernels
 
     private static void BuildDecoding(StringBuilder sb)
     {
-        const string RowStart = """
-            mul.lo.u32 %r5, %i, %s_cols;
+        const string BlockRowStart = """
+            mul.lo.u32 %r5, %row, %s_cols;
             mul.wide.u32 %rd1, %r5, 4;
             """;
 
-        // softmax(scale * x + mask[row % maskrows]) per row, one thread per row.
-        Elementwise(sb, "scale_mask_softmax_f32", ["x", "mask", "y"], [("u32", "cols"), ("u32", "maskrows"), ("f32", "scale"), ("u32", "hasmask")],
-            RowStart + $"""
+        // softmax(scale * x + mask[row % maskrows]) per row, one block per row.
+        RowBlock(sb, "scale_mask_softmax_f32", ["x", "mask", "y"], [("u32", "cols"), ("u32", "maskrows"), ("f32", "scale"), ("u32", "hasmask")],
+            BlockRowStart + $"""
             add.u64 %rd2, %b_x, %rd1;
             add.u64 %rd3, %b_y, %rd1;
             sub.u64 %rd6, %rd3, %rd2;
-            rem.u32 %r7, %i, %s_maskrows;
+            rem.u32 %r7, %row, %s_maskrows;
             mul.lo.u32 %r7, %r7, %s_cols;
             mul.wide.u32 %rd4, %r7, 4;
             add.u64 %rd4, %b_mask, %rd4;
             sub.u64 %rd8, %rd4, %rd2;
             setp.ne.u32 %p3, %s_hasmask, 0;
             mov.f32 %f1, {NegInf};
-            """ + "\n" + RowLoop("SZ", "%rd2", """
+            """ + "\n" + StridedLoop("SZ", "%rd2", "%s_cols", """
             mul.f32 %f2, %f2, %s_scale;
             mov.f32 %f3, 0f00000000;
             add.u64 %rd9, %rd5, %rd8;
@@ -42,41 +42,42 @@ internal static partial class PtxKernels
             add.u64 %rd7, %rd5, %rd6;
             st.global.f32 [%rd7], %f2;
             max.f32 %f1, %f1, %f2;
-            """) + "\n" + $"""
+            """) + "\n" + BlockReduce("RMAX", "%f1", "max", NegInf) + "\n" + $"""
             mov.f32 %f4, {Zero};
-            """ + "\n" + RowLoop("SE", "%rd3", $"""
+            """ + "\n" + StridedLoop("SE", "%rd3", "%s_cols", $"""
             sub.f32 %f2, %f2, %f1;
             mul.f32 %f2, %f2, {Log2E};
             ex2.approx.ftz.f32 %f2, %f2;
             st.global.f32 [%rd5], %f2;
             add.f32 %f4, %f4, %f2;
-            """) + "\n" + """
+            """) + "\n" + BlockReduce("RSUM", "%f4", "add", Zero) + "\n" + """
             rcp.rn.f32 %f4, %f4;
-            """ + "\n" + RowLoop("SN", "%rd3", """
+            """ + "\n" + StridedLoop("SN", "%rd3", "%s_cols", """
             mul.f32 %f2, %f2, %f4;
             st.global.f32 [%rd5], %f2;
             """));
 
-        // LayerNorm over the last dimension with gamma/beta, one thread per row.
-        Elementwise(sb, "layernorm_fused_f32", ["x", "gamma", "beta", "y"], [("u32", "cols"), ("f32", "eps")],
-            RowStart + $"""
+        // LayerNorm over the last dimension with gamma/beta, one block per row.
+        RowBlock(sb, "layernorm_fused_f32", ["x", "gamma", "beta", "y"], [("u32", "cols"), ("f32", "eps")],
+            BlockRowStart + $"""
             add.u64 %rd2, %b_x, %rd1;
             add.u64 %rd3, %b_y, %rd1;
             sub.u64 %rd6, %rd3, %rd2;
             cvt.rn.f32.u32 %f10, %s_cols;
             mov.f32 %f1, {Zero};
-            """ + "\n" + RowLoop("LS", "%rd2", "add.f32 %f1, %f1, %f2;") + "\n" + $"""
+            """ + "\n" + StridedLoop("LS", "%rd2", "%s_cols", "add.f32 %f1, %f1, %f2;") + "\n"
+            + BlockReduce("RMEAN", "%f1", "add", Zero) + "\n" + $"""
             div.rn.f32 %f3, %f1, %f10;
             mov.f32 %f4, {Zero};
-            """ + "\n" + RowLoop("LV", "%rd2", """
+            """ + "\n" + StridedLoop("LV", "%rd2", "%s_cols", """
             sub.f32 %f5, %f2, %f3;
             fma.rn.f32 %f4, %f5, %f5, %f4;
-            """) + "\n" + """
+            """) + "\n" + BlockReduce("RVAR", "%f4", "add", Zero) + "\n" + """
             div.rn.f32 %f4, %f4, %f10;
             add.f32 %f4, %f4, %s_eps;
             sqrt.rn.f32 %f4, %f4;
             rcp.rn.f32 %f4, %f4;
-            """ + "\n" + RowLoop("LW", "%rd2", """
+            """ + "\n" + StridedLoop("LW", "%rd2", "%s_cols", """
             mul.wide.u32 %rd7, %r6, 4;
             add.u64 %rd8, %b_gamma, %rd7;
             ld.global.f32 %f6, [%rd8];
@@ -145,49 +146,68 @@ internal static partial class PtxKernels
         SampleRows(sb);
     }
 
-    /// <summary>Loop over the vocabulary of the current row: %r6 = index, %rd3 = address, %f2 = scaled score, %f5 = kept exp weight.</summary>
-    private static string VocabularyLoop(string label, string body) => $"""
-        mov.u32 %r6, 0;
-        mov.u64 %rd3, %rd2;
-        {label}:
-        setp.ge.u32 %p1, %r6, %s_vocab;
-        @%p1 bra {label}_END;
-        ld.global.f32 %f2, [%rd3];
-        mul.f32 %f2, %f2, %s_invt;
-        setp.ge.f32 %p4, %f2, %f3;
-        sub.f32 %f5, %f2, %f1;
-        mul.f32 %f5, %f5, {Log2E};
-        ex2.approx.ftz.f32 %f5, %f5;
-        selp.f32 %f5, %f5, {Zero}, %p4;
-        {body}
-        {label}_NEXT:
-        add.u64 %rd3, %rd3, 4;
-        add.u32 %r6, %r6, 1;
-        bra {label};
-        {label}_END:
-        """;
-
-    /// <summary>The sampler: see Backend.SampleRows. One thread per row; mirrors CpuBackend.SampleRows step by step.</summary>
+    /// <summary>
+    /// The sampler: see Backend.SampleRows; one block per row, mirroring CpuBackend.SampleRows step by step (each pass
+    /// over the vocabulary is a block reduction). The draw: each thread sums the kept weights of a contiguous chunk,
+    /// thread 0 finds the chunk where the running total passes the target, and that chunk's thread walks it.
+    /// </summary>
     private static void SampleRows(StringBuilder sb)
     {
+        // Strided loop over the row's vocabulary: %r6 = index, %rd3 = address, %f2 = scaled score, %f5 = kept weight.
+        static string Kept(string label, string body) => $"""
+            mov.u32 %r6, %tx;
+            {label}:
+            setp.ge.u32 %p1, %r6, %s_vocab;
+            @%p1 bra {label}_END;
+            mul.wide.u32 %rd3, %r6, 4;
+            add.u64 %rd3, %rd3, %rd2;
+            ld.global.f32 %f2, [%rd3];
+            mul.f32 %f2, %f2, %s_invt;
+            setp.ge.f32 %p4, %f2, %f3;
+            sub.f32 %f5, %f2, %f1;
+            mul.f32 %f5, %f5, {Log2E};
+            ex2.approx.ftz.f32 %f5, %f5;
+            selp.f32 %f5, %f5, {Zero}, %p4;
+            {body}
+            {label}_NEXT:
+            add.u32 %r6, %r6, %nt;
+            bra {label};
+            {label}_END:
+            """;
+
+        // The same over this thread's chunk [%r21, %r22).
+        static string Chunk(string label, string body) => $"""
+            mov.u32 %r6, %r21;
+            {label}:
+            setp.ge.u32 %p1, %r6, %r22;
+            @%p1 bra {label}_END;
+            mul.wide.u32 %rd3, %r6, 4;
+            add.u64 %rd3, %rd3, %rd2;
+            ld.global.f32 %f2, [%rd3];
+            mul.f32 %f2, %f2, %s_invt;
+            setp.ge.f32 %p4, %f2, %f3;
+            sub.f32 %f5, %f2, %f1;
+            mul.f32 %f5, %f5, {Log2E};
+            ex2.approx.ftz.f32 %f5, %f5;
+            selp.f32 %f5, %f5, {Zero}, %p4;
+            {body}
+            {label}_NEXT:
+            add.u32 %r6, %r6, 1;
+            bra {label};
+            {label}_END:
+            """;
+
         var body = new StringBuilder();
         body.AppendLine($"""
-            mad.lo.u32 %r5, %i, %s_rowstride, %s_rowoffset;
+            mad.lo.u32 %r5, %row, %s_rowstride, %s_rowoffset;
             mul.wide.u32 %rd1, %r5, 4;
             add.u64 %rd2, %b_logits, %rd1;
             mov.f32 %f1, {NegInf};
-            mov.u32 %r6, 0;
-            mov.u64 %rd3, %rd2;
-            PMAX:
-            setp.ge.u32 %p1, %r6, %s_vocab;
-            @%p1 bra PMAX_END;
-            ld.global.f32 %f2, [%rd3];
-            mul.f32 %f2, %f2, %s_invt;
-            max.f32 %f1, %f1, %f2;
-            add.u64 %rd3, %rd3, 4;
-            add.u32 %r6, %r6, 1;
-            bra PMAX;
-            PMAX_END:
+            mov.f32 %f3, {NegInf};
+            """);
+        body.AppendLine(Kept("PMAX", "max.f32 %f1, %f1, %f2;"));
+        body.AppendLine(BlockReduce("RMAX", "%f1", "max", NegInf));
+        body.AppendLine($"""
             mov.f32 %f3, {NegInf};
             setp.eq.u32 %p2, %s_topk, 0;
             @%p2 bra THR_DONE;
@@ -196,23 +216,17 @@ internal static partial class PtxKernels
             mov.f32 %f3, {PosInf};
             mov.u32 %r7, 0;
             TK:
-            setp.ge.u32 %p1, %r7, %s_topk;
-            @%p1 bra THR_DONE;
+            setp.ge.u32 %p2, %r7, %s_topk;
+            @%p2 bra THR_DONE;
             mov.f32 %f4, {NegInf};
-            mov.u32 %r6, 0;
-            mov.u64 %rd3, %rd2;
-            TKI:
-            setp.ge.u32 %p1, %r6, %s_vocab;
-            @%p1 bra TKI_END;
-            ld.global.f32 %f2, [%rd3];
-            mul.f32 %f2, %f2, %s_invt;
+            """);
+        body.AppendLine(Kept("TKI", """
             setp.lt.f32 %p3, %f2, %f3;
             setp.gt.and.f32 %p3, %f2, %f4, %p3;
             selp.f32 %f4, %f2, %f4, %p3;
-            add.u64 %rd3, %rd3, 4;
-            add.u32 %r6, %r6, 1;
-            bra TKI;
-            TKI_END:
+            """));
+        body.AppendLine(BlockReduce("RTK", "%f4", "max", NegInf));
+        body.AppendLine($"""
             mov.f32 %f3, %f4;
             add.u32 %r7, %r7, 1;
             bra TK;
@@ -229,7 +243,8 @@ internal static partial class PtxKernels
             @!%p7 bra TOPP_DONE;
             mov.f32 %f20, {Zero};
             """);
-        body.AppendLine(VocabularyLoop("TPM", "add.f32 %f20, %f20, %f5;"));
+        body.AppendLine(Kept("TPM", "add.f32 %f20, %f20, %f5;"));
+        body.AppendLine(BlockReduce("RTPM", "%f20", "add", Zero));
         body.AppendLine($"""
             mul.f32 %f20, %f20, %s_topp;
             sub.f32 %f21, %f1, {F(40f)};
@@ -243,11 +258,12 @@ internal static partial class PtxKernels
             mul.f32 %f23, %f23, {F(0.5f)};
             mov.f32 %f24, {Zero};
             """);
-        body.AppendLine(VocabularyLoop("TPB", $"""
+        body.AppendLine(Kept("TPB", $"""
             setp.ge.f32 %p9, %f2, %f23;
             selp.f32 %f25, %f5, {Zero}, %p9;
             add.f32 %f24, %f24, %f25;
             """));
+        body.AppendLine(BlockReduce("RTPB", "%f24", "add", Zero));
         body.AppendLine($"""
             setp.ge.f32 %p9, %f24, %f20;
             selp.f32 %f21, %f23, %f21, %p9;
@@ -259,7 +275,10 @@ internal static partial class PtxKernels
             TOPP_DONE:
             mov.f32 %f6, {Zero};
             """);
-        body.AppendLine(VocabularyLoop("PSUM", "add.f32 %f6, %f6, %f5;"));
+        body.AppendLine(Kept("PSUM", "add.f32 %f6, %f6, %f5;"));
+        body.AppendLine(BlockReduce("RPSUM", "%f6", "add", Zero));
+
+        // The target: uniform(seed, step, row) · Σ weights (the counter-based random stream of the CPU sampler).
         body.AppendLine($"""
             ld.global.f32 %f7, [%b_step];
             cvt.rzi.u32.f32 %r8, %f7;
@@ -279,11 +298,58 @@ internal static partial class PtxKernels
             cvt.rn.f32.u32 %f8, %r10;
             mul.f32 %f8, %f8, {F(1f / 16777216f)};
             mul.f32 %f8, %f8, %f6;
-            mov.s32 %r11, -1;
-            mov.f32 %f9, {Zero};
-            mov.f32 %f10, {Zero};
+            add.u32 %r20, %s_vocab, %nt;
+            sub.u32 %r20, %r20, 1;
+            div.u32 %r20, %r20, %nt;
+            mul.lo.u32 %r21, %tx, %r20;
+            min.u32 %r21, %r21, %s_vocab;
+            add.u32 %r22, %r21, %r20;
+            min.u32 %r22, %r22, %s_vocab;
+            mov.f32 %f26, {Zero};
             """);
-        body.AppendLine(VocabularyLoop("PS", """
+        body.AppendLine(Chunk("PC", "add.f32 %f26, %f26, %f5;"));
+        body.AppendLine($"""
+            shl.b32 %r23, %tx, 2;
+            add.u32 %r23, %r23, %spart;
+            st.shared.f32 [%r23], %f26;
+            bar.sync 0;
+            setp.ne.u32 %p10, %tx, 0;
+            @%p10 bra SCAN_DONE;
+            mov.f32 %f27, {Zero};
+            mov.s32 %r24, -1;
+            mov.f32 %f28, {Zero};
+            mov.u32 %r25, 0;
+            SC:
+            setp.ge.u32 %p11, %r25, %nt;
+            @%p11 bra SC_END;
+            shl.b32 %r23, %r25, 2;
+            add.u32 %r23, %r23, %spart;
+            ld.shared.f32 %f29, [%r23];
+            setp.gt.f32 %p12, %f29, {Zero};
+            @!%p12 bra SC_NEXT;
+            mov.b32 %r24, %r25;
+            mov.f32 %f28, %f27;
+            add.f32 %f27, %f27, %f29;
+            setp.gt.f32 %p12, %f27, %f8;
+            @%p12 bra SC_END;
+            SC_NEXT:
+            add.u32 %r25, %r25, 1;
+            bra SC;
+            SC_END:
+            st.shared.b32 [%sb], %r24;
+            st.shared.f32 [%sb+4], %f28;
+            SCAN_DONE:
+            bar.sync 0;
+            ld.shared.b32 %r24, [%sb];
+            ld.shared.f32 %f28, [%sb+4];
+            bar.sync 0;
+            mov.s32 %r11, -1;
+            mov.f32 %f10, {Zero};
+            setp.ne.u32 %p10, %tx, %r24;
+            @%p10 bra PICK_DONE;
+            mov.f32 %f9, %f28;
+            """);
+        body.AppendLine(Chunk("PS", """
             setp.gt.f32 %p5, %f5, 0f00000000;
             @!%p5 bra PS_NEXT;
             mov.u32 %r11, %r6;
@@ -292,10 +358,17 @@ internal static partial class PtxKernels
             setp.gt.f32 %p6, %f9, %f8;
             @%p6 bra PS_END;
             """));
-        body.AppendLine($"""
-            mov.f32 %f11, {Zero};
+        body.AppendLine("""
+            st.shared.b32 [%sb], %r11;
+            st.shared.f32 [%sb+4], %f10;
+            PICK_DONE:
+            bar.sync 0;
+            ld.shared.b32 %r11, [%sb];
+            ld.shared.f32 %f10, [%sb+4];
+            bar.sync 0;
+            mov.f32 %f11, 0f00000000;
             """);
-        body.AppendLine(VocabularyLoop("PH", """
+        body.AppendLine(Kept("PH", """
             setp.gt.f32 %p5, %f5, 0f00000000;
             @!%p5 bra PH_NEXT;
             div.rn.f32 %f12, %f5, %f6;
@@ -303,17 +376,19 @@ internal static partial class PtxKernels
             mul.f32 %f13, %f13, %f12;
             sub.f32 %f11, %f11, %f13;
             """));
+        body.AppendLine(BlockReduce("RPH", "%f11", "add", Zero));
         body.AppendLine("""
+            setp.eq.u32 %p15, %tx, 0;
             mad.lo.u32 %r12, %r8, %s_rows, %i;
             mul.lo.u32 %r12, %r12, 13;
             mul.wide.u32 %rd4, %r12, 4;
             add.u64 %rd5, %b_stats, %rd4;
             cvt.rn.f32.s32 %f14, %r11;
-            st.global.f32 [%a_ids], %f14;
-            st.global.f32 [%rd5], %f14;
+            @%p15 st.global.f32 [%a_ids], %f14;
+            @%p15 st.global.f32 [%rd5], %f14;
             div.rn.f32 %f15, %f10, %f6;
-            st.global.f32 [%rd5+4], %f15;
-            st.global.f32 [%rd5+8], %f11;
+            @%p15 st.global.f32 [%rd5+4], %f15;
+            @%p15 st.global.f32 [%rd5+8], %f11;
             mov.s32 %r13, -1;
             mov.s32 %r14, -1;
             mov.s32 %r15, -1;
@@ -335,19 +410,20 @@ internal static partial class PtxKernels
                 mov.s32 %r18, -1;
                 mov.f32 %f16, {Zero};
                 """);
-            body.AppendLine(VocabularyLoop($"TOP{a}", exclude.ToString()));
+            body.AppendLine(Kept($"TOP{a}", exclude.ToString()));
+            body.AppendLine(BlockArgMax($"RTOP{a}", "%f16", "%r18"));
             body.AppendLine($"""
                 mov.b32 %r{13 + a}, %r18;
                 cvt.rn.f32.s32 %f17, %r18;
-                st.global.f32 [%rd5+{12 + 8 * a}], %f17;
+                @%p15 st.global.f32 [%rd5+{12 + 8 * a}], %f17;
                 div.rn.f32 %f18, %f16, %f6;
-                st.global.f32 [%rd5+{16 + 8 * a}], %f18;
+                @%p15 st.global.f32 [%rd5+{16 + 8 * a}], %f18;
                 """);
         }
 
-        Elementwise(sb, "sample_rows_f32", ["logits", "ids", "stats", "step"],
+        RowBlock(sb, "sample_rows_f32", ["logits", "ids", "stats", "step"],
             [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("f32", "invt"), ("u32", "topk"), ("f32", "topp"), ("f32", "minp"), ("u32", "seed"), ("u32", "rows")],
-            body.ToString());
+            body.ToString(), sharedFloats: RowThreads);
 
         // Repetition penalties: copy the row to work[r, :], then penalize each distinct token of the last n history entries once.
         Elementwise(sb, "penalize_rows_f32", ["logits", "work", "history", "len"],

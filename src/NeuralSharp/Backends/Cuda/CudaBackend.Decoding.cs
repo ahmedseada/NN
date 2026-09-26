@@ -6,11 +6,11 @@ namespace NeuralSharp.Backends.Cuda;
 internal sealed unsafe partial class CudaBackend
 {
     public override void ScaleMaskSoftmax(Storage x, Storage? mask, Storage y, int rows, int cols, int maskRows, float scale) =>
-        Launch1D(K("scale_mask_softmax_f32"), rows, P(x), mask is null ? P(x) : P(mask), P(y),
+        LaunchRows(K("scale_mask_softmax_f32"), rows, P(x), mask is null ? P(x) : P(mask), P(y),
             U(cols), U(Math.Max(maskRows, 1)), F(scale), U(mask is null ? 0 : 1), U(rows));
 
     public override void LayerNormFused(Storage x, Storage gamma, Storage beta, Storage y, int rows, int cols, float eps) =>
-        Launch1D(K("layernorm_fused_f32"), rows, P(x), P(gamma), P(beta), P(y), U(cols), F(eps), U(rows));
+        LaunchRows(K("layernorm_fused_f32"), rows, P(x), P(gamma), P(beta), P(y), U(cols), F(eps), U(rows));
 
     public override void BiasGelu(Storage x, Storage bias, Storage y, int n, int cols) =>
         Launch1D(K("bias_gelu_f32"), n, P(x), P(bias), P(y), U(cols), U(n));
@@ -29,7 +29,7 @@ internal sealed unsafe partial class CudaBackend
 
     public override void SampleRows(Storage logits, Storage ids, Storage stats, Storage step, int rows, int vocabulary,
         int rowStride, int rowOffset, float temperature, int topK, float topP, float minP, uint seed) =>
-        Launch1D(K("sample_rows_f32"), rows, P(logits), P(ids), P(stats), P(step),
+        LaunchRows(K("sample_rows_f32"), rows, P(logits), P(ids), P(stats), P(step),
             U(vocabulary), U(rowStride), U(rowOffset), F(1f / MathF.Max(temperature, 1e-3f)), U(topK), F(topP), F(minP), seed, U(rows), U(rows));
 
     public override void PenalizeRows(Storage logits, Storage work, Storage history, Storage length, int rows, int vocabulary,

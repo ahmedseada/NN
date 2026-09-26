@@ -284,6 +284,7 @@ internal static partial class PtxKernels
         BuildDecoding(sb);
         BuildQuantized(sb);
         BuildDecoder(sb);
+        BuildRows(sb);
         return sb.ToString();
     }
 

@@ -10,32 +10,34 @@ internal static partial class PtxKernels
     private static void BuildDecoder(StringBuilder sb)
     {
         const string RowStart = """
-            mul.lo.u32 %r5, %i, %s_cols;
+            mul.lo.u32 %r5, %row, %s_cols;
             mul.wide.u32 %rd1, %r5, 4;
             """;
 
-        // y = x · inv, inv = 1 / sqrt(mean(x²) + eps) per row (stored for the backward pass): one thread per row.
-        Elementwise(sb, "rms_norm_f32", ["x", "y", "inv"], [("u32", "cols"), ("f32", "eps")],
+        // y = x · inv, inv = 1 / sqrt(mean(x²) + eps) per row (stored for the backward pass): one block per row.
+        RowBlock(sb, "rms_norm_f32", ["x", "y", "inv"], [("u32", "cols"), ("f32", "eps")],
             RowStart + $"""
             add.u64 %rd2, %b_x, %rd1;
             add.u64 %rd3, %b_y, %rd1;
             sub.u64 %rd6, %rd3, %rd2;
             cvt.rn.f32.u32 %f10, %s_cols;
             mov.f32 %f1, {Zero};
-            """ + "\n" + RowLoop("RS", "%rd2", "fma.rn.f32 %f1, %f2, %f2, %f1;") + "\n" + """
+            """ + "\n" + StridedLoop("RS", "%rd2", "%s_cols", "fma.rn.f32 %f1, %f2, %f2, %f1;") + "\n"
+            + BlockReduce("RSUM", "%f1", "add", Zero) + "\n" + """
             div.rn.f32 %f1, %f1, %f10;
             add.f32 %f1, %f1, %s_eps;
             sqrt.rn.f32 %f1, %f1;
             rcp.rn.f32 %f1, %f1;
-            st.global.f32 [%a_inv], %f1;
-            """ + "\n" + RowLoop("RW", "%rd2", """
+            setp.eq.u32 %p5, %tx, 0;
+            @%p5 st.global.f32 [%a_inv], %f1;
+            """ + "\n" + StridedLoop("RW", "%rd2", "%s_cols", """
             mul.f32 %f2, %f2, %f1;
             add.u64 %rd7, %rd5, %rd6;
             st.global.f32 [%rd7], %f2;
             """));
 
-        // dx += inv · (dy - y · mean(dy · y)) per row (y is the normalized output): one thread per row.
-        Elementwise(sb, "rms_norm_backward_f32", ["dy", "y", "inv", "dx"], [("u32", "cols")],
+        // dx += inv · (dy - y · mean(dy · y)) per row (y is the normalized output): one block per row.
+        RowBlock(sb, "rms_norm_backward_f32", ["dy", "y", "inv", "dx"], [("u32", "cols")],
             RowStart + $"""
             add.u64 %rd2, %b_dy, %rd1;
             add.u64 %rd3, %b_y, %rd1;
@@ -44,14 +46,14 @@ internal static partial class PtxKernels
             sub.u64 %rd8, %rd4, %rd2;
             cvt.rn.f32.u32 %f10, %s_cols;
             mov.f32 %f1, {Zero};
-            """ + "\n" + RowLoop("RD", "%rd2", """
+            """ + "\n" + StridedLoop("RD", "%rd2", "%s_cols", """
             add.u64 %rd7, %rd5, %rd6;
             ld.global.f32 %f3, [%rd7];
             fma.rn.f32 %f1, %f2, %f3, %f1;
-            """) + "\n" + """
+            """) + "\n" + BlockReduce("RDOT", "%f1", "add", Zero) + "\n" + """
             div.rn.f32 %f1, %f1, %f10;
             ld.global.f32 %f6, [%a_inv];
-            """ + "\n" + RowLoop("RB", "%rd2", """
+            """ + "\n" + StridedLoop("RB", "%rd2", "%s_cols", """
             add.u64 %rd7, %rd5, %rd6;
             ld.global.f32 %f3, [%rd7];
             mul.f32 %f4, %f3, %f1;

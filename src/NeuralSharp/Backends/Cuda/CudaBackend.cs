@@ -96,7 +96,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         _sgdMomentum = Fn("sgd_momentum_f32");
         _adam = Fn("adam_f32");
         _matmul = Fn("matmul_f32");
-        _kernels = PtxKernels.AdvancedNames.Concat(PtxKernels.DecodingNames).Concat(PtxKernels.QuantizedNames).Concat(PtxKernels.DecoderNames).ToDictionary(k => k, Fn);
+        _kernels = PtxKernels.AdvancedNames.Concat(PtxKernels.DecodingNames).Concat(PtxKernels.QuantizedNames).Concat(PtxKernels.DecoderNames).Concat(PtxKernels.RowNames).ToDictionary(k => k, Fn);
     }
 
     public static int DeviceCount => Probe.Value.Count;
@@ -397,10 +397,19 @@ internal sealed unsafe partial class CudaBackend : Backend
         const int T = PtxKernels.Tile;
         const int MaxGridZ = 65535;
         ulong mk = (ulong)m * (ulong)k, kn = (ulong)k * (ulong)n, mn = (ulong)m * (ulong)n;
+        bool few = m <= PtxKernels.GemvRows && !transA;                     // token-by-token decoding: read the weights once
         for (int first = 0; first < batch; first += MaxGridZ)
         {
             int count = Math.Min(MaxGridZ, batch - first);
             ulong offset = (ulong)first * sizeof(float);
+            if (few)
+            {
+                uint columnsPerBlock = transB ? 8u : 32u;
+                Launch(K(transB ? "gemv_nt_f32" : "gemv_nn_f32"), (uint)((n + columnsPerBlock - 1) / columnsPerBlock), 1, (uint)count,
+                    PtxKernels.RowThreads, 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn, U(m), U(n), U(k), F(beta), mk, kn, mn);
+                continue;
+            }
+
             Launch(_matmul, (uint)((n + T - 1) / T), (uint)((m + T - 1) / T), (uint)count, T, T,
                 P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn, U(m), U(n), U(k), U(transA ? 1 : 0), U(transB ? 1 : 0), F(beta),
                 mk, kn, mn);
@@ -432,6 +441,15 @@ internal sealed unsafe partial class CudaBackend : Backend
     {
         MakeCurrent();
         Check(cuCtxSynchronize(), nameof(cuCtxSynchronize));
+    }
+
+    // One block of PtxKernels.RowThreads threads per row (PtxKernels.RowBlock kernels).
+    private void LaunchRows(IntPtr function, int rows, params ReadOnlySpan<ulong> args)
+    {
+        if (rows > 0)
+        {
+            Launch(function, (uint)rows, 1, 1, PtxKernels.RowThreads, 1, args);
+        }
     }
 
     private void Launch1D(IntPtr function, int n, params ReadOnlySpan<ulong> args)

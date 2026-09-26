@@ -158,27 +158,34 @@ internal static partial class PtxKernels
             mul.wide.u32 %rd1, %r5, 4;
             """;
 
-        // Softmax / log-softmax: max, then Σ exp(x - max) (exp stored in y), then normalize.
-        Elementwise(sb, "softmax_f32", ["x", "y"], [("u32", "cols"), ("u32", "log")],
-            RowStart + $"""
+        const string BlockRowStart = """
+            mul.lo.u32 %r5, %row, %s_cols;
+            mul.wide.u32 %rd1, %r5, 4;
+            """;
+
+        // Softmax / log-softmax, one block per row: max, then Σ exp(x - max) (exp stored in y), then normalize.
+        // Each thread revisits only the columns it wrote, so the passes need no synchronization between them.
+        RowBlock(sb, "softmax_f32", ["x", "y"], [("u32", "cols"), ("u32", "log")],
+            BlockRowStart + $"""
             add.u64 %rd2, %b_x, %rd1;
             add.u64 %rd3, %b_y, %rd1;
-            mov.f32 %f1, {NegInf};
-            """ + "\n" + RowLoop("MAX", "%rd2", "max.f32 %f1, %f1, %f2;") + "\n" + $"""
-            mov.f32 %f3, {Zero};
             sub.u64 %rd6, %rd3, %rd2;
-            """ + "\n" + RowLoop("EXP", "%rd2", $"""
+            mov.f32 %f1, {NegInf};
+            """ + "\n" + StridedLoop("MAX", "%rd2", "%s_cols", "max.f32 %f1, %f1, %f2;") + "\n"
+            + BlockReduce("RMAX", "%f1", "max", NegInf) + "\n" + $"""
+            mov.f32 %f3, {Zero};
+            """ + "\n" + StridedLoop("EXP", "%rd2", "%s_cols", $"""
             sub.f32 %f2, %f2, %f1;
             mul.f32 %f2, %f2, {Log2E};
             ex2.approx.ftz.f32 %f2, %f2;
             add.u64 %rd7, %rd5, %rd6;
             st.global.f32 [%rd7], %f2;
             add.f32 %f3, %f3, %f2;
-            """) + "\n" + $"""
+            """) + "\n" + BlockReduce("RSUM", "%f3", "add", Zero) + "\n" + $"""
             setp.ne.u32 %p3, %s_log, 0;
             @%p3 bra LOGPATH;
             rcp.rn.f32 %f4, %f3;
-            """ + "\n" + RowLoop("NORM", "%rd3", """
+            """ + "\n" + StridedLoop("NORM", "%rd3", "%s_cols", """
             mul.f32 %f2, %f2, %f4;
             st.global.f32 [%rd5], %f2;
             """) + "\n" + $"""
@@ -186,15 +193,15 @@ internal static partial class PtxKernels
             LOGPATH:
             lg2.approx.ftz.f32 %f5, %f3;
             fma.rn.f32 %f5, %f5, {Ln2}, %f1;
-            """ + "\n" + RowLoop("LOGNORM", "%rd2", """
+            """ + "\n" + StridedLoop("LOGNORM", "%rd2", "%s_cols", """
             sub.f32 %f2, %f2, %f5;
             add.u64 %rd7, %rd5, %rd6;
             st.global.f32 [%rd7], %f2;
             """) + "\nFINISHED:");
 
-        // Softmax: dx += y (dy - Σ dy·y). Log-softmax: dx += dy - exp(y) Σ dy.
-        Elementwise(sb, "softmax_bwd_f32", ["y", "dy", "dx"], [("u32", "cols"), ("u32", "log")],
-            RowStart + $"""
+        // Softmax: dx += y (dy - Σ dy·y). Log-softmax: dx += dy - exp(y) Σ dy. One block per row.
+        RowBlock(sb, "softmax_bwd_f32", ["y", "dy", "dx"], [("u32", "cols"), ("u32", "log")],
+            BlockRowStart + $"""
             add.u64 %rd2, %b_y, %rd1;
             add.u64 %rd3, %b_dy, %rd1;
             add.u64 %rd4, %b_dx, %rd1;
@@ -202,13 +209,13 @@ internal static partial class PtxKernels
             sub.u64 %rd8, %rd4, %rd2;
             setp.ne.u32 %p3, %s_log, 0;
             mov.f32 %f1, {Zero};
-            """ + "\n" + RowLoop("DOT", "%rd2", """
+            """ + "\n" + StridedLoop("DOT", "%rd2", "%s_cols", """
             add.u64 %rd7, %rd5, %rd6;
             ld.global.f32 %f3, [%rd7];
             mul.f32 %f4, %f3, %f2;
             selp.f32 %f4, %f3, %f4, %p3;
             add.f32 %f1, %f1, %f4;
-            """) + "\n" + RowLoop("GRAD", "%rd2", $"""
+            """) + "\n" + BlockReduce("RDOT", "%f1", "add", Zero) + "\n" + StridedLoop("GRAD", "%rd2", "%s_cols", $"""
             add.u64 %rd7, %rd5, %rd6;
             ld.global.f32 %f3, [%rd7];
             add.u64 %rd9, %rd5, %rd8;

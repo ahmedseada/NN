@@ -256,7 +256,7 @@ internal static partial class Tests
         _ = device;
         var counts = NeuralSharp.Backends.Cuda.PtxKernels.ParameterCounts;
         string[] all = [.. NeuralSharp.Backends.Cuda.PtxKernels.Names, .. NeuralSharp.Backends.Cuda.PtxKernels.AdvancedNames,
-            .. NeuralSharp.Backends.Cuda.PtxKernels.DecodingNames, .. NeuralSharp.Backends.Cuda.PtxKernels.QuantizedNames, .. NeuralSharp.Backends.Cuda.PtxKernels.DecoderNames];
+            .. NeuralSharp.Backends.Cuda.PtxKernels.DecodingNames, .. NeuralSharp.Backends.Cuda.PtxKernels.QuantizedNames, .. NeuralSharp.Backends.Cuda.PtxKernels.DecoderNames, .. NeuralSharp.Backends.Cuda.PtxKernels.RowNames];
         Check(counts.Count == all.Length && all.All(k => counts.TryGetValue(k, out int n) && n > 0), $"{counts.Count} kernels parsed, {all.Length} expected");
         // Parameter names must be unique within a kernel (a duplicate makes the whole module fail to load on the GPU).
         foreach (var entry in System.Text.RegularExpressions.Regex.Matches(NeuralSharp.Backends.Cuda.PtxKernels.Source, @"\.entry (\w+)\(([^)]*)\)"))
