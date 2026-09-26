@@ -13,6 +13,7 @@
     <ProjectReference Include="..\..\src\NeuralSharp\NeuralSharp.csproj" />
     <ProjectReference Include="..\..\src\NeuralSharp.AspNetCore\NeuralSharp.AspNetCore.csproj" />
     <ProjectReference Include="..\..\src\NeuralSharp.Mcp\NeuralSharp.Mcp.csproj" />
+    <ProjectReference Include="..\..\src\NeuralSharp.Onnx.Runtime\NeuralSharp.Onnx.Runtime.csproj" />
   </ItemGroup>
 
 </Project>

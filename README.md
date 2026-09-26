@@ -39,6 +39,8 @@ src/NeuralSharp/
   Backends/Cpu, Backends/Cuda       device implementations (CPU SIMD kernels, PTX kernels)
 src/NeuralSharp.AspNetCore/         optional package: AddNeuralSharp(), MapPredictor, MapGenerate, MapOllamaApi, MapNeuralSharpStatus
 src/NeuralSharp.Mcp/                optional package: tools of Model Context Protocol servers, and serving tools over MCP
+src/NeuralSharp.Onnx/               optional package, no dependencies: export networks to .onnx (opset 17)
+src/NeuralSharp.Onnx.Runtime/       optional package: run .onnx models with ONNX Runtime as NeuralSharp modules
 samples/
   NeuralSharp.Samples.Xor             the classic XOR problem
   NeuralSharp.Samples.HousePrices     regression: predict house prices from a CSV file
@@ -72,6 +74,7 @@ tests/NeuralSharp.Tests             self-contained test runner (runs on every av
 | `ReRanker` | two-stage search: BM25 + cross-encoder, hard negatives, listwise loss, placeholder tokens for unseen names | Hit@1 on unseen towns 27.1% (BM25) → 86.6% re-ranked, 6.9 ms per question, 180 s training |
 | `HouseApi` | `AddNeuralSharp().AddPredictor(...)` + `MapPredictor`: the HousePrices package served over HTTP with micro-batching | same prices as `HousePrices --predict` |
 | `Summarizer` | word-level decoder-only transformer, loss masking, greedy generation with a stop token, ROUGE | ROUGE-1 0.999 vs 0.503 (first sentence), 90% exact, 7.7 ms per summary |
+| `Rag` | `RetrievalIndex` (BM25 + trained bi-encoder + rank fusion), `CrossEncoder` re-ranking, `Rag.For(chat)` with a word-level ChatML model that cites passages; hashing and placeholder tokens for unseen names | unseen towns: Hit@1 27.1% (BM25), 85.8% (hybrid), 99.9% (re-ranked); answers 91.1% correct (0% closed book), 99.9% cite the right passage; 14 min training |
 
 ### Train and predict modes
 
@@ -622,6 +625,28 @@ options.ToolCollection = [.. McpTools.ServerTools(registry)];                // 
 `ConnectHttpAsync(uri)` and `ConnectAsync(transport)` connect to other servers. The package depends on
 `ModelContextProtocol.Core`; the core library stays dependency-free.
 
+### ONNX: the optional `NeuralSharp.Onnx` and `NeuralSharp.Onnx.Runtime` packages
+
+```csharp
+model.ExportOnnx("house-price.onnx", 9);                                  // one sample is [9]; the batch stays dynamic
+
+OnnxExport.For(model).Input(28)                                          // or configure the export
+    .Names("ids", "logits").Metadata("tokenizer", "words")
+    .Lambda("ClsToken", OnnxExport.FirstStep)                             // your own lambdas need a translator
+    .Save("reranker.onnx");
+
+using var onnx = OnnxModule.Load("model.onnx", o => o.AppendExecutionProvider_CUDA());   // any .onnx file
+using var predictor = Predictor.For(onnx).Classes(["cat", "dog"]).Build();                // a Module like any other
+```
+
+`NeuralSharp.Onnx` has no dependencies: it writes the protobuf itself and exports Linear (LoRA adapters merged),
+activations, Softmax, BatchNorm, LayerNorm, Conv2d, pooling, Flatten, Embedding, PositionalEncoding, attention,
+transformer layers, LSTM, GRU and the builder's shape helpers. Only `NeuralSharp.Onnx.Runtime` references
+`Microsoft.ML.OnnxRuntime`, so apps that only export never load it. `OnnxModule` works with predictors, the
+inference engine (`engine.Predictor("m", () => OnnxModule.Load(path), ...)`) and the ASP.NET Core endpoints; the
+tests run every exported layer in ONNX Runtime and compare it with NeuralSharp (within 1e-4). Import into
+NeuralSharp layers is planned.
+
 ### Fine-tuning: freezing, a learning rate per group, saving only what changed, LoRA
 
 ```csharp
@@ -739,7 +764,7 @@ The backend design (`Backends/Backend.cs`) leaves room for an optional add-on pa
 dotnet run -c Release --project tests/NeuralSharp.Tests
 ```
 
-There are 88 tests. They cover reference comparisons for every kernel (matrix products, softmax,
+There are 93 tests. They cover reference comparisons for every kernel (matrix products, softmax,
 convolution and pooling against direct implementations) and finite-difference gradient checks for
 every op and layer, including their weights. They also cover end-to-end learning (regression, spiral
 classification, a CNN, LSTM and transformer sequence models), optimizers and schedules, CSV parsing,
@@ -749,16 +774,16 @@ streaming parser, keep-alive expiry). The simplified API is tested against the o
 layers, weights, data splits and training histories), together with predictors, packages, tools,
 conversations, the inference engine (batching, copies, queue limits, timeouts, keep-alive with a manual
 clock) and the ASP.NET Core endpoints over a real Kestrel server. Retrieval is checked against the formulas
-(BM25 scores, masked mean pooling, reciprocal rank fusion), and MCP tools round-trip through an in-process
-server. The suite runs on every available device; `NS_FILTER=text` runs only the tests whose name contains it.
+(BM25 scores, masked mean pooling, reciprocal rank fusion), MCP tools round-trip through an in-process
+server, and every layer exported to ONNX gives the same output in ONNX Runtime. The suite runs on every available device; `NS_FILTER=text` runs only the tests whose name contains it.
 
 ## Status
 
 * **Verified on real hardware.** The first 64 tests pass on both the CPU and an NVIDIA GeForce RTX 5050
   Laptop GPU (Blackwell), 128 of 128, including KV-cache and batched decoding, graph replay, the
   sampler with top-p, min-p and penalties, the generation layer and the kernel-signature check. The
-  24 newest ones (simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine,
-  ASP.NET Core, retrieval, MCP) pass on the CPU and still need a run on a GPU.
+  29 newest ones (simplified API, fine-tuning and LoRA, predictors, packages, tools, the inference engine,
+  ASP.NET Core, retrieval, MCP, ONNX) pass on the CPU and still need a run on a GPU.
   That covers every GPU kernel: matrix products, softmax,
   normalization, embeddings, convolution, pooling, recurrent and attention layers, and end-to-end
   training of classifiers, a CNN, an LSTM and a transformer.

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>NeuralSharp.Onnx.Runtime</RootNamespace>
+    <AssemblyName>NeuralSharp.Onnx.Runtime</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageId>NeuralSharp.Onnx.Runtime</PackageId>
+    <Description>Runs ONNX models (exported by NeuralSharp.Onnx or any other tool) with ONNX Runtime as NeuralSharp modules, so they work with predictors, the inference engine and the ASP.NET Core endpoints.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.30.0" />
+    <ProjectReference Include="..\NeuralSharp\NeuralSharp.csproj" />
+    <ProjectReference Include="..\NeuralSharp.Onnx\NeuralSharp.Onnx.csproj" />
+  </ItemGroup>
+
+</Project>

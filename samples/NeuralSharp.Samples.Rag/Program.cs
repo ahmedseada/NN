@@ -169,7 +169,7 @@ var transcripts = Transcripts(trainQueries, new Random(9));
 var sequences = Sequences(transcripts, out double replyTokens);
 var (chatTrain, chatValidation) = sequences.Split(0.95, seed: 10);
 using var generator = Generator(vocabulary);
-int chatEpochs = options.Epochs ?? 12;
+int chatEpochs = options.Epochs ?? 8;
 var chatRun = new TrainingRun
 {
     Model = generator,
