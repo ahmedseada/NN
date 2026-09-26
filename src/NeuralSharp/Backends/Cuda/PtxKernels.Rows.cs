@@ -11,6 +11,9 @@ internal static partial class PtxKernels
     /// <summary>Threads per row in <see cref="RowBlock"/> kernels (a multiple of 32, at most 1024).</summary>
     public const int RowThreads = 256;
 
+    /// <summary>Threads of the sampler's block (one row: a whole vocabulary per block, so more loads in flight).</summary>
+    public const int SamplerThreads = 1024;
+
     /// <summary>Rows at most this many take the few-row matrix product kernels.</summary>
     public const int GemvRows = 8;
 
@@ -213,9 +216,12 @@ internal static partial class PtxKernels
         GemvNT(sb);
     }
 
-    // c[b][r, j] = Σ_k a[b][r, k] · w[b][k, j] (+ beta · c) for m ≤ 8 rows. Block: 32 columns × 8 slices of k; each
-    // thread keeps 8 row sums, the slices are added in shared memory, warp r writes row r.
-    // Grid: x = ⌈n / 32⌉, z = batch. Reads of w are coalesced (consecutive columns per warp).
+    /// <summary>Threads of a <c>gemv_nn_f32</c> block: 32 columns × 32 slices of k.</summary>
+    public const int GemvThreads = 1024;
+
+    // c[b][r, j] = Σ_k a[b][r, k] · w[b][k, j] (+ beta · c) for m ≤ 8 rows. Block: 32 columns × 32 slices of k (slice s
+    // takes k = s, s + 32, …, four at a time so several loads are in flight); each thread keeps 8 row sums, the slices
+    // are added in shared memory and warp r writes row r. Grid: x = ⌈n / 32⌉, z = batch. Reads of w are coalesced.
     private static void GemvNN(StringBuilder sb)
     {
         var s = new StringBuilder();
@@ -227,10 +233,10 @@ internal static partial class PtxKernels
             )
             {
                 .reg .pred %p<16>;
-                .reg .f32 %f<24>;
+                .reg .f32 %f<32>;
                 .reg .b32 %r<24>;
                 .reg .b64 %rd<24>;
-                .shared .align 4 .f32 gemv_nn_part[2048];
+                .shared .align 4 .f32 gemv_nn_part[8192];
                 ld.param.u64 %rd1, [p_a];
                 ld.param.u64 %rd2, [p_b];
                 ld.param.u64 %rd3, [p_c];
@@ -262,6 +268,9 @@ internal static partial class PtxKernels
                 shl.b32 %r8, %r8, 5;
                 add.u32 %r8, %r8, %r6;
                 setp.lt.u32 %p9, %r8, %r2;
+                mul.wide.u32 %rd12, %r3, 4;
+                mul.wide.u32 %rd14, %r2, 128;
+                cvt.u64.u32 %rd10, %r8;
             """);
         for (int r = 0; r < GemvRows; r++)
         {
@@ -269,21 +278,62 @@ internal static partial class PtxKernels
             s.AppendLine($"    setp.lt.u32 %p{r}, {r}, %r1;");
         }
 
+        // Four k at a time: kk, kk + 32, kk + 64, kk + 96 while kk + 96 < k.
         s.AppendLine("""
                 mov.u32 %r9, %r7;
-            KLOOP:
+            K4:
+                add.u32 %r14, %r9, 96;
+                setp.ge.u32 %p10, %r14, %r3;
+                @%p10 bra K1;
+                mul.wide.u32 %rd9, %r9, %r2;
+                add.u64 %rd9, %rd9, %rd10;
+                shl.b64 %rd9, %rd9, 2;
+                add.u64 %rd9, %rd9, %rd2;
+                mov.f32 %f8, 0f00000000;
+                mov.f32 %f10, 0f00000000;
+                mov.f32 %f11, 0f00000000;
+                mov.f32 %f12, 0f00000000;
+                @%p9 ld.global.f32 %f8, [%rd9];
+                add.u64 %rd9, %rd9, %rd14;
+                @%p9 ld.global.f32 %f10, [%rd9];
+                add.u64 %rd9, %rd9, %rd14;
+                @%p9 ld.global.f32 %f11, [%rd9];
+                add.u64 %rd9, %rd9, %rd14;
+                @%p9 ld.global.f32 %f12, [%rd9];
+                mul.wide.u32 %rd11, %r9, 4;
+                add.u64 %rd11, %rd11, %rd1;
+            """);
+        for (int r = 0; r < GemvRows; r++)
+        {
+            s.AppendLine($"""
+                    @!%p{r} bra K4_ROWS_DONE;
+                    ld.global.f32 %f13, [%rd11];
+                    ld.global.f32 %f14, [%rd11+128];
+                    ld.global.f32 %f15, [%rd11+256];
+                    ld.global.f32 %f16, [%rd11+384];
+                    fma.rn.f32 %f{r}, %f13, %f8, %f{r};
+                    fma.rn.f32 %f{r}, %f14, %f10, %f{r};
+                    fma.rn.f32 %f{r}, %f15, %f11, %f{r};
+                    fma.rn.f32 %f{r}, %f16, %f12, %f{r};
+                    add.u64 %rd11, %rd11, %rd12;
+                """);
+        }
+
+        s.AppendLine("""
+            K4_ROWS_DONE:
+                add.u32 %r9, %r9, 128;
+                bra K4;
+            K1:
                 setp.ge.u32 %p10, %r9, %r3;
                 @%p10 bra KEND;
                 mov.f32 %f8, 0f00000000;
                 mul.wide.u32 %rd9, %r9, %r2;
-                cvt.u64.u32 %rd10, %r8;
                 add.u64 %rd9, %rd9, %rd10;
                 shl.b64 %rd9, %rd9, 2;
                 add.u64 %rd9, %rd9, %rd2;
                 @%p9 ld.global.f32 %f8, [%rd9];
                 mul.wide.u32 %rd11, %r9, 4;
                 add.u64 %rd11, %rd11, %rd1;
-                mul.wide.u32 %rd12, %r3, 4;
             """);
         for (int r = 0; r < GemvRows; r++)
         {
@@ -292,10 +342,10 @@ internal static partial class PtxKernels
             s.AppendLine("    add.u64 %rd11, %rd11, %rd12;");
         }
 
-        // part[slice][row][lane]
+        // part[slice][row][lane]: slice stride 1024 bytes, row stride 128 bytes.
         s.AppendLine("""
-                add.u32 %r9, %r9, 8;
-                bra KLOOP;
+                add.u32 %r9, %r9, 32;
+                bra K1;
             KEND:
                 mov.u32 %r10, gemv_nn_part;
                 shl.b32 %r11, %r7, 10;
@@ -316,26 +366,25 @@ internal static partial class PtxKernels
                 shl.b32 %r13, %r7, 7;
                 add.u32 %r13, %r13, %r12;
                 add.u32 %r13, %r13, %r10;
-                mov.f32 %f10, 0f00000000;
+                mov.f32 %f17, 0f00000000;
             """);
-        for (int slice = 0; slice < 8; slice++)
+        for (int slice = 0; slice < 32; slice++)
         {
-            s.AppendLine($"    ld.shared.f32 %f11, [%r13+{slice * 1024}];");
-            s.AppendLine("    add.f32 %f10, %f10, %f11;");
+            s.AppendLine($"    ld.shared.f32 %f18, [%r13+{slice * 1024}];");
+            s.AppendLine("    add.f32 %f17, %f17, %f18;");
         }
 
         s.AppendLine("""
                 mul.wide.u32 %rd13, %r7, %r2;
-                cvt.u64.u32 %rd10, %r8;
                 add.u64 %rd13, %rd13, %rd10;
                 shl.b64 %rd13, %rd13, 2;
                 add.u64 %rd13, %rd13, %rd3;
                 setp.eq.f32 %p12, %f20, 0f00000000;
                 @%p12 bra STORE;
-                ld.global.f32 %f12, [%rd13];
-                fma.rn.f32 %f10, %f12, %f20, %f10;
+                ld.global.f32 %f19, [%rd13];
+                fma.rn.f32 %f17, %f19, %f20, %f17;
             STORE:
-                st.global.f32 [%rd13], %f10;
+                st.global.f32 [%rd13], %f17;
             DONE:
                 ret;
             }

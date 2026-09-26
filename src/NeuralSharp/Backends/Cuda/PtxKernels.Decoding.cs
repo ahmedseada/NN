@@ -423,7 +423,7 @@ internal static partial class PtxKernels
 
         RowBlock(sb, "sample_rows_f32", ["logits", "ids", "stats", "step"],
             [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("f32", "invt"), ("u32", "topk"), ("f32", "topp"), ("f32", "minp"), ("u32", "seed"), ("u32", "rows")],
-            body.ToString(), sharedFloats: RowThreads);
+            body.ToString(), sharedFloats: SamplerThreads);
 
         // Repetition penalties: copy the row to work[r, :], then penalize each distinct token of the last n history entries once.
         Elementwise(sb, "penalize_rows_f32", ["logits", "work", "history", "len"],

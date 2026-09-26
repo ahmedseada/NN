@@ -29,7 +29,7 @@ internal sealed unsafe partial class CudaBackend
 
     public override void SampleRows(Storage logits, Storage ids, Storage stats, Storage step, int rows, int vocabulary,
         int rowStride, int rowOffset, float temperature, int topK, float topP, float minP, uint seed) =>
-        LaunchRows(K("sample_rows_f32"), rows, P(logits), P(ids), P(stats), P(step),
+        LaunchRows(K("sample_rows_f32"), rows, PtxKernels.SamplerThreads, P(logits), P(ids), P(stats), P(step),
             U(vocabulary), U(rowStride), U(rowOffset), F(1f / MathF.Max(temperature, 1e-3f)), U(topK), F(topP), F(minP), seed, U(rows), U(rows));
 
     public override void PenalizeRows(Storage logits, Storage work, Storage history, Storage length, int rows, int vocabulary,

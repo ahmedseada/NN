@@ -191,7 +191,7 @@ internal static partial class Tests
     private static void FewRowMatMul(Device device)
     {
         var r = new Random(48);
-        foreach (var (m, n, k) in new[] { (1, 700, 300), (3, 1030, 257), (4, 512, 512) })
+        foreach (var (m, n, k) in new[] { (1, 700, 300), (3, 1030, 257), (4, 512, 512), (8, 300, 1000) })
         {
             foreach (var (transA, transB) in new[] { (false, false), (true, false), (false, true), (true, true) })
             {
@@ -217,6 +217,36 @@ internal static partial class Tests
 
                 AssertClose(expected, actual, 1e-3f, $"[{m}x{k}]{(transA ? "ᵀ" : "")} × [{k}x{n}]{(transB ? "ᵀ" : "")}");
             }
+        }
+
+        // Batched, as in decoding attention: weights · values and queries · keysᵀ for 3 heads of 2 rows.
+        foreach (bool transB in new[] { false, true })
+        {
+            const int B = 3, M = 2, K = 600, N = 200;
+            var a = Enumerable.Range(0, B * M * K).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+            var b = Enumerable.Range(0, B * K * N).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+            using var ta = Tensor.From(a, [B, M, K], device);
+            using var tb = Tensor.From(b, transB ? [B, N, K] : [B, K, N], device);
+            var actual = ta.MatMul(tb, transposeB: transB).ToArray();
+            var expected = new float[B * M * N];
+            for (int h = 0; h < B; h++)
+            {
+                for (int i = 0; i < M; i++)
+                {
+                    for (int j = 0; j < N; j++)
+                    {
+                        double sum = 0;
+                        for (int p = 0; p < K; p++)
+                        {
+                            sum += (double)a[(h * M + i) * K + p] * b[h * K * N + (transB ? j * K + p : p * N + j)];
+                        }
+
+                        expected[(h * M + i) * N + j] = (float)sum;
+                    }
+                }
+            }
+
+            AssertClose(expected, actual, 1e-3f, $"batched [{B}x{M}x{K}] × [{B}x{K}x{N}]{(transB ? "ᵀ" : "")}");
         }
 
         // beta = 1 accumulates (the gradient path): dx += dy · wᵀ with one row.

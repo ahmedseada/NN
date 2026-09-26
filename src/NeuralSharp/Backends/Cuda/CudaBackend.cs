@@ -397,7 +397,9 @@ internal sealed unsafe partial class CudaBackend : Backend
         const int T = PtxKernels.Tile;
         const int MaxGridZ = 65535;
         ulong mk = (ulong)m * (ulong)k, kn = (ulong)k * (ulong)n, mn = (ulong)m * (ulong)n;
-        bool few = m <= PtxKernels.GemvRows && !transA;                     // token-by-token decoding: read the weights once
+        // Token-by-token decoding: few rows through a large matrix read each weight once. (Smaller products keep the
+        // tiled kernel, whose sums do not depend on the number of rows, so small models predict identically in any batch.)
+        bool few = m <= PtxKernels.GemvRows && !transA && (long)n * k >= 1 << 16;
         for (int first = 0; first < batch; first += MaxGridZ)
         {
             int count = Math.Min(MaxGridZ, batch - first);
@@ -406,7 +408,7 @@ internal sealed unsafe partial class CudaBackend : Backend
             {
                 uint columnsPerBlock = transB ? 8u : 32u;
                 Launch(K(transB ? "gemv_nt_f32" : "gemv_nn_f32"), (uint)((n + columnsPerBlock - 1) / columnsPerBlock), 1, (uint)count,
-                    PtxKernels.RowThreads, 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn, U(m), U(n), U(k), F(beta), mk, kn, mn);
+                    (uint)(transB ? PtxKernels.RowThreads : PtxKernels.GemvThreads), 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn, U(m), U(n), U(k), F(beta), mk, kn, mn);
                 continue;
             }
 
@@ -444,11 +446,13 @@ internal sealed unsafe partial class CudaBackend : Backend
     }
 
     // One block of PtxKernels.RowThreads threads per row (PtxKernels.RowBlock kernels).
-    private void LaunchRows(IntPtr function, int rows, params ReadOnlySpan<ulong> args)
+    private void LaunchRows(IntPtr function, int rows, params ReadOnlySpan<ulong> args) => LaunchRows(function, rows, PtxKernels.RowThreads, args);
+
+    private void LaunchRows(IntPtr function, int rows, int threads, params ReadOnlySpan<ulong> args)
     {
         if (rows > 0)
         {
-            Launch(function, (uint)rows, 1, 1, PtxKernels.RowThreads, 1, args);
+            Launch(function, (uint)rows, 1, 1, (uint)threads, 1, args);
         }
     }
 
