@@ -23,13 +23,51 @@ internal static partial class PtxKernels
     private const int NarrowStride = (TensorK + 8) * 2, WideStride = (TensorTile + 8) * 2;
     private const int StageBytes = TensorTile * NarrowStride;           // the larger of 128 × 80 and 32 × 272
 
-    /// <summary>gemm_tc_{a}{b}_f32: a / b = n (as stored) or t (transposed), as the ta / tb flags of <c>gemm128_f32</c>.</summary>
-    public static readonly string[] TensorCoreNames = ["gemm_tc_nn_f32", "gemm_tc_nt_f32", "gemm_tc_tn_f32", "gemm_tc_tt_f32", .. FlashTensorKernels];
+    /// <summary>
+    /// The tensor-core modules (PTX 7.0, sm_80), loaded separately so a GPU driver that rejects one still gets the others:
+    /// products (gemm_tc_{a}{b}_f32 with a / b = n (as stored) or t (transposed), plus the GELU and GELU-gradient
+    /// epilogue variants), flash attention for head sizes 64 and 128, and the attention backward's row sums.
+    /// </summary>
+    public static IReadOnlyList<(string Name, string[] Kernels, string Source)> TensorCoreModules => LazyTensorCoreModules.Value;
 
-    private static readonly Lazy<string> LazyTensorCoreSource = new(BuildTensorCore);
+    private static readonly Lazy<IReadOnlyList<(string Name, string[] Kernels, string Source)>> LazyTensorCoreModules = new(() =>
+    [
+        Module("products", sb =>
+        {
+            foreach (bool ta in new[] { false, true })
+            {
+                foreach (bool tb in new[] { false, true })
+                {
+                    TensorCoreGemm(sb, ta, tb, 0);
+                }
+            }
 
-    /// <summary>The tensor-core module (PTX 7.0, sm_80).</summary>
-    public static string TensorCoreSource => LazyTensorCoreSource.Value;
+            TensorCoreGemm(sb, false, false, 1);
+            TensorCoreGemm(sb, false, true, 2);
+        }),
+        Module("attention d64", sb => { FlashForward(sb, 64); FlashBackwardQ(sb, 64); FlashBackwardKv(sb, 64); }),
+        Module("attention d128", sb => { FlashForward(sb, 128); FlashBackwardQ(sb, 128); FlashBackwardKv(sb, 128); }),
+        Module("attention row sums", FlashDelta),
+    ]);
+
+    private static (string Name, string[] Kernels, string Source) Module(string name, Action<StringBuilder> build)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine(".version 7.0");
+        sb.AppendLine(".target sm_80");
+        sb.AppendLine(".address_size 64");
+        sb.AppendLine();
+        build(sb);
+        string source = sb.ToString();
+        string[] kernels = [.. System.Text.RegularExpressions.Regex.Matches(source, @"\.entry\s+(\w+)").Select(m => m.Groups[1].Value)];
+        return (name, kernels, source);
+    }
+
+    /// <summary>Every tensor-core kernel.</summary>
+    public static string[] TensorCoreNames => [.. TensorCoreModules.SelectMany(m => m.Kernels)];
+
+    /// <summary>All tensor-core modules' PTX (for dumps and signature checks).</summary>
+    public static string TensorCoreSource => string.Concat(TensorCoreModules.Select(m => m.Source));
 
     private static readonly Lazy<IReadOnlyDictionary<string, int>> LazyTensorCoreParameterCounts = new(() =>
         System.Text.RegularExpressions.Regex.Matches(TensorCoreSource, @"\.entry\s+(\w+)\s*\(([^)]*)\)")
@@ -38,25 +76,14 @@ internal static partial class PtxKernels
     /// <summary>Parameters each tensor-core kernel declares.</summary>
     public static IReadOnlyDictionary<string, int> TensorCoreParameterCounts => LazyTensorCoreParameterCounts.Value;
 
-    private static string BuildTensorCore()
+    /// <summary>The product kernel for the layouts and epilogue (null when there is no such variant).</summary>
+    public static string? GemmKernel(bool transA, bool transB, GemmEpilogue epilogue) => epilogue switch
     {
-        var sb = new StringBuilder();
-        sb.AppendLine(".version 7.0");
-        sb.AppendLine(".target sm_80");
-        sb.AppendLine(".address_size 64");
-        sb.AppendLine();
-        foreach (bool ta in new[] { false, true })
-        {
-            foreach (bool tb in new[] { false, true })
-            {
-                TensorCoreGemm(sb, ta, tb);
-            }
-        }
-
-        BuildFlashTensorCore(sb);
-
-        return sb.ToString();
-    }
+        GemmEpilogue.None => $"gemm_tc_{(transA ? 't' : 'n')}{(transB ? 't' : 'n')}_f32",
+        GemmEpilogue.Gelu when !transA && !transB => "gemm_tc_nn_gelu_f32",
+        GemmEpilogue.GeluGradient when !transA && transB => "gemm_tc_nt_gelugrad_f32",
+        _ => null,
+    };
 
     // One operand's tile as it is read from global memory: `outer` rows of `width` contiguous floats (the stored layout),
     // copied to shared memory in the same orientation. A as stored [m, k] is 128 rows of 32 k; transposed ([k, m]) 32
@@ -82,9 +109,10 @@ internal static partial class PtxKernels
             fma.rn.f32 %t5, %t4, 0fC0000000, 0f3F800000;
         """;
 
-    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb)
+    // mode (compile time): 0 plain, 1 GELU (aux = pre-activations when given), 2 GELU gradient (· gelu'(aux)).
+    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode)
     {
-        string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}_f32";
+        string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}{mode switch { 1 => "_gelu", 2 => "_gelugrad", _ => "" }}_f32";
         // Registers: %rd1..3 = a, b, c; %r1..3 = m, n, k; %r9 / %r10 = the tile's first row / column.
         var a = new TileLoad("a", KIsOuter: ta, Width: ta ? TensorTile : TensorK, OuterLimit: ta ? "%r3" : "%r1", InnerLimit: ta ? "%r1" : "%r3", Tile: "%r9");
         var b = new TileLoad("b", KIsOuter: !tb, Width: tb ? TensorK : TensorTile, OuterLimit: tb ? "%r2" : "%r3", InnerLimit: tb ? "%r3" : "%r2", Tile: "%r10");
@@ -94,7 +122,7 @@ internal static partial class PtxKernels
                 .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .f32 p_beta,
                 .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc, .param .u64 p_bias,
-                .param .u32 p_lda, .param .u32 p_ldb, .param .u32 p_ldc, .param .u32 p_mode, .param .u64 p_aux
+                .param .u32 p_lda, .param .u32 p_ldb, .param .u32 p_ldc, .param .u64 p_aux
             )
             {
                 .reg .pred %p<16>;
@@ -104,7 +132,7 @@ internal static partial class PtxKernels
                 .reg .f32 %h<8>;
                 .reg .f32 %t<8>;
                 .reg .f32 %bias<8>;
-                .reg .pred %pbias, %paux, %pm1, %pm2;
+                .reg .pred %pbias, %paux;
                 .reg .f32 %c<64>;
                 .reg .b32 %fa<16>;
                 .reg .b32 %fb<8>;
@@ -169,7 +197,6 @@ internal static partial class PtxKernels
                 ld.param.u32 %r58, [p_lda];
                 ld.param.u32 %r59, [p_ldb];
                 ld.param.u32 %r60, [p_ldc];
-                ld.param.u32 %r61, [p_mode];
             """);
 
         // Per-thread load coordinates (row within the tile, first of its two columns) and shared-memory store address.
@@ -408,19 +435,19 @@ internal static partial class PtxKernels
         s.AppendLine("""
                 ld.param.u64 %rd21, [p_aux];
                 setp.ne.u64 %paux, %rd21, 0;
-                @%paux cvta.to.global.u64 %rd21, %rd21;
-                setp.eq.u32 %pm1, %r61, 1;
-                setp.eq.u32 %pm2, %r61, 2;
+                cvta.to.global.u64 %rd21, %rd21;
                 and.b32 %r47, %r60, 1;
                 setp.eq.u32 %peven, %r47, 0;
                 cvt.u32.u64 %r47, %rd3;
-                cvt.u32.u64 %r48, %rd21;
+                ld.param.u64 %rd24, [p_aux];
+                cvt.u32.u64 %r48, %rd24;
                 or.b32 %r47, %r47, %r48;
                 and.b32 %r47, %r47, 7;
                 setp.eq.and.u32 %peven, %r47, 0, %peven;
                 sub.u64 %rd22, %rd21, %rd3;
                 ld.param.u64 %rd18, [p_bias];
                 setp.ne.u64 %pbias, %rd18, 0;
+                cvta.to.global.u64 %rd18, %rd18;
             """);
         for (int nt = 0; nt < 4; nt++)
         {
@@ -431,9 +458,8 @@ internal static partial class PtxKernels
                         add.u32 %r46, %r43, {{nt * 8 + j}};
                         setp.lt.u32 %p9, %r46, %r2;
                         and.pred %p9, %p9, %pbias;
-                        @%p9 cvta.to.global.u64 %rd19, %rd18;
-                        @%p9 mul.wide.u32 %rd20, %r46, 4;
-                        @%p9 add.u64 %rd19, %rd19, %rd20;
+                        mul.wide.u32 %rd20, %r46, 4;
+                        add.u64 %rd19, %rd18, %rd20;
                         @%p9 ld.global.f32 %bias{{2 * nt + j}}, [%rd19];
                     """);
             }
@@ -480,26 +506,23 @@ internal static partial class PtxKernels
                         """);
                 }
 
-                // Mode 2 reads the pre-activations (same layout as c, at c + %rd22).
-                s.AppendLine($"""
-                    EPI_AUX_{group}:
-                        @!%pm2 bra EPI_ADD_{group};
-                        add.u64 %rd23, %rd17, %rd22;
-                    """);
-                for (int nt = 0; nt < 4; nt++)
+                s.AppendLine($"EPI_AUX_{group}:");
+                s.AppendLine("add.u64 %rd23, %rd17, %rd22;");
+                if (mode == 2)
                 {
-                    s.AppendLine($$"""
-                            @%q{{3 * nt}} ld.global.v2.f32 {%h{{2 * nt}}, %h{{2 * nt + 1}}}, [%rd23+{{nt * 32}}];
-                            @%q{{3 * nt + 1}} ld.global.f32 %h{{2 * nt}}, [%rd23+{{nt * 32}}];
-                            @%q{{3 * nt + 2}} ld.global.f32 %h{{2 * nt + 1}}, [%rd23+{{nt * 32 + 4}}];
-                        """);
+                    // The pre-activations (same layout as c, at c + %rd22).
+                    for (int nt = 0; nt < 4; nt++)
+                    {
+                        s.AppendLine($$"""
+                                @%q{{3 * nt}} ld.global.v2.f32 {%h{{2 * nt}}, %h{{2 * nt + 1}}}, [%rd23+{{nt * 32}}];
+                                @%q{{3 * nt + 1}} ld.global.f32 %h{{2 * nt}}, [%rd23+{{nt * 32}}];
+                                @%q{{3 * nt + 2}} ld.global.f32 %h{{2 * nt + 1}}, [%rd23+{{nt * 32 + 4}}];
+                            """);
+                    }
                 }
 
-                s.AppendLine($"EPI_ADD_{group}:");
-                s.AppendLine($"@%pm1 bra EPI_GELU_{group};");
-                s.AppendLine($"@%pm2 bra EPI_GRAD_{group};");
                 // Mode 0.
-                for (int nt = 0; nt < 4; nt++)
+                for (int nt = 0; nt < 4 && mode == 0; nt++)
                 {
                     int c = (mt * 4 + nt) * 4 + half * 2;
                     s.AppendLine($$"""
@@ -510,11 +533,8 @@ internal static partial class PtxKernels
                         """);
                 }
 
-                s.AppendLine($"bra EPI_STORE_{group};");
                 // Mode 1: pre = acc + bias (stored when aux is given), c = beta·c + gelu(pre).
-                s.AppendLine($"EPI_GELU_{group}:");
-                s.AppendLine("add.u64 %rd23, %rd17, %rd22;");
-                for (int nt = 0; nt < 4; nt++)
+                for (int nt = 0; nt < 4 && mode == 1; nt++)
                 {
                     int c = (mt * 4 + nt) * 4 + half * 2;
                     s.AppendLine($$"""
@@ -539,10 +559,8 @@ internal static partial class PtxKernels
                     }
                 }
 
-                s.AppendLine($"bra EPI_STORE_{group};");
                 // Mode 2: c = beta·c + acc · gelu'(pre).
-                s.AppendLine($"EPI_GRAD_{group}:");
-                for (int nt = 0; nt < 4; nt++)
+                for (int nt = 0; nt < 4 && mode == 2; nt++)
                 {
                     int c = (mt * 4 + nt) * 4 + half * 2;
                     for (int j = 0; j < 2; j++)
@@ -566,7 +584,6 @@ internal static partial class PtxKernels
                     }
                 }
 
-                s.AppendLine($"EPI_STORE_{group}:");
                 for (int nt = 0; nt < 4; nt++)
                 {
                     s.AppendLine($$"""

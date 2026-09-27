@@ -343,11 +343,12 @@ internal sealed unsafe partial class CudaBackend
     public override bool AttentionStrided(Storage q, long qOffset, Storage k, long kOffset, Storage v, long vOffset, int qRow, int kRow,
         Storage y, Storage? logSumExp, int batch, int kvHeads, int group, int steps, int dim, float scale)
     {
-        if (!PtxKernels.FlashTensorDim(dim) || TensorCoreKernels() is not { } tc)
+        if (!PtxKernels.FlashTensorDim(dim) || !FlashKernelsLoaded(dim))
         {
             return false;
         }
 
+        var tc = _tensorCoreAny;
         int heads = batch * kvHeads, rowsPerHead = group * steps;
         Launch(tc[$"flash_tc_fwd_d{dim}"], (uint)((rowsPerHead + PtxKernels.FlashTensorRows - 1) / PtxKernels.FlashTensorRows), (uint)heads, 1, 128, 1,
             [P(q) + (ulong)qOffset * 4, P(k) + (ulong)kOffset * 4, P(v) + (ulong)vOffset * 4, P(ZeroPosition), P(y), logSumExp is null ? 0UL : P(logSumExp),
@@ -359,11 +360,12 @@ internal sealed unsafe partial class CudaBackend
         Storage y, Storage logSumExp, Storage dOutput, Storage dq, long dqOffset, Storage dk, long dkOffset, Storage dv, long dvOffset,
         int batch, int kvHeads, int group, int steps, int dim, float scale)
     {
-        if (!PtxKernels.FlashTensorDim(dim) || TensorCoreKernels() is not { } tc)
+        if (!PtxKernels.FlashTensorDim(dim) || !FlashKernelsLoaded(dim))
         {
             return false;
         }
 
+        var tc = _tensorCoreAny;
         int heads = batch * kvHeads, rowsPerHead = group * steps, rows = heads * rowsPerHead, yRow = kvHeads * group * dim;
         var layout = RowLayout(kvHeads, group, steps, dim, qRow, kRow, yRow);
         var delta = Allocate(rows, zeroed: false);
@@ -398,7 +400,11 @@ internal sealed unsafe partial class CudaBackend
 
     // The tensor-core flash kernels when MixedPrecision asks for bfloat16 and the head size and GPU allow them.
     private Dictionary<string, IntPtr>? FlashTensorCore(int dim) =>
-        MixedPrecision.Current == MatMulPrecision.BFloat16 && PtxKernels.FlashTensorDim(dim) ? TensorCoreKernels() : null;
+        MixedPrecision.Current == MatMulPrecision.BFloat16 && PtxKernels.FlashTensorDim(dim) && FlashKernelsLoaded(dim) ? _tensorCoreAny : null;
+
+    private bool FlashKernelsLoaded(int dim) =>
+        TensorKernel($"flash_tc_fwd_d{dim}") is not null && TensorKernel($"flash_tc_bwd_q_d{dim}") is not null
+        && TensorKernel($"flash_tc_bwd_kv_d{dim}") is not null && TensorKernel("flash_tc_delta") is not null;
 
     public override void AttentionTiledBackward(Storage q, Storage keys, Storage values, Storage output, Storage logSumExp, Storage dOutput,
         Storage dq, Storage dkeys, Storage dvalues, int heads, int rowsPerHead, int steps, int capacity, int dim, float scale)

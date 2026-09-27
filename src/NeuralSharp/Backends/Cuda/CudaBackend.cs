@@ -81,6 +81,12 @@ internal sealed unsafe partial class CudaBackend : Backend
     /// <summary>Why bfloat16 tensor-core products are unavailable on this GPU (null when they are available or untried).</summary>
     public string? TensorCoreUnavailableReason { get; private set; }
 
+    /// <summary>Tensor-core modules the driver could not load, with its message (empty when all loaded).</summary>
+    public IReadOnlyList<string> TensorCoreModuleErrors { get; private set; } = [];
+
+    // Every tensor-core kernel that loaded (attention even when the products did not).
+    private Dictionary<string, IntPtr> _tensorCoreAny = [];
+
     /// <summary>
     /// Tensor-core products copy a transposed operand into [m, k] / [k, n] layout first. Off: the transposing kernels
     /// measured as fast as the plain one (tests --bench-gemm), so the copy only costs time and memory.
@@ -116,8 +122,15 @@ internal sealed unsafe partial class CudaBackend : Backend
     {
         lock (_signatures)
         {
-            return TensorCoreKernels() is null ? TensorCoreUnavailableReason : null;
+            return TensorCoreKernels() is null ? TensorCoreUnavailableReason ?? "the tensor-core products did not load" : null;
         }
+    }
+
+    // A loaded tensor-core kernel by name, or null.
+    private IntPtr? TensorKernel(string name)
+    {
+        TensorCoreKernels();
+        return _tensorCoreAny.TryGetValue(name, out var function) ? function : null;
     }
 
     private Dictionary<string, IntPtr>? TensorCoreKernels()
@@ -134,35 +147,47 @@ internal sealed unsafe partial class CudaBackend : Backend
             return null;
         }
 
-        try
+        // Each module on its own: a driver that rejects one (a JIT compiler error) still runs the others.
+        MakeCurrent();
+        var kernels = new Dictionary<string, IntPtr>();
+        var errors = new List<string>();
+        foreach (var (moduleName, names, source) in PtxKernels.TensorCoreModules)
         {
-            MakeCurrent();
-            IntPtr module = LoadModule(PtxKernels.TensorCoreSource);
-            var kernels = new Dictionary<string, IntPtr>();
-            foreach (var kernel in PtxKernels.TensorCoreNames)
+            try
             {
-                byte[] bytes = Encoding.ASCII.GetBytes(kernel + "\0");
-                fixed (byte* p = bytes)
+                IntPtr module = LoadModule(source);
+                foreach (var kernel in names)
                 {
-                    Check(cuModuleGetFunction(out IntPtr function, module, p), $"cuModuleGetFunction({kernel})");
-                    _signatures[function] = (kernel, PtxKernels.TensorCoreParameterCounts[kernel]);
-                    kernels[kernel] = function;
-                    if (kernel.StartsWith("flash_tc_bwd", StringComparison.Ordinal))
+                    byte[] bytes = Encoding.ASCII.GetBytes(kernel + "\0");
+                    fixed (byte* p = bytes)
                     {
-                        int dim = kernel.EndsWith("d64", StringComparison.Ordinal) ? 64 : 128;
-                        int sharedBytes = kernel.Contains("_kv_", StringComparison.Ordinal) ? PtxKernels.FlashTensorBackwardKvShared(dim) : PtxKernels.FlashTensorBackwardQShared(dim);
-                        Check(cuFuncSetAttribute(function, FunctionAttributeMaxDynamicSharedSizeBytes, sharedBytes), $"cuFuncSetAttribute({kernel})");
+                        Check(cuModuleGetFunction(out IntPtr function, module, p), $"cuModuleGetFunction({kernel})");
+                        _signatures[function] = (kernel, PtxKernels.TensorCoreParameterCounts[kernel]);
+                        if (kernel.StartsWith("flash_tc_bwd", StringComparison.Ordinal))
+                        {
+                            int dim = kernel.EndsWith("d64", StringComparison.Ordinal) ? 64 : 128;
+                            int sharedBytes = kernel.Contains("_kv_", StringComparison.Ordinal) ? PtxKernels.FlashTensorBackwardKvShared(dim) : PtxKernels.FlashTensorBackwardQShared(dim);
+                            Check(cuFuncSetAttribute(function, FunctionAttributeMaxDynamicSharedSizeBytes, sharedBytes), $"cuFuncSetAttribute({kernel})");
+                        }
+
+                        kernels[kernel] = function;
                     }
                 }
             }
-
-            _tensorCore = kernels;
+            catch (CudaException e)
+            {
+                errors.Add($"{moduleName}: {e.Message}");
+            }
         }
-        catch (CudaException e)
+
+        TensorCoreModuleErrors = errors;
+        if (errors.Count > 0)
         {
-            TensorCoreUnavailableReason = e.Message;
+            TensorCoreUnavailableReason = string.Join(" | ", errors);
         }
 
+        _tensorCore = kernels.ContainsKey("gemm_tc_nn_f32") ? kernels : null;
+        _tensorCoreAny = kernels;
         return _tensorCore;
     }
 
@@ -789,7 +814,7 @@ internal sealed unsafe partial class CudaBackend : Backend
                 string kernel = transA ? (transB ? "gemm_tc_tt_f32" : "gemm_tc_tn_f32") : (transB ? "gemm_tc_nt_f32" : "gemm_tc_nn_f32");
                 Launch(tensorCore[kernel], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
                     (uint)count, PtxKernels.TensorThreads, 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn,
-                    U(m), U(n), U(k), F(beta), mk, kn, mn, 0UL, U(transA ? m : k), U(transB ? k : n), U(n), 0UL, 0UL);
+                    U(m), U(n), U(k), F(beta), mk, kn, mn, 0UL, U(transA ? m : k), U(transB ? k : n), U(n), 0UL);
                 Interlocked.Increment(ref TensorCoreLaunches);
                 continue;
             }
@@ -829,7 +854,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
 
         Launch(tensorCore["gemm_tc_nn_f32"], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
-            1, PtxKernels.TensorThreads, 1, P(a), P(b), P(c), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, P(bias), U(k), U(n), U(n), 0UL, 0UL);
+            1, PtxKernels.TensorThreads, 1, P(a), P(b), P(c), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, P(bias), U(k), U(n), U(n), 0UL);
         Interlocked.Increment(ref TensorCoreLaunches);
         return true;
     }
@@ -850,10 +875,14 @@ internal sealed unsafe partial class CudaBackend : Backend
             _profileFlops = 2.0 * m * n * k;
         }
 
-        string kernel = transA ? (transB ? "gemm_tc_tt_f32" : "gemm_tc_tn_f32") : (transB ? "gemm_tc_nt_f32" : "gemm_tc_nn_f32");
-        Launch(tensorCore[kernel], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
+        if (PtxKernels.GemmKernel(transA, transB, epilogue) is not { } kernel || !tensorCore.TryGetValue(kernel, out var function))
+        {
+            return false;
+        }
+
+        Launch(function, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
             1, PtxKernels.TensorThreads, 1, P(a) + (ulong)aOffset * 4, P(b) + (ulong)bOffset * 4, P(c) + (ulong)cOffset * 4, U(m), U(n), U(k), F(beta),
-            0UL, 0UL, 0UL, bias is null ? 0UL : P(bias), U(lda), U(ldb), U(ldc), U((int)epilogue), aux is null ? 0UL : P(aux) + (ulong)auxOffset * 4);
+            0UL, 0UL, 0UL, bias is null ? 0UL : P(bias), U(lda), U(ldb), U(ldc), aux is null ? 0UL : P(aux) + (ulong)auxOffset * 4);
         Interlocked.Increment(ref TensorCoreLaunches);
         return true;
     }

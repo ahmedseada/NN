@@ -28,21 +28,6 @@ internal static partial class PtxKernels
 
     private static int FlashStride(int dim) => (dim + 8) * 2;
 
-    // A property, not a field: TensorCoreNames (another file) reads it during its own static initialization.
-    private static string[] FlashTensorKernels =>
-        [.. new[] { 64, 128 }.SelectMany(d => new[] { $"flash_tc_fwd_d{d}", $"flash_tc_bwd_q_d{d}", $"flash_tc_bwd_kv_d{d}" }), "flash_tc_delta"];
-
-    private static void BuildFlashTensorCore(StringBuilder sb)
-    {
-        FlashDelta(sb);
-        foreach (int d in new[] { 64, 128 })
-        {
-            FlashForward(sb, d);
-            FlashBackwardQ(sb, d);
-            FlashBackwardKv(sb, d);
-        }
-    }
-
     // ------------------------------------------------------------------ shared emitters
 
     // Declarations common to the three kernels.
