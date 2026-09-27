@@ -21,7 +21,7 @@ using NeuralSharp.Pretrained;
 //                                   only the assistant's turns are trained; writes a PEFT adapter to <dir>
 //                                   (--eval F, --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048,
 //                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
-//                                   --eval-every N; with --int4 / --int8 / --bf16 the base stays quantized)
+//                                   --eval-every N, --no-checkpointing; with --int4 / --int8 / --bf16 the base stays quantized)
 //   (<folder> may also be a Hugging Face model id already downloaded, for example Qwen/Qwen3-0.6B)
 //   export <folder> <adapter> --out <dir>
 //                                   merges a PEFT adapter into the float weights and writes a Hugging Face checkpoint
@@ -59,6 +59,7 @@ for (int i = 0; i < args.Length; i++)
         case "--batch-tokens": tuning = tuning with { BatchTokens = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--accumulate": tuning = tuning with { GradientAccumulation = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--save-every": tuning = tuning with { SaveEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--no-checkpointing": tuning = tuning with { Checkpointing = false }; break;
         case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
         case ['-', '-', ..]:
@@ -163,8 +164,14 @@ switch (positional[0])
         using var cancel = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
         {
+            if (cancel.IsCancellationRequested)
+            {
+                return;                                                           // a second Ctrl+C quits at once
+            }
+
             e.Cancel = true;
             cancel.Cancel();
+            Console.WriteLine("stopping after the current batch and saving the adapter (Ctrl+C again to quit now)…");
         };
         var watch = Stopwatch.StartNew();
         var progress = new ConsoleProgress<FineTuningProgress>(p => Console.WriteLine(

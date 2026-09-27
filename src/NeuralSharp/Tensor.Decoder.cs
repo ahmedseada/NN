@@ -59,6 +59,49 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// <paramref name="forward"/>(input) without storing its intermediate results (activation checkpointing): the
+    /// forward pass runs without recording, and the backward pass runs it again with recording, back-propagates through
+    /// it and frees it at once. Parameters used inside receive their gradients then. Memory drops to the checkpointed
+    /// outputs at the cost of a second forward pass. The function must be deterministic (no dropout).
+    /// </summary>
+    internal static Tensor Checkpoint(Func<Tensor, Tensor> forward, Tensor input)
+    {
+        if (!Autograd.IsEnabled)
+        {
+            return forward(input);
+        }
+
+        Tensor output;
+        using (Autograd.NoGrad())
+        {
+            output = forward(input);
+        }
+
+        if (ReferenceEquals(output, input))
+        {
+            return output;
+        }
+
+        output.Record("checkpoint", g =>
+        {
+            using var scope = new TensorScope();
+            var replay = input.Detach();
+            replay.RequiresGrad = input.RequiresGrad;
+            var recomputed = forward(replay);
+            if (recomputed.RequiresGrad)
+            {
+                recomputed.Backward(g);
+            }
+
+            if (input.RequiresGrad && replay.Grad is { } grad)
+            {
+                input.Backend.Axpy(grad.Storage, input.GradStorage(), input.Size, 1f);
+            }
+        }, input);
+        return output;
+    }
+
+    /// <summary>
     /// Weighted token cross-entropy of a language model's output head applied to <paramref name="hidden"/> [rows, dim]:
     /// Σ_r w_r · (logsumexp(head(h_r)) - head(h_r)[t_r]) / <paramref name="normalizer"/>. The head runs on
     /// <paramref name="chunkRows"/> rows at a time and each chunk's gradient is back-propagated through the head at once,

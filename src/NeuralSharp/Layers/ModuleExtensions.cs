@@ -32,6 +32,13 @@ public static class ModuleExtensions
     public static IEnumerable<Module> Descendants(this Module module) =>
         new[] { module }.Concat(module.Children().SelectMany(Descendants));
 
+    /// <summary>
+    /// Runs the module with activation checkpointing: its intermediate results are not kept for the backward pass but
+    /// recomputed then (one more forward pass of the module, far less memory: only its output is stored). Use it for the
+    /// blocks of a deep model when training long sequences. Without gradient recording it is an ordinary forward pass.
+    /// </summary>
+    public static Tensor ForwardCheckpointed(this Module module, Tensor input) => Tensor.Checkpoint(module.Forward, input);
+
     // ------------------------------------------------------------------ saving only what changed
 
     /// <summary>

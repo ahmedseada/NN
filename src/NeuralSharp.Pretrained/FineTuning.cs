@@ -312,6 +312,12 @@ public sealed record FineTuningOptions
     /// <summary>Save the adapters every this many optimizer steps (0: only at the end).</summary>
     public int SaveEvery { get; init; }
 
+    /// <summary>
+    /// Recompute each decoder block's activations in the backward pass instead of storing them (about 20× less
+    /// activation memory for about a third more compute): needed for long sequences or large batches.
+    /// </summary>
+    public bool Checkpointing { get; init; } = true;
+
     /// <summary>Seed for the adapters' initial values and the batch order.</summary>
     public int Seed { get; init; }
 }
@@ -389,10 +395,11 @@ public static class FineTuner
                 optimizer.ZeroGrad();
                 for (int b = 0; b < group.Count; b++)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var batch = group[b];
                     var batchWatch = Stopwatch.StartNew();
                     using var scope = new TensorScope();
-                    var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows);
+                    var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing);
                     lossTensor.Backward();
                     float batchLoss = lossTensor.Item();
                     loss += batchLoss;
@@ -511,7 +518,7 @@ public static class FineTuner
     // The summed weighted loss of one batch divided by normalizer (padding and untrained positions weigh 0), and the
     // number of tokens it covers. The network runs up to its final normalization; the head runs inside the loss.
     private static (Tensor Loss, long Tokens) BatchLoss(PretrainedModel model, IReadOnlyList<TrainingSequence> sequences, int[] batch, float normalizer,
-        int chunkRows)
+        int chunkRows, bool checkpointing = false)
     {
         int length = batch.Max(i => sequences[i].Tokens.Length) - 1;
         int rows = batch.Length;
@@ -541,7 +548,7 @@ public static class FineTuner
         var hidden = Tensor.From(inputs, [rows, length], device);
         for (int i = 0; i < modules.Count - 1; i++)
         {
-            hidden = modules[i].Forward(hidden);
+            hidden = checkpointing && modules[i] is DecoderBlock ? modules[i].ForwardCheckpointed(hidden) : modules[i].Forward(hidden);
         }
 
         var loss = Losses.TokenCrossEntropy(hidden.Reshape(rows * length, hidden.Shape[^1]), h => head.Forward(h),

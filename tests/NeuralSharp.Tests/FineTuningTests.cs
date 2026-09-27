@@ -9,8 +9,46 @@ internal static partial class Tests
     private static readonly (string Name, Action<Device> Run)[] FineTuning =
     [
         ("fine-tuning: chunked token cross-entropy matches the dense loss, its input gradient and a head adapter's gradient", TokenLoss),
+        ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("fine-tuning: agent transcripts through the chat template, assistant-only tokens, LoRA and QLoRA training, PEFT adapters, merged export", AgentFineTuning),
     ];
+
+    private static void CheckpointingGradients(Device device)
+    {
+        var spec = SmallSpec with { QkNorm = true };
+        var r = new Random(92);
+        var inputValues = Enumerable.Range(0, 2 * 7 * spec.Dim).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+        var weightValues = Enumerable.Range(0, 2 * 7 * spec.Dim).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+        (float Loss, float[] Input, float[] Adapters) Run(bool checkpointed)
+        {
+            using var model = spec.Build(new RandomWeights(93), new DecoderBuildOptions { Device = device });
+            model.AddLora(rank: 2, alpha: 4, targets: l => l.Name is "q" or "v" or "down", freezeBase: true, random: new Random(94));
+            foreach (var adapter in model.Descendants().OfType<Linear>().Select(l => l.Adapter).OfType<LoraAdapter>())
+            {
+                adapter.B.Load([.. Enumerable.Range(0, adapter.B.Size).Select(i => MathF.Sin(i))]);
+            }
+
+            model.Train();
+            using var scope = new TensorScope();
+            var x = Tensor.From(inputValues, [2, 7, spec.Dim], device, requiresGrad: true);
+            var hidden = x;
+            foreach (var block in model.OfType<DecoderBlock>())
+            {
+                hidden = checkpointed ? block.ForwardCheckpointed(hidden) : block.Forward(hidden);
+            }
+
+            var loss = (hidden * Tensor.From(weightValues, [2, 7, spec.Dim], device)).Sum();
+            loss.Backward();
+            var adapters = model.TrainableParameters().SelectMany(p => p.Grad!.ToArray()).ToArray();
+            return (loss.Item(), x.Grad!.ToArray(), adapters);
+        }
+
+        var plain = Run(false);
+        var checkpointed = Run(true);
+        AssertClose([plain.Loss], [checkpointed.Loss], 1e-4f, "loss");
+        AssertClose(plain.Input, checkpointed.Input, 1e-4f, "input gradient");
+        AssertClose(plain.Adapters, checkpointed.Adapters, 1e-4f, "adapter gradients");
+    }
 
     // A tiny Qwen3-style model folder: byte-level tokenizer with ChatML tokens, Qwen3's chat template, random weights.
     private static string WriteChatModel(DecoderSpec spec)
