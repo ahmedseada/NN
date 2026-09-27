@@ -32,7 +32,7 @@ internal static partial class Tests
         ComputeResources.ReleaseCachedMemory(device);
         try
         {
-            ComputeResources.GpuMemoryLimit = ComputeResources.GetMemoryUsage(device).InUse + (1L << 20);   // 1 MiB to spare
+            ComputeResources.GpuMemoryLimit = ComputeResources.GetMemoryUsage(device).InUse + (256L << 10);   // less than one 1 MiB tensor
             ComputeResources.OffloadToHostMemory = false;
             try
             {
