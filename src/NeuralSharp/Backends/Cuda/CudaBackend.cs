@@ -262,7 +262,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         _sgdMomentum = Fn("sgd_momentum_f32");
         _adam = Fn("adam_f32");
         _matmul = Fn("matmul_f32");
-        _kernels = PtxKernels.AdvancedNames.Concat(PtxKernels.DecodingNames).Concat(PtxKernels.QuantizedNames).Concat(PtxKernels.DecoderNames).Concat(PtxKernels.RowNames).ToDictionary(k => k, Fn);
+        _kernels = PtxKernels.AdvancedNames.Concat(PtxKernels.DecodingNames).Concat(PtxKernels.QuantizedNames).Concat(PtxKernels.DecoderNames).Concat(PtxKernels.RowNames).Append("add_dropout_f32").ToDictionary(k => k, Fn);
     }
 
     public static int DeviceCount => Probe.Value.Count;
@@ -695,7 +695,16 @@ internal sealed unsafe partial class CudaBackend : Backend
         Launch1D(_addRowVec, n, P(a), P(v), P(c), U(cols), U(n));
     }
 
-    public override void SumRows(Storage x, Storage y, int rows, int cols) => Launch1D(_sumRows, cols, P(x), P(y), U(rows), U(cols));
+    public override void SumRows(Storage x, Storage y, int rows, int cols)
+    {
+        if (rows >= 256)
+        {
+            SumColumns(x, 0, cols, y, rows, cols);                  // chunks of rows in parallel (a bias gradient)
+            return;
+        }
+
+        Launch1D(_sumRows, cols, P(x), P(y), U(rows), U(cols));
+    }
 
     public override void Sum(Storage x, Storage result, int n, float scale)
     {
@@ -896,13 +905,6 @@ internal sealed unsafe partial class CudaBackend : Backend
             return false;
         }
 
-        if (_profile is not null)
-        {
-            _profileLabel = $"gemm_tc_{(transA ? 't' : 'n')}{(transB ? 't' : 'n')}{(epilogue == GemmEpilogue.None ? "" : epilogue == GemmEpilogue.Gelu ? "+gelu" : "+gelu'")}"
-                            + $"{(bias is null ? "" : "+bias")} {m}x{n}x{k}";
-            _profileFlops = 2.0 * m * n * k;
-        }
-
         if (MixedPrecision.Current == MatMulPrecision.Float8 && EightBitReady(fp8: true) && k >= 16)
         {
             Gemm8(true, P(a) + (ulong)aOffset * 4, lda, transA, P(b) + (ulong)bOffset * 4, ldb, transB, P(c) + (ulong)cOffset * 4, ldc, m, n, k, beta,
@@ -913,6 +915,13 @@ internal sealed unsafe partial class CudaBackend : Backend
         if (PtxKernels.GemmKernel(transA, transB, epilogue) is not { } kernel || !tensorCore.TryGetValue(kernel, out var function))
         {
             return false;
+        }
+
+        if (_profile is not null)
+        {
+            _profileLabel = $"gemm_tc_{(transA ? 't' : 'n')}{(transB ? 't' : 'n')}{(epilogue == GemmEpilogue.None ? "" : epilogue == GemmEpilogue.Gelu ? "+gelu" : "+gelu'")}"
+                            + $"{(bias is null ? "" : "+bias")} {m}x{n}x{k}";
+            _profileFlops = 2.0 * m * n * k;
         }
 
         Launch(function, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
@@ -935,16 +944,12 @@ internal sealed unsafe partial class CudaBackend : Backend
         float beta, ulong bias, GemmEpilogue epilogue, ulong aux)
     {
         int kp = PtxKernels.EightBitPaddedK(k);
-        var a8 = Allocate(Math.Max(1, m * kp / 4), zeroed: false);
-        var b8 = Allocate(Math.Max(1, n * kp / 4), zeroed: false);
-        var sa = Allocate(m, zeroed: false);
-        var sb = Allocate(n, zeroed: false);
+        // op(a) [m, k]: stored [m][lda] (rows) or, transposed, [k][lda] (columns). op(b) needs [n][k]: stored
+        // transposed [n][ldb] (rows) or as is, [k][ldb] (columns).
+        var (a8, sa, ownA) = Quantized(fp8, a, lda, byRows: !transA, m, k, kp);
+        var (b8, sb, ownB) = Quantized(fp8, b, ldb, byRows: transB, n, k, kp);
         try
         {
-            // op(a) [m, k]: stored [m][lda] (rows) or, transposed, [k][lda] (columns). op(b) needs [n][k]: stored
-            // transposed [n][ldb] (rows) or as is, [k][ldb] (columns).
-            QuantizeOperand(fp8, a, lda, byRows: !transA, a8, sa, m, k, kp);
-            QuantizeOperand(fp8, b, ldb, byRows: transB, b8, sb, n, k, kp);
             if (_profile is not null)
             {
                 _profileLabel = $"gemm8_{(fp8 ? "e4m3" : "s8")}_{(transA ? 't' : 'n')}{(transB ? 't' : 'n')}"
@@ -960,10 +965,69 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
         finally
         {
-            a8.Release();
-            b8.Release();
-            sa.Release();
-            sb.Release();
+            if (ownA)
+            {
+                a8.Release();
+                sa.Release();
+            }
+
+            if (ownB)
+            {
+                b8.Release();
+                sb.Release();
+            }
+        }
+    }
+
+    // Quantized operands kept while a ReuseQuantizedOperands scope is open (on the thread that opened it).
+    [ThreadStatic]
+    private static Dictionary<(ulong Address, int Ld, bool ByRows, int Rows, int K, bool Fp8), (Storage Values, Storage Scales)>? t_reuse;
+
+    // The operand quantized (or the kept copy): Owned = the caller releases it.
+    private (Storage Values, Storage Scales, bool Owned) Quantized(bool fp8, ulong x, int ld, bool byRows, int rows, int k, int kp)
+    {
+        var key = (x, ld, byRows, rows, k, fp8);
+        if (t_reuse is { } reuse && reuse.TryGetValue(key, out var kept))
+        {
+            return (kept.Values, kept.Scales, false);
+        }
+
+        var values = Allocate(Math.Max(1, rows * kp / 4), zeroed: false);
+        var scales = Allocate(rows, zeroed: false);
+        QuantizeOperand(fp8, x, ld, byRows, values, scales, rows, k, kp);
+        if (t_reuse is { } open)
+        {
+            open[key] = (values, scales);
+            return (values, scales, false);
+        }
+
+        return (values, scales, true);
+    }
+
+    public override IDisposable? ReuseQuantizedOperands()
+    {
+        if (t_reuse is not null || MixedPrecision.Current != MatMulPrecision.Float8)
+        {
+            return null;                                            // nested, or nothing is quantized
+        }
+
+        t_reuse = [];
+        return new ReuseScope();
+    }
+
+    private sealed class ReuseScope : IDisposable
+    {
+        public void Dispose()
+        {
+            if (t_reuse is { } reuse)
+            {
+                t_reuse = null;
+                foreach (var (values, scales) in reuse.Values)
+                {
+                    values.Release();
+                    scales.Release();
+                }
+            }
         }
     }
 
@@ -1027,6 +1091,9 @@ internal sealed unsafe partial class CudaBackend : Backend
 
     public override void Dropout(Storage x, Storage y, int n, float p, uint seed) =>
         Launch1D(_dropout, n, P(x), P(y), F(p), F(1f / (1f - p)), seed, 0UL, U(n));
+
+    public override void AddDropout(Storage residual, Storage x, Storage output, int n, float p, uint seed) =>
+        Launch1D(K("add_dropout_f32"), n, P(residual), P(x), P(output), F(p), F(1f / (1f - p)), seed, U(n));
 
     public override void DropoutBackward(Storage dy, Storage dx, int n, float p, uint seed) =>
         Launch1D(_dropout, n, P(dy), P(dx), F(p), F(1f / (1f - p)), seed, 1UL, U(n));

@@ -19,6 +19,7 @@ public sealed partial class Tensor
         long start = Telemetry.Start(TelemetryLevel.Operations);
         var y = Empty([.. x._shape[..^1], width], x.Device);
         var offsets = new int[layers.Count];
+        using var reuse = x.Backend.ReuseQuantizedOperands();              // x is quantized once for all projections
         for (int j = 0, offset = 0; j < layers.Count; offset += layers[j].OutFeatures, j++)
         {
             offsets[j] = offset;
@@ -37,6 +38,7 @@ public sealed partial class Tensor
             y.Record("project_packed", g =>
             {
                 var backend = x.Backend;
+                using var reuseBackward = backend.ReuseQuantizedOperands();  // xᵀ once for the weight gradients
                 for (int j = 0; j < layers.Count; j++)
                 {
                     var layer = layers[j];

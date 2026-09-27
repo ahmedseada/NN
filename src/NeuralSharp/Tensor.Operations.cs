@@ -81,6 +81,34 @@ public sealed partial class Tensor
         return Traced("dropout", y, start);
     }
 
+    /// <summary>residual + x.Dropout(p, seed) in one pass (a residual connection with dropout on its branch).</summary>
+    internal static Tensor AddDropout(Tensor residual, Tensor x, float p, uint seed)
+    {
+        residual.ThrowIfDisposed();
+        x.ThrowIfDisposed();
+        CheckSameShape(residual, x);
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty(x._shape, x.Device);
+        x.Backend.AddDropout(residual.Storage, x.Storage, y.Storage, x.Size, p, seed);
+        if (WillRecord(residual, x))
+        {
+            y.Record("add_dropout", g =>
+            {
+                if (x.RequiresGrad)
+                {
+                    x.Backend.DropoutBackward(g.Storage, x.GradStorage(), x.Size, p, seed);
+                }
+
+                if (residual.RequiresGrad)
+                {
+                    residual.AddGradient(g, adopt: !ReferenceEquals(residual, x));   // last: it may take g's buffer
+                }
+            }, residual, x);
+        }
+
+        return Traced("add_dropout", y, start);
+    }
+
     // ---------------------------------------------------------------- linear algebra and reductions
 
     /// <summary>Sum of all elements, as a scalar tensor.</summary>

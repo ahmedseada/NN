@@ -207,6 +207,20 @@ internal abstract class Backend
         throw new NotSupportedException($"{GetType().Name} has no strided column sums.");
     }
 
+    /// <summary>
+    /// Until disposed, 8-bit products on this device reuse the quantized form of an operand they have already quantized
+    /// (same memory, layout and size), for callers that multiply one unchanged tensor several times (the query, key and
+    /// value projections of one input). Null when the device quantizes nothing.
+    /// </summary>
+    public virtual IDisposable? ReuseQuantizedOperands() => null;
+
+    /// <summary>output = residual + dropout(x) (the mask of <see cref="Dropout"/> with <paramref name="seed"/>).</summary>
+    public virtual void AddDropout(Storage residual, Storage x, Storage output, int n, float p, uint seed)
+    {
+        Dropout(x, output, n, p, seed);
+        Axpy(residual, output, n, 1f);
+    }
+
     /// <summary><see cref="MatMul"/> for <paramref name="batch"/> independent, contiguous matrix triples.</summary>
     public abstract void BatchedMatMul(Storage a, Storage b, Storage c, int batch, int m, int n, int k, bool transA, bool transB, float beta);
 

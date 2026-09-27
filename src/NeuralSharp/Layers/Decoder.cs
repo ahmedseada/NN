@@ -689,15 +689,10 @@ public sealed class DecoderBlock : Module, ICachedModule
             attended = PostAttentionNorm.Forward(attended);
         }
 
-        if (Dropping)
-        {
-            attended = ResidualDropout!.Forward(attended);
-        }
-
         if (Parallel)
         {
             var parallel = FeedForward.Forward(normalized);
-            return input + attended + (Dropping ? ResidualDropout!.Forward(parallel) : parallel);
+            return Dropping ? ResidualDropout!.AddTo(ResidualDropout.AddTo(input, attended), parallel) : input + attended + parallel;
         }
 
         Tensor x, fed;
@@ -709,18 +704,13 @@ public sealed class DecoderBlock : Module, ICachedModule
         }
         else
         {
-            x = input + attended;
+            x = Dropping ? ResidualDropout!.AddTo(input, attended) : input + attended;          // dropout fused in
             fed = FeedForward.Forward(FeedForwardNorm!.Forward(x));
         }
 
         if (PostFeedForwardNorm is not null)
         {
             fed = PostFeedForwardNorm.Forward(fed);
-        }
-
-        if (Dropping)
-        {
-            fed = ResidualDropout!.Forward(fed);
         }
 
         if (NextNorm is { } next && !Autograd.IsEnabled && !Dropping)
@@ -730,7 +720,7 @@ public sealed class DecoderBlock : Module, ICachedModule
             return output;
         }
 
-        return x + fed;
+        return Dropping ? ResidualDropout!.AddTo(x, fed) : x + fed;
     }
 
     /// <inheritdoc />

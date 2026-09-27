@@ -59,6 +59,10 @@ public sealed class Dropout : Module
     protected override Tensor ForwardCore(Tensor input) =>
         IsTraining && Probability > 0f ? input.Dropout(Probability, DropoutSeeds.Next(_random)) : input;
 
+    /// <summary>residual + this(x) in one pass (the seed drawn as <see cref="ForwardCore"/> draws it).</summary>
+    internal Tensor AddTo(Tensor residual, Tensor x) =>
+        IsTraining && Probability > 0f ? Tensor.AddDropout(residual, x, Probability, DropoutSeeds.Next(_random)) : residual + x;
+
     /// <inheritdoc />
     public override string ToString() => $"Dropout(p={Probability})";
 }

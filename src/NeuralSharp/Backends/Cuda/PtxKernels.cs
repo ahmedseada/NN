@@ -24,7 +24,7 @@ internal static partial class PtxKernels
         "fill_f32", "affine_f32", "axpy_f32", "muladd_f32",
         "add_f32", "sub_f32", "mul_f32",
         "sigmoid_f32", "tanh_f32", "relu_f32", "square_f32", "abs_f32",
-        "sigmoid_bwd_f32", "tanh_bwd_f32", "relu_bwd_f32", "square_bwd_f32", "abs_bwd_f32", "dropout_f32",
+        "sigmoid_bwd_f32", "tanh_bwd_f32", "relu_bwd_f32", "square_bwd_f32", "abs_bwd_f32", "dropout_f32", "add_dropout_f32",
         "add_rowvec_f32", "add_scalar_f32", "sum_rows_f32", "sum_f32",
         "sgd_momentum_f32", "adam_f32", "matmul_f32",
     ];
@@ -218,6 +218,31 @@ internal static partial class PtxKernels
             ld.global.f32 %f4, [%a_y];
             add.f32 %f3, %f3, %f4;
             STORE:
+            st.global.f32 [%a_y], %f3;
+            """);
+
+        // out[i] = r[i] + (dropout mask of dropout_f32 with this seed)[i] · y[i] · scale: a residual addition and dropout in one pass.
+        Elementwise(sb, "add_dropout_f32", ["r", "x", "y"], [("f32", "p"), ("f32", "scale"), ("u32", "seed")],
+            $"""
+            mul.lo.u32 %r5, %i, 0x9E3779B9;
+            xor.b32 %r5, %r5, %s_seed;
+            shr.u32 %r6, %r5, 16;
+            xor.b32 %r5, %r5, %r6;
+            mul.lo.u32 %r5, %r5, 0x85EBCA6B;
+            shr.u32 %r6, %r5, 13;
+            xor.b32 %r5, %r5, %r6;
+            mul.lo.u32 %r5, %r5, 0xC2B2AE35;
+            shr.u32 %r6, %r5, 16;
+            xor.b32 %r5, %r5, %r6;
+            shr.u32 %r6, %r5, 8;
+            cvt.rn.f32.u32 %f1, %r6;
+            mul.f32 %f1, %f1, {F(1f / 16777216f)};
+            setp.ge.f32 %p1, %f1, %s_p;
+            ld.global.f32 %f2, [%a_x];
+            mul.f32 %f3, %f2, %s_scale;
+            selp.f32 %f3, %f3, {Zero}, %p1;
+            ld.global.f32 %f4, [%a_r];
+            add.f32 %f3, %f3, %f4;
             st.global.f32 [%a_y], %f3;
             """);
 
