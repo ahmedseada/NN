@@ -32,7 +32,6 @@ internal static partial class PtxKernels
         QuantizeRows(sb, fp8);
         ColumnMaxima(sb, fp8);
         QuantizeColumns(sb, fp8);
-        QuantizeColumns(sb, fp8, onePass: true);
     }
 
     // Largest magnitude of the format (e4m3: 448; int8: 127, symmetric).
@@ -245,19 +244,14 @@ internal static partial class PtxKernels
     // block whose 32 columns all have amax[j] ≤ 2·only[j] (only = the kept maxima: nothing saturated) returns before
     // reading x, the others quantize again with the recorded maxima (no headroom). Blocks take tiles ctaid.y, +
     // gridDim.y, … so the correction can run on a few blocks per strip.
-    //
-    // onePass (quant_cols1_…): the maxima and the quantization in one launch, x read twice (the second time largely from
-    // L2): a persistent grid (every block resident) first adds 32-column × 256-row maxima into p_amax (zeroed first), waits
-    // at a grid barrier (p_counter, zeroed first), then quantizes the 32 × 32 tiles, the last-read rows first.
-    private static void QuantizeColumns(StringBuilder sb, bool fp8, bool onePass = false)
+    private static void QuantizeColumns(StringBuilder sb, bool fp8)
     {
-        string name = $"quant_cols{(onePass ? "1" : "")}_{(fp8 ? "e4m3" : "s8")}";
-        string done = onePass ? "TILE_DONE" : "YTILE_DONE";
+        string name = $"quant_cols_{(fp8 ? "e4m3" : "s8")}";
         var s = new StringBuilder();
         s.AppendLine($$"""
             .visible .entry {{name}}(
                 .param .u64 p_x, .param .u64 p_out, .param .u64 p_amax, .param .u64 p_scale, .param .u32 p_ld, .param .u32 p_ldo,
-                .param .u32 p_rows, .param .u32 p_cols, .param .u64 {{(onePass ? "p_counter" : "p_record")}}{{(onePass ? "" : ", .param .u64 p_only")}}
+                .param .u32 p_rows, .param .u32 p_cols, .param .u64 p_record, .param .u64 p_only
             )
             {
                 .reg .pred %p<12>;
@@ -267,12 +261,11 @@ internal static partial class PtxKernels
                 .reg .f32 %x<4>;
                 .reg .b16 %hs<2>;
                 .shared .align 4 .f32 {{name}}_t[1056];
-                .shared .align 4 .f32 {{name}}_m[256];
                 ld.param.u64 %rd1, [p_x];
                 ld.param.u64 %rd2, [p_out];
                 ld.param.u64 %rd3, [p_amax];
                 ld.param.u64 %rd4, [p_scale];
-                ld.param.u64 %rd12, [{{(onePass ? "p_counter" : "p_record")}}];
+                ld.param.u64 %rd12, [p_record];
                 setp.ne.u64 %p8, %rd12, 0;
                 cvta.to.global.u64 %rd1, %rd1;
                 cvta.to.global.u64 %rd2, %rd2;
@@ -286,151 +279,32 @@ internal static partial class PtxKernels
                 mov.u32 %r5, %tid.x;
                 mov.u32 %r6, %tid.y;
                 mov.u32 %r9, {{name}}_t;
-                mov.u32 %r19, {{name}}_m;
             """);
-        if (onePass)
-        {
-            // Phase 1: item i = (stripe i % stripes, 256-row chunk i / stripes); thread (tx, ty) takes column
-            // stripe·32 + tx, rows chunk·256 + ty + 8t (four loads in flight), the eight ty maxima meet in shared memory.
-            s.AppendLine("""
-                    add.u32 %r20, %r4, 31;
-                    shr.u32 %r20, %r20, 5;
-                    add.u32 %r21, %r3, 255;
-                    shr.u32 %r21, %r21, 8;
-                    mul.lo.u32 %r22, %r20, %r21;
-                    mov.u32 %r23, %nctaid.x;
-                    mov.u32 %r24, %ctaid.x;
-                    shl.b32 %r34, %r6, 5;
-                    add.u32 %r34, %r34, %r5;
-                    shl.b32 %r34, %r34, 2;
-                    add.u32 %r34, %r34, %r19;
-                P1:
-                    setp.ge.u32 %p5, %r24, %r22;
-                    @%p5 bra P1_END;
-                    rem.u32 %r25, %r24, %r20;
-                    div.u32 %r26, %r24, %r20;
-                    shl.b32 %r27, %r25, 5;
-                    add.u32 %r27, %r27, %r5;
-                    setp.lt.u32 %p6, %r27, %r4;
-                    shl.b32 %r28, %r26, 8;
-                    add.u32 %r29, %r28, 256;
-                    min.u32 %r29, %r29, %r3;
-                    add.u32 %r28, %r28, %r6;
-                    mov.f32 %f5, 0f00000000;
-                P1R:
-                    setp.ge.u32 %p5, %r28, %r29;
-                    @%p5 bra P1R_END;
-                """);
-            for (int j = 0; j < 4; j++)
-            {
-                s.AppendLine($"""
-                        add.u32 %r30, %r28, {8 * j};
-                        setp.lt.u32 %p7, %r30, %r29;
-                        and.pred %p7, %p7, %p6;
-                        mul.wide.u32 %rd13, %r30, %r1;
-                        cvt.u64.u32 %rd14, %r27;
-                        add.u64 %rd13, %rd13, %rd14;
-                        shl.b64 %rd13, %rd13, 2;
-                        add.u64 %rd13, %rd13, %rd1;
-                        mov.f32 %f{6 + j}, 0f00000000;
-                        @%p7 ld.global.f32 %f{6 + j}, [%rd13];
-                    """);
-            }
-
-            s.AppendLine("""
-                    abs.f32 %f6, %f6;
-                    abs.f32 %f7, %f7;
-                    abs.f32 %f8, %f8;
-                    abs.f32 %f9, %f9;
-                    max.f32 %f6, %f6, %f7;
-                    max.f32 %f8, %f8, %f9;
-                    max.f32 %f6, %f6, %f8;
-                    max.f32 %f5, %f5, %f6;
-                    add.u32 %r28, %r28, 32;
-                    bra P1R;
-                P1R_END:
-                    st.shared.f32 [%r34], %f5;
-                    bar.sync 0;
-                    setp.eq.u32 %p5, %r6, 0;
-                    and.pred %p5, %p5, %p6;
-                    @!%p5 bra P1_NEXT;
-                    shl.b32 %r31, %r5, 2;
-                    add.u32 %r31, %r31, %r19;
-                    ld.shared.f32 %f5, [%r31];
-                """);
-            for (int t = 1; t < 8; t++)
-            {
-                s.AppendLine($"""
-                        ld.shared.f32 %f6, [%r31+{128 * t}];
-                        max.f32 %f5, %f5, %f6;
-                    """);
-            }
-
-            s.AppendLine("""
-                    mov.b32 %r32, %f5;
-                    mul.wide.u32 %rd13, %r27, 4;
-                    add.u64 %rd13, %rd13, %rd3;
-                    red.global.max.u32 [%rd13], %r32;
-                P1_NEXT:
-                    bar.sync 0;
-                    add.u32 %r24, %r24, %r23;
-                    bra P1;
-                P1_END:
-                    membar.gl;
-                    bar.sync 0;
-                    or.b32 %r33, %r5, %r6;
-                    setp.eq.u32 %p9, %r33, 0;
-                    @!%p9 bra WAITED;
-                    atom.global.add.u32 %r33, [%rd12], 1;
-                SPIN:
-                    ld.volatile.global.u32 %r33, [%rd12];
-                    setp.lt.u32 %p10, %r33, %r23;
-                    @%p10 bra SPIN;
-                    membar.gl;
-                WAITED:
-                    bar.sync 0;
-                    shr.u32 %r35, %r2, 5;
-                    mul.lo.u32 %r36, %r20, %r35;
-                    mov.u32 %r24, %ctaid.x;
-                P2:
-                    setp.ge.u32 %p5, %r24, %r36;
-                    @%p5 bra DONE;
-                    sub.u32 %r37, %r36, 1;
-                    sub.u32 %r37, %r37, %r24;
-                    rem.u32 %r7, %r37, %r20;
-                    shl.b32 %r7, %r7, 5;
-                    div.u32 %r8, %r37, %r20;
-                    shl.b32 %r8, %r8, 5;
-                """);
-        }
-        else
-        {
-            s.AppendLine("""
-                    mov.u32 %r7, %ctaid.x;
-                    shl.b32 %r7, %r7, 5;
-                    mov.u32 %r8, %ctaid.y;
-                    shl.b32 %r8, %r8, 5;
-                    ld.param.u64 %rd15, [p_only];
-                    setp.ne.u64 %p9, %rd15, 0;
-                    @!%p9 bra WHOLE;
-                    cvta.to.global.u64 %rd15, %rd15;
-                    add.u32 %r23, %r7, %r5;
-                    setp.lt.u32 %p10, %r23, %r4;
-                    mul.wide.u32 %rd13, %r23, 4;
-                    add.u64 %rd14, %rd13, %rd3;
-                    add.u64 %rd13, %rd13, %rd15;
-                    mov.f32 %f10, 0f00000000;
-                    mov.f32 %f11, 0f00000000;
-                    @%p10 ld.global.f32 %f10, [%rd14];
-                    @%p10 ld.global.f32 %f11, [%rd13];
-                    add.f32 %f11, %f11, %f11;
-                    setp.gt.f32 %p10, %f10, %f11;
-                    bar.red.or.pred %p11, 0, %p10;
-                    @!%p11 bra DONE;
-                WHOLE:
-                YTILE:
-                """);
-        }
+        s.AppendLine("""
+                mov.u32 %r7, %ctaid.x;
+                shl.b32 %r7, %r7, 5;
+                mov.u32 %r8, %ctaid.y;
+                shl.b32 %r8, %r8, 5;
+                ld.param.u64 %rd15, [p_only];
+                setp.ne.u64 %p9, %rd15, 0;
+                @!%p9 bra WHOLE;
+                cvta.to.global.u64 %rd15, %rd15;
+                add.u32 %r23, %r7, %r5;
+                setp.lt.u32 %p10, %r23, %r4;
+                mul.wide.u32 %rd13, %r23, 4;
+                add.u64 %rd14, %rd13, %rd3;
+                add.u64 %rd13, %rd13, %rd15;
+                mov.f32 %f10, 0f00000000;
+                mov.f32 %f11, 0f00000000;
+                @%p10 ld.global.f32 %f10, [%rd14];
+                @%p10 ld.global.f32 %f11, [%rd13];
+                add.f32 %f11, %f11, %f11;
+                setp.gt.f32 %p10, %f10, %f11;
+                bar.red.or.pred %p11, 0, %p10;
+                @!%p11 bra DONE;
+            WHOLE:
+            YTILE:
+            """);
 
         for (int i = 0; i < 4; i++)
         {
@@ -459,11 +333,11 @@ internal static partial class PtxKernels
                 bar.sync 0;
                 add.u32 %r14, %r7, %r5;
                 setp.ge.u32 %p2, %r14, %r4;
-                @%p2 bra {{done}};
+                @%p2 bra YTILE_DONE;
                 mul.wide.u32 %rd7, %r14, 4;
                 add.u64 %rd8, %rd7, %rd3;
-                {{(onePass ? "ld.global.cg.f32" : "ld.global.f32")}} %f2, [%rd8];
-                {{(onePass ? "" : "@%p8 add.f32 %f2, %f2, %f2;")}}
+                ld.global.f32 %f2, [%rd8];
+                @%p8 add.f32 %f2, %f2, %f2;
                 setp.gt.f32 %p3, %f2, 0f00000000;
                 div.rn.f32 %f3, %f2, {{QuantMax(fp8)}};
                 selp.f32 %f3, %f3, 0f3F800000, %p3;
@@ -474,31 +348,28 @@ internal static partial class PtxKernels
                 @%p4 st.global.f32 [%rd9], %f3;
                 shl.b32 %r16, %r6, 2;
             """);
-        if (!onePass)
-        {
-            // Recording: thread (tx, 0) takes the maximum of its column over the tile's 32 rows.
-            s.AppendLine("""
-                    setp.eq.u32 %p5, %r6, 0;
-                    and.pred %p5, %p5, %p8;
-                    @!%p5 bra RECORDED;
-                    shl.b32 %r20, %r5, 2;
-                    add.u32 %r20, %r20, %r9;
-                    mov.f32 %f5, 0f00000000;
-                    mov.u32 %r21, 0;
-                REC:
-                    ld.shared.f32 %f6, [%r20];
-                    abs.f32 %f6, %f6;
-                    max.f32 %f5, %f5, %f6;
-                    add.u32 %r20, %r20, 132;
-                    add.u32 %r21, %r21, 1;
-                    setp.lt.u32 %p6, %r21, 32;
-                    @%p6 bra REC;
-                    mov.b32 %r22, %f5;
-                    add.u64 %rd13, %rd7, %rd12;
-                    red.global.max.u32 [%rd13], %r22;
-                RECORDED:
-                """);
-        }
+        // Recording: thread (tx, 0) takes the maximum of its column over the tile's 32 rows.
+        s.AppendLine("""
+                setp.eq.u32 %p5, %r6, 0;
+                and.pred %p5, %p5, %p8;
+                @!%p5 bra RECORDED;
+                shl.b32 %r20, %r5, 2;
+                add.u32 %r20, %r20, %r9;
+                mov.f32 %f5, 0f00000000;
+                mov.u32 %r21, 0;
+            REC:
+                ld.shared.f32 %f6, [%r20];
+                abs.f32 %f6, %f6;
+                max.f32 %f5, %f5, %f6;
+                add.u32 %r20, %r20, 132;
+                add.u32 %r21, %r21, 1;
+                setp.lt.u32 %p6, %r21, 32;
+                @%p6 bra REC;
+                mov.b32 %r22, %f5;
+                add.u64 %rd13, %rd7, %rd12;
+                red.global.max.u32 [%rd13], %r22;
+            RECORDED:
+            """);
 
         for (int j = 0; j < 4; j++)
         {
@@ -522,29 +393,16 @@ internal static partial class PtxKernels
                 add.u64 %rd10, %rd10, %rd2;
                 st.global.b32 [%rd10], %r40;
             """);
-        if (!onePass)
-        {
-            // Tiles ctaid.y, + gridDim.y, … (one per block unless the correction pass runs on a few blocks per strip).
-            s.AppendLine("""
-                YTILE_DONE:
-                    bar.sync 0;
-                    mov.u32 %r24, %nctaid.y;
-                    shl.b32 %r24, %r24, 5;
-                    add.u32 %r8, %r8, %r24;
-                    setp.lt.u32 %p5, %r8, %r2;
-                    @%p5 bra YTILE;
-                """);
-        }
-
-        if (onePass)
-        {
-            s.AppendLine("""
-                TILE_DONE:
-                    bar.sync 0;
-                    add.u32 %r24, %r24, %r23;
-                    bra P2;
-                """);
-        }
+        // Tiles ctaid.y, + gridDim.y, … (one per block unless the correction pass runs on a few blocks per strip).
+        s.AppendLine("""
+            YTILE_DONE:
+                bar.sync 0;
+                mov.u32 %r24, %nctaid.y;
+                shl.b32 %r24, %r24, 5;
+                add.u32 %r8, %r8, %r24;
+                setp.lt.u32 %p5, %r8, %r2;
+                @%p5 bra YTILE;
+            """);
 
         s.AppendLine("""
             DONE:

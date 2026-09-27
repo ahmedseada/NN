@@ -12,7 +12,7 @@ internal static partial class Tests
         ("layer norm: the fused training kernels match the composed operations (output, input, gamma and beta gradients)", LayerNormTraining),
         ("mixed precision: strided products and GELU epilogues match references (slices, activation, its gradient)", StridedProducts),
         ("mixed precision: 8-bit tensor-core products (fp8, int8; every layout, beta, bias) track float32", EightBitProducts),
-        ("mixed precision: 8-bit column quantizers: the one-launch kernel and delayed scaling (given maxima, recorded maxima, correction of saturated columns) match the two-launch pair", ColumnQuantizers),
+        ("mixed precision: 8-bit column quantizers: delayed scaling (given maxima with headroom, recorded maxima, correction of saturated columns) matches the two-launch pair", ColumnQuantizers),
         ("mixed precision: prompts through int8 / int4 / bfloat16 weights on tensor cores match the float32 kernels", PackedTensorCoreProducts),
         ("mixed precision: fused decoder blocks (packed q/k/v, attention in place, GELU inside the products) match the composed ones", FusedDecoderBlocks),
         ("mixed precision: product + bias in one pass matches the product and a bias addition (output and gradients)", MatMulBiasPass),
@@ -261,8 +261,6 @@ internal static partial class Tests
 
                 string what = $"{(fp8 ? "fp8" : "int8")} {k}x{cols} (ld {ld})";
                 var (bytes, scales) = Run(0);
-                var (onePass, onePassScales) = Run(1);
-                Check(bytes.AsSpan().SequenceEqual(onePass) && scales.AsSpan().SequenceEqual(onePassScales), $"{what}: one-launch kernel");
                 // Kept maxima get twice their value as headroom: half the true maxima give the exact result.
                 using var recorded = Tensor.Zeros([cols], device);
                 var (delayed, delayedScales) = Run(2, [.. maxima.Select(m => m / 2)], recorded);
@@ -694,8 +692,8 @@ internal static partial class Tests
     }
 
     // FP8 operand quantizers for x [k][n] (n columns → n quantized rows): the two-launch column pair (absmax_cols +
-    // quant_cols, current), the one-launch kernel (option C), delayed scaling (quant_cols with maxima kept from an earlier
-    // pass, recording x's own: option D), and the row quantizer of the same tensor for reference. 20 calls per graph;
+    // quant_cols, current), delayed scaling (quant_cols with maxima kept from an earlier pass, recording x's own; then
+    // with its correction pass), and the row quantizer of the same tensor for reference. 20 calls per graph;
     // GB/s counts one read of x. Then the error of delayed scaling: x' = x drifted (next step), quantized with x's maxima
     // (stale) against its own (exact), relative RMS after dequantizing, without and with a new outlier.
     internal static int BenchFp8Quantizers()
@@ -738,7 +736,7 @@ internal static partial class Tests
             return watch.Elapsed.TotalMilliseconds * 1000 / 100;          // µs per call
         }
 
-        Console.WriteLine($"{"x [k][n]",-16} {"MB",6} {"current (2 launches)",22} {"C: one launch",22} {"D: kept maxima",22} {"D + correction",22} {"rows (reference)",22}");
+        Console.WriteLine($"{"x [k][n]",-16} {"MB",6} {"current (2 launches)",22} {"D: kept maxima",22} {"D + correction",22} {"rows (reference)",22}");
         foreach (var (k, n) in new[] { (4096, 2048), (4096, 8192), (2048, 8192), (8192, 2048), (2048, 2048), (12288, 768), (12288, 3072) })
         {
             using var x = Tensor.From([.. Enumerable.Range(0, k * n).Select(_ => random.NextSingle() * 2 - 1)], [k * n], device);
@@ -750,11 +748,10 @@ internal static partial class Tests
             double mb = 4.0 * k * n / 1e6;
             string Cell(double us) => $"{us,8:F1}us {mb * 1e-3 / (us * 1e-6),7:F0}GB/s";
             double current = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 0));
-            double onePass = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 1));
             double delayed = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 2, maxima.Storage, record.Storage));
             double corrected = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 3, maxima.Storage, record.Storage));
             double rows = Time(() => backend.QuantizeRowsForBenchmark(true, x.Storage, n, output.Storage, scale.Storage, k, n));
-            Console.WriteLine($"{$"{k}x{n}",-16} {mb,6:F0} {Cell(current),22} {Cell(onePass),22} {Cell(delayed),22} {Cell(corrected),22} {Cell(rows),22}");
+            Console.WriteLine($"{$"{k}x{n}",-16} {mb,6:F0} {Cell(current),22} {Cell(delayed),22} {Cell(corrected),22} {Cell(rows),22}");
         }
 
         // Error of delayed scaling (fp8 e4m3), x [4096][2048] of normal values with a few larger columns.

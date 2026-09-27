@@ -1096,16 +1096,10 @@ internal sealed unsafe partial class CudaBackend : Backend
             }
         }
 
-        var amax = Allocate(rows + 1, zeroed: true);                // + the one-pass kernel's barrier counter
+        var amax = Allocate(rows, zeroed: true);
         bool keepAmax = false;
         try
         {
-            if (OnePassColumnQuantizer)
-            {
-                QuantizeColumnsOnePass(fp8, x, ld, output, scale, rows, k, kp, amax);
-                return;
-            }
-
             Launch(TensorKernel($"absmax_cols_{format}")!.Value, (uint)((rows + 255) / 256), (uint)((k + Chunk - 1) / Chunk), 1, 256, 1,
                 x, P(amax), U(ld), U(k), U(rows), U(Chunk));
             QuantizeColumnsWithMaxima(fp8, x, ld, output, scale, rows, k, kp, amax, null);
@@ -1147,21 +1141,6 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
     }
 
-    /// <summary>
-    /// Column operands quantized by the one-launch kernel (maxima and conversion together, see quant_cols1) instead of
-    /// the two-launch pair. Off by default until --bench-fp8 shows it faster.
-    /// </summary>
-    internal static bool OnePassColumnQuantizer { get; set; }
-
-    // quant_cols1: `amax` holds rows + 1 zeroed words (the maxima, then the grid barrier's counter). The grid is
-    // persistent: three blocks of 256 threads per SM are always resident together, which the barrier needs.
-    private void QuantizeColumnsOnePass(bool fp8, ulong x, int ld, Storage output, Storage scale, int rows, int k, int kp, Storage amax)
-    {
-        string format = fp8 ? "e4m3" : "s8";
-        Launch(TensorKernel($"quant_cols1_{format}")!.Value, (uint)(3 * Math.Max(1, _multiprocessors)), 1, 1, 32, 8,
-            x, P(output), P(amax), P(scale), U(ld), U(kp), U(k), U(rows), P(amax) + (ulong)rows * 4);
-    }
-
     // The column quantization with given maxima (one per output row: the absmax_cols result, or maxima kept from an
     // earlier pass for delayed scaling: with `record` set they are doubled as headroom, larger values saturating);
     // `record` (zeroed) receives this x's maxima.
@@ -1197,8 +1176,8 @@ internal sealed unsafe partial class CudaBackend : Backend
     private readonly Dictionary<(ulong X, int Ld, int Rows, int K), Storage> _keptMaxima = [];
 
     // Benchmarks and tests: the column quantization of x [k][ld] (rows = its columns) by the two-launch pair (variant 0),
-    // the one-launch kernel (1), with given maxima, recording x's own (2), or that plus the correction pass (3: delayed
-    // scaling as training uses it; record zeroed).
+    // with given maxima, recording x's own (2), or that plus the correction pass (3: delayed scaling as training uses it;
+    // record zeroed).
     internal void QuantizeColumnsVariant(bool fp8, Storage x, int ld, Storage output, Storage scale, int rows, int k, int variant,
         Storage? maxima = null, Storage? record = null)
     {
@@ -1214,16 +1193,7 @@ internal sealed unsafe partial class CudaBackend : Backend
             return;
         }
 
-        bool saved = OnePassColumnQuantizer;
-        OnePassColumnQuantizer = variant == 1;
-        try
-        {
-            QuantizeOperand(fp8, P(x), ld, byRows: false, output, scale, rows, k, PtxKernels.EightBitPaddedK(k));
-        }
-        finally
-        {
-            OnePassColumnQuantizer = saved;
-        }
+        QuantizeOperand(fp8, P(x), ld, byRows: false, output, scale, rows, k, PtxKernels.EightBitPaddedK(k));
     }
 
     public override void SgdStep(Storage p, Storage g, Storage? v, int n, float lr, float momentum)

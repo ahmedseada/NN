@@ -10,7 +10,11 @@
 //                    capability 8.9+: faster, coarser; compare the loss curve), --cpu, --gpu-memory GiB, --offload,
 //                    --log-every N (a new progress line every N steps; default: one line redrawn in place),
 //                    --profile (time every kernel of one step, after three warm-up steps, and exit; without a corpus
-//                    it times random tokens)
+//                    it times random tokens), --loss-log file.csv (step, loss, lr and, at evaluations, val per step),
+//                    --no-save (no checkpoints: comparison runs)
+//   compare          a.csv b.csv [c.csv …] [--window 200]: loss logs side by side (the mean loss of each window of
+//                    steps, each run's difference from the first) and their validation losses, e.g. --fp8 against
+//                    bfloat16 from the same --seed and schedule
 //   generate         --out <checkpoint dir> [--checkpoint best|last] --prompt "text" --tokens 500
 //                    --temperature 0.7 --top-k 0 --top-p 0.9 --repeat-penalty 1.15
 //
@@ -33,10 +37,15 @@ using NeuralSharp.Optimizers;
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
 var flags = new HashSet<string>(StringComparer.Ordinal);
 string command = "train";
-string[] flagNames = ["--skip-clean", "--grad-checkpoint", "--optim8bit", "--fp32", "--cpu", "--cuda", "--offload", "--profile", "--fp8"];
+if (args is ["compare", .. var logs])
+{
+    return CompareLogs(logs);
+}
+
+string[] flagNames = ["--skip-clean", "--grad-checkpoint", "--optim8bit", "--fp32", "--cpu", "--cuda", "--offload", "--profile", "--fp8", "--no-save"];
 string[] valueNames = ["--corpus", "--clean-out", "--out", "--block", "--batch", "--dmodel", "--heads", "--layers", "--dropout", "--lr", "--min-lr",
     "--warmup", "--steps", "--eval-every", "--eval-steps", "--save-every", "--seed", "--resume", "--bin", "--vocab-file", "--gpu-memory",
-    "--log-every", "--checkpoint", "--prompt", "--tokens", "--temperature", "--top-k", "--top-p", "--repeat-penalty"];
+    "--log-every", "--loss-log", "--checkpoint", "--prompt", "--tokens", "--temperature", "--top-k", "--top-p", "--repeat-penalty"];
 for (int i = 0; i < args.Length; i++)
 {
     if (i == 0 && args[i] is "train" or "generate")
@@ -232,6 +241,11 @@ int Train()
 
     void Save(string name, int step, double value)
     {
+        if (flags.Contains("--no-save"))
+        {
+            return;
+        }
+
         string path = Path.Combine(outDir, name + ".nsw");
         model.Save(path);
         var info = new JsonObject
@@ -254,6 +268,12 @@ int Train()
     };
 
     model.Train();
+    using var lossLog = options.TryGetValue("--loss-log", out var lossLogPath) ? new StreamWriter(lossLogPath, append: startStep > 0) : null;
+    if (lossLog is not null && startStep == 0)
+    {
+        lossLog.WriteLine("step,loss,lr,val");
+    }
+
     var progress = new ProgressLine(startStep, steps, logEvery);
     double lossSum = 0, lastVal = double.IsFinite(best) ? best : double.NaN;
     var watch = Stopwatch.StartNew();
@@ -298,9 +318,11 @@ int Train()
             + (double.IsNaN(lastVal) ? "" : $", val={lastVal:F4}") + $", {ComputeResources.GetMemoryUsage(device)}");
 
         bool stopping = Volatile.Read(ref stopRequests) > 0;
+        double? evaluated = null;
         if (step % evalEvery == 0 || step == steps)
         {
             double v = Evaluate();
+            evaluated = v;
             lastVal = v;
             Save("last", step, v);
             string tag = "";
@@ -316,6 +338,16 @@ int Train()
         else if (step % saveEvery == 0 || stopping)
         {
             Save("last", step, lastVal);
+        }
+
+        if (lossLog is not null)
+        {
+            var invariant = System.Globalization.CultureInfo.InvariantCulture;
+            lossLog.WriteLine(string.Create(invariant, $"{step},{loss:R},{lr:R},{(evaluated is { } e ? e.ToString("R", invariant) : "")}"));
+            if (step % 50 == 0 || evaluated is not null)
+            {
+                lossLog.Flush();
+            }
         }
 
         if (stopping)
@@ -411,6 +443,97 @@ static List<string> LoadVocab(string path)
     return itos;
 
     static string Unescape(string raw) => raw switch { "\\n" => "\n", "\\r" => "\r", "\\t" => "\t", "\\\\" => "\\", _ => raw };
+}
+
+// Loss logs (--loss-log) side by side: the mean training loss of each window of steps in every run, each run's relative
+// difference from the first, then the validation losses at the steps they share and a summary over the last fifth.
+static int CompareLogs(string[] arguments)
+{
+    int window = 200;
+    var files = new List<string>();
+    for (int i = 0; i < arguments.Length; i++)
+    {
+        if (arguments[i] == "--window" && i + 1 < arguments.Length)
+        {
+            window = int.Parse(arguments[++i], System.Globalization.CultureInfo.InvariantCulture);
+        }
+        else
+        {
+            files.Add(arguments[i]);
+        }
+    }
+
+    if (files.Count < 2)
+    {
+        Console.Error.WriteLine("compare needs two or more loss logs (--loss-log files).");
+        return 2;
+    }
+
+    var runs = files.Select(f =>
+    {
+        var losses = new SortedDictionary<int, double>();
+        var vals = new SortedDictionary<int, double>();
+        foreach (var line in File.ReadLines(f).Skip(1))
+        {
+            var parts = line.Split(',');
+            if (parts.Length < 4 || !int.TryParse(parts[0], System.Globalization.CultureInfo.InvariantCulture, out int step))
+            {
+                continue;
+            }
+
+            losses[step] = double.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture);
+            if (parts[3].Length > 0)
+            {
+                vals[step] = double.Parse(parts[3], System.Globalization.CultureInfo.InvariantCulture);
+            }
+        }
+
+        return (Name: Path.GetFileNameWithoutExtension(f), Losses: losses, Vals: vals);
+    }).ToList();
+
+    int last = runs.Min(r => r.Losses.Count == 0 ? 0 : r.Losses.Keys.Max());
+    string Header(string first) => $"{first,-16}" + string.Concat(runs.Select((r, i) => $"{r.Name,16}" + (i == 0 ? "" : $"{"diff",9}")));
+    Console.WriteLine($"training loss, mean of each {window} steps (diff: relative to {runs[0].Name}; steps 1..{last}, shared by all runs)");
+    Console.WriteLine(Header("steps"));
+    var tail = new double[runs.Count];
+    int tailWindows = 0;
+    for (int start = 1; start <= last; start += window)
+    {
+        int end = Math.Min(start + window - 1, last);
+        var means = runs.Select(r => r.Losses.Where(p => p.Key >= start && p.Key <= end).Select(p => p.Value).DefaultIfEmpty(double.NaN).Average()).ToList();
+        Console.WriteLine($"{$"{start}-{end}",-16}" + string.Concat(means.Select((m, i) => $"{m,16:F4}" + (i == 0 ? "" : $"{(m - means[0]) / means[0],9:P2}"))));
+        if (end > last * 4 / 5)
+        {
+            for (int i = 0; i < runs.Count; i++)
+            {
+                tail[i] += means[i];
+            }
+
+            tailWindows++;
+        }
+    }
+
+    var shared = runs[0].Vals.Keys.Where(step => runs.All(r => r.Vals.ContainsKey(step))).ToList();
+    if (shared.Count > 0)
+    {
+        Console.WriteLine();
+        Console.WriteLine("validation loss");
+        Console.WriteLine(Header("step"));
+        foreach (int step in shared)
+        {
+            double first = runs[0].Vals[step];
+            Console.WriteLine($"{step,-16}" + string.Concat(runs.Select((r, i) => $"{r.Vals[step],16:F4}" + (i == 0 ? "" : $"{(r.Vals[step] - first) / first,9:P2}"))));
+        }
+    }
+
+    if (tailWindows > 0)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"last fifth of the steps: mean training loss " + string.Join(", ", runs.Select((r, i) =>
+            $"{r.Name} {tail[i] / tailWindows:F4}" + (i == 0 ? "" : $" ({(tail[i] - tail[0]) / tail[0]:+0.00%;-0.00%})"))));
+    }
+
+    return 0;
 }
 
 static void SaveVocab(string path, List<string> itos)
