@@ -81,6 +81,24 @@ internal sealed unsafe partial class CudaBackend : Backend
     /// <summary>Why bfloat16 tensor-core products are unavailable on this GPU (null when they are available or untried).</summary>
     public string? TensorCoreUnavailableReason { get; private set; }
 
+    // Kernel times per name while GpuProfiler runs (null otherwise); matrix products are keyed by kernel and shape.
+    private Dictionary<string, (long Calls, long Ticks, double Flops)>? _profile;
+
+    [ThreadStatic]
+    private static string? _profileLabel;
+
+    [ThreadStatic]
+    private static double _profileFlops;
+
+    public void StartProfile() => _profile = [];
+
+    public Dictionary<string, (long Calls, long Ticks, double Flops)> StopProfile()
+    {
+        var profile = _profile ?? [];
+        _profile = null;
+        return profile;
+    }
+
     /// <summary>Number of tensor-core GEMM launches (for tests and diagnostics).</summary>
     internal long TensorCoreLaunches;
 
@@ -714,6 +732,13 @@ internal sealed unsafe partial class CudaBackend : Backend
                 continue;
             }
 
+            if (_profile is not null)
+            {
+                string kind = tensorCore is not null ? "gemm_tc" : few ? "gemv" : gemmTile > 0 ? $"gemm{gemmTile}" : "matmul16";
+                _profileLabel = $"{kind}_{(transA ? 't' : 'n')}{(transB ? 't' : 'n')} {m}x{n}x{k}{(count > 1 ? $" batch {count}" : "")}";
+                _profileFlops = 2.0 * m * n * k * count;
+            }
+
             if (tensorCore is not null)
             {
                 string kernel = transA ? (transB ? "gemm_tc_tt_f32" : "gemm_tc_tn_f32") : (transB ? "gemm_tc_nt_f32" : "gemm_tc_nn_f32");
@@ -817,6 +842,26 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
 
         using var use = UseStream();
+        if (_profile is { } profile && _captureFree is null)
+        {
+            // Profiling (GpuProfiler): the kernel alone, between two synchronizations.
+            Check(cuStreamSynchronize(_stream), nameof(cuStreamSynchronize));
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, 0, _stream, pointers, null), nameof(cuLaunchKernel));
+            Check(cuStreamSynchronize(_stream), nameof(cuStreamSynchronize));
+            long ticks = System.Diagnostics.Stopwatch.GetTimestamp() - started;
+            string key = _profileLabel ?? (_signatures.TryGetValue(function, out var named) ? named.Name : $"0x{function:X}");
+            lock (profile)
+            {
+                var entry = profile.GetValueOrDefault(key);
+                profile[key] = (entry.Calls + 1, entry.Ticks + ticks, entry.Flops + _profileFlops);
+            }
+
+            _profileLabel = null;
+            _profileFlops = 0;
+            return;
+        }
+
         Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, 0, _stream, pointers, null), nameof(cuLaunchKernel));
         if (DebugLaunches && _captureFree is null)
         {

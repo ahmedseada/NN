@@ -7,7 +7,8 @@
 //                    --lr 3e-4 --min-lr 3e-5 --warmup 1000 --steps 80000 --eval-every 500 --eval-steps 40
 //                    --save-every 1000 --seed 42 --resume <out>/last.nsw --grad-checkpoint --optim8bit
 //                    NeuralSharp only: --fp32 (no bfloat16 tensor cores), --cpu, --gpu-memory GiB, --offload,
-//                    --log-every N (a new progress line every N steps; default: one line redrawn in place)
+//                    --log-every N (a new progress line every N steps; default: one line redrawn in place),
+//                    --profile (time every kernel of one step, after three warm-up steps, and exit)
 //   generate         --out <checkpoint dir> [--checkpoint best|last] --prompt "text" --tokens 500
 //                    --temperature 0.7 --top-k 0 --top-p 0.9 --repeat-penalty 1.15
 //
@@ -22,6 +23,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using NeuralSharp;
+using NeuralSharp.Diagnostics;
 using NeuralSharp.Generation;
 using NeuralSharp.Layers;
 using NeuralSharp.Optimizers;
@@ -29,7 +31,7 @@ using NeuralSharp.Optimizers;
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
 var flags = new HashSet<string>(StringComparer.Ordinal);
 string command = "train";
-string[] flagNames = ["--skip-clean", "--grad-checkpoint", "--optim8bit", "--fp32", "--cpu", "--cuda", "--offload"];
+string[] flagNames = ["--skip-clean", "--grad-checkpoint", "--optim8bit", "--fp32", "--cpu", "--cuda", "--offload", "--profile"];
 string[] valueNames = ["--corpus", "--clean-out", "--out", "--block", "--batch", "--dmodel", "--heads", "--layers", "--dropout", "--lr", "--min-lr",
     "--warmup", "--steps", "--eval-every", "--eval-steps", "--save-every", "--seed", "--resume", "--bin", "--vocab-file", "--gpu-memory",
     "--log-every", "--checkpoint", "--prompt", "--tokens", "--temperature", "--top-k", "--top-p", "--repeat-penalty"];
@@ -218,8 +220,19 @@ int Train()
     var progress = new ProgressLine(startStep, steps, logEvery);
     double lossSum = 0, lastVal = double.IsFinite(best) ? best : double.NaN;
     var watch = Stopwatch.StartNew();
+    bool profiling = flags.Contains("--profile");
+    var stepWatch = new Stopwatch();
     for (int step = startStep + 1; step <= steps; step++)
     {
+        if (profiling && step - startStep == 4)
+        {
+            device.Synchronize();
+            progress.Write($"last step {stepWatch.Elapsed.TotalMilliseconds:F0} ms wall; profiling the next one (every kernel waited for)…");
+            GpuProfiler.Start(device);
+        }
+
+        device.Synchronize();
+        stepWatch.Restart();
         float lr = CosineLr(step, steps, baseLr, minLr, warmup);
         optimizer.LearningRate = lr;
         Sample(train);
@@ -237,6 +250,13 @@ int Train()
 
         lossSum += loss;
         int done = step - startStep;
+        if (profiling && done == 4)
+        {
+            var entries = GpuProfiler.Stop(device);
+            progress.Write(GpuProfiler.Format(entries, rows: 60));
+            return 0;
+        }
+
         double tokPerSecond = done * (double)tokensPerStep / Math.Max(watch.Elapsed.TotalSeconds, 1e-6);
         progress.Update(step, $"loss={loss:F4}, avg={lossSum / done:F4}, lr={lr:0.00e+00}, tok/s={tokPerSecond:N0}"
             + (double.IsNaN(lastVal) ? "" : $", val={lastVal:F4}") + $", {ComputeResources.GetMemoryUsage(device)}");
