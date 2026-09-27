@@ -212,12 +212,17 @@ internal static partial class PtxKernels
                 ld.param.u32 %r59, [p_ldb];
                 ld.param.u32 %r60, [p_ldc];
             """);
-        if (packed != 0)
+        if (mode == 0)
         {
-            // Split k (packed weights, gridDim.z > 1 with zero batch strides): block z sums k [%r62, %r3) of chunks
-            // rounded to 32 (the int4 scale groups), added into c atomically by the epilogue.
-            s.AppendLine("""
+            // Split k (gridDim.z > 1 on packed weights, or with p_sc = 0 on plain ones, whose z otherwise indexes a
+            // batch): block z sums k [%r62, %r3) of chunks rounded to 32 (the int4 scale groups), added into c
+            // atomically by the epilogue.
+            s.AppendLine($"""
                     mov.u32 %r49, %nctaid.z;
+                    setp.gt.u32 %psplit, %r49, 1;
+                    {(packed != 0 ? "" : "setp.eq.and.u64 %psplit, %rd6, 0, %psplit;")}
+                    mov.u32 %r62, 0;
+                    @!%psplit bra KSPLIT_DONE;
                     add.u32 %r61, %r3, %r49;
                     sub.u32 %r61, %r61, 1;
                     div.u32 %r61, %r61, %r49;
@@ -226,6 +231,7 @@ internal static partial class PtxKernels
                     mul.lo.u32 %r62, %r40, %r61;
                     add.u32 %r63, %r62, %r61;
                     min.u32 %r3, %r63, %r3;
+                KSPLIT_DONE:
                 """);
         }
 
@@ -512,7 +518,7 @@ internal static partial class PtxKernels
         }
 
         s.AppendLine($"""
-                mov.u32 %r30, {(packed != 0 ? "%r62" : "0")};
+                mov.u32 %r30, {(mode == 0 ? "%r62" : "0")};
                 mov.u32 %r34, 0;
             """);
         Load(a, "%rd1", "%rd9", "%r13", "%r14", "%ga");
@@ -577,7 +583,7 @@ internal static partial class PtxKernels
             KEND:
             """);
 
-        EmitTensorEpilogue(s, mode, packed == 1 ? ColumnScales : null, splitK: packed != 0);
+        EmitTensorEpilogue(s, mode, packed == 1 ? ColumnScales : null, splitK: mode == 0);
         s.AppendLine("""
                 ret;
             }
@@ -591,8 +597,8 @@ internal static partial class PtxKernels
     // %rd14 = its address, %rd15 = a row in bytes. Expects %r1 = m, %r2 = n, %r5 = lane, %r7 / %r8 = the warp's tile row /
     // column, %r9 / %r10 = the block's first row / column, %r60 = ldc, %rd3 = c, %beta / %pbeta, float accumulators %c0-63,
     // and the parameters p_bias and p_aux. `scale` may rescale the accumulators once %r42 / %r43 are set. With `splitK`
-    // (mode 0) and gridDim.z > 1, each block adds its partial sums into c atomically: beta must be 0 (c zeroed first) or
-    // 1, and only block z = 0 adds the bias.
+    // (mode 0), %psplit (set by the caller) marks a split k: each block adds its partial sums into c atomically (beta
+    // must be 0, c zeroed first, or 1) and only block z = 0 adds the bias.
     private static void EmitTensorEpilogue(StringBuilder s, int mode, Action<StringBuilder>? scale, bool splitK = false)
     {
         // Epilogue: c[row, col] = acc + beta · c (rows (lane >> 2) and +8 of each m16 tile, columns 2 (lane & 3) and +1
@@ -641,8 +647,6 @@ internal static partial class PtxKernels
         if (splitK)
         {
             s.AppendLine("""
-                    mov.u32 %r49, %nctaid.z;
-                    setp.gt.u32 %psplit, %r49, 1;
                     @%psplit mov.f32 %beta, 0f00000000;
                     @%psplit setp.ne.u32 %pbeta, %r49, %r49;
                     mov.u32 %r49, %ctaid.z;

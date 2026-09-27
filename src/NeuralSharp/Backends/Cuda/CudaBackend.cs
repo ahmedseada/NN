@@ -844,9 +844,10 @@ internal sealed unsafe partial class CudaBackend : Backend
             if (tensorCore is not null)
             {
                 string kernel = transA ? (transB ? "gemm_tc_tt_f32" : "gemm_tc_tn_f32") : (transB ? "gemm_tc_nt_f32" : "gemm_tc_nn_f32");
+                int splits = count == 1 ? TensorSplits(m, n, k, beta, P(c), n) : 1;
                 Launch(tensorCore[kernel], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
-                    (uint)count, PtxKernels.TensorThreads, 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn,
-                    U(m), U(n), U(k), F(beta), mk, kn, mn, 0UL, U(transA ? m : k), U(transB ? k : n), U(n), 0UL);
+                    (uint)(splits > 1 ? splits : count), PtxKernels.TensorThreads, 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn,
+                    U(m), U(n), U(k), F(beta), splits > 1 ? 0UL : mk, splits > 1 ? 0UL : kn, splits > 1 ? 0UL : mn, 0UL, U(transA ? m : k), U(transB ? k : n), U(n), 0UL);
                 Interlocked.Increment(ref TensorCoreLaunches);
                 continue;
             }
@@ -925,11 +926,35 @@ internal sealed unsafe partial class CudaBackend : Backend
             _profileFlops = 2.0 * m * n * k;
         }
 
+        int splits = epilogue == GemmEpilogue.None ? TensorSplits(m, n, k, beta, P(c) + (ulong)cOffset * 4, ldc) : 1;
         Launch(function, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
-            1, PtxKernels.TensorThreads, 1, P(a) + (ulong)aOffset * 4, P(b) + (ulong)bOffset * 4, P(c) + (ulong)cOffset * 4, U(m), U(n), U(k), F(beta),
+            (uint)splits, PtxKernels.TensorThreads, 1, P(a) + (ulong)aOffset * 4, P(b) + (ulong)bOffset * 4, P(c) + (ulong)cOffset * 4, U(m), U(n), U(k), F(beta),
             0UL, 0UL, 0UL, bias is null ? 0UL : P(bias), U(lda), U(ldb), U(ldc), aux is null ? 0UL : P(aux) + (ulong)auxOffset * 4);
         Interlocked.Increment(ref TensorCoreLaunches);
         return true;
+    }
+
+    /// <summary>Benchmarks only: the k splits of plain tensor-core products instead of the heuristic's (1: none).</summary>
+    internal static int? TensorSplitsOverride { get; set; }
+
+    // k splits of a plain tensor-core product whose output tiles leave SMs idle (small m·n, long k: weight gradients):
+    // about two blocks per SM, chunks of 1024 k or more. The blocks add their partial sums into c atomically, so beta must
+    // be 1, or 0 with c zeroed here (only when its rows are contiguous: ldc = n).
+    private int TensorSplits(int m, int n, int k, float beta, ulong c, int ldc)
+    {
+        if (beta != 1f && (beta != 0f || ldc != n))
+        {
+            return 1;
+        }
+
+        int tiles = ((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile) * ((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile);
+        int splits = Math.Clamp(TensorSplitsOverride ?? (int)Math.Round(2.0 * Math.Max(1, _multiprocessors) / tiles), 1, Math.Max(1, Math.Min(8, k / 1024)));
+        if (splits > 1 && beta == 0f)
+        {
+            Check(cuMemsetD32Async(c, 0, (nuint)((long)m * n), _stream), nameof(cuMemsetD32Async));
+        }
+
+        return splits;
     }
 
     // The 8-bit products and their quantizers loaded (FP8: compute capability 8.9+; INT8: 8.0+).

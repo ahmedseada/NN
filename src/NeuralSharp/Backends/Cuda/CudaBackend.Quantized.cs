@@ -83,6 +83,12 @@ internal sealed unsafe partial class CudaBackend
         Launch1D(K("bf16_dequant_f32"), k * words, P(packed), P(w), U(words), U(n), U(k * words));
     }
 
+    /// <summary>Benchmarks only: the k splits of prompt-sized packed products on tensor cores instead of the heuristic's.</summary>
+    internal static int? PackedSplits { get; set; }
+
+    /// <summary>Benchmarks only: the number of blocks decoding attention splits the cache over instead of the heuristic's.</summary>
+    internal static int? DecodeSplits { get; set; }
+
     /// <summary>Benchmarks only: the number of k splits of the few-row packed products instead of the heuristic's.</summary>
     internal static int? GemvSplits { get; set; }
 
@@ -153,7 +159,8 @@ internal sealed unsafe partial class CudaBackend
             // Split k when the output tiles leave SMs idle (prompt-sized m): up to two blocks per SM, chunks of 256 k or
             // more, partial sums added into the zeroed output.
             int rowTiles = (m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile, columnTiles = (n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
-            int splits = Math.Clamp(Math.Min(k / 256, 2 * Math.Max(1, _multiprocessors) / (rowTiles * columnTiles)), 1, 8);
+            int splits = PackedSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 32))
+                : Math.Clamp(Math.Min(k / 256, 2 * Math.Max(1, _multiprocessors) / (rowTiles * columnTiles)), 1, 8);
             if (splits > 1)
             {
                 Check(cuMemsetD32Async(P(y), 0, (nuint)((long)m * n), _stream), nameof(cuMemsetD32Async));
@@ -343,7 +350,8 @@ internal sealed unsafe partial class CudaBackend
     // so recorded graphs stay valid as the cache fills (chunks are computed on the device from the current length).
     private void DecodeSplit(int rows, int capacity, int dim, Storage y, Action<int, Storage, Storage> launch)
     {
-        int splits = Math.Clamp((2 * Math.Max(1, _multiprocessors) + rows - 1) / rows, 1, Math.Clamp(capacity / 64, 1, 32));
+        int splits = DecodeSplits is int forced ? Math.Clamp(forced, 1, 64)
+            : Math.Clamp((2 * Math.Max(1, _multiprocessors) + rows - 1) / rows, 1, Math.Clamp(capacity / 64, 1, 32));
         var counters = SplitCounters(rows);
         if (splits == 1)
         {

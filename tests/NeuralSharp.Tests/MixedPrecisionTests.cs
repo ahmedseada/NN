@@ -7,7 +7,7 @@ internal static partial class Tests
 {
     private static readonly (string Name, Action<Device> Run)[] MixedPrecisionGroup =
     [
-        ("mixed precision: bfloat16 tensor-core products (every transpose, edges, batches, beta) match bfloat16-rounded references", TensorCoreProducts),
+        ("mixed precision: bfloat16 tensor-core products (every transpose, edges, batches, beta, split k) match bfloat16-rounded references", TensorCoreProducts),
         ("mixed precision: tensor-core flash attention (forward, log-sum-exp, dq, dk, dv; head sizes 64 and 128) matches float32", TensorCoreAttention),
         ("layer norm: the fused training kernels match the composed operations (output, input, gamma and beta gradients)", LayerNormTraining),
         ("mixed precision: strided products and GELU epilogues match references (slices, activation, its gradient)", StridedProducts),
@@ -558,6 +558,64 @@ internal static partial class Tests
             Console.WriteLine(line);
         }
 
+        // Timed like the products above: `run` 100 times per graph; the forced setting is applied by `force`.
+        string Timed(Action run, Action<int?> force, int? setting)
+        {
+            force(setting);
+            try
+            {
+                using var graph = ComputeGraph.Capture(device, () =>
+                {
+                    for (int i = 0; i < 100; i++)
+                    {
+                        using var calls = new TensorScope();
+                        run();
+                    }
+                });
+                graph.Replay();
+                device.Synchronize();
+                var watch = System.Diagnostics.Stopwatch.StartNew();
+                for (int r = 0; r < 10; r++)
+                {
+                    graph.Replay();
+                }
+
+                device.Synchronize();
+                return $"{watch.Elapsed.TotalMilliseconds:F1}us";      // 1000 calls: ms total = µs per call
+            }
+            finally
+            {
+                force(null);
+            }
+        }
+
+        // Decoding attention over a bfloat16 cache (8 key/value heads × 2 query heads, head size 128), forced block splits.
+        Console.WriteLine();
+        int?[] attentionSplits = [null, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64];
+        Console.WriteLine($"{"attention, cached positions",-32} " + string.Join(" ", attentionSplits.Select(s => $"{(s is null ? "auto" : s.ToString()),9}")));
+        using var cache = new KeyValueCache(8, 4096, 128, device, KeyValueFormat.BFloat16);
+        using var query = Tensor.From([.. Enumerable.Range(0, 8 * 2 * 128).Select(_ => random.NextSingle() - 0.5f)], [8, 2, 128], device);
+        foreach (int length in new[] { 200, 1000, 4000 })
+        {
+            using var position = Tensor.From([length - 1f], [1], device);
+            Console.WriteLine($"{length,-32} " + string.Join(" ", attentionSplits.Select(split =>
+                $"{Timed(() => Tensor.AttentionBFloat16(query, cache, position, 1, 0.088f, tiled: false), v => CudaBackend.DecodeSplits = v, split),9}")));
+        }
+
+        // Prompt-sized products (180 rows) through int8 weights on tensor cores, forced k splits.
+        Console.WriteLine();
+        int?[] promptSplits = [null, 1, 2, 4, 6, 8, 12, 16];
+        Console.WriteLine($"{"180 rows, int8 weights",-32} " + string.Join(" ", promptSplits.Select(s => $"{(s is null ? "auto" : s.ToString()),9}")));
+        using (MixedPrecision.BFloat16())
+        {
+            foreach (var (kIn, nOut, layer) in new[] { (1024, 1024, k), (1024, 2048, q), (1024, 3072, gate), (2048, 1024, o), (3072, 1024, down) })
+            {
+                using var x = Tensor.From([.. Enumerable.Range(0, 180 * kIn).Select(_ => random.NextSingle() - 0.5f)], [180, kIn], device);
+                Console.WriteLine($"{$"{kIn} -> {nOut}",-32} " + string.Join(" ", promptSplits.Select(split =>
+                    $"{Timed(() => x.MatMulInt8(layer.Int8!), v => CudaBackend.PackedSplits = v, split),9}")));
+            }
+        }
+
         return 0;
     }
 
@@ -614,6 +672,28 @@ internal static partial class Tests
                     Console.WriteLine($"{$"{m}x{n}x{k}",-20} {(ta ? "t" : "n") + (tb ? "t" : "n"),6} {beta,4} {Tflops(direct),14} {Tflops(copied),14} {Tflops(fresh),14}");
                 }
             }
+        }
+
+        // Weight-gradient shapes (small output, long k) with forced k splits (1: none).
+        Console.WriteLine();
+        int?[] splitCounts = [null, 1, 2, 3, 4, 6, 8];
+        Console.WriteLine($"{"m x n x k (tn)",-20} " + string.Join(" ", splitCounts.Select(s => $"{(s is null ? "auto" : $"split {s}"),13}")));
+        foreach (var (m, n, k) in new[] { (768, 768, 12288), (3072, 768, 12288), (768, 3072, 12288), (1024, 1024, 8192), (1024, 3072, 8192) })
+        {
+            using var a = Random(k * m);
+            using var b = Random(k * n);
+            using var c = Random(m * n);
+            var line = new System.Text.StringBuilder($"{$"{m}x{n}x{k}",-20} ");
+            foreach (var split in splitCounts)
+            {
+                CudaBackend.TensorSplitsOverride = split;
+                CudaBackend.PretransposeForTensorCores = false;
+                double ms = Time(() => backend.BatchedMatMul(a.Storage, b.Storage, c.Storage, 1, m, n, k, true, false, 1f), 10);
+                line.Append($"{$"{2.0 * m * n * k / (ms * 1e9):F1} TFLOPS",13} ");
+            }
+
+            CudaBackend.TensorSplitsOverride = null;
+            Console.WriteLine(line);
         }
 
         // 8-bit products (quantization of both operands included) against bfloat16.
@@ -677,13 +757,14 @@ internal static partial class Tests
         }
         long launchesBefore = device.Type == DeviceType.Cuda ? ((CudaBackend)device.Backend).TensorCoreLaunches : 0;
         bool anyDifferent = false;
-        foreach (var (m, n, k, batch) in new[] { (64, 64, 32, 1), (200, 130, 71, 2), (257, 300, 129, 1), (128, 256, 512, 1) })
+        // 130×150×4200: few output tiles and a long k, so k is split over blocks (beta 0 and 1; an uneven last chunk).
+        foreach (var (m, n, k, batch) in new[] { (64, 64, 32, 1), (200, 130, 71, 2), (257, 300, 129, 1), (128, 256, 512, 1), (130, 150, 4200, 1) })
         {
             foreach (bool ta in new[] { false, true })
             {
                 foreach (bool tb in new[] { false, true })
                 {
-                    foreach (float beta in new[] { 0f, 0.5f })
+                    foreach (float beta in new[] { 0f, 0.5f, 1f })
                     {
                         float[] a = [.. Enumerable.Range(0, batch * m * k).Select(_ => random.NextSingle() * 2 - 1)];
                         float[] b = [.. Enumerable.Range(0, batch * k * n).Select(_ => random.NextSingle() * 2 - 1)];
