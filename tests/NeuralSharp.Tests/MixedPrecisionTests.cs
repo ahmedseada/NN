@@ -185,7 +185,11 @@ internal static partial class Tests
         Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == 10)
               && PtxKernels.TensorCoreNames.All(PtxKernels.TensorCoreParameterCounts.ContainsKey), "tensor-core kernel signatures");
         var random = new Random(3);
-        bool tensorCores = device.Type == DeviceType.Cuda && ((CudaBackend)device.Backend) is var backend && backend.TensorCoreUnavailableReason is null;
+        // A GPU that has tensor cores must load the module: a JIT error would otherwise fall back to float32 silently.
+        string? unavailable = MixedPrecision.TensorCoresUnavailable(device);
+        Check(device.Type == DeviceType.Cpu || unavailable is null || unavailable.StartsWith("compute capability", StringComparison.Ordinal),
+            $"tensor-core module: {unavailable}");
+        bool tensorCores = device.Type == DeviceType.Cuda && unavailable is null;
         long launchesBefore = device.Type == DeviceType.Cuda ? ((CudaBackend)device.Backend).TensorCoreLaunches : 0;
         bool anyDifferent = false;
         foreach (var (m, n, k, batch) in new[] { (64, 64, 32, 1), (200, 130, 71, 2), (257, 300, 129, 1), (128, 256, 512, 1) })

@@ -51,7 +51,7 @@ internal static partial class PtxKernels
             .reg .b64 %rd<48>;
             .reg .f32 %f<64>;
             .reg .f32 %acc<{{accumulators}}>;
-            .reg .f32 %acc2<{{accumulators}}>;
+            .reg .f32 %dv<{{accumulators}}>;
             .reg .f32 %s<32>;
             .reg .f32 %dp<32>;
             .reg .b32 %qa<{{d / 4}}>;
@@ -744,7 +744,7 @@ internal static partial class PtxKernels
                 setp.eq.u32 %p2, %r23, 0;
                 selp.b32 %r43, 0, %r43, %p2;
             {Zeros("%acc", 4 * dTiles)}
-            {Zeros("%acc2", 4 * dTiles)}
+            {Zeros("%dv", 4 * dTiles)}
             ROWS:
                 setp.ge.u32 %p3, %r43, %r20;
                 @%p3 bra ROWS_END;
@@ -838,8 +838,8 @@ internal static partial class PtxKernels
             for (int dn2 = 0; dn2 < d / 16; dn2++)
             {
                 s.AppendLine(LdMatrix("%tb", "%r47", j * 16 * stride + dn2 * 32, transpose: true));
-                s.AppendLine(Mma("%acc2", 2 * dn2, "%pa", "%tb0", "%tb1"));
-                s.AppendLine(Mma("%acc2", 2 * dn2 + 1, "%pa", "%tb2", "%tb3"));
+                s.AppendLine(Mma("%dv", 2 * dn2, "%pa", "%tb0", "%tb1"));
+                s.AppendLine(Mma("%dv", 2 * dn2 + 1, "%pa", "%tb2", "%tb3"));
             }
 
             s.AppendLine(PackA("%dp", j));
@@ -873,8 +873,8 @@ internal static partial class PtxKernels
                         fma.rn.f32 %f46, %acc{{4 * nt + half + 1}}, %f39, %f46;
                         @{{predicate}} st.global.v2.f32 [%rd32+{{offset}}], {%f45, %f46};
                         @{{predicate}} ld.global.v2.f32 {%f47, %f48}, [%rd33+{{offset}}];
-                        add.f32 %f47, %f47, %acc2{{4 * nt + half}};
-                        add.f32 %f48, %f48, %acc2{{4 * nt + half + 1}};
+                        add.f32 %f47, %f47, %dv{{4 * nt + half}};
+                        add.f32 %f48, %f48, %dv{{4 * nt + half + 1}};
                         @{{predicate}} st.global.v2.f32 [%rd33+{{offset}}], {%f47, %f48};
                     """);
             }
