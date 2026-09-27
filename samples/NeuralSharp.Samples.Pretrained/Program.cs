@@ -151,10 +151,14 @@ switch (positional[0])
         var evaluation = evalFile is null ? null : Read(evalFile, "evaluation");
         var readable = new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
         Console.WriteLine($"assistant turns start with {JsonSerializer.Serialize(encoder.AssistantHeader, readable)} and end with {JsonSerializer.Serialize(encoder.AssistantEnd, readable)}");
+        void Trace(string line) => Console.WriteLine("  " + line);
         if (evaluation is { Count: > 0 })
         {
-            Console.WriteLine($"evaluation loss before training: {FineTuner.Evaluate(model, evaluation, tuning.BatchTokens, tuning.LossChunkRows):F4}");
+            Console.WriteLine($"evaluating {evaluation.Count} transcripts before training…");
+            Console.WriteLine($"evaluation loss before training: {FineTuner.Evaluate(model, evaluation, tuning.BatchTokens, tuning.LossChunkRows, Trace):F4}");
         }
+
+        Console.WriteLine("training…");
 
         using var cancel = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) =>
@@ -163,12 +167,12 @@ switch (positional[0])
             cancel.Cancel();
         };
         var watch = Stopwatch.StartNew();
-        var progress = new Progress<FineTuningProgress>(p => Console.WriteLine(
+        var progress = new ConsoleProgress<FineTuningProgress>(p => Console.WriteLine(
             $"step {p.Step}/{p.TotalSteps} (epoch {p.Epoch}): loss {p.Loss:F4}, lr {p.LearningRate:G3}, {p.TokensPerSecond:F0} tok/s"
             + (p.EvaluationLoss is { } e ? $", evaluation loss {e:F4}" : "") + $", {watch.Elapsed.TotalMinutes:F1} min"));
         try
         {
-            FineTuner.Train(model, train, evaluation, tuning, output, progress, cancel.Token);
+            FineTuner.Train(model, train, evaluation, tuning, output, progress, cancel.Token, Trace);
             Console.WriteLine($"adapter written to {output}");
         }
         catch (OperationCanceledException)
@@ -488,4 +492,10 @@ sealed class ProfileRecorder : ITelemetryHook
             Console.WriteLine($"    {ms,9:F1} ms {count,6}×  {name}");
         }
     }
+}
+
+// Reports on the calling thread, at once (Progress<T> posts to the thread pool, so lines can arrive late or out of order).
+internal sealed class ConsoleProgress<T>(Action<T> report) : IProgress<T>
+{
+    public void Report(T value) => report(value);
 }

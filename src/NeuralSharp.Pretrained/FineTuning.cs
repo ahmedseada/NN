@@ -339,8 +339,17 @@ public static class FineTuner
     /// evaluates on <paramref name="evaluation"/> when given, and writes the adapters to <paramref name="outputFolder"/>
     /// (PEFT format, see <see cref="PretrainedModel.SaveAdapter"/>) when given. Returns the evaluation losses.
     /// </summary>
+    /// <param name="model">The model (adapters are added unless it has some).</param>
+    /// <param name="train">Training sequences.</param>
+    /// <param name="evaluation">Sequences to evaluate on, or null.</param>
+    /// <param name="options">Settings.</param>
+    /// <param name="outputFolder">Where to write the adapters (and checkpoints), or null.</param>
+    /// <param name="progress">Receives one report per optimizer step.</param>
+    /// <param name="cancellationToken">Stops between batches.</param>
+    /// <param name="trace">Receives a line per batch (its shape and time) and per evaluation, as they finish.</param>
     public static IReadOnlyList<float> Train(PretrainedModel model, IReadOnlyList<TrainingSequence> train, IReadOnlyList<TrainingSequence>? evaluation,
-        FineTuningOptions options, string? outputFolder = null, IProgress<FineTuningProgress>? progress = null, CancellationToken cancellationToken = default)
+        FineTuningOptions options, string? outputFolder = null, IProgress<FineTuningProgress>? progress = null, CancellationToken cancellationToken = default,
+        Action<string>? trace = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(options);
@@ -378,13 +387,18 @@ public static class FineTuner
                 long tokens = 0;
                 network.Train();
                 optimizer.ZeroGrad();
-                foreach (var batch in group)
+                for (int b = 0; b < group.Count; b++)
                 {
+                    var batch = group[b];
+                    var batchWatch = Stopwatch.StartNew();
                     using var scope = new TensorScope();
                     var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows);
                     lossTensor.Backward();
-                    loss += lossTensor.Item();
+                    float batchLoss = lossTensor.Item();
+                    loss += batchLoss;
                     tokens += count;
+                    trace?.Invoke($"step {step + 1}/{totalSteps}, batch {first + b + 1}/{batches.Count} of epoch {epoch + 1}: {batch.Length} sequences × "
+                        + $"{batch.Max(i => train[i].Tokens.Length) - 1} tokens, forward and backward {batchWatch.Elapsed.TotalSeconds:F2} s");
                 }
 
                 if (options.MaxGradientNorm > 0f)
@@ -400,7 +414,7 @@ public static class FineTuner
                 bool lastOfEpoch = first + accumulation >= batches.Count;
                 if (evaluation is { Count: > 0 } && (options.EvaluateEvery > 0 ? step % options.EvaluateEvery == 0 : lastOfEpoch))
                 {
-                    evaluationLoss = Evaluate(model, evaluation, options.BatchTokens, options.LossChunkRows);
+                    evaluationLoss = Evaluate(model, evaluation, options.BatchTokens, options.LossChunkRows, trace);
                     evaluations.Add(evaluationLoss.Value);
                 }
 
@@ -423,20 +437,25 @@ public static class FineTuner
     }
 
     /// <summary>Mean loss per trained token of <paramref name="sequences"/> (no gradients).</summary>
-    public static float Evaluate(PretrainedModel model, IReadOnlyList<TrainingSequence> sequences, int batchTokens = 4096, int chunkRows = 512)
+    public static float Evaluate(PretrainedModel model, IReadOnlyList<TrainingSequence> sequences, int batchTokens = 4096, int chunkRows = 512,
+        Action<string>? trace = null)
     {
         model.Network.Eval();
         double total = 0;
         long trained = 0;
         using (Autograd.NoGrad())
         {
-            foreach (var batch in Batches(sequences, batchTokens, random: null))
+            var batches = Batches(sequences, batchTokens, random: null);
+            for (int b = 0; b < batches.Count; b++)
             {
+                var batch = batches[b];
+                var watch = Stopwatch.StartNew();
                 using var scope = new TensorScope();
                 int count = batch.Sum(i => sequences[i].TrainedTokens);
                 var (loss, _) = BatchLoss(model, sequences, batch, 1f, chunkRows);
                 total += loss.Item();
                 trained += count;
+                trace?.Invoke($"evaluation batch {b + 1}/{batches.Count}: {batch.Length} sequences × {batch.Max(i => sequences[i].Tokens.Length) - 1} tokens, {watch.Elapsed.TotalSeconds:F2} s");
             }
         }
 
