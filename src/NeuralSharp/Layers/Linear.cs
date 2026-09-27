@@ -114,6 +114,11 @@ public sealed class Linear : Module
     /// <inheritdoc />
     protected override Tensor ForwardCore(Tensor input)
     {
+        if (Bias is not null && _weight is not null && _tiedTo is null && Adapter is null && input.Rank >= 2)
+        {
+            return Tensor.MatMulBias(input, _weight, Bias);                 // one pass on tensor cores
+        }
+
         var product = ProjectWithoutBias(input);
         return Bias is null ? product : product + Bias;
     }

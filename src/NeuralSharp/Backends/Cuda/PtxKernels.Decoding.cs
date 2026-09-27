@@ -7,11 +7,174 @@ internal static partial class PtxKernels
 {
     public static readonly string[] DecodingNames =
     [
-        "scale_mask_softmax_f32", "layernorm_fused_f32", "bias_gelu_f32", "decoder_mask_f32", "kv_write_f32", "kv_write_bf16", "sample_rows_f32",
+        "scale_mask_softmax_f32", "layernorm_fused_f32", "layernorm_train_f32", "layernorm_bwd_f32", "layernorm_bwd_params_f32", "bias_gelu_f32", "decoder_mask_f32", "kv_write_f32", "kv_write_bf16", "sample_rows_f32",
         "penalize_rows_f32", "history_push_f32", "sample_candidates_f32", "topk_candidates_f32",
     ];
 
     private const string PosInf = "0f7F800000";
+
+    // LayerNorm for training: the forward pass of layernorm_fused_f32 that also stores mean and 1 / std per row; its
+    // backward per row (dx += rstd · (g - mean(g) - x̂ · mean(g ∘ x̂)), g = dy ∘ gamma); and the gamma / beta gradients
+    // (Σ over rows of dy ∘ x̂ and dy), one thread per column over a chunk of rows, added atomically.
+    private static void LayerNormTraining(StringBuilder sb, string blockRowStart)
+    {
+        RowBlock(sb, "layernorm_train_f32", ["x", "gamma", "beta", "y", "stats"], [("u32", "cols"), ("f32", "eps")],
+            blockRowStart + $"""
+            add.u64 %rd2, %b_x, %rd1;
+            add.u64 %rd3, %b_y, %rd1;
+            sub.u64 %rd6, %rd3, %rd2;
+            cvt.rn.f32.u32 %f10, %s_cols;
+            mov.f32 %f1, {Zero};
+            """ + "\n" + StridedLoop("LS", "%rd2", "%s_cols", "add.f32 %f1, %f1, %f2;") + "\n"
+            + BlockReduce("RMEAN", "%f1", "add", Zero) + "\n" + $"""
+            div.rn.f32 %f3, %f1, %f10;
+            mov.f32 %f4, {Zero};
+            """ + "\n" + StridedLoop("LV", "%rd2", "%s_cols", """
+            sub.f32 %f5, %f2, %f3;
+            fma.rn.f32 %f4, %f5, %f5, %f4;
+            """) + "\n" + BlockReduce("RVAR", "%f4", "add", Zero) + "\n" + """
+            div.rn.f32 %f4, %f4, %f10;
+            add.f32 %f4, %f4, %s_eps;
+            sqrt.rn.f32 %f4, %f4;
+            rcp.rn.f32 %f4, %f4;
+            setp.eq.u32 %p5, %tx, 0;
+            @%p5 st.global.f32 [%a_stats], %f3;
+            mul.wide.u32 %rd11, %n, 4;
+            add.u64 %rd11, %rd11, %a_stats;
+            @%p5 st.global.f32 [%rd11], %f4;
+            """ + "\n" + StridedLoop("LW", "%rd2", "%s_cols", """
+            mul.wide.u32 %rd7, %r6, 4;
+            add.u64 %rd8, %b_gamma, %rd7;
+            ld.global.f32 %f6, [%rd8];
+            add.u64 %rd9, %b_beta, %rd7;
+            ld.global.f32 %f7, [%rd9];
+            sub.f32 %f5, %f2, %f3;
+            mul.f32 %f5, %f5, %f4;
+            fma.rn.f32 %f5, %f5, %f6, %f7;
+            add.u64 %rd10, %rd5, %rd6;
+            st.global.f32 [%rd10], %f5;
+            """));
+
+        // dx: %f3 = mean, %f4 = rstd; pass 1 sums g and g·x̂, pass 2 adds rstd · (g - s1 / cols - x̂ · s2 / cols).
+        RowBlock(sb, "layernorm_bwd_f32", ["x", "gamma", "dy", "stats", "dx"], [("u32", "cols")],
+            blockRowStart + $"""
+            add.u64 %rd2, %b_x, %rd1;
+            add.u64 %rd3, %b_dy, %rd1;
+            add.u64 %rd4, %b_dx, %rd1;
+            sub.u64 %rd6, %rd3, %rd2;
+            sub.u64 %rd12, %rd4, %rd2;
+            ld.global.f32 %f3, [%a_stats];
+            mul.wide.u32 %rd11, %n, 4;
+            add.u64 %rd11, %rd11, %a_stats;
+            ld.global.f32 %f4, [%rd11];
+            cvt.rn.f32.u32 %f10, %s_cols;
+            rcp.rn.f32 %f10, %f10;
+            mov.f32 %f11, {Zero};
+            mov.f32 %f12, {Zero};
+            """ + "\n" + StridedLoop("B1", "%rd2", "%s_cols", """
+            mul.wide.u32 %rd7, %r6, 4;
+            add.u64 %rd8, %b_gamma, %rd7;
+            ld.global.f32 %f6, [%rd8];
+            add.u64 %rd9, %rd5, %rd6;
+            ld.global.f32 %f7, [%rd9];
+            mul.f32 %f7, %f7, %f6;
+            sub.f32 %f5, %f2, %f3;
+            mul.f32 %f5, %f5, %f4;
+            add.f32 %f11, %f11, %f7;
+            fma.rn.f32 %f12, %f7, %f5, %f12;
+            """) + "\n" + BlockReduce("R1", "%f11", "add", Zero) + "\n" + BlockReduce("R2", "%f12", "add", Zero) + "\n" + """
+            mul.f32 %f11, %f11, %f10;
+            mul.f32 %f12, %f12, %f10;
+            """ + "\n" + StridedLoop("B2", "%rd2", "%s_cols", """
+            mul.wide.u32 %rd7, %r6, 4;
+            add.u64 %rd8, %b_gamma, %rd7;
+            ld.global.f32 %f6, [%rd8];
+            add.u64 %rd9, %rd5, %rd6;
+            ld.global.f32 %f7, [%rd9];
+            mul.f32 %f7, %f7, %f6;
+            sub.f32 %f5, %f2, %f3;
+            mul.f32 %f5, %f5, %f4;
+            sub.f32 %f7, %f7, %f11;
+            mul.f32 %f8, %f5, %f12;
+            sub.f32 %f7, %f7, %f8;
+            add.u64 %rd9, %rd5, %rd12;
+            ld.global.f32 %f9, [%rd9];
+            fma.rn.f32 %f9, %f7, %f4, %f9;
+            st.global.f32 [%rd9], %f9;
+            """));
+
+        // dgamma / dbeta: thread = column (x = column block of 256), grid y = chunks of `chunk` rows.
+        sb.AppendLine("""
+            .visible .entry layernorm_bwd_params_f32(
+                .param .u64 p_x, .param .u64 p_dy, .param .u64 p_stats, .param .u64 p_dgamma, .param .u64 p_dbeta,
+                .param .u32 p_rows, .param .u32 p_cols, .param .u32 p_chunk
+            )
+            {
+                .reg .pred %p<4>;
+                .reg .b32 %r<16>;
+                .reg .b64 %rd<16>;
+                .reg .f32 %f<12>;
+                ld.param.u64 %rd1, [p_x];
+                ld.param.u64 %rd2, [p_dy];
+                ld.param.u64 %rd3, [p_stats];
+                ld.param.u64 %rd4, [p_dgamma];
+                ld.param.u64 %rd5, [p_dbeta];
+                cvta.to.global.u64 %rd1, %rd1;
+                cvta.to.global.u64 %rd2, %rd2;
+                cvta.to.global.u64 %rd3, %rd3;
+                ld.param.u32 %r1, [p_rows];
+                ld.param.u32 %r2, [p_cols];
+                ld.param.u32 %r3, [p_chunk];
+                mov.u32 %r4, %ctaid.x;
+                mov.u32 %r5, %tid.x;
+                mad.lo.u32 %r6, %r4, 256, %r5;
+                setp.ge.u32 %p1, %r6, %r2;
+                @%p1 bra DONE;
+                mov.u32 %r7, %ctaid.y;
+                mul.lo.u32 %r8, %r7, %r3;
+                add.u32 %r9, %r8, %r3;
+                min.u32 %r9, %r9, %r1;
+                mov.f32 %f1, 0f00000000;
+                mov.f32 %f2, 0f00000000;
+                mul.wide.u32 %rd12, %r1, 4;
+            ROWS:
+                setp.ge.u32 %p2, %r8, %r9;
+                @%p2 bra ROWS_END;
+                mad.lo.u32 %r10, %r8, %r2, %r6;
+                mul.wide.u32 %rd6, %r10, 4;
+                add.u64 %rd7, %rd6, %rd1;
+                add.u64 %rd8, %rd6, %rd2;
+                ld.global.f32 %f3, [%rd7];
+                ld.global.f32 %f4, [%rd8];
+                mul.wide.u32 %rd9, %r8, 4;
+                add.u64 %rd10, %rd9, %rd3;
+                ld.global.f32 %f5, [%rd10];
+                add.u64 %rd11, %rd10, %rd12;
+                ld.global.f32 %f6, [%rd11];
+                sub.f32 %f3, %f3, %f5;
+                mul.f32 %f3, %f3, %f6;
+                fma.rn.f32 %f1, %f4, %f3, %f1;
+                add.f32 %f2, %f2, %f4;
+                add.u32 %r8, %r8, 1;
+                bra ROWS;
+            ROWS_END:
+                mul.wide.u32 %rd13, %r6, 4;
+                setp.eq.u64 %p3, %rd4, 0;
+                @%p3 bra NO_GAMMA;
+                cvta.to.global.u64 %rd4, %rd4;
+                add.u64 %rd14, %rd4, %rd13;
+                red.global.add.f32 [%rd14], %f1;
+            NO_GAMMA:
+                setp.eq.u64 %p3, %rd5, 0;
+                @%p3 bra DONE;
+                cvta.to.global.u64 %rd5, %rd5;
+                add.u64 %rd15, %rd5, %rd13;
+                red.global.add.f32 [%rd15], %f2;
+            DONE:
+                ret;
+            }
+            """);
+    }
 
     private static void BuildDecoding(StringBuilder sb)
     {
@@ -56,6 +219,8 @@ internal static partial class PtxKernels
             mul.f32 %f2, %f2, %f4;
             st.global.f32 [%rd5], %f2;
             """));
+
+        LayerNormTraining(sb, BlockRowStart);
 
         // LayerNorm over the last dimension with gamma/beta, one block per row.
         RowBlock(sb, "layernorm_fused_f32", ["x", "gamma", "beta", "y"], [("u32", "cols"), ("f32", "eps")],

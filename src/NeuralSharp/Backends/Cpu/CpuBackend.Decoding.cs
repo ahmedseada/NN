@@ -31,6 +31,92 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override void LayerNormTrain(Storage x, Storage gamma, Storage beta, Storage y, Storage stats, int rows, int cols, float eps)
+    {
+        LayerNormFused(x, gamma, beta, y, rows, cols, eps);
+        float[] xv = D(x), sv = D(stats);
+        For(rows, (long)rows * cols * 2, (start, end) =>
+        {
+            for (int r = start; r < end; r++)
+            {
+                var xs = xv.AsSpan(r * cols, cols);
+                float mean = 0f;
+                foreach (float v in xs)
+                {
+                    mean += v;
+                }
+
+                mean /= cols;
+                float var = 0f;
+                foreach (float v in xs)
+                {
+                    var += (v - mean) * (v - mean);
+                }
+
+                sv[r] = mean;
+                sv[rows + r] = 1f / MathF.Sqrt(var / cols + eps);
+            }
+        });
+    }
+
+    public override void LayerNormBackward(Storage x, Storage gamma, Storage dy, Storage stats, Storage? dx, Storage? dgamma, Storage? dbeta, int rows, int cols)
+    {
+        float[] xv = D(x), gv = D(gamma), dyv = D(dy), sv = D(stats);
+        float[]? dxv = dx is null ? null : D(dx);
+        if (dxv is not null)
+        {
+            For(rows, (long)rows * cols * 4, (start, end) =>
+            {
+                for (int r = start; r < end; r++)
+                {
+                    float mean = sv[r], rstd = sv[rows + r], s1 = 0f, s2 = 0f;
+                    for (int j = 0; j < cols; j++)
+                    {
+                        float xhat = (xv[r * cols + j] - mean) * rstd, g = dyv[r * cols + j] * gv[j];
+                        s1 += g;
+                        s2 += g * xhat;
+                    }
+
+                    s1 /= cols;
+                    s2 /= cols;
+                    for (int j = 0; j < cols; j++)
+                    {
+                        float xhat = (xv[r * cols + j] - mean) * rstd, g = dyv[r * cols + j] * gv[j];
+                        dxv[r * cols + j] += rstd * (g - s1 - xhat * s2);
+                    }
+                }
+            });
+        }
+
+        if (dgamma is not null || dbeta is not null)
+        {
+            float[]? dg = dgamma is null ? null : D(dgamma), db = dbeta is null ? null : D(dbeta);
+            For(cols, (long)rows * cols * 2, (start, end) =>
+            {
+                for (int j = start; j < end; j++)
+                {
+                    double sg = 0, sb = 0;
+                    for (int r = 0; r < rows; r++)
+                    {
+                        float d = dyv[r * cols + j];
+                        sg += d * ((xv[r * cols + j] - sv[r]) * sv[rows + r]);
+                        sb += d;
+                    }
+
+                    if (dg is not null)
+                    {
+                        dg[j] += (float)sg;
+                    }
+
+                    if (db is not null)
+                    {
+                        db[j] += (float)sb;
+                    }
+                }
+            });
+        }
+    }
+
     public override void LayerNormFused(Storage x, Storage gamma, Storage beta, Storage y, int rows, int cols, float eps)
     {
         float[] xv = D(x), gv = D(gamma), bv = D(beta), yv = D(y);

@@ -789,7 +789,7 @@ internal sealed unsafe partial class CudaBackend : Backend
                 string kernel = transA ? (transB ? "gemm_tc_tt_f32" : "gemm_tc_tn_f32") : (transB ? "gemm_tc_nt_f32" : "gemm_tc_nn_f32");
                 Launch(tensorCore[kernel], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
                     (uint)count, PtxKernels.TensorThreads, 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn,
-                    U(m), U(n), U(k), F(beta), mk, kn, mn);
+                    U(m), U(n), U(k), F(beta), mk, kn, mn, 0UL);
                 Interlocked.Increment(ref TensorCoreLaunches);
                 continue;
             }
@@ -814,6 +814,25 @@ internal sealed unsafe partial class CudaBackend : Backend
     private void TransposeBatched(Storage x, Storage y, int batch, int rows, int cols) =>
         Launch(K("transpose_f32"), (uint)((cols + 31) / 32), (uint)((rows + 31) / 32), (uint)batch, 32, 8,
             P(x), P(y), U(rows), U(cols), (ulong)rows * (ulong)cols, (ulong)rows * (ulong)cols);
+
+    public override bool MatMulBias(Storage a, Storage b, Storage bias, Storage c, int m, int n, int k)
+    {
+        if (m < 64 || n < 64 || k < 32 || MixedPrecision.Current != MatMulPrecision.BFloat16 || TensorCoreKernels() is not { } tensorCore)
+        {
+            return false;
+        }
+
+        if (_profile is not null)
+        {
+            _profileLabel = $"gemm_tc_nn+bias {m}x{n}x{k}";
+            _profileFlops = 2.0 * m * n * k;
+        }
+
+        Launch(tensorCore["gemm_tc_nn_f32"], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
+            1, PtxKernels.TensorThreads, 1, P(a), P(b), P(c), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, P(bias));
+        Interlocked.Increment(ref TensorCoreLaunches);
+        return true;
+    }
 
     public override void SgdStep(Storage p, Storage g, Storage? v, int n, float lr, float momentum)
     {

@@ -58,6 +58,51 @@ public sealed partial class Tensor
         throw new ArgumentException($"MatMul does not support shapes {FormatShape(_shape)} and {FormatShape(other._shape)}.");
     }
 
+    /// <summary>
+    /// x·w + bias for x [..., k], w [k, n], bias [n]: one pass where the device has one (bfloat16 tensor cores),
+    /// otherwise a product and a bias addition. Same gradients as <c>x.MatMul(w) + bias</c>.
+    /// </summary>
+    internal static Tensor MatMulBias(Tensor x, Tensor w, Tensor bias)
+    {
+        int k = x._shape[^1], n = w._shape[1], m = x.Size / Math.Max(1, k);
+        if (w.Rank != 2 || w._shape[0] != k || bias.Size != n)
+        {
+            return x.MatMul(w) + bias;
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty([.. x._shape[..^1], n], x.Device);
+        if (!x.Backend.MatMulBias(x.Storage, w.Storage, bias.Storage, y.Storage, m, n, k))
+        {
+            y.Dispose();
+            return x.MatMul(w) + bias;
+        }
+
+        if ((x.RequiresGrad || w.RequiresGrad || bias.RequiresGrad) && Autograd.IsEnabled)
+        {
+            y.Record("matmul_bias", g =>
+            {
+                var backend = x.Backend;
+                if (bias.RequiresGrad)
+                {
+                    backend.SumRows(g.Storage, bias.GradStorage(), m, n);
+                }
+
+                if (x.RequiresGrad)
+                {
+                    backend.BatchedMatMul(g.Storage, w.Storage, x.GradStorage(), 1, m, k, n, false, true, 1f);
+                }
+
+                if (w.RequiresGrad)
+                {
+                    backend.BatchedMatMul(x.Storage, g.Storage, w.GradStorage(), 1, k, n, m, true, false, 1f);
+                }
+            }, x, w, bias);
+        }
+
+        return Traced("matmul_bias", y, start);
+    }
+
     private static Tensor MatMulCore(Tensor a, Tensor b, int batch, bool transA, bool transB)
     {
         int ra = a._shape[^2], ca = a._shape[^1], rb = b._shape[^2], cb = b._shape[^1];

@@ -40,6 +40,34 @@ public sealed partial class Tensor
         return Traced("layernorm_fused", y, start);
     }
 
+    /// <summary>LayerNorm over the last dimension for training: one forward kernel (keeping each row's mean and 1 / std) and one backward pass.</summary>
+    internal Tensor LayerNormTrain(Tensor gamma, Tensor beta, float eps)
+    {
+        ThrowIfDisposed();
+        int cols = _shape[^1], rows = Size / cols;
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty(_shape, Device);
+        var stats = Empty([2 * rows], Device, track: false);                 // kept for the backward pass, which frees it
+        Backend.LayerNormTrain(Storage, gamma.Storage, beta.Storage, y.Storage, stats.Storage, rows, cols, eps);
+        if ((RequiresGrad || gamma.RequiresGrad || beta.RequiresGrad) && Autograd.IsEnabled)
+        {
+            var x = this;
+            y.Record("layernorm", g =>
+            {
+                x.Backend.LayerNormBackward(x.Storage, gamma.Storage, g.Storage, stats.Storage,
+                    x.RequiresGrad ? x.GradStorage() : null, gamma.RequiresGrad ? gamma.GradStorage() : null, beta.RequiresGrad ? beta.GradStorage() : null,
+                    rows, cols);
+                stats.Dispose();
+            }, x, gamma, beta);
+        }
+        else
+        {
+            stats.Dispose();
+        }
+
+        return Traced("layernorm", y, start);
+    }
+
     /// <summary>gelu(x + bias) over the last dimension, in one kernel.</summary>
     internal Tensor BiasGelu(Tensor bias)
     {

@@ -12,6 +12,24 @@ internal sealed unsafe partial class CudaBackend
     public override void LayerNormFused(Storage x, Storage gamma, Storage beta, Storage y, int rows, int cols, float eps) =>
         LaunchRows(K("layernorm_fused_f32"), rows, P(x), P(gamma), P(beta), P(y), U(cols), F(eps), U(rows));
 
+    public override void LayerNormTrain(Storage x, Storage gamma, Storage beta, Storage y, Storage stats, int rows, int cols, float eps) =>
+        LaunchRows(K("layernorm_train_f32"), rows, P(x), P(gamma), P(beta), P(y), P(stats), U(cols), F(eps), U(rows));
+
+    public override void LayerNormBackward(Storage x, Storage gamma, Storage dy, Storage stats, Storage? dx, Storage? dgamma, Storage? dbeta, int rows, int cols)
+    {
+        if (dx is not null)
+        {
+            LaunchRows(K("layernorm_bwd_f32"), rows, P(x), P(gamma), P(dy), P(stats), P(dx), U(cols), U(rows));
+        }
+
+        if (dgamma is not null || dbeta is not null)
+        {
+            const int Chunk = 64;
+            Launch(K("layernorm_bwd_params_f32"), (uint)((cols + 255) / 256), (uint)((rows + Chunk - 1) / Chunk), 1, 256, 1,
+                P(x), P(dy), P(stats), dgamma is null ? 0UL : P(dgamma), dbeta is null ? 0UL : P(dbeta), U(rows), U(cols), U(Chunk));
+        }
+    }
+
     public override void BiasGelu(Storage x, Storage bias, Storage y, int n, int cols) =>
         Launch1D(K("bias_gelu_f32"), n, P(x), P(bias), P(y), U(cols), U(n));
 

@@ -9,6 +9,8 @@ internal static partial class Tests
     [
         ("mixed precision: bfloat16 tensor-core products (every transpose, edges, batches, beta) match bfloat16-rounded references", TensorCoreProducts),
         ("mixed precision: tensor-core flash attention (forward, log-sum-exp, dq, dk, dv; head sizes 64 and 128) matches float32", TensorCoreAttention),
+        ("layer norm: the fused training kernels match the composed operations (output, input, gamma and beta gradients)", LayerNormTraining),
+        ("mixed precision: product + bias in one pass matches the product and a bias addition (output and gradients)", MatMulBiasPass),
         ("optimizer: 8-bit AdamW (dynamic code map, nearest codes, tracks 32-bit AdamW, CPU parity)", EightBitAdam),
         ("decoder: GPT-2 style (learned positions, LayerNorm, GELU, dropout): checkpointed blocks replay the dropout masks", GptStyleDecoder),
     ];
@@ -72,6 +74,60 @@ internal static partial class Tests
                     }
                 }
             }
+        }
+    }
+
+    private static void MatMulBiasPass(Device device)
+    {
+        var random = new Random(6);
+        const int M = 150, K = 96, N = 130;
+        float[] Values(int n) => [.. Enumerable.Range(0, n).Select(_ => random.NextSingle() * 2 - 1)];
+        float[] x0 = Values(M * K), w0 = Values(K * N), b0 = Values(N), g0 = Values(M * N);
+        (float[] Y, float[] Dx, float[] Dw, float[] Db) Run(bool fused)
+        {
+            using var precision = MixedPrecision.BFloat16();
+            using var scope = new TensorScope();
+            var x = Tensor.From(x0, [3, M / 3, K], device, requiresGrad: true);
+            var w = Tensor.From(w0, [K, N], device, requiresGrad: true);
+            var b = Tensor.From(b0, [N], device, requiresGrad: true);
+            var y = fused ? Tensor.MatMulBias(x, w, b) : x.MatMul(w) + b;
+            (y * Tensor.From(g0, y.Shape, device)).Sum().Backward();
+            return (y.ToArray(), x.Grad!.ToArray(), w.Grad!.ToArray(), b.Grad!.ToArray());
+        }
+
+        var separate = Run(false);
+        var fusedRun = Run(true);
+        AssertClose(separate.Y, fusedRun.Y, 1e-5f, "output");
+        AssertClose(separate.Dx, fusedRun.Dx, 1e-4f, "input gradient");
+        AssertClose(separate.Dw, fusedRun.Dw, 1e-4f, "weight gradient");
+        AssertClose(separate.Db, fusedRun.Db, 1e-4f, "bias gradient");
+    }
+
+    private static void LayerNormTraining(Device device)
+    {
+        var random = new Random(4);
+        foreach (var (rows, cols) in new[] { (37, 50), (5, 300), (64, 2048) })
+        {
+            float[] Values(int n) => [.. Enumerable.Range(0, n).Select(_ => random.NextSingle() * 4 - 1)];
+            float[] x0 = Values(rows * cols), g0 = Values(cols), b0 = Values(cols), w = Values(rows * cols);
+            (float[] Y, float[] Dx, float[] Dg, float[] Db) Run(bool fused)
+            {
+                using var scope = new TensorScope();
+                var x = Tensor.From(x0, [rows, cols], device, requiresGrad: true);
+                var gamma = Tensor.From(g0, [cols], device, requiresGrad: true);
+                var beta = Tensor.From(b0, [cols], device, requiresGrad: true);
+                var y = fused ? x.LayerNormTrain(gamma, beta, 1e-5f)
+                    : x.Normalize(1, rows, cols, 1e-5f, out _, out _).GroupAffine(gamma, beta, cols, 1);
+                (y * Tensor.From(w, [rows, cols], device)).Sum().Backward();
+                return (y.ToArray(), x.Grad!.ToArray(), gamma.Grad!.ToArray(), beta.Grad!.ToArray());
+            }
+
+            var composed = Run(false);
+            var fusedRun = Run(true);
+            AssertClose(composed.Y, fusedRun.Y, 1e-4f, $"{rows}×{cols}: output");
+            AssertClose(composed.Dx, fusedRun.Dx, 1e-3f, $"{rows}×{cols}: input gradient");
+            AssertClose(composed.Dg, fusedRun.Dg, 1e-3f, $"{rows}×{cols}: gamma gradient");
+            AssertClose(composed.Db, fusedRun.Db, 1e-3f, $"{rows}×{cols}: beta gradient");
         }
     }
 
@@ -251,7 +307,7 @@ internal static partial class Tests
 
     private static void TensorCoreProducts(Device device)
     {
-        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == 10)
+        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == 11)
               && PtxKernels.TensorCoreNames.All(PtxKernels.TensorCoreParameterCounts.ContainsKey), "tensor-core kernel signatures");
         var random = new Random(3);
         // A GPU that has tensor cores must load the module: a JIT error would otherwise fall back to float32 silently.

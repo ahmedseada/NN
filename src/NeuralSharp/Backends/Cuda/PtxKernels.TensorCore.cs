@@ -80,13 +80,15 @@ internal static partial class PtxKernels
             .visible .entry {{name}}(
                 .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .f32 p_beta,
-                .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc
+                .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc, .param .u64 p_bias
             )
             {
                 .reg .pred %p<16>;
                 .reg .pred %pbeta, %peven, %qnot;
                 .reg .pred %q<12>;
                 .reg .f32 %e<8>;
+                .reg .f32 %bias<8>;
+                .reg .pred %pbias;
                 .reg .f32 %c<64>;
                 .reg .b32 %fa<16>;
                 .reg .b32 %fb<8>;
@@ -128,9 +130,23 @@ internal static partial class PtxKernels
                 shr.u32 %r6, %r4, 5;
                 and.b32 %r7, %r6, 1;
                 shr.u32 %r8, %r6, 1;
-                mov.u32 %r9, %ctaid.y;
+                // Tile order grouped by 8 row tiles (blocks that run together share B's column tiles in L2): linear
+                // block b, group of 8·gx blocks, row tile first + b % size, column tile (b % (8·gx)) / size.
+                mov.u32 %r50, %nctaid.x;
+                mov.u32 %r51, %nctaid.y;
+                mov.u32 %r52, %ctaid.y;
+                mov.u32 %r53, %ctaid.x;
+                mad.lo.u32 %r52, %r52, %r50, %r53;
+                shl.b32 %r54, %r50, 3;
+                div.u32 %r55, %r52, %r54;
+                shl.b32 %r55, %r55, 3;
+                sub.u32 %r56, %r51, %r55;
+                min.u32 %r56, %r56, 8;
+                rem.u32 %r57, %r52, %r54;
+                rem.u32 %r9, %r57, %r56;
+                add.u32 %r9, %r9, %r55;
+                div.u32 %r10, %r57, %r56;
                 shl.b32 %r9, %r9, 7;
-                mov.u32 %r10, %ctaid.x;
                 shl.b32 %r10, %r10, 7;
                 mov.u32 %r11, {{name}}_as;
                 mov.u32 %r12, {{name}}_bs;
@@ -365,10 +381,30 @@ internal static partial class PtxKernels
         // Per row group (8 elements of one row): read the old values first, all at once (pairs as 8-byte loads when n is
         // even, so both columns share an aligned pair), then add and store. Reading them one by one between the stores
         // made the epilogue wait on memory 64 times per thread, halving the speed of beta ≠ 0 products.
+        // Bias (optional, one value per column): this thread's 8 columns, loaded once.
         s.AppendLine("""
                 and.b32 %r47, %r2, 1;
                 setp.eq.u32 %peven, %r47, 0;
+                ld.param.u64 %rd18, [p_bias];
+                setp.ne.u64 %pbias, %rd18, 0;
             """);
+        for (int nt = 0; nt < 4; nt++)
+        {
+            for (int j = 0; j < 2; j++)
+            {
+                s.AppendLine($$"""
+                        mov.f32 %bias{{2 * nt + j}}, 0f00000000;
+                        add.u32 %r46, %r43, {{nt * 8 + j}};
+                        setp.lt.u32 %p9, %r46, %r2;
+                        and.pred %p9, %p9, %pbias;
+                        @%p9 cvta.to.global.u64 %rd19, %rd18;
+                        @%p9 mul.wide.u32 %rd20, %r46, 4;
+                        @%p9 add.u64 %rd19, %rd19, %rd20;
+                        @%p9 ld.global.f32 %bias{{2 * nt + j}}, [%rd19];
+                    """);
+            }
+        }
+
         for (int mt = 0; mt < 4; mt++)
         {
             for (int half = 0; half < 2; half++)
@@ -416,6 +452,8 @@ internal static partial class PtxKernels
                     s.AppendLine($$"""
                             fma.rn.f32 %e{{2 * nt}}, %e{{2 * nt}}, %beta, %c{{c}};
                             fma.rn.f32 %e{{2 * nt + 1}}, %e{{2 * nt + 1}}, %beta, %c{{c + 1}};
+                            add.f32 %e{{2 * nt}}, %e{{2 * nt}}, %bias{{2 * nt}};
+                            add.f32 %e{{2 * nt + 1}}, %e{{2 * nt + 1}}, %bias{{2 * nt + 1}};
                             @%q{{3 * nt}} st.global.v2.f32 [%rd17+{{nt * 32}}], {%e{{2 * nt}}, %e{{2 * nt + 1}}};
                             @%q{{3 * nt + 1}} st.global.f32 [%rd17+{{nt * 32}}], %e{{2 * nt}};
                             @%q{{3 * nt + 2}} st.global.f32 [%rd17+{{nt * 32 + 4}}], %e{{2 * nt + 1}};

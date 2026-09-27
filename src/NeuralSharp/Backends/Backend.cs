@@ -165,6 +165,12 @@ internal abstract class Backend
         }
     }
 
+    /// <summary>
+    /// c = a·b + bias (bias [n] added to every row) in one pass, for a [m, k] and b [k, n] as stored. Returns false when
+    /// the device has no such pass for these sizes (callers then multiply and add the bias separately).
+    /// </summary>
+    public virtual bool MatMulBias(Storage a, Storage b, Storage bias, Storage c, int m, int n, int k) => false;
+
     /// <summary><see cref="MatMul"/> for <paramref name="batch"/> independent, contiguous matrix triples.</summary>
     public abstract void BatchedMatMul(Storage a, Storage b, Storage c, int batch, int m, int n, int k, bool transA, bool transB, float beta);
 
@@ -283,6 +289,14 @@ internal abstract class Backend
 
     /// <summary>y[r, :] = (x[r, :] - mean) / sqrt(var + eps) * gamma + beta over the last dimension.</summary>
     public abstract void LayerNormFused(Storage x, Storage gamma, Storage beta, Storage y, int rows, int cols, float eps);
+
+    /// <summary><see cref="LayerNormFused"/> that also stores each row's mean (stats[r]) and 1 / sqrt(var + eps) (stats[rows + r]).</summary>
+    public abstract void LayerNormTrain(Storage x, Storage gamma, Storage beta, Storage y, Storage stats, int rows, int cols, float eps);
+
+    /// <summary>
+    /// Gradients of <see cref="LayerNormTrain"/> given dy: adds to dx (when given), dgamma += Σ_r dy ∘ x̂ and dbeta += Σ_r dy.
+    /// </summary>
+    public abstract void LayerNormBackward(Storage x, Storage gamma, Storage dy, Storage stats, Storage? dx, Storage? dgamma, Storage? dbeta, int rows, int cols);
 
     /// <summary>y[i] = gelu(x[i] + bias[i % cols]).</summary>
     public abstract void BiasGelu(Storage x, Storage bias, Storage y, int n, int cols);
