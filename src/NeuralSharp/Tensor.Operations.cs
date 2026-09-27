@@ -115,7 +115,7 @@ public sealed partial class Tensor
         if (WillRecord(this))
         {
             var x = this;
-            y.Record("reshape", g => x.Backend.Axpy(g.Storage, x.GradStorage(), x.Size, 1f), x);
+            y.Record("reshape", g => x.AddGradient(g, adopt: true), x);
         }
 
         return y;
@@ -192,14 +192,14 @@ public sealed partial class Tensor
         {
             c.Record("add_bias", g =>
             {
-                if (a.RequiresGrad)
-                {
-                    a.Backend.Axpy(g.Storage, a.GradStorage(), a.Size, 1f);
-                }
-
                 if (b.RequiresGrad)
                 {
                     b.Backend.SumRows(g.Storage, b.GradStorage(), rows, cols);
+                }
+
+                if (a.RequiresGrad)
+                {
+                    a.AddGradient(g, adopt: true);                  // last: a may take g's buffer
                 }
             }, a, b);
         }
@@ -225,12 +225,14 @@ public sealed partial class Tensor
                 switch (op)
                 {
                     case BinaryOp.Add:
-                        if (a.RequiresGrad) backend.Axpy(g.Storage, a.GradStorage(), n, 1f);
-                        if (b.RequiresGrad) backend.Axpy(g.Storage, b.GradStorage(), n, 1f);
+                        // b first (added), then a may take g's buffer (x + x: a takes it, then... b is a, already done).
+                        if (b.RequiresGrad && !ReferenceEquals(a, b)) b.AddGradient(g, adopt: false);
+                        if (a.RequiresGrad) a.AddGradient(g, adopt: true);
+                        if (b.RequiresGrad && ReferenceEquals(a, b)) backend.Axpy(g.Storage, a.GradStorage(), n, 1f);
                         break;
                     case BinaryOp.Sub:
-                        if (a.RequiresGrad) backend.Axpy(g.Storage, a.GradStorage(), n, 1f);
                         if (b.RequiresGrad) backend.Axpy(g.Storage, b.GradStorage(), n, -1f);
+                        if (a.RequiresGrad) a.AddGradient(g, adopt: !ReferenceEquals(a, b));
                         break;
                     case BinaryOp.Mul:
                         if (a.RequiresGrad) backend.MulAdd(g.Storage, b.Storage, a.GradStorage(), n);

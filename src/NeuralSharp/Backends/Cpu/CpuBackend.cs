@@ -215,7 +215,20 @@ internal sealed partial class CpuBackend : Backend
     public override void AdamStep(Storage p, Storage g, Storage m, Storage v, int n, float lr, float beta1, float beta2, float eps) =>
         Run(new AdamKernel(D(p), D(g), D(m), D(v), lr, beta1, beta2, eps), n);
 
-    public override void AdamStep8Bit(Storage p, Storage g, Storage m, Storage v, Storage absMax, Storage map, int n, float lr, float beta1, float beta2, float eps)
+    public override void SumSquares(Storage x, Storage total, int n)
+    {
+        var values = D(x).AsSpan(0, n);
+        double sum = 0;
+        foreach (float value in values)
+        {
+            sum += (double)value * value;
+        }
+
+        D(total)[0] += (float)sum;
+    }
+
+    public override void AdamStep8Bit(Storage p, Storage g, Storage m, Storage v, Storage absMax, Storage map, int n, float lr, float beta1, float beta2, float eps,
+        float gradientScale, float decay)
     {
         float[] ps = D(p), gs = D(g), ms = D(m), vs = D(v), scales = D(absMax), codes = D(map);
         const int B = Optimizers.AdamW8Bit.BlockSize;
@@ -231,10 +244,10 @@ internal sealed partial class CpuBackend : Backend
             float mScale = scales[block], vScale = scales[blocks + block], mMax = 0f, vMax = 0f;
             for (int i = start; i < end; i++)
             {
-                float grad = gs[i];
+                float grad = gs[i] * gradientScale;
                 float mom = MathF.FusedMultiplyAdd(beta1, signedMap[mb[i]] * mScale, (1f - beta1) * grad);
                 float vel = MathF.FusedMultiplyAdd(beta2, unsignedMap[vb[i]] * vScale, grad * grad * (1f - beta2));
-                ps[i] -= mom / (MathF.Sqrt(vel) + eps) * lr;
+                ps[i] = ps[i] * decay - mom / (MathF.Sqrt(vel) + eps) * lr;
                 mNew[i - start] = mom;
                 vNew[i - start] = vel;
                 mMax = MathF.Max(mMax, MathF.Abs(mom));

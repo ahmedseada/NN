@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "attention_decode_bf16", "attention_flash_bf16", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32", "adam8_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "attention_decode_bf16", "attention_flash_bf16", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32", "adam8_f32", "transpose_f32", "sumsq_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -247,7 +247,7 @@ internal static partial class PtxKernels
             """;
 
         RowBlock(sb, "adam8_f32", ["p", "g", "m", "v", "absmax", "map"],
-            [("f32", "lr"), ("f32", "b1"), ("f32", "b2"), ("f32", "c1"), ("f32", "c2"), ("f32", "eps"), ("u32", "count")],
+            [("f32", "lr"), ("f32", "b1"), ("f32", "b2"), ("f32", "c1"), ("f32", "c2"), ("f32", "eps"), ("u32", "count"), ("f32", "gscale"), ("f32", "decay")],
             $"""
             mul.wide.u32 %rd1, %tx, 4;
             add.u64 %rd2, %b_map, %rd1;
@@ -280,6 +280,8 @@ internal static partial class PtxKernels
             @%p2 ld.global.u8 %r4, [%rd5];
             @%p2 ld.global.f32 %f5, [%rd8];
             @%p2 ld.global.f32 %f6, [%rd7];
+            mul.f32 %f5, %f5, %s_gscale;
+            mul.f32 %f6, %f6, %s_decay;
             shl.b32 %r5, %r3, 2;
             add.u32 %r5, %r5, %spart;
             ld.shared.f32 %f7, [%r5];
@@ -321,8 +323,125 @@ internal static partial class PtxKernels
             """, sharedFloats: 512);
     }
 
+    // y[b][c, r] = x[b][r, c] for x [batch][rows, cols]: 32 × 32 tiles through shared memory (padded to 33, so both the
+    // row-wise reads and the column-wise writes are conflict-free and coalesced). Block 32 × 8, grid (⌈cols / 32⌉,
+    // ⌈rows / 32⌉, batch); batch strides in elements.
+    private static void Transpose(StringBuilder sb)
+    {
+        var s = new StringBuilder();
+        s.AppendLine("""
+            .visible .entry transpose_f32(
+                .param .u64 p_x, .param .u64 p_y, .param .u32 p_rows, .param .u32 p_cols, .param .u64 p_sx, .param .u64 p_sy
+            )
+            {
+                .reg .pred %p<4>;
+                .reg .b32 %r<24>;
+                .reg .b64 %rd<12>;
+                .reg .f32 %f<2>;
+                .shared .align 4 .f32 transpose_f32_t[1056];
+                ld.param.u64 %rd1, [p_x];
+                ld.param.u64 %rd2, [p_y];
+                cvta.to.global.u64 %rd1, %rd1;
+                cvta.to.global.u64 %rd2, %rd2;
+                ld.param.u32 %r1, [p_rows];
+                ld.param.u32 %r2, [p_cols];
+                ld.param.u64 %rd3, [p_sx];
+                ld.param.u64 %rd4, [p_sy];
+                mov.u32 %r3, %ctaid.z;
+                cvt.u64.u32 %rd5, %r3;
+                mul.lo.u64 %rd6, %rd5, %rd3;
+                shl.b64 %rd6, %rd6, 2;
+                add.u64 %rd1, %rd1, %rd6;
+                mul.lo.u64 %rd6, %rd5, %rd4;
+                shl.b64 %rd6, %rd6, 2;
+                add.u64 %rd2, %rd2, %rd6;
+                mov.u32 %r4, %tid.x;
+                mov.u32 %r5, %tid.y;
+                mov.u32 %r6, %ctaid.x;
+                shl.b32 %r6, %r6, 5;
+                mov.u32 %r7, %ctaid.y;
+                shl.b32 %r7, %r7, 5;
+                mov.u32 %r8, transpose_f32_t;
+            """);
+        for (int i = 0; i < 4; i++)
+        {
+            s.AppendLine($"""
+                    add.u32 %r9, %r5, {8 * i};
+                    add.u32 %r10, %r7, %r9;
+                    add.u32 %r11, %r6, %r4;
+                    setp.lt.u32 %p1, %r10, %r1;
+                    setp.lt.and.u32 %p1, %r11, %r2, %p1;
+                    mul.wide.u32 %rd7, %r10, %r2;
+                    cvt.u64.u32 %rd8, %r11;
+                    add.u64 %rd7, %rd7, %rd8;
+                    shl.b64 %rd7, %rd7, 2;
+                    add.u64 %rd7, %rd7, %rd1;
+                    mov.f32 %f1, 0f00000000;
+                    @%p1 ld.global.f32 %f1, [%rd7];
+                    mul.lo.u32 %r12, %r9, 33;
+                    add.u32 %r12, %r12, %r4;
+                    shl.b32 %r12, %r12, 2;
+                    add.u32 %r12, %r12, %r8;
+                    st.shared.f32 [%r12], %f1;
+                """);
+        }
+
+        s.AppendLine("bar.sync 0;");
+        for (int i = 0; i < 4; i++)
+        {
+            s.AppendLine($"""
+                    add.u32 %r9, %r5, {8 * i};
+                    add.u32 %r10, %r6, %r9;
+                    add.u32 %r11, %r7, %r4;
+                    setp.lt.u32 %p1, %r10, %r2;
+                    setp.lt.and.u32 %p1, %r11, %r1, %p1;
+                    mul.lo.u32 %r12, %r4, 33;
+                    add.u32 %r12, %r12, %r9;
+                    shl.b32 %r12, %r12, 2;
+                    add.u32 %r12, %r12, %r8;
+                    ld.shared.f32 %f1, [%r12];
+                    mul.wide.u32 %rd7, %r10, %r1;
+                    cvt.u64.u32 %rd8, %r11;
+                    add.u64 %rd7, %rd7, %rd8;
+                    shl.b64 %rd7, %rd7, 2;
+                    add.u64 %rd7, %rd7, %rd2;
+                    @%p1 st.global.f32 [%rd7], %f1;
+                """);
+        }
+
+        s.AppendLine("""
+                ret;
+            }
+            """);
+        sb.Append(s);
+        sb.AppendLine();
+    }
+
+    // total[0] += Σ x²: blocks stride over x (n = blocks), reduce, and add their sums atomically.
+    private static void SumSquares(StringBuilder sb) =>
+        RowBlock(sb, "sumsq_f32", ["x", "total"], [("u32", "count")], $"""
+            mov.f32 %f1, {Zero};
+            mad.lo.u32 %r1, %row, %nt, %tx;
+            mul.lo.u32 %r2, %n, %nt;
+            SQ:
+            setp.ge.u32 %p1, %r1, %s_count;
+            @%p1 bra SQ_END;
+            mul.wide.u32 %rd1, %r1, 4;
+            add.u64 %rd1, %rd1, %b_x;
+            ld.global.f32 %f2, [%rd1];
+            fma.rn.f32 %f1, %f2, %f2, %f1;
+            add.u32 %r1, %r1, %r2;
+            bra SQ;
+            SQ_END:
+            {BlockReduce("RS", "%f1", "add", Zero)}
+            setp.eq.u32 %p2, %tx, 0;
+            @%p2 red.global.add.f32 [%b_total], %f1;
+            """);
+
     private static void BuildRows(StringBuilder sb)
     {
+        SumSquares(sb);
+        Transpose(sb);
         Adam8(sb);
         GemvNN(sb);
         GemvNN(sb, multi: true);

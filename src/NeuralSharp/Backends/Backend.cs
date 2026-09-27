@@ -260,7 +260,13 @@ internal abstract class Backend
     /// <paramref name="absMax"/> (the blocks' m scales, then their v scales). The moments are decoded, updated, and
     /// encoded again to the nearest code with new block scales.
     /// </summary>
-    public abstract void AdamStep8Bit(Storage p, Storage g, Storage m, Storage v, Storage absMax, Storage map, int n, float lr, float beta1, float beta2, float eps);
+    /// <remarks>The gradient is multiplied by <paramref name="gradientScale"/> as it is read (gradient clipping) and the
+    /// parameter by <paramref name="decay"/> before the update (decoupled weight decay, 1 - lr·λ).</remarks>
+    public abstract void AdamStep8Bit(Storage p, Storage g, Storage m, Storage v, Storage absMax, Storage map, int n, float lr, float beta1, float beta2, float eps,
+        float gradientScale, float decay);
+
+    /// <summary>total[0] += Σ x² over <paramref name="n"/> elements (a gradient norm without temporary tensors).</summary>
+    public abstract void SumSquares(Storage x, Storage total, int n);
 
     /// <summary>Inverted dropout: y = keep(i) ? x / (1 - p) : 0, where keep(i) comes from <see cref="DropoutMask"/>.</summary>
     public abstract void Dropout(Storage x, Storage y, int n, float p, uint seed);

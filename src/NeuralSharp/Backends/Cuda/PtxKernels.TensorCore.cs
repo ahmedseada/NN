@@ -24,7 +24,7 @@ internal static partial class PtxKernels
     private const int StageBytes = TensorTile * NarrowStride;           // the larger of 128 × 80 and 32 × 272
 
     /// <summary>gemm_tc_{a}{b}_f32: a / b = n (as stored) or t (transposed), as the ta / tb flags of <c>gemm128_f32</c>.</summary>
-    public static readonly string[] TensorCoreNames = ["gemm_tc_nn_f32", "gemm_tc_nt_f32", "gemm_tc_tn_f32", "gemm_tc_tt_f32"];
+    public static readonly string[] TensorCoreNames = ["gemm_tc_nn_f32", "gemm_tc_nt_f32", "gemm_tc_tn_f32", "gemm_tc_tt_f32", .. FlashTensorKernels];
 
     private static readonly Lazy<string> LazyTensorCoreSource = new(BuildTensorCore);
 
@@ -52,6 +52,8 @@ internal static partial class PtxKernels
                 TensorCoreGemm(sb, ta, tb);
             }
         }
+
+        BuildFlashTensorCore(sb);
 
         return sb.ToString();
     }

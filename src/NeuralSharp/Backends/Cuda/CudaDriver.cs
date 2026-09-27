@@ -121,6 +121,11 @@ internal static unsafe partial class CudaDriver
     [LibraryImport(Library)]
     public static partial int cuModuleGetFunction(out IntPtr function, IntPtr module, byte* name);
 
+    public const int FunctionAttributeMaxDynamicSharedSizeBytes = 8;
+
+    [LibraryImport(Library)]
+    public static partial int cuFuncSetAttribute(IntPtr function, int attribute, int value);
+
     [LibraryImport(Library, EntryPoint = "cuMemAlloc_v2")]
     public static partial int cuMemAlloc(out ulong pointer, nuint bytes);
 

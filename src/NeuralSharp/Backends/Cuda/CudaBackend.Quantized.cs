@@ -305,6 +305,14 @@ internal sealed unsafe partial class CudaBackend
     public override void AttentionTiled(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage? logSumExp, int heads,
         int rowsPerHead, int steps, int capacity, int dim, float scale)
     {
+        if (FlashTensorCore(dim) is { } tc)
+        {
+            Launch(tc[$"flash_tc_fwd_d{dim}"], (uint)((rowsPerHead + PtxKernels.FlashTensorRows - 1) / PtxKernels.FlashTensorRows), (uint)heads, 1, 128, 1,
+                P(q), P(keys), P(values), P(position), P(y), logSumExp is null ? 0UL : P(logSumExp),
+                U(rowsPerHead), U(steps), U(capacity), F(scale * Log2E));
+            return;
+        }
+
         if (dim > PtxKernels.FlashMaxDim)
         {
             base.AttentionTiled(q, keys, values, position, y, logSumExp, heads, rowsPerHead, steps, capacity, dim, scale);
@@ -316,6 +324,12 @@ internal sealed unsafe partial class CudaBackend
             U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale));
     }
 
+    private const float Log2E = 1.4426950408889634f;
+
+    // The tensor-core flash kernels when MixedPrecision asks for bfloat16 and the head size and GPU allow them.
+    private Dictionary<string, IntPtr>? FlashTensorCore(int dim) =>
+        MixedPrecision.Current == MatMulPrecision.BFloat16 && PtxKernels.FlashTensorDim(dim) ? TensorCoreKernels() : null;
+
     public override void AttentionTiledBackward(Storage q, Storage keys, Storage values, Storage output, Storage logSumExp, Storage dOutput,
         Storage dq, Storage dkeys, Storage dvalues, int heads, int rowsPerHead, int steps, int capacity, int dim, float scale)
     {
@@ -324,6 +338,19 @@ internal sealed unsafe partial class CudaBackend
         try
         {
             Launch1D(K("attn_bwd_d_f32"), rows, P(output), P(dOutput), P(delta), U(dim), U(rows));
+            if (FlashTensorCore(dim) is { } tc)
+            {
+                t_sharedBytes = (uint)PtxKernels.FlashTensorBackwardKvShared(dim);
+                Launch(tc[$"flash_tc_bwd_kv_d{dim}"], (uint)((capacity + PtxKernels.FlashTensorRows - 1) / PtxKernels.FlashTensorRows), (uint)heads, 1, 128, 1,
+                    P(q), P(keys), P(values), P(dOutput), P(logSumExp), P(delta), P(dkeys), P(dvalues),
+                    U(rowsPerHead), U(steps), U(capacity), F(scale), F(scale * Log2E), U(rowsPerHead == steps ? 1 : 0));
+                t_sharedBytes = (uint)PtxKernels.FlashTensorBackwardQShared(dim);
+                Launch(tc[$"flash_tc_bwd_q_d{dim}"], (uint)((rowsPerHead + PtxKernels.FlashTensorRows - 1) / PtxKernels.FlashTensorRows), (uint)heads, 1, 128, 1,
+                    P(q), P(keys), P(values), P(dOutput), P(logSumExp), P(delta), P(dq),
+                    U(rowsPerHead), U(steps), U(capacity), F(scale), F(scale * Log2E));
+                return;
+            }
+
             ReadOnlySpan<ulong> args = [P(q), P(keys), P(values), P(dOutput), P(logSumExp), P(delta), P(dq), P(dkeys), P(dvalues),
                 U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale)];
             Launch(K("attn_bwd_kv_f32"), (uint)((capacity + 15) / 16), (uint)heads, 1, 128, 1, args);

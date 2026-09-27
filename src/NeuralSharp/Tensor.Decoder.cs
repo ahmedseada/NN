@@ -104,7 +104,7 @@ public sealed partial class Tensor
 
             if (input.RequiresGrad && replay.Grad is { } grad)
             {
-                input.Backend.Axpy(grad.Storage, input.GradStorage(), input.Size, 1f);
+                input.AddGradient(grad, adopt: true);             // the replay dies with this scope
             }
         }, input);
         return output;
@@ -375,7 +375,7 @@ public sealed partial class Tensor
                 }
 
                 x.Backend.Rope(g.Storage, back.Storage, cos.Storage, sin.Storage, positions.Storage, rows, heads, steps, dim, half, interleaved, -1f);
-                x.Backend.Axpy(back.Storage, x.GradStorage(), x.Size, 1f);
+                x.AddGradient(back, adopt: true);
             }, x);
         }
 

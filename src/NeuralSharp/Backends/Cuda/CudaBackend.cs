@@ -81,6 +81,10 @@ internal sealed unsafe partial class CudaBackend : Backend
     /// <summary>Why bfloat16 tensor-core products are unavailable on this GPU (null when they are available or untried).</summary>
     public string? TensorCoreUnavailableReason { get; private set; }
 
+    // Dynamic shared memory of the next launch on this thread (consumed by Launch).
+    [ThreadStatic]
+    private static uint t_sharedBytes;
+
     // Kernel times per name while GpuProfiler runs (null otherwise); matrix products are keyed by kernel and shape.
     private Dictionary<string, (long Calls, long Ticks, double Flops)>? _profile;
 
@@ -137,6 +141,12 @@ internal sealed unsafe partial class CudaBackend : Backend
                     Check(cuModuleGetFunction(out IntPtr function, module, p), $"cuModuleGetFunction({kernel})");
                     _signatures[function] = (kernel, PtxKernels.TensorCoreParameterCounts[kernel]);
                     kernels[kernel] = function;
+                    if (kernel.StartsWith("flash_tc_bwd", StringComparison.Ordinal))
+                    {
+                        int dim = kernel.EndsWith("d64", StringComparison.Ordinal) ? 64 : 128;
+                        int sharedBytes = kernel.Contains("_kv_", StringComparison.Ordinal) ? PtxKernels.FlashTensorBackwardKvShared(dim) : PtxKernels.FlashTensorBackwardQShared(dim);
+                        Check(cuFuncSetAttribute(function, FunctionAttributeMaxDynamicSharedSizeBytes, sharedBytes), $"cuFuncSetAttribute({kernel})");
+                    }
                 }
             }
 
@@ -720,6 +730,35 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
         // bfloat16 tensor cores (MixedPrecision): products large enough to fill 128 × 128 tiles.
         var tensorCore = !few && m >= 64 && n >= 64 && k >= 32 && MixedPrecision.Current == MatMulPrecision.BFloat16 ? TensorCoreKernels() : null;
+        if (tensorCore is not null && (transA || transB) && batch <= MaxGridZ)
+        {
+            // The tensor-core kernel is fastest with both operands as stored ([m, k] · [k, n]): a transposed operand is
+            // copied into that layout first (a memory-bound pass, far cheaper than the product it speeds up).
+            Storage? at = transA ? Allocate(batch * m * k, zeroed: false) : null;
+            Storage? bt = transB ? Allocate(batch * k * n, zeroed: false) : null;
+            try
+            {
+                if (at is not null)
+                {
+                    TransposeBatched(a, at, batch, k, m);
+                }
+
+                if (bt is not null)
+                {
+                    TransposeBatched(b, bt, batch, n, k);
+                }
+
+                BatchedMatMul(at ?? a, bt ?? b, c, batch, m, n, k, false, false, beta);
+            }
+            finally
+            {
+                at?.Release();
+                bt?.Release();
+            }
+
+            return;
+        }
+
         for (int first = 0; first < batch; first += MaxGridZ)
         {
             int count = Math.Min(MaxGridZ, batch - first);
@@ -763,6 +802,11 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
     }
 
+    // y[b] = x[b]ᵀ for x [batch][rows, cols].
+    private void TransposeBatched(Storage x, Storage y, int batch, int rows, int cols) =>
+        Launch(K("transpose_f32"), (uint)((cols + 31) / 32), (uint)((rows + 31) / 32), (uint)batch, 32, 8,
+            P(x), P(y), U(rows), U(cols), (ulong)rows * (ulong)cols, (ulong)rows * (ulong)cols);
+
     public override void SgdStep(Storage p, Storage g, Storage? v, int n, float lr, float momentum)
     {
         if (v is null)
@@ -778,11 +822,21 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void AdamStep(Storage p, Storage g, Storage m, Storage v, int n, float lr, float beta1, float beta2, float eps) =>
         Launch1D(_adam, n, P(p), P(g), P(m), P(v), F(lr), F(beta1), F(beta2), F(1f - beta1), F(1f - beta2), F(eps), U(n));
 
-    public override void AdamStep8Bit(Storage p, Storage g, Storage m, Storage v, Storage absMax, Storage map, int n, float lr, float beta1, float beta2, float eps)
+    public override void AdamStep8Bit(Storage p, Storage g, Storage m, Storage v, Storage absMax, Storage map, int n, float lr, float beta1, float beta2, float eps,
+        float gradientScale, float decay)
     {
         int blocks = (n + Optimizers.AdamW8Bit.BlockSize - 1) / Optimizers.AdamW8Bit.BlockSize;
         LaunchRows(K("adam8_f32"), blocks, P(p), P(g), P(m), P(v), P(absMax), P(map),
-            F(lr), F(beta1), F(beta2), F(1f - beta1), F(1f - beta2), F(eps), U(n), U(blocks));
+            F(lr), F(beta1), F(beta2), F(1f - beta1), F(1f - beta2), F(eps), U(n), F(gradientScale), F(decay), U(blocks));
+    }
+
+    public override void SumSquares(Storage x, Storage total, int n)
+    {
+        if (n > 0)
+        {
+            int blocks = Math.Min(1024, (n + PtxKernels.RowThreads - 1) / PtxKernels.RowThreads);
+            LaunchRows(K("sumsq_f32"), blocks, P(x), P(total), U(n), U(blocks));
+        }
     }
 
     public override void Dropout(Storage x, Storage y, int n, float p, uint seed) =>
@@ -832,6 +886,8 @@ internal sealed unsafe partial class CudaBackend : Backend
                 $"Kernel {signature.Name} declares {signature.Parameters} parameters but was launched with {args.Length} arguments.");
         }
 
+        uint shared = t_sharedBytes;
+        t_sharedBytes = 0;
         MakeCurrent();
         ulong* values = stackalloc ulong[args.Length];
         void** pointers = stackalloc void*[args.Length];
@@ -847,7 +903,7 @@ internal sealed unsafe partial class CudaBackend : Backend
             // Profiling (GpuProfiler): the kernel alone, between two synchronizations.
             Check(cuStreamSynchronize(_stream), nameof(cuStreamSynchronize));
             long started = System.Diagnostics.Stopwatch.GetTimestamp();
-            Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, 0, _stream, pointers, null), nameof(cuLaunchKernel));
+            Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, shared, _stream, pointers, null), nameof(cuLaunchKernel));
             Check(cuStreamSynchronize(_stream), nameof(cuStreamSynchronize));
             long ticks = System.Diagnostics.Stopwatch.GetTimestamp() - started;
             string key = _profileLabel ?? (_signatures.TryGetValue(function, out var named) ? named.Name : $"0x{function:X}");
@@ -862,7 +918,7 @@ internal sealed unsafe partial class CudaBackend : Backend
             return;
         }
 
-        Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, 0, _stream, pointers, null), nameof(cuLaunchKernel));
+        Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, shared, _stream, pointers, null), nameof(cuLaunchKernel));
         if (DebugLaunches && _captureFree is null)
         {
             // Debugging aid: wait for every kernel so a fault is reported by the kernel that caused it.

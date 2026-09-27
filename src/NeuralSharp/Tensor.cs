@@ -443,6 +443,24 @@ public sealed partial class Tensor : IDisposable
         return postOrder;
     }
 
+    /// <summary>
+    /// Adds <paramref name="gradient"/> (same size) to this tensor's gradient. With <paramref name="adopt"/>, a tensor that
+    /// has no gradient yet takes <paramref name="gradient"/>'s buffer itself instead of a zeroed copy it is added to (no
+    /// memory traffic). Only for the gradient of an intermediate result, which nothing writes once its backward step has
+    /// run, and for one receiver per gradient (a second would share the buffer).
+    /// </summary>
+    internal void AddGradient(Tensor gradient, bool adopt)
+    {
+        if (adopt && Grad is null && gradient.Size == Size)
+        {
+            gradient.Storage.AddRef();
+            Grad = new Tensor(_shape, gradient.Storage, Device, track: false);
+            return;
+        }
+
+        Backend.Axpy(gradient.Storage, GradStorage(), Size, 1f);
+    }
+
     /// <summary>The gradient buffer, allocated (zeroed and outside any scope) on first use.</summary>
     internal Storage GradStorage()
     {

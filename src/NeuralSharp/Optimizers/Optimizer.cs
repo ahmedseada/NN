@@ -43,14 +43,9 @@ public abstract class Optimizer : IDisposable
         }
 
         using var total = Tensor.Zeros([1], withGrad[0].Device);
-        using (Autograd.NoGrad())
+        foreach (var p in withGrad)
         {
-            foreach (var p in withGrad)
-            {
-                using var squared = p.Grad!.Square();
-                using var sum = squared.Sum();
-                total.Backend.AxpyAt(sum.Storage, total.Storage, 0, 1f);
-            }
+            total.Backend.SumSquares(p.Grad!.Storage, total.Storage, p.Size);
         }
 
         return Math.Sqrt(total.Item());
@@ -66,6 +61,12 @@ public abstract class Optimizer : IDisposable
         if (norm > maxNorm && norm > 0)
         {
             float factor = (float)(maxNorm / norm);
+            if (ScalesGradientsInStep)
+            {
+                GradientScale = factor;                             // applied as the next Step reads the gradients
+                return norm;
+            }
+
             foreach (var p in Parameters)
             {
                 if (p.Grad is { } g)
@@ -77,6 +78,15 @@ public abstract class Optimizer : IDisposable
 
         return norm;
     }
+
+    /// <summary>
+    /// True when <see cref="Step"/> multiplies the gradients by <see cref="GradientScale"/> as it reads them (so
+    /// <see cref="ClipGradientNorm"/> needs no separate pass over them); the step then resets it to 1.
+    /// </summary>
+    protected virtual bool ScalesGradientsInStep => false;
+
+    /// <summary>Factor for the gradients of the next <see cref="Step"/> (see <see cref="ScalesGradientsInStep"/>).</summary>
+    protected float GradientScale { get; set; } = 1f;
 
     /// <summary>Adds L2 weight decay to the gradients: g += decay · p.</summary>
     protected void ApplyCoupledWeightDecay(float decay)

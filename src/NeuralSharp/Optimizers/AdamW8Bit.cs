@@ -50,8 +50,13 @@ public sealed class AdamW8Bit : Optimizer
         _m.Zip(_v).Sum(p => (long)((p.First?.Size ?? 0) + (p.Second?.Size ?? 0)) * 4) + _scales.Sum(s => (long)(s?.Size ?? 0) * 4);
 
     /// <inheritdoc />
+    protected override bool ScalesGradientsInStep => true;
+
+    /// <inheritdoc />
     public override void Step()
     {
+        float scale = GradientScale;
+        GradientScale = 1f;
         _step++;
         float correctedLr = (float)(LearningRate * Math.Sqrt(1 - Math.Pow(Beta2, _step)) / (1 - Math.Pow(Beta1, _step)));
         for (int i = 0; i < Parameters.Count; i++)
@@ -62,13 +67,19 @@ public sealed class AdamW8Bit : Optimizer
                 continue;
             }
 
-            if (WeightDecay != 0f)
-            {
-                p.Backend.Affine(p.Storage, p.Storage, p.Size, 1f - LearningRate * WeightDecay, 0f);
-            }
-
+            float decay = 1f - LearningRate * WeightDecay;
             if (p.Size < MinimumSize)
             {
+                if (decay != 1f)
+                {
+                    p.Backend.Affine(p.Storage, p.Storage, p.Size, decay, 0f);
+                }
+
+                if (scale != 1f)
+                {
+                    p.Backend.Affine(p.Grad.Storage, p.Grad.Storage, p.Size, scale, 0f);
+                }
+
                 var m = _m[i] ??= CreateState(p);
                 var v = _v[i] ??= CreateState(p);
                 p.Backend.AdamStep(p.Storage, p.Grad.Storage, m.Storage, v.Storage, p.Size, correctedLr, Beta1, Beta2, Epsilon);
@@ -81,7 +92,7 @@ public sealed class AdamW8Bit : Optimizer
             var scales = _scales[i] ??= Tensor.PersistentZeros([2 * blocks], p.Device);
             _map ??= Tensor.Persistent([.. DynamicMap(signed: true), .. DynamicMap(signed: false)], [512], p.Device, requiresGrad: false);
             p.Backend.AdamStep8Bit(p.Storage, p.Grad.Storage, m8.Storage, v8.Storage, scales.Storage, _map.Storage, p.Size,
-                correctedLr, Beta1, Beta2, Epsilon);
+                correctedLr, Beta1, Beta2, Epsilon, scale, decay);
         }
     }
 
