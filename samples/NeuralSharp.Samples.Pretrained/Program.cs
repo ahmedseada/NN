@@ -105,7 +105,12 @@ PretrainedModel Load(string folder)
 {
     folder = ResolveModel(folder);
     var watch = Stopwatch.StartNew();
-    var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, Int8 = int8, BFloat16 = bf16, Int4 = int4, MaxPositions = context });
+    // Chat, profile and check merge the adapter as the weights are read (full speed); finetune and export keep it separate.
+    bool merge = adapterFolder is not null && positional[0] is not ("finetune" or "export");
+    var model = PretrainedModel.Load(folder, new PretrainedOptions
+    {
+        Device = device, Int8 = int8, BFloat16 = bf16, Int4 = int4, MaxPositions = context, MergeAdapter = merge ? adapterFolder : null,
+    });
     Console.WriteLine($"Loaded {model.Config["architectures"]?[0]} from {folder} in {watch.Elapsed.TotalSeconds:F1} s on {device}{(int8 ? ", int8 weights" : int4 ? ", int4 weights" : bf16 ? ", bf16 weights" : "")}");
     Console.WriteLine($"  {model.Spec.ParameterCount / 1e6:F0}M parameters, {model.Spec.Layers} layers, dim {model.Spec.Dim}, heads {model.Spec.Heads}/{model.Spec.KvHeads}, "
                       + $"vocabulary {model.Spec.Vocabulary}, context {model.MaxPositions}");
@@ -114,7 +119,7 @@ PretrainedModel Load(string folder)
         Console.WriteLine($"  note: {note}");
     }
 
-    if (adapterFolder is not null)
+    if (adapterFolder is not null && !merge)
     {
         Console.WriteLine($"  adapter: {model.LoadAdapter(adapterFolder)} layers from {adapterFolder}");
     }

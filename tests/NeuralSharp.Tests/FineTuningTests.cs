@@ -202,6 +202,19 @@ internal static partial class Tests
                 AssertClose([after], [FineTuner.Evaluate(merged, sequences)], 1e-3f, "loss of the merged export");
             }
 
+            using (var merged = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, MergeAdapter = adapter }))
+            {
+                Check(!merged.Network.Descendants().OfType<Linear>().Any(l => l.Adapter is not null)
+                      && merged.Notes.Any(n => n.Contains($"merged into {7 * spec.Layers} weights")), "merged while loading");
+                AssertClose([after], [FineTuner.Evaluate(merged, sequences)], 1e-3f, "loss with the adapter merged while loading");
+            }
+
+            using (var merged = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, MergeAdapter = adapter, Int8 = true }))
+            {
+                float loss = FineTuner.Evaluate(merged, sequences);
+                Check(loss < before * 0.5f, $"int8 weights with the adapter merged while loading: {loss:F3}");
+            }
+
             // QLoRA: adapters on a 4-bit base also learn.
             using var quantized = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, Int4 = true });
             float q0 = FineTuner.Evaluate(quantized, sequences);

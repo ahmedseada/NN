@@ -24,6 +24,14 @@ public sealed record PretrainedOptions
 
     /// <summary>The architecture to use instead of the one named in config.json.</summary>
     public string? Architecture { get; init; }
+
+    /// <summary>
+    /// A folder holding a PEFT LoRA adapter (from <see cref="PretrainedModel.SaveAdapter"/> or peft) to merge into the
+    /// weights as they are read: the model then runs as fast as the base model, and int8 / int4 / bfloat16 weights are
+    /// packed with the update included. Use <see cref="PretrainedModel.LoadAdapter"/> instead to keep the adapter separate
+    /// (to train it further, or export it).
+    /// </summary>
+    public string? MergeAdapter { get; init; }
 }
 
 /// <summary>
@@ -94,12 +102,22 @@ public sealed class PretrainedModel : IDisposable
         var spec = architecture.Spec(config, notes);
         int maxPositions = Math.Min(options.MaxPositions ?? spec.MaxPositions, spec.MaxPositions);
         using var reader = SafeTensorsReader.Open(folder);
-        var weights = new CheckpointWeights(reader, architecture);
+        using var adapter = options.MergeAdapter is { } adapterFolder ? new AdapterMerge(adapterFolder) : null;
+        var weights = new CheckpointWeights(reader, architecture) { Adapter = adapter };
         var network = spec.Build(weights, new DecoderBuildOptions { Device = options.Device, Int8 = options.Int8, BFloat16 = options.BFloat16, Int4 = options.Int4, MaxPositions = maxPositions });
         var unused = reader.Tensors.Keys.Where(k => !weights.Used.Contains(k) && !k.EndsWith("rotary_emb.inv_freq", StringComparison.Ordinal)).ToList();
         if (unused.Count > 0)
         {
             notes.Add($"{unused.Count} checkpoint tensors were not used (for example {string.Join(", ", unused.Take(3))}).");
+        }
+
+        if (adapter is not null)
+        {
+            notes.Add($"adapter {options.MergeAdapter} merged into {adapter.Merged} weights.");
+            if (adapter.Merged == 0)
+            {
+                throw new InvalidDataException($"The adapter in {options.MergeAdapter} matches none of the model's weights.");
+            }
         }
 
         var tokenizer = File.Exists(Path.Combine(folder, "tokenizer.json")) ? BpeTokenizer.Load(folder) : null;
