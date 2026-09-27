@@ -543,7 +543,7 @@ internal sealed class ProgressLine(int start, int total, int every)
     private readonly Stopwatch _watch = Stopwatch.StartNew();
     private readonly bool _inPlace = every <= 0 && !Console.IsOutputRedirected;
     private readonly int _every = every > 0 ? every : 10;
-    private TimeSpan _lastDraw = TimeSpan.MinValue;
+    private double _lastDraw = double.NegativeInfinity;             // milliseconds
     private int _width;
 
     public void Update(int step, string stats)
@@ -553,12 +553,12 @@ internal sealed class ProgressLine(int start, int total, int every)
             return;
         }
 
-        if (_inPlace && (_watch.Elapsed - _lastDraw).TotalMilliseconds < 200 && step != total)
+        if (_inPlace && _watch.Elapsed.TotalMilliseconds - _lastDraw < 200 && step != total)
         {
             return;
         }
 
-        _lastDraw = _watch.Elapsed;
+        _lastDraw = _watch.Elapsed.TotalMilliseconds;
         int done = step - start;
         double rate = done / Math.Max(_watch.Elapsed.TotalSeconds, 1e-6);
         var remaining = TimeSpan.FromSeconds(rate > 0 ? (total - step) / rate : 0);
