@@ -212,6 +212,51 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// residual + x · W for a packed layer W with few rows (no bias, no adapter) and the RMS normalization of that sum
+    /// with gain, in one device pass (inference: not recorded): the output projection of a block, its residual addition
+    /// and the next normalization. Null when the layer or the shapes do not fit or the device has no fused version.
+    /// </summary>
+    internal static (Tensor Sum, Tensor Normalized)? MatMulPackedAddRmsNorm(Tensor x, Layers.Linear layer, Tensor residual, Layers.RMSNorm norm)
+    {
+        x.ThrowIfDisposed();
+        residual.ThrowIfDisposed();
+        int kind = layer.Int8 is not null ? 0 : layer.Int4 is not null ? 1 : layer.BFloat16 is not null ? 2 : -1;
+        int k = x._shape[^1], m = x.Size / Math.Max(1, k), n = layer.OutFeatures;
+        if (kind < 0 || layer.Bias is not null || layer.Adapter is not null || k != layer.InFeatures || m > Backends.Cuda.PtxKernels.GemvRows
+            || residual.Size != m * n || residual._shape[^1] != n || norm.Features != n || x.Device.Type != DeviceType.Cuda)
+        {
+            return null;
+        }
+
+        var (packed, scales) = kind switch
+        {
+            0 => (layer.Int8!.Packed, layer.Int8.Scales),
+            1 => (layer.Int4!.Packed, layer.Int4.Scales),
+            _ => (layer.BFloat16!.Packed, (Tensor?)null),
+        };
+        if (packed.Device != x.Device || residual.Device != x.Device || norm.Gain.Device != x.Device)
+        {
+            return null;
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var y = Empty(residual._shape, x.Device, track: false);
+        var sum = Empty(residual._shape, x.Device);
+        var normalized = Empty(residual._shape, x.Device);
+        bool done = x.Backend.PackedMatMulAddRmsNorm(kind, x.Storage, packed.Storage, scales?.Storage, y.Storage, m, n, k, residual.Storage, sum.Storage,
+            norm.Gain.Storage, normalized.Storage, norm.Epsilon, norm.Offset);
+        y.Dispose();                                                 // stream-ordered: freed after the kernel read it
+        if (!done)
+        {
+            sum.Dispose();
+            normalized.Dispose();
+            return null;
+        }
+
+        return (sum, Traced("matmul_add_rms_norm_packed", normalized, start));
+    }
+
+    /// <summary>
     /// The layers' packed products of one input in one device pass (few rows, not recorded), or null when the device has
     /// no single-pass version.
     /// </summary>
@@ -313,6 +358,59 @@ public sealed partial class Tensor
             dim, steps, half, interleaved);
         Traced("rms_norm_rope", yq, start);
         return (yq, Traced("rms_norm_rope", yk, start));
+    }
+
+    /// <summary>
+    /// An attention layer's projections q [batch, steps, heads·dim], k and v [batch, steps, kvHeads·dim] in the layouts
+    /// attention reads, in one pass where the device can (inference: not recorded): each query and key head
+    /// RMS-normalized with gain (when the norms are given) and rotated (when the tables are given), queries as
+    /// [batch·kvHeads, group·steps, dim] (the heads sharing a key/value head stacked), keys and values as
+    /// [batch·kvHeads, steps, dim], or, with a cache, written into it at <paramref name="position"/> (then K and V are
+    /// null). Null when the device has no fused version.
+    /// </summary>
+    internal static (Tensor Q, Tensor? K, Tensor? V)? NormRopeHeads(Tensor q, Tensor k, Tensor v, int heads, int kvHeads, int dim,
+        Layers.RMSNorm? queryNorm, Layers.RMSNorm? keyNorm, Tensor? cos, Tensor? sin, Tensor positions, bool interleaved,
+        Layers.KeyValueCache? cache, Tensor? position)
+    {
+        q.ThrowIfDisposed();
+        k.ThrowIfDisposed();
+        v.ThrowIfDisposed();
+        if ((queryNorm is null) != (keyNorm is null) || (cos is null) != (sin is null) || (cache is null) != (position is null)
+            || cache is { Format: Layers.KeyValueFormat.Int8 } || q.Device.Type != DeviceType.Cuda)
+        {
+            return null;
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int n = q._shape[0], t = q._shape[1];
+        var yq = Empty([n * kvHeads, heads / kvHeads * t, dim], q.Device);
+        Tensor? yk = null, yv = null;
+        int capacity = t, stride = dim;
+        bool bfloat16 = cache is { Format: Layers.KeyValueFormat.BFloat16 };
+        if (cache is null)
+        {
+            yk = Empty([n * kvHeads, t, dim], q.Device);
+            yv = Empty([n * kvHeads, t, dim], q.Device);
+        }
+        else
+        {
+            capacity = cache.Keys._shape[1];
+            stride = bfloat16 ? 2 * cache.Keys._shape[2] : cache.Keys._shape[2];
+        }
+
+        if (!q.Backend.NormRopeHeads(q.Storage, k.Storage, v.Storage, n, t, heads, kvHeads, dim, queryNorm?.Gain.Storage, queryNorm?.Epsilon ?? 0f,
+            queryNorm?.Offset ?? 0f, keyNorm?.Gain.Storage, keyNorm?.Epsilon ?? 0f, keyNorm?.Offset ?? 0f, cos?.Storage, sin?.Storage, positions.Storage,
+            cos?._shape[1] ?? 0, interleaved, yq.Storage, (yk ?? cache!.Keys).Storage, (yv ?? cache!.Values).Storage, position?.Storage, capacity, stride,
+            bfloat16))
+        {
+            yq.Dispose();
+            yk?.Dispose();
+            yv?.Dispose();
+            return null;
+        }
+
+        Traced("norm_rope_heads", yq, start);
+        return (yq, yk, yv);
     }
 
     /// <summary>act(gate) · up element-wise (kind 0 = SiLU, 1 = GELU, 2 = ReLU), with its gradient: one pass either way.</summary>

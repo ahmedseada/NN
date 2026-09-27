@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "attention_decode_bf16", "attention_flash_bf16", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32", "adam8_f32", "transpose_f32", "sumsq_f32", "sum_cols_strided_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_decode_bf16", "attention_flash_bf16", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32", "adam8_f32", "transpose_f32", "sumsq_f32", "sum_cols_strided_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -499,7 +499,6 @@ internal static partial class PtxKernels
         AttentionDecode(sb);
         AttentionDecode(sb, int8: true);
         AttentionDecode(sb, bf16: true);
-        AttentionCombine(sb);
         AttentionFlash(sb);
         AttentionFlash(sb, int8: true);
         AttentionFlash(sb, bf16: true);
@@ -1932,97 +1931,115 @@ internal static partial class PtxKernels
             bra CO;
             CO_END:
             """);
-        if (bf16)
-        {
-            RowBlock(sb, "attention_decode_bf16", ["q", "keys", "values", "pos", "y", "part"],
-                [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale"), ("u32", "words")], b.ToString(),
-                sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
-        }
-        else if (int8)
-        {
-            RowBlock(sb, "attention_decode_int8", ["q", "keys", "values", "kscales", "vscales", "pos", "y", "part"],
-                [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale"), ("u32", "words")], b.ToString(),
-                sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
-        }
-        else
-        {
-            RowBlock(sb, "attention_decode_f32", ["q", "keys", "values", "pos", "y", "part"],
-                [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale")], b.ToString(),
-                sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
-        }
-    }
 
-    // Merges the partial results of a split decoding attention: part[row, split] = (max, sum, acc[dim]) over one chunk
-    // of cached positions (max -inf for an empty chunk); y[row] = Σ acc·e^(max - M) / Σ sum·e^(max - M), M the largest max.
-    private static void AttentionCombine(StringBuilder sb) =>
-        RowBlock(sb, "attention_combine_f32", ["part", "y"], [("u32", "splits"), ("u32", "dim")], $$"""
-            mul.lo.u32 %r5, %row, %s_splits;
+        // With several splits, the last block of this row to finish (counted per row, reset afterwards) merges the
+        // splits' partial results: part[row, split] = (max, sum, acc[dim]) over its chunk of cached positions (max -inf
+        // when empty); y[row] = Σ acc·e^(max - M) / Σ sum·e^(max - M), M the largest max. Same launch, same order of sums.
+        b.AppendLine($"""
+            @!%p14 bra DONE;
+            membar.gl;
+            bar.sync 0;
+            mul.wide.u32 %rd1, %row, 4;
+            add.u64 %rd1, %rd1, %b_counters;
+            setp.eq.u32 %p15, %tx, 0;
+            mov.u32 %r5, 0;
+            @%p15 atom.global.add.u32 %r5, [%rd1], 1;
+            sub.u32 %r6, %r23, 1;
+            setp.eq.u32 %p1, %r5, %r6;
+            selp.u32 %r7, 1, 0, %p1;
+            @%p15 st.shared.u32 [%sbi], %r7;
+            bar.sync 0;
+            ld.shared.u32 %r7, [%sbi];
+            setp.eq.u32 %p1, %r7, 0;
+            @%p1 bra DONE;
+            membar.gl;
+            @%p15 st.global.u32 [%rd1], 0;
+            mul.lo.u32 %r5, %row, %r23;
             add.u32 %r6, %s_dim, 2;
             mul.lo.u32 %r7, %r5, %r6;
             mul.wide.u32 %rd1, %r7, 4;
             add.u64 %rd1, %rd1, %b_part;
             mul.wide.u32 %rd2, %r6, 4;
-            mov.f32 %f1, {{NegInf}};
+            mov.f32 %f1, {NegInf};
             mov.u32 %r8, 0;
             mov.u64 %rd3, %rd1;
-            AM:
-            setp.ge.u32 %p1, %r8, %s_splits;
-            @%p1 bra AM_END;
-            ld.global.f32 %f2, [%rd3];
+            FM:
+            setp.ge.u32 %p1, %r8, %r23;
+            @%p1 bra FM_END;
+            ld.global.cg.f32 %f2, [%rd3];
             max.f32 %f1, %f1, %f2;
             add.u64 %rd3, %rd3, %rd2;
             add.u32 %r8, %r8, 1;
-            bra AM;
-            AM_END:
-            mov.f32 %f3, {{Zero}};
+            bra FM;
+            FM_END:
+            mov.f32 %f3, {Zero};
             mov.u32 %r8, 0;
             mov.u64 %rd3, %rd1;
-            AS:
-            setp.ge.u32 %p1, %r8, %s_splits;
-            @%p1 bra AS_END;
-            ld.global.f32 %f2, [%rd3];
+            FS:
+            setp.ge.u32 %p1, %r8, %r23;
+            @%p1 bra FS_END;
+            ld.global.cg.f32 %f2, [%rd3];
             sub.f32 %f2, %f2, %f1;
-            mul.f32 %f2, %f2, {{Log2E}};
+            mul.f32 %f2, %f2, {Log2E};
             ex2.approx.ftz.f32 %f2, %f2;
-            ld.global.f32 %f4, [%rd3+4];
+            ld.global.cg.f32 %f4, [%rd3+4];
             fma.rn.f32 %f3, %f4, %f2, %f3;
             add.u64 %rd3, %rd3, %rd2;
             add.u32 %r8, %r8, 1;
-            bra AS;
-            AS_END:
+            bra FS;
+            FS_END:
             rcp.rn.f32 %f3, %f3;
             mul.lo.u32 %r10, %row, %s_dim;
             mul.wide.u32 %rd6, %r10, 4;
             add.u64 %rd6, %rd6, %b_y;
             mov.u32 %r9, %tx;
-            AD:
+            FD:
             setp.ge.u32 %p2, %r9, %s_dim;
-            @%p2 bra AD_END;
-            mov.f32 %f5, {{Zero}};
+            @%p2 bra FD_END;
+            mov.f32 %f5, {Zero};
             mov.u32 %r8, 0;
             mov.u64 %rd3, %rd1;
             mul.wide.u32 %rd4, %r9, 4;
-            AL:
-            setp.ge.u32 %p1, %r8, %s_splits;
-            @%p1 bra AL_END;
-            ld.global.f32 %f2, [%rd3];
+            FL:
+            setp.ge.u32 %p1, %r8, %r23;
+            @%p1 bra FL_END;
+            ld.global.cg.f32 %f2, [%rd3];
             sub.f32 %f2, %f2, %f1;
-            mul.f32 %f2, %f2, {{Log2E}};
+            mul.f32 %f2, %f2, {Log2E};
             ex2.approx.ftz.f32 %f2, %f2;
             add.u64 %rd5, %rd3, %rd4;
-            ld.global.f32 %f6, [%rd5+8];
+            ld.global.cg.f32 %f6, [%rd5+8];
             fma.rn.f32 %f5, %f6, %f2, %f5;
             add.u64 %rd3, %rd3, %rd2;
             add.u32 %r8, %r8, 1;
-            bra AL;
-            AL_END:
+            bra FL;
+            FL_END:
             mul.f32 %f5, %f5, %f3;
             add.u64 %rd7, %rd6, %rd4;
             st.global.f32 [%rd7], %f5;
             add.u32 %r9, %r9, %nt;
-            bra AD;
-            AD_END:
+            bra FD;
+            FD_END:
             """);
+        if (bf16)
+        {
+            RowBlock(sb, "attention_decode_bf16", ["q", "keys", "values", "pos", "y", "part", "counters"],
+                [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale"), ("u32", "words")], b.ToString(),
+                sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
+        }
+        else if (int8)
+        {
+            RowBlock(sb, "attention_decode_int8", ["q", "keys", "values", "kscales", "vscales", "pos", "y", "part", "counters"],
+                [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale"), ("u32", "words")], b.ToString(),
+                sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
+        }
+        else
+        {
+            RowBlock(sb, "attention_decode_f32", ["q", "keys", "values", "pos", "y", "part", "counters"],
+                [("u32", "rph"), ("u32", "steps"), ("u32", "cap"), ("u32", "dim"), ("f32", "scale")], b.ToString(),
+                sharedFloats: RowThreads / 32 * (2 + DecodeMaxDim));
+        }
+    }
 
     /// <summary>Threads of a <c>gemv_nn_f32</c> block: 32 columns × 32 slices of k.</summary>
     public const int GemvThreads = 1024;

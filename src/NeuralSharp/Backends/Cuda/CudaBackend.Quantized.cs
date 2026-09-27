@@ -86,19 +86,20 @@ internal sealed unsafe partial class CudaBackend
     // Few rows (decoding) through packed weights: read each weight word once, with enough blocks to keep every
     // multiprocessor busy; narrow matrices split k, and the last block of each column range adds the splits in order.
     // `align`: split boundaries fall on multiples of it (int4 splits start on a 64-row block).
+    // `up`: the gated kernels' second input; `tail`: further arguments (the addnorm kernels').
     private void PackedFewRows(string kernel, Storage x, Storage q, Storage scales, Storage y, int m, int n, int k, int words, int align = 1,
-        Storage? up = null)
+        Storage? up = null, ulong[]? tail = null)
     {
         int columnBlocks = (words + 31) / 32;
         int splits = Math.Clamp((4 * Math.Max(1, _multiprocessors) + columnBlocks - 1) / columnBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
         int chunk = ((k + splits - 1) / splits + align - 1) / align * align;
         splits = (k + chunk - 1) / chunk;
-        var counters = SplitCounters(columnBlocks);
+        var counters = SplitCounters(columnBlocks + 1);
         void Run(Storage partials, int count)
         {
-            ReadOnlySpan<ulong> args = [P(x), P(q), P(scales), P(y), P(partials), U(m), U(n), U(k), U(words), U(chunk), U(count), P(counters),
-                up is null ? 0UL : P(up)];
-            Launch(K(kernel), (uint)columnBlocks, (uint)count, 1, PtxKernels.Int8GemvThreads, 1, up is null ? args[..^1] : args);
+            ulong[] args = [P(x), P(q), P(scales), P(y), P(partials), U(m), U(n), U(k), U(words), U(chunk), U(count), P(counters),
+                .. up is null ? [] : new[] { P(up) }, .. tail ?? []];
+            Launch(K(kernel), (uint)columnBlocks, (uint)count, 1, PtxKernels.Int8GemvThreads, 1, args);
         }
 
         if (splits == 1)
@@ -172,6 +173,21 @@ internal sealed unsafe partial class CudaBackend
         int cpw = kind switch { 0 => 4, 1 => 8, _ => 2 };
         string kernel = (kind switch { 0 => "int8_gemv", 1 => "int4_gemv", _ => "bf16_gemv" }) + (activation == 0 ? "_silu_f32" : "_gelu_f32");
         PackedFewRows(kernel, gate, packed, scales ?? packed, y, m, n, k, (n + cpw - 1) / cpw, kind == 1 ? 64 : 1, up);
+        return true;
+    }
+
+    public override bool PackedMatMulAddRmsNorm(int kind, Storage x, Storage packed, Storage? scales, Storage y, int m, int n, int k,
+        Storage residual, Storage sum, Storage gain, Storage normalized, float eps, float offset)
+    {
+        if (m > PtxKernels.GemvRows || k == 0 || kind is < 0 or > 2)
+        {
+            return false;
+        }
+
+        int cpw = kind switch { 0 => 4, 1 => 8, _ => 2 };
+        string kernel = kind switch { 0 => "int8_gemv_addnorm_f32", 1 => "int4_gemv_addnorm_f32", _ => "bf16_gemv_addnorm_f32" };
+        PackedFewRows(kernel, x, packed, scales ?? packed, y, m, n, k, (n + cpw - 1) / cpw, kind == 1 ? 64 : 1,
+            tail: [P(residual), P(sum), P(gain), P(normalized), F(eps), F(offset)]);
         return true;
     }
 
@@ -292,28 +308,28 @@ internal sealed unsafe partial class CudaBackend
         }
 
         int rows = heads * rowsPerHead;
-        DecodeSplit(rows, capacity, dim, y, (splits, part) => Launch(K("attention_decode_f32"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
-            P(q), P(keys), P(values), P(position), P(y), P(part), U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(rows)));
+        DecodeSplit(rows, capacity, dim, y, (splits, part, counters) => Launch(K("attention_decode_f32"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
+            P(q), P(keys), P(values), P(position), P(y), P(part), P(counters), U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(rows)));
     }
 
     // Decoding attention has one block per query row (few rows: the heads of one token), so the cached positions are
-    // split over enough blocks to fill the GPU; each writes (max, sum, weighted values) for its chunk and
-    // attention_combine_f32 merges them. The split count depends only on the shapes, so recorded graphs stay valid as
-    // the cache fills (chunks are computed on the device from the current length).
-    private void DecodeSplit(int rows, int capacity, int dim, Storage y, Action<int, Storage> launch)
+    // split over enough blocks to fill the GPU; each writes (max, sum, weighted values) for its chunk and the last
+    // block of a row to finish merges them (counted in the split counters). The split count depends only on the shapes,
+    // so recorded graphs stay valid as the cache fills (chunks are computed on the device from the current length).
+    private void DecodeSplit(int rows, int capacity, int dim, Storage y, Action<int, Storage, Storage> launch)
     {
         int splits = Math.Clamp((2 * Math.Max(1, _multiprocessors) + rows - 1) / rows, 1, Math.Clamp(capacity / 64, 1, 32));
+        var counters = SplitCounters(rows);
         if (splits == 1)
         {
-            launch(1, y);
+            launch(1, y, counters);
             return;
         }
 
         var part = Allocate(rows * splits * (dim + 2), zeroed: false);
         try
         {
-            launch(splits, part);
-            LaunchRows(K("attention_combine_f32"), rows, P(part), P(y), U(splits), U(dim), U(rows));
+            launch(splits, part, counters);
         }
         finally
         {
@@ -485,8 +501,8 @@ internal sealed unsafe partial class CudaBackend
         }
 
         int rows = heads * rowsPerHead;
-        DecodeSplit(rows, capacity, dim, y, (splits, part) => Launch(K("attention_decode_int8"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
-            P(q), P(keys), P(values), P(keyScales), P(valueScales), P(position), P(y), P(part),
+        DecodeSplit(rows, capacity, dim, y, (splits, part, counters) => Launch(K("attention_decode_int8"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
+            P(q), P(keys), P(values), P(keyScales), P(valueScales), P(position), P(y), P(part), P(counters),
             U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows)));
     }
 
@@ -510,8 +526,8 @@ internal sealed unsafe partial class CudaBackend
         }
 
         int rows = heads * rowsPerHead;
-        DecodeSplit(rows, capacity, dim, y, (splits, part) => Launch(K("attention_decode_bf16"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
-            P(q), P(keys), P(values), P(position), P(y), P(part), U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows)));
+        DecodeSplit(rows, capacity, dim, y, (splits, part, counters) => Launch(K("attention_decode_bf16"), (uint)rows, (uint)splits, 1, PtxKernels.RowThreads, 1,
+            P(q), P(keys), P(values), P(position), P(y), P(part), P(counters), U(rowsPerHead), U(steps), U(capacity), U(dim), F(scale), U(words), U(rows)));
     }
 
     public override void KeyValueWriteBFloat16(Storage source, Storage cache, Storage position, int heads, int steps, int capacity, int dim)
@@ -534,4 +550,17 @@ internal sealed unsafe partial class CudaBackend
         LaunchRows(K("rms_norm_rope2_f32"), rows1 + rows2, P(x), P(gain), P(cos), P(sin), P(positions), P(y), P(x2), P(gain2), P(y2),
             U(cols), F(eps), F(offset), U(heads), U(steps), U(half), U(interleaved ? 1 : 0), U(rows1), F(eps2), F(offset2), U(heads2),
             U(rows1 + rows2));
+
+    public override bool NormRopeHeads(Storage q, Storage k, Storage v, int batch, int steps, int heads, int kvHeads, int cols,
+        Storage? gainQ, float epsQ, float offsetQ, Storage? gainK, float epsK, float offsetK, Storage? cos, Storage? sin, Storage? positions,
+        int half, bool interleaved, Storage yq, Storage yk, Storage yv, Storage? position, int capacity, int stride, bool bfloat16)
+    {
+        int rows1 = batch * steps * heads, rows2 = batch * steps * kvHeads;
+        int flags = (gainQ is not null ? 1 : 0) | (bfloat16 ? 2 : 0) | (position is not null ? 4 : 0);
+        static ulong Optional(Storage? s) => s is null ? 0UL : P(s);
+        LaunchRows(K("norm_rope_heads_f32"), rows1 + 2 * rows2, P(q), Optional(gainQ), P(k), Optional(gainK), P(v), Optional(cos), Optional(sin),
+            Optional(positions), Optional(position), P(yq), P(yk), P(yv), U(cols), F(epsQ), F(offsetQ), U(heads), F(epsK), F(offsetK), U(kvHeads),
+            U(steps), U(cos is null ? 0 : half), U(interleaved ? 1 : 0), U(rows1), U(rows2), U(flags), U(capacity), U(stride), U(rows1 + 2 * rows2));
+        return true;
+    }
 }

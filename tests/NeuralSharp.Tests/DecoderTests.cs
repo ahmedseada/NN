@@ -14,6 +14,7 @@ internal static partial class Tests
         ("decoder: tiled attention gradients (finite differences through queries, keys and values)", AttentionGradients),
         ("decoder: DecoderSpec variants match a plain reference implementation (GQA, q/k norm, biases, rope, tied, post-norms, parallel)", DecoderMatchesReference),
         ("decoder: cached decoding (float32 and int8 KV) and int8 weights match the full pass; generation", DecoderCachedAndInt8),
+        ("decoder: cached decoding through int8 / int4 / bfloat16 weights (fused head layout, cache writes, split attention, projection + residual + norm) matches the full pass and the CPU", DecoderCachedPacked),
         ("decoder: LoRA by layer name trains; JSON and package round trip", DecoderLoraAndPackage),
         ("decoder: tied head shares the table; last-position prefill; bf16 embedding tables save and load", DecoderMemory),
     ];
@@ -575,6 +576,69 @@ internal static partial class Tests
         var generator = new TextGenerator(model, new CharTokenizer("abcdefghijklmnopqrstuvw"), 16);
         var (text, _, stats) = generator.Generate("abc", new GenerationOptions { Temperature = 0f, TopK = 1, NumPredict = 8 });
         Check(stats.GeneratedTokens == 8 && text.Length == 8, $"generated '{text}'");
+    }
+
+    // Packed weights and a long cache: on CUDA the decoding steps run the fused kernels (q/k normalization, rotation,
+    // head layout and cache writes in one pass; attention split over the cache and merged by its last block; output and
+    // down projections with the residual addition and next normalization), the full pass the composed ones. Quantized
+    // caches only roughly match the full pass, so each device's decoding is also compared with the CPU's (same rounding).
+    private static void DecoderCachedPacked(Device device)
+    {
+        var specs = new (string Name, DecoderSpec Spec)[]
+        {
+            ("q/k norm", SmallSpec with { Dim = 64, HeadDim = 16, FfDim = 128, MaxPositions = 256, QkNorm = true }),
+            ("partial interleaved rope, norm offset", SmallSpec with
+            {
+                Dim = 64, HeadDim = 16, FfDim = 128, MaxPositions = 256, NormOffset = 1f, Rope = new RopeSettings(100f, RotaryDim: 8, Interleaved: true),
+            }),
+        };
+        int[] ids = [1, 4, 9, 16, 2, 7, 11, 3, 8, 20];
+        int T = ids.Length;
+        foreach (var (name, spec) in specs)
+        {
+            foreach (var weights in new[] { "int8", "int4", "bfloat16" })
+            {
+                var options = new DecoderBuildOptions { Int8 = weights == "int8", Int4 = weights == "int4", BFloat16 = weights == "bfloat16" };
+                using var model = spec.Build(new RandomWeights(63), options with { Device = device });
+                using var cpuModel = device.Type == DeviceType.Cpu ? null : spec.Build(new RandomWeights(63), options with { Device = Device.Cpu });
+                int V = spec.Vocabulary;
+                using var sequence = Tensor.From([.. ids.Select(i => (float)i)], [1, T], device);
+                var full = model.Predict(sequence).ToArray();
+                float range = full.Max(MathF.Abs);
+
+                // Logits of a 4-token prefill, then one token at a time (the cache is long enough to be split).
+                float[] Decode(Sequential m, Device d, KeyValueFormat format)
+                {
+                    m.Eval();
+                    var logits = new List<float>();
+                    using var context = new DecodingContext(d, 1, 256, format);
+                    using (Autograd.NoGrad())
+                    {
+                        using var prompt = Tensor.From([.. ids.Take(4).Select(i => (float)i)], [1, 4], d);
+                        logits.AddRange(m.ForwardCached(prompt, context).ToArray());
+                        for (int t = 4; t < T; t++)
+                        {
+                            using var next = Tensor.From([(float)ids[t]], [1, 1], d);
+                            logits.AddRange(m.ForwardCached(next, context).ToArray());
+                        }
+                    }
+
+                    return [.. logits];
+                }
+
+                foreach (var format in new[] { KeyValueFormat.Float32, KeyValueFormat.BFloat16, KeyValueFormat.Int8 })
+                {
+                    string label = $"{name}, {weights} weights, {format} cache";
+                    var cached = Decode(model, device, format);
+                    float tolerance = format switch { KeyValueFormat.Float32 => 1e-3f * range, KeyValueFormat.BFloat16 => 0.04f * range, _ => 0.1f * range };
+                    AssertClose(full, cached, tolerance, $"{label}: against the full pass");
+                    if (cpuModel is not null)
+                    {
+                        AssertClose(Decode(cpuModel, Device.Cpu, format), cached, (format == KeyValueFormat.Int8 ? 0.01f : 2e-3f) * range, $"{label}: against the CPU");
+                    }
+                }
+            }
+        }
     }
 
     private static void DecoderLoraAndPackage(Device device)

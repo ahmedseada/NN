@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // row padded to n4 = ceil(n / 4) words), with one float scale per column: w[k, j] = q[k, j] · scale[j].
 internal static partial class PtxKernels
 {
-    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32", "int4_gemv_f32", "int4_dequant_f32", "int8_gemv_multi_f32", "bf16_gemv_multi_f32", "int4_gemv_multi_f32", "int8_gemv_silu_f32", "bf16_gemv_silu_f32", "int4_gemv_silu_f32", "int8_gemv_gelu_f32", "bf16_gemv_gelu_f32", "int4_gemv_gelu_f32"];
+    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32", "int4_gemv_f32", "int4_dequant_f32", "int8_gemv_multi_f32", "bf16_gemv_multi_f32", "int4_gemv_multi_f32", "int8_gemv_silu_f32", "bf16_gemv_silu_f32", "int4_gemv_silu_f32", "int8_gemv_gelu_f32", "bf16_gemv_gelu_f32", "int4_gemv_gelu_f32", "int8_gemv_addnorm_f32", "bf16_gemv_addnorm_f32", "int4_gemv_addnorm_f32"];
 
     /// <summary>Rows of an int4 weight matrix that share one scale per column.</summary>
     public const int Int4Group = 32;
@@ -29,6 +29,9 @@ internal static partial class PtxKernels
         Int8Gemv(sb, multi: true);
         Int8Gemv(sb, bf16: true, multi: true);
         Int8Gemv(sb, int4: true, multi: true);
+        Int8Gemv(sb, addNorm: true);
+        Int8Gemv(sb, bf16: true, addNorm: true);
+        Int8Gemv(sb, int4: true, addNorm: true);
 
         // w[r, 8c + j] = nibble j of packed word (r, c) · s[r / Int4Group, 8c + j]: one thread per word.
         var dequant = new StringBuilder("""
@@ -379,12 +382,18 @@ internal static partial class PtxKernels
     //
     // gated 1 (…_gemv_silu_f32) / 2 (…_gemv_gelu_f32): the input is act(x) · up, computed as it is read (the gated
     // feed-forward's down projection without a separate activation pass); p_up follows p_counters.
-    private static void Int8Gemv(StringBuilder sb, bool bf16 = false, bool int4 = false, bool multi = false, int gated = 0)
+    //
+    // addNorm (…_gemv_addnorm_f32): then sum = res + y and norm = RMS-normalized sum · (gain + offset) per row (a
+    // residual addition and the next normalization): the last block to finish its column range (counted in
+    // counters[gridDim.x], reset afterwards) computes them over whole rows. p_res, p_sum, p_gain, p_norm, p_eps and
+    // p_offset follow p_counters.
+    private static void Int8Gemv(StringBuilder sb, bool bf16 = false, bool int4 = false, bool multi = false, int gated = 0, bool addNorm = false)
     {
         int cpw = bf16 ? 2 : int4 ? 8 : 4, columns = 32 * cpw;
         int acc = GemvRows * cpw, dec = Math.Max(32, acc), xr = dec + 8, sc = dec + 9, red = dec + 20;
         string part = bf16 ? "h_part" : int4 ? "i4_part" : "i8_part";
-        string name = (bf16 ? "bf16_gemv" : int4 ? "int4_gemv" : "int8_gemv") + (multi ? "_multi_f32" : gated == 1 ? "_silu_f32" : gated == 2 ? "_gelu_f32" : "_f32");
+        string name = (bf16 ? "bf16_gemv" : int4 ? "int4_gemv" : "int8_gemv") + (multi ? "_multi_f32" : gated == 1 ? "_silu_f32" : gated == 2 ? "_gelu_f32" : addNorm ? "_addnorm_f32" : "_f32");
+        string finished = addNorm ? "COLS_DONE" : "DONE";
         int gu = red + 8, gt = red + 9;
         bool scaled = !bf16 && !int4;
         var s = new StringBuilder();
@@ -400,7 +409,8 @@ internal static partial class PtxKernels
                 .param .u64 p_x, .param .u64 p_q, .param .u64 p_s, .param .u64 p_y, .param .u64 p_part,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_n4, .param .u32 p_chunk, .param .u32 p_splits,
                 .param .u64 p_counters
-              """ + (gated > 0 ? ", .param .u64 p_up" : "");
+              """ + (gated > 0 ? ", .param .u64 p_up" : "")
+              + (addNorm ? ", .param .u64 p_res, .param .u64 p_sum, .param .u64 p_gain, .param .u64 p_norm, .param .f32 p_eps, .param .f32 p_offset" : "");
         string loads = multi
             ? $$"""
                 mov.u32 %r39, %ctaid.z;
@@ -758,7 +768,7 @@ internal static partial class PtxKernels
         // the splits' partial sums in split order and writes the scaled result: one launch, deterministic sums.
         s.AppendLine($$"""
             ROWS_DONE:
-                @%p13 bra DONE;
+                @%p13 bra {{finished}};
                 membar.gl;
                 bar.sync 0;
                 ld.param.u64 %rd17, [p_counters];
@@ -780,13 +790,13 @@ internal static partial class PtxKernels
                 @%p15 bra DONE;
                 membar.gl;
                 @%p14 st.global.u32 [%rd17], 0;
-                @!%p11 bra DONE;
+                @!%p11 bra {{finished}};
                 mul.wide.u32 %rd19, %r1, %r2;
                 shl.b64 %rd19, %rd19, 2;
                 mov.u32 %r32, 0;
             FIN_ROW:
                 setp.ge.u32 %p16, %r32, %r1;
-                @%p16 bra DONE;
+                @%p16 bra {{finished}};
                 mul.wide.u32 %rd21, %r32, %r2;
                 shl.b64 %rd21, %rd21, 2;
                 add.u64 %rd21, %rd21, %rd13;
@@ -808,6 +818,122 @@ internal static partial class PtxKernels
                 st.global.f32 [%rd23], %f{{red + 3}};
                 add.u32 %r32, %r32, 1;
                 bra FIN_ROW;
+            """);
+        if (addNorm)
+        {
+            // Every thread of every block gets here once its columns are final; the last block adds and normalizes.
+            int t0 = red + 6, t1 = red + 7, t2 = red + 8, t3 = red + 9, t4 = red + 10, t5 = red + 11;
+            s.AppendLine($$"""
+                COLS_DONE:
+                    membar.gl;
+                    bar.sync 0;
+                    ld.param.u64 %rd17, [p_counters];
+                    cvta.to.global.u64 %rd17, %rd17;
+                    mov.u32 %r26, %nctaid.x;
+                    mul.wide.u32 %rd18, %r26, 4;
+                    add.u64 %rd17, %rd17, %rd18;
+                    setp.eq.u32 %p14, %r5, 0;
+                    mov.u32 %r27, 0;
+                    @%p14 atom.global.add.u32 %r27, [%rd17], 1;
+                    sub.u32 %r28, %r26, 1;
+                    setp.eq.u32 %p15, %r27, %r28;
+                    selp.u32 %r29, 1, 0, %p15;
+                    @%p14 st.shared.u32 [%r14], %r29;
+                    bar.sync 0;
+                    ld.shared.u32 %r29, [%r14];
+                    setp.eq.u32 %p15, %r29, 0;
+                    @%p15 bra DONE;
+                    membar.gl;
+                    @%p14 st.global.u32 [%rd17], 0;
+                    bar.sync 0;
+                    ld.param.u64 %rd18, [p_res];
+                    ld.param.u64 %rd19, [p_sum];
+                    ld.param.u64 %rd20, [p_gain];
+                    ld.param.u64 %rd21, [p_norm];
+                    cvta.to.global.u64 %rd18, %rd18;
+                    cvta.to.global.u64 %rd19, %rd19;
+                    cvta.to.global.u64 %rd20, %rd20;
+                    cvta.to.global.u64 %rd21, %rd21;
+                    ld.param.f32 %f{{t0}}, [p_eps];
+                    ld.param.f32 %f{{t1}}, [p_offset];
+                    cvt.rn.f32.u32 %f{{t2}}, %r2;
+                    shl.b32 %r22, %r7, 2;
+                    add.u32 %r22, %r22, %r14;
+                    setp.eq.u32 %p18, %r6, 0;
+                    mov.u32 %r32, 0;
+                AN_ROW:
+                    setp.ge.u32 %p16, %r32, %r1;
+                    @%p16 bra DONE;
+                    mul.lo.u32 %r33, %r32, %r2;
+                    mov.f32 %f{{t3}}, 0f00000000;
+                    mov.u32 %r20, %r5;
+                AN_SUM:
+                    setp.ge.u32 %p17, %r20, %r2;
+                    @%p17 bra AN_SUM_END;
+                    add.u32 %r21, %r33, %r20;
+                    mul.wide.u32 %rd22, %r21, 4;
+                    add.u64 %rd23, %rd22, %rd18;
+                    ld.global.f32 %f{{t4}}, [%rd23];
+                    add.u64 %rd23, %rd22, %rd4;
+                    ld.global.cg.f32 %f{{t5}}, [%rd23];
+                    add.f32 %f{{t4}}, %f{{t4}}, %f{{t5}};
+                    add.u64 %rd23, %rd22, %rd19;
+                    st.global.f32 [%rd23], %f{{t4}};
+                    fma.rn.f32 %f{{t3}}, %f{{t4}}, %f{{t4}}, %f{{t3}};
+                    add.u32 %r20, %r20, {{Int8GemvThreads}};
+                    bra AN_SUM;
+                AN_SUM_END:
+                    shfl.sync.bfly.b32 %f{{t5}}, %f{{t3}}, 16, 31, 0xffffffff;
+                    add.f32 %f{{t3}}, %f{{t3}}, %f{{t5}};
+                    shfl.sync.bfly.b32 %f{{t5}}, %f{{t3}}, 8, 31, 0xffffffff;
+                    add.f32 %f{{t3}}, %f{{t3}}, %f{{t5}};
+                    shfl.sync.bfly.b32 %f{{t5}}, %f{{t3}}, 4, 31, 0xffffffff;
+                    add.f32 %f{{t3}}, %f{{t3}}, %f{{t5}};
+                    shfl.sync.bfly.b32 %f{{t5}}, %f{{t3}}, 2, 31, 0xffffffff;
+                    add.f32 %f{{t3}}, %f{{t3}}, %f{{t5}};
+                    shfl.sync.bfly.b32 %f{{t5}}, %f{{t3}}, 1, 31, 0xffffffff;
+                    add.f32 %f{{t3}}, %f{{t3}}, %f{{t5}};
+                    @%p18 st.shared.f32 [%r22], %f{{t3}};
+                    bar.sync 0;
+                    mov.f32 %f{{t3}}, 0f00000000;
+                """);
+            for (int w = 0; w < Int8GemvThreads / 32; w++)
+            {
+                s.AppendLine($"    ld.shared.f32 %f{t5}, [%r14+{4 * w}];");
+                s.AppendLine($"    add.f32 %f{t3}, %f{t3}, %f{t5};");
+            }
+
+            s.AppendLine($$"""
+                    bar.sync 0;
+                    div.rn.f32 %f{{t3}}, %f{{t3}}, %f{{t2}};
+                    add.f32 %f{{t3}}, %f{{t3}}, %f{{t0}};
+                    sqrt.rn.f32 %f{{t3}}, %f{{t3}};
+                    rcp.rn.f32 %f{{t3}}, %f{{t3}};
+                    mov.u32 %r20, %r5;
+                AN_NORM:
+                    setp.ge.u32 %p17, %r20, %r2;
+                    @%p17 bra AN_NORM_END;
+                    add.u32 %r21, %r33, %r20;
+                    mul.wide.u32 %rd22, %r21, 4;
+                    add.u64 %rd23, %rd22, %rd19;
+                    ld.global.f32 %f{{t4}}, [%rd23];
+                    mul.wide.u32 %rd24, %r20, 4;
+                    add.u64 %rd24, %rd24, %rd20;
+                    ld.global.f32 %f{{t5}}, [%rd24];
+                    add.f32 %f{{t5}}, %f{{t5}}, %f{{t1}};
+                    mul.f32 %f{{t4}}, %f{{t4}}, %f{{t3}};
+                    mul.f32 %f{{t4}}, %f{{t4}}, %f{{t5}};
+                    add.u64 %rd23, %rd22, %rd21;
+                    st.global.f32 [%rd23], %f{{t4}};
+                    add.u32 %r20, %r20, {{Int8GemvThreads}};
+                    bra AN_NORM;
+                AN_NORM_END:
+                    add.u32 %r32, %r32, 1;
+                    bra AN_ROW;
+                """);
+        }
+
+        s.AppendLine("""
             DONE:
                 ret;
             }

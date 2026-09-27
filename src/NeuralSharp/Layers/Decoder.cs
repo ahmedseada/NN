@@ -311,7 +311,8 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         }
 
         var positions = Positions(t);
-        var (q, k, v) = Project(input, positions);
+        var (q, keys, values) = Project(input, positions);
+        Tensor k = keys!, v = values!;
         if (HeadDim <= Backends.Cuda.PtxKernels.FlashMaxDim)
         {
             // Tiled attention, forward and backward: no [t, t] weights stored (positions[0] = 0 is the causal offset).
@@ -333,24 +334,31 @@ public sealed class CausalSelfAttention : Module, ICachedModule
     }
 
     /// <inheritdoc />
-    public Tensor ForwardCached(Tensor input, DecodingContext context)
+    public Tensor ForwardCached(Tensor input, DecodingContext context) => Output.Forward(HeadsCached(input, context));
+
+    // ForwardCached without the output projection: the heads' results side by side, [n, t, heads·d].
+    internal Tensor HeadsCached(Tensor input, DecodingContext context)
     {
         int n = input.Shape[0], t = input.Shape[1];
         var positions = context.Positions ?? throw new InvalidOperationException("Call DecodingContext.BeginStep first.");
         var cache = context.CacheFor(this, n * KvHeads, HeadDim);
-        var (q, k, v) = Project(input, positions);
+        var (q, k, v) = Project(input, positions, cache, context.Position);   // k and v null: already in the cache
         float scale = 1f / MathF.Sqrt(HeadDim);
         Tensor context8;
         if (cache.Format == KeyValueFormat.BFloat16)
         {
-            Tensor.WriteKeyValuesBFloat16(k, cache.Keys, context.Position, HeadDim);
-            Tensor.WriteKeyValuesBFloat16(v, cache.Values, context.Position, HeadDim);
+            if (k is not null)
+            {
+                Tensor.WriteKeyValuesBFloat16(k, cache.Keys, context.Position, HeadDim);
+                Tensor.WriteKeyValuesBFloat16(v!, cache.Values, context.Position, HeadDim);
+            }
+
             context8 = Tensor.AttentionBFloat16(q, cache, context.Position, t, scale, tiled: t >= 8);   // only the filled positions
         }
         else if (cache.Format == KeyValueFormat.Int8)
         {
-            Tensor.WriteKeyValuesInt8(k, cache.Keys, cache.KeyScales!, context.Position);
-            Tensor.WriteKeyValuesInt8(v, cache.Values, cache.ValueScales!, context.Position);
+            Tensor.WriteKeyValuesInt8(k!, cache.Keys, cache.KeyScales!, context.Position);
+            Tensor.WriteKeyValuesInt8(v!, cache.Values, cache.ValueScales!, context.Position);
             if (HeadDim <= Backends.Cuda.PtxKernels.DecodeMaxDim)
             {
                 context8 = Tensor.AttentionInt8(q, cache, context.Position, t, scale, tiled: t >= 8);   // only the filled positions
@@ -363,8 +371,12 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         }
         else
         {
-            Tensor.WriteKeyValues(k, cache.Keys, context.Position);
-            Tensor.WriteKeyValues(v, cache.Values, context.Position);
+            if (k is not null)
+            {
+                Tensor.WriteKeyValues(k, cache.Keys, context.Position);
+                Tensor.WriteKeyValues(v!, cache.Values, context.Position);
+            }
+
             if (t >= 8 && HeadDim <= Backends.Cuda.PtxKernels.FlashMaxDim)
             {
                 context8 = Tensor.AttentionTiled(q, cache.Keys, cache.Values, context.Position, t, scale);   // a prompt: tiled
@@ -380,14 +392,22 @@ public sealed class CausalSelfAttention : Module, ICachedModule
             }
         }
 
-        return Merge(context8, n, t);
+        return MergeHeads(context8, n, t);
     }
 
-    // Projections → q [n·kv, group·t, d] (the query heads sharing a key/value head are stacked), k and v [n·kv, t, d].
-    private (Tensor Q, Tensor K, Tensor V) Project(Tensor input, Tensor positions)
+    // Projections → q [n·kv, group·t, d] (the query heads sharing a key/value head are stacked), k and v [n·kv, t, d];
+    // with a (float32 or bfloat16) cache, inference writes k and v into it in the same pass and returns them null.
+    private (Tensor Q, Tensor? K, Tensor? V) Project(Tensor input, Tensor positions, KeyValueCache? cache = null, Tensor? position = null)
     {
         int n = input.Shape[0], t = input.Shape[1], d = HeadDim;
         var projected = Linear.ForwardMany(input, Query, Key, Value);
+        if (!Autograd.IsEnabled && Tensor.NormRopeHeads(projected[0], projected[1], projected[2], Heads, KvHeads, d, QueryNorm, KeyNorm,
+                Rope is null ? null : _cos, Rope is null ? null : _sin, positions, Rope?.Interleaved ?? false,
+                cache is { Format: not KeyValueFormat.Int8 } ? cache : null, cache is { Format: not KeyValueFormat.Int8 } ? position : null) is { } heads)
+        {
+            return heads;                           // normalization, rotation and head layout (or cache writes) in one pass
+        }
+
         var q = projected[0].Reshape(n, t, Heads, d);
         var k = projected[1].Reshape(n, t, KvHeads, d);
         var v = projected[2].Reshape(n, t, KvHeads, d);
@@ -425,8 +445,10 @@ public sealed class CausalSelfAttention : Module, ICachedModule
     }
 
     // [n·kv, group·t, d] → [n, t, heads·d] → output projection (query head h = kv · group + g, as the heads were split).
-    private Tensor Merge(Tensor context, int n, int t) =>
-        Output.Forward(context.Reshape(n, KvHeads, Group, t, HeadDim).Permute(0, 3, 1, 2, 4).Reshape(n, t, Heads * HeadDim));
+    private Tensor Merge(Tensor context, int n, int t) => Output.Forward(MergeHeads(context, n, t));
+
+    private Tensor MergeHeads(Tensor context, int n, int t) =>
+        context.Reshape(n, KvHeads, Group, t, HeadDim).Permute(0, 3, 1, 2, 4).Reshape(n, t, Heads * HeadDim);
 
     private Tensor Positions(int t)
     {
@@ -582,6 +604,24 @@ public sealed class FeedForward : Module
         return Down.Forward(hidden);
     }
 
+    /// <summary>
+    /// Whether <see cref="DownInput"/> and a fused down projection (int8 or bfloat16 weights, no bias or adapter) can
+    /// stand in for <see cref="Module.Forward"/> at inference (4-bit weights keep their activation-reading product).
+    /// </summary>
+    internal bool DownFusable => (Down.Int8 is not null || Down.BFloat16 is not null) && Down.Bias is null && Down.Adapter is null;
+
+    // The down projection's input at inference: act(gate) · up, or act(up).
+    internal Tensor DownInput(Tensor input)
+    {
+        if (Gate is null)
+        {
+            return Activate(Up.Forward(input));
+        }
+
+        var projected = Linear.ForwardMany(input, Gate, Up);
+        return Tensor.GatedActivation(projected[0], projected[1], (int)Activation);
+    }
+
     private Tensor Activate(Tensor x) => Activation switch
     {
         FeedForwardActivation.Silu => x * x.Sigmoid(),
@@ -678,32 +718,40 @@ public sealed class DecoderBlock : Module, ICachedModule
     protected override Tensor ForwardCore(Tensor input) => Run(input, x => Attention.Forward(x));
 
     /// <inheritdoc />
-    public Tensor ForwardCached(Tensor input, DecodingContext context) => Run(input, x => Attention.ForwardCached(x, context));
+    public Tensor ForwardCached(Tensor input, DecodingContext context) =>
+        Run(input, x => Attention.ForwardCached(x, context), x => Attention.HeadsCached(x, context));
 
-    private Tensor Run(Tensor input, Func<Tensor, Tensor> attend)
+    // attendHeads: attention without its output projection, which inference then runs together with the residual
+    // addition and the next normalization where the device can (few rows, packed weights).
+    private Tensor Run(Tensor input, Func<Tensor, Tensor> attend, Func<Tensor, Tensor>? attendHeads = null)
     {
         var normalized = AttentionNorm.Forward(input);
-        var attended = attend(normalized);
-        if (PostAttentionNorm is not null)
-        {
-            attended = PostAttentionNorm.Forward(attended);
-        }
-
-        if (Parallel)
-        {
-            var parallel = FeedForward.Forward(normalized);
-            return Dropping ? ResidualDropout!.AddTo(ResidualDropout.AddTo(input, attended), parallel) : input + attended + parallel;
-        }
-
+        bool inference = !Autograd.IsEnabled && !Dropping;
         Tensor x, fed;
-        if (FeedForwardNorm is RMSNorm norm && !Autograd.IsEnabled && !Dropping)
+        if (!Parallel && inference && FeedForwardNorm is RMSNorm norm)
         {
-            var (sum, fedInput) = Tensor.AddRmsNormAffine(input, attended, norm.Gain, norm.Epsilon, norm.Offset);   // one pass
+            var (sum, fedInput) = attendHeads is not null && PostAttentionNorm is null
+                ? AddProjected(attendHeads(normalized), Attention.Output, input, norm)
+                : Tensor.AddRmsNormAffine(input, Attend(normalized, attend), norm.Gain, norm.Epsilon, norm.Offset);   // one pass
             x = sum;
+            if (PostFeedForwardNorm is null && NextNorm is { } following && FeedForward.DownFusable)
+            {
+                var (output, nextInput) = AddProjected(FeedForward.DownInput(fedInput), FeedForward.Down, x, following);
+                RMSNorm.HandOff(following, output, nextInput);
+                return output;
+            }
+
             fed = FeedForward.Forward(fedInput);
         }
         else
         {
+            var attended = Attend(normalized, attend);
+            if (Parallel)
+            {
+                var parallel = FeedForward.Forward(normalized);
+                return Dropping ? ResidualDropout!.AddTo(ResidualDropout.AddTo(input, attended), parallel) : input + attended + parallel;
+            }
+
             x = Dropping ? ResidualDropout!.AddTo(input, attended) : input + attended;          // dropout fused in
             fed = FeedForward.Forward(FeedForwardNorm!.Forward(x));
         }
@@ -722,6 +770,18 @@ public sealed class DecoderBlock : Module, ICachedModule
 
         return Dropping ? ResidualDropout!.AddTo(x, fed) : x + fed;
     }
+
+    private Tensor Attend(Tensor normalized, Func<Tensor, Tensor> attend)
+    {
+        var attended = attend(normalized);
+        return PostAttentionNorm is null ? attended : PostAttentionNorm.Forward(attended);
+    }
+
+    // residual + projection(h) and its normalization: one pass for packed weights and few rows, else the projection
+    // followed by the fused addition and normalization.
+    private static (Tensor Sum, Tensor Normalized) AddProjected(Tensor h, Linear projection, Tensor residual, RMSNorm norm) =>
+        Tensor.MatMulPackedAddRmsNorm(h, projection, residual, norm)
+        ?? Tensor.AddRmsNormAffine(residual, projection.Forward(h), norm.Gain, norm.Epsilon, norm.Offset);
 
     /// <inheritdoc />
     public override string ToString() => $"DecoderBlock({(Parallel ? "parallel" : "sequential")})";

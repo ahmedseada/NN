@@ -9,7 +9,8 @@
 //                    NeuralSharp only: --fp32 (no bfloat16 tensor cores), --fp8 (FP8 tensor-core products, compute
 //                    capability 8.9+: faster, coarser; compare the loss curve), --cpu, --gpu-memory GiB, --offload,
 //                    --log-every N (a new progress line every N steps; default: one line redrawn in place),
-//                    --profile (time every kernel of one step, after three warm-up steps, and exit)
+//                    --profile (time every kernel of one step, after three warm-up steps, and exit; without a corpus
+//                    it times random tokens)
 //   generate         --out <checkpoint dir> [--checkpoint best|last] --prompt "text" --tokens 500
 //                    --temperature 0.7 --top-k 0 --top-p 0.9 --repeat-penalty 1.15
 //
@@ -87,6 +88,7 @@ int Train()
     Directory.CreateDirectory(outDir);
 
     // ---------------------------------------------------------------- data
+    bool profiling = flags.Contains("--profile"), synthetic = false;
     string binPath;
     List<string> itos;
     if (options.TryGetValue("--bin", out var bin))
@@ -97,14 +99,45 @@ int Train()
     else
     {
         string corpus = Get("--corpus", "data/outlets.txt");
-        if (!flags.Contains("--skip-clean"))
+        string encoded = Path.Combine(outDir, "corpus.bin"), encodedVocab = Path.Combine(outDir, "vocab.txt");
+        if (File.Exists(corpus))
         {
-            Console.WriteLine($"note: clean_corpus.py's cleaning is not reproduced; training on {corpus} as it is "
-                              + "(pass the cleaned file the Python script wrote, with --skip-clean, to match it).");
-        }
+            if (!flags.Contains("--skip-clean"))
+            {
+                Console.WriteLine($"note: clean_corpus.py's cleaning is not reproduced; training on {corpus} as it is "
+                                  + "(pass the cleaned file the Python script wrote, with --skip-clean, to match it).");
+            }
 
-        binPath = Path.Combine(outDir, "corpus.bin");
-        itos = EncodeCorpus(corpus, binPath);
+            binPath = encoded;
+            itos = EncodeCorpus(corpus, binPath);
+        }
+        else if (File.Exists(encoded) && File.Exists(encodedVocab))
+        {
+            Console.WriteLine($"note: {corpus} not found; using {encoded} and {encodedVocab}, encoded by an earlier run.");
+            binPath = encoded;
+            itos = LoadVocab(encodedVocab);
+        }
+        else if (profiling)
+        {
+            // Timing needs no real text: random ids over a character-sized vocabulary.
+            const int SyntheticVocabulary = 256;
+            Console.WriteLine($"note: {corpus} not found; profiling on random tokens (vocabulary {SyntheticVocabulary}).");
+            binPath = Path.Combine(outDir, "profile-tokens.bin");
+            var ids = new byte[2 * (4 << 20)];
+            var fill = new Random(seed);
+            for (int i = 0; i < ids.Length; i += 2)
+            {
+                ids[i] = (byte)fill.Next(SyntheticVocabulary);
+            }
+
+            File.WriteAllBytes(binPath, ids);
+            itos = [.. Enumerable.Range(0, SyntheticVocabulary).Select(i => char.ConvertFromUtf32(0x100 + i))];
+            synthetic = true;
+        }
+        else
+        {
+            throw new FileNotFoundException($"{corpus} not found: pass --corpus <text file> (or --bin <ids> with --vocab-file <vocab>).", corpus);
+        }
     }
 
     using var tokens = new TokenFile(binPath);
@@ -112,7 +145,10 @@ int Train()
     var train = (Start: 0L, Length: split);
     var val = (Start: split, Length: tokens.Length - split);
     Console.WriteLine($"memmap  bin={binPath}  vocab={itos.Count}  train={train.Length:N0}  val={val.Length:N0}");
-    SaveVocab(Path.Combine(outDir, "vocab.txt"), itos);
+    if (!synthetic)
+    {
+        SaveVocab(Path.Combine(outDir, "vocab.txt"), itos);
+    }
 
     // ---------------------------------------------------------------- model
     var spec = GptSpec(itos.Count, dim, heads, layers, block, dropout);
@@ -221,7 +257,6 @@ int Train()
     var progress = new ProgressLine(startStep, steps, logEvery);
     double lossSum = 0, lastVal = double.IsFinite(best) ? best : double.NaN;
     var watch = Stopwatch.StartNew();
-    bool profiling = flags.Contains("--profile");
     var stepWatch = new Stopwatch();
     for (int step = startStep + 1; step <= steps; step++)
     {

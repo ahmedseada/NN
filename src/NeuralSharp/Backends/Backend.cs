@@ -141,6 +141,14 @@ internal abstract class Backend
         int m, int n, int k) => false;
 
     /// <summary>
+    /// y = x · w for few rows with packed weights w (<paramref name="kind"/> as in <see cref="PackedMatMulMany"/>), then
+    /// sum = residual + y and normalized = its RMS normalization · (gain + offset) per row (a residual addition and the
+    /// next normalization) in the same pass. Returns false when the device has no fused version.
+    /// </summary>
+    public virtual bool PackedMatMulAddRmsNorm(int kind, Storage x, Storage packed, Storage? scales, Storage y, int m, int n, int k,
+        Storage residual, Storage sum, Storage gain, Storage normalized, float eps, float offset) => false;
+
+    /// <summary>
     /// Several few-row products of packed weights sharing one input x [m, k]: y_j = x · w_j (+ bias_j), with w_j int8
     /// (<paramref name="kind"/> 0, as in <see cref="Int8MatMul"/>), 4-bit (1, <see cref="Int4MatMul"/>) or bfloat16 (2,
     /// <see cref="BFloat16MatMul"/>; no scales). Returns false when the device has no single-pass version (callers then
@@ -419,6 +427,18 @@ internal abstract class Backend
         RmsNormRope(x, gain, cos, sin, positions, y, rows1, cols, eps, offset, heads, steps, half, interleaved);
         RmsNormRope(x2, gain2, cos, sin, positions, y2, rows2, cols, eps2, offset2, heads2, steps, half, interleaved);
     }
+
+    /// <summary>
+    /// The attention layer's queries, keys and values [batch, steps, heads·cols] (its projections) put in the layouts
+    /// attention reads, in one pass (inference): query heads RMS-normalized with gain (when <paramref name="gainQ"/> is
+    /// set; keys then with <paramref name="gainK"/>) and rotated as <see cref="Rope"/> (half 0: no rotation) into
+    /// yq [batch, heads, steps, cols]; keys the same and values unchanged into yk and yv [batch, kvHeads, capacity, stride]
+    /// at row position[0] + s (a cache; row s when <paramref name="position"/> is null), as floats or bfloat16 pairs.
+    /// Returns false when the device has no such kernel (callers then run the steps one by one).
+    /// </summary>
+    public virtual bool NormRopeHeads(Storage q, Storage k, Storage v, int batch, int steps, int heads, int kvHeads, int cols,
+        Storage? gainQ, float epsQ, float offsetQ, Storage? gainK, float epsK, float offsetK, Storage? cos, Storage? sin, Storage? positions,
+        int half, bool interleaved, Storage yq, Storage yk, Storage yv, Storage? position, int capacity, int stride, bool bfloat16) => false;
 
     /// <summary>
     /// Token cross-entropy for language-model training, per row r of logits [rows, vocabulary] with target class t_r and
