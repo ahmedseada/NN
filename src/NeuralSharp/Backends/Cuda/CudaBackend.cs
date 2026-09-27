@@ -316,6 +316,10 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void ReleaseCachedMemory()
     {
         MakeCurrent();
+
+        // A cached block was released by the host, but kernels queued earlier may still read or write it: wait for
+        // them before the memory goes back to the driver.
+        Check(cuStreamSynchronize(_stream), nameof(cuStreamSynchronize));
         lock (_pool)
         {
             foreach (var (length, bucket) in _pool)
@@ -620,7 +624,27 @@ internal sealed unsafe partial class CudaBackend : Backend
 
         using var use = UseStream();
         Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, 0, _stream, pointers, null), nameof(cuLaunchKernel));
+        if (DebugLaunches && _captureFree is null)
+        {
+            // Debugging aid: wait for every kernel so a fault is reported by the kernel that caused it.
+            int result = cuStreamSynchronize(_stream);
+            if (result != 0)
+            {
+                string name = _signatures.TryGetValue(function, out var failed) ? failed.Name : $"0x{function:X}";
+                var shown = new List<string>();
+                for (int i = 0; i < args.Length; i++)
+                {
+                    shown.Add($"0x{args[i]:X}");
+                }
+
+                throw new CudaException($"Kernel {name} failed (grid {gridX}×{gridY}×{gridZ}, block {blockX}×{blockY}; arguments {string.Join(", ", shown)}): "
+                    + CudaDriver.Describe(result));
+            }
+        }
     }
+
+    // NEURALSHARP_CUDA_DEBUG=1: synchronize after every kernel launch and name the kernel that failed (slow).
+    private static readonly bool DebugLaunches = Environment.GetEnvironmentVariable("NEURALSHARP_CUDA_DEBUG") is "1" or "true";
 
     private static ulong P(Storage s) => ((CudaStorage)s).Pointer;
 

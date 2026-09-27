@@ -62,18 +62,22 @@ internal static unsafe partial class CudaDriver
 
     public static void Check(int result, string call)
     {
-        if (result == 0)
+        if (result != 0)
         {
-            return;
+            throw new CudaException($"{call} failed: {Describe(result)}");
         }
+    }
 
+    // The driver's name for an error code, with the code.
+    public static string Describe(int result)
+    {
         string name = "CUDA_ERROR";
         if (cuGetErrorName(result, out var text) == 0 && text != null)
         {
             name = Marshal.PtrToStringAnsi((IntPtr)text) ?? name;
         }
 
-        throw new CudaException($"{call} failed: {name} ({result})");
+        return $"{name} ({result})";
     }
 
     public const int ErrorOutOfMemory = 2;
