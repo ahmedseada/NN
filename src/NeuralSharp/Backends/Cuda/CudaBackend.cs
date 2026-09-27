@@ -81,8 +81,11 @@ internal sealed unsafe partial class CudaBackend : Backend
     /// <summary>Why bfloat16 tensor-core products are unavailable on this GPU (null when they are available or untried).</summary>
     public string? TensorCoreUnavailableReason { get; private set; }
 
-    /// <summary>Tensor-core products copy a transposed operand into [m, k] / [k, n] layout first (benchmarks switch it off).</summary>
-    internal static bool PretransposeForTensorCores = true;
+    /// <summary>
+    /// Tensor-core products copy a transposed operand into [m, k] / [k, n] layout first. Off: the transposing kernels
+    /// measured as fast as the plain one (tests --bench-gemm), so the copy only costs time and memory.
+    /// </summary>
+    internal static bool PretransposeForTensorCores;
 
     // Dynamic shared memory of the next launch on this thread (consumed by Launch).
     [ThreadStatic]

@@ -84,7 +84,9 @@ internal static partial class PtxKernels
             )
             {
                 .reg .pred %p<16>;
-                .reg .pred %pbeta;
+                .reg .pred %pbeta, %peven, %qnot;
+                .reg .pred %q<12>;
+                .reg .f32 %e<8>;
                 .reg .f32 %c<64>;
                 .reg .b32 %fa<16>;
                 .reg .b32 %fb<8>;
@@ -360,6 +362,13 @@ internal static partial class PtxKernels
                 add.u64 %rd14, %rd14, %rd16;
                 add.u64 %rd14, %rd14, %rd3;
             """);
+        // Per row group (8 elements of one row): read the old values first, all at once (pairs as 8-byte loads when n is
+        // even, so both columns share an aligned pair), then add and store. Reading them one by one between the stores
+        // made the epilogue wait on memory 64 times per thread, halving the speed of beta ≠ 0 products.
+        s.AppendLine("""
+                and.b32 %r47, %r2, 1;
+                setp.eq.u32 %peven, %r47, 0;
+            """);
         for (int mt = 0; mt < 4; mt++)
         {
             for (int half = 0; half < 2; half++)
@@ -373,20 +382,44 @@ internal static partial class PtxKernels
                     """);
                 for (int nt = 0; nt < 4; nt++)
                 {
-                    for (int j = 0; j < 2; j++)
-                    {
-                        int dc = nt * 8 + j, c = (mt * 4 + nt) * 4 + half * 2 + j;
-                        s.AppendLine($"""
-                                add.u32 %r46, %r43, {dc};
-                                setp.lt.u32 %p7, %r46, %r2;
-                                and.pred %p7, %p7, %p6;
-                                and.pred %p8, %p7, %pbeta;
-                                mov.f32 %f1, 0f00000000;
-                                @%p8 ld.global.f32 %f1, [%rd17+{dc * 4}];
-                                fma.rn.f32 %f2, %f1, %beta, %c{c};
-                                @%p7 st.global.f32 [%rd17+{dc * 4}], %f2;
-                            """);
-                    }
+                    // %q(3nt): the pair as one vector; %q(3nt+1), %q(3nt+2): single columns (odd n, or the last column).
+                    s.AppendLine($"""
+                            add.u32 %r46, %r43, {nt * 8};
+                            setp.lt.u32 %q{3 * nt + 1}, %r46, %r2;
+                            and.pred %q{3 * nt + 1}, %q{3 * nt + 1}, %p6;
+                            add.u32 %r46, %r46, 1;
+                            setp.lt.u32 %q{3 * nt + 2}, %r46, %r2;
+                            and.pred %q{3 * nt + 2}, %q{3 * nt + 2}, %p6;
+                            and.pred %q{3 * nt}, %q{3 * nt + 2}, %peven;
+                            not.pred %qnot, %q{3 * nt};
+                            and.pred %q{3 * nt + 1}, %q{3 * nt + 1}, %qnot;
+                            and.pred %q{3 * nt + 2}, %q{3 * nt + 2}, %qnot;
+                            mov.f32 %e{2 * nt}, 0f00000000;
+                            mov.f32 %e{2 * nt + 1}, 0f00000000;
+                        """);
+                }
+
+                s.AppendLine("@!%pbeta bra EPI_ADD_" + (mt * 2 + half) + ";");
+                for (int nt = 0; nt < 4; nt++)
+                {
+                    s.AppendLine($$"""
+                            @%q{{3 * nt}} ld.global.v2.f32 {%e{{2 * nt}}, %e{{2 * nt + 1}}}, [%rd17+{{nt * 32}}];
+                            @%q{{3 * nt + 1}} ld.global.f32 %e{{2 * nt}}, [%rd17+{{nt * 32}}];
+                            @%q{{3 * nt + 2}} ld.global.f32 %e{{2 * nt + 1}}, [%rd17+{{nt * 32 + 4}}];
+                        """);
+                }
+
+                s.AppendLine("EPI_ADD_" + (mt * 2 + half) + ":");
+                for (int nt = 0; nt < 4; nt++)
+                {
+                    int c = (mt * 4 + nt) * 4 + half * 2;
+                    s.AppendLine($$"""
+                            fma.rn.f32 %e{{2 * nt}}, %e{{2 * nt}}, %beta, %c{{c}};
+                            fma.rn.f32 %e{{2 * nt + 1}}, %e{{2 * nt + 1}}, %beta, %c{{c + 1}};
+                            @%q{{3 * nt}} st.global.v2.f32 [%rd17+{{nt * 32}}], {%e{{2 * nt}}, %e{{2 * nt + 1}}};
+                            @%q{{3 * nt + 1}} st.global.f32 [%rd17+{{nt * 32}}], %e{{2 * nt}};
+                            @%q{{3 * nt + 2}} st.global.f32 [%rd17+{{nt * 32 + 4}}], %e{{2 * nt + 1}};
+                        """);
                 }
             }
         }

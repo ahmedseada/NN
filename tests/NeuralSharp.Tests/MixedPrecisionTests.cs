@@ -220,6 +220,7 @@ internal static partial class Tests
                     double direct = Time(() => backend.BatchedMatMul(a.Storage, b.Storage, c.Storage, 1, m, n, k, ta, tb, beta), 10);
                     CudaBackend.PretransposeForTensorCores = true;
                     double copied = ta || tb ? Time(() => backend.BatchedMatMul(a.Storage, b.Storage, c.Storage, 1, m, n, k, ta, tb, beta), 10) : direct;
+                    CudaBackend.PretransposeForTensorCores = false;
                     double fresh = Time(() =>
                     {
                         using var output = Tensor.Zeros([m * n], device);
