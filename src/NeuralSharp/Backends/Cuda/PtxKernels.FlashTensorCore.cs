@@ -449,13 +449,13 @@ internal static partial class PtxKernels
         string name = $"flash_tc_bwd_q_d{d}";
         var s = new StringBuilder();
         s.AppendLine($$"""
+            .extern .shared .align 16 .b8 {{name}}_smem[];
             .visible .entry {{name}}(
                 .param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_do, .param .u64 p_lse, .param .u64 p_delta, .param .u64 p_dq,
                 .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_cap, .param .f32 p_scale, .param .f32 p_scale2
             )
             {
             {{FlashRegisters(d, 4 * dTiles)}}
-                .extern .shared .align 16 .b8 {{name}}_smem[];
             {{FlashLanes(stride)}}
                 ld.param.u64 %rd10, [p_q];
                 ld.param.u64 %rd11, [p_k];
@@ -663,6 +663,7 @@ internal static partial class PtxKernels
         string name = $"flash_tc_bwd_kv_d{d}";
         var s = new StringBuilder();
         s.AppendLine($$"""
+            .extern .shared .align 16 .b8 {{name}}_smem[];
             .visible .entry {{name}}(
                 .param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_do, .param .u64 p_lse, .param .u64 p_delta,
                 .param .u64 p_dk, .param .u64 p_dv,
@@ -670,7 +671,6 @@ internal static partial class PtxKernels
             )
             {
             {{FlashRegisters(d, 4 * dTiles)}}
-                .extern .shared .align 16 .b8 {{name}}_smem[];
             {{FlashLanes(stride)}}
                 ld.param.u64 %rd10, [p_q];
                 ld.param.u64 %rd11, [p_k];
