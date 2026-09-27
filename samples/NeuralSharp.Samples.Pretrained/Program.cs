@@ -16,12 +16,13 @@ using NeuralSharp.Pretrained;
 //   check <reference.json>          compare with transformers: token ids, chat templates, logits, greedy output
 //                                   (make the reference with tools/pytorch/pretrained_reference.py)
 //
-//   finetune <folder> <train.jsonl> --out <dir>
+//   finetune <folder> <train.jsonl> --out <dir>      (try: data/agent-demo-train.jsonl, data/agent-demo-eval.jsonl)
 //                                   LoRA / QLoRA on chat transcripts (JSON Lines: {"messages": [...], "tools": [...]});
 //                                   only the assistant's turns are trained; writes a PEFT adapter to <dir>
 //                                   (--eval F, --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048,
 //                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
 //                                   --eval-every N; with --int4 / --int8 / --bf16 the base stays quantized)
+//   (<folder> may also be a Hugging Face model id already downloaded, for example Qwen/Qwen3-0.6B)
 //   export <folder> <adapter> --out <dir>
 //                                   merges a PEFT adapter into the float weights and writes a Hugging Face checkpoint
 //
@@ -78,8 +79,27 @@ if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or
 Device.Default = device;
 var cacheFormat = kv8 ? KeyValueFormat.Int8 : kv16 ? KeyValueFormat.BFloat16 : KeyValueFormat.Float32;
 
+// A model folder, or a Hugging Face model id (Org/Name) already in the local cache (HF_HOME or ~/.cache/huggingface).
+static string ResolveModel(string folder)
+{
+    if (Directory.Exists(folder) || !folder.Contains('/'))
+    {
+        return folder;
+    }
+
+    string home = Environment.GetEnvironmentVariable("HF_HOME")
+        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface");
+    string snapshots = Path.Combine(home, "hub", "models--" + folder.Replace("/", "--", StringComparison.Ordinal), "snapshots");
+    var found = Directory.Exists(snapshots)
+        ? Directory.GetDirectories(snapshots).Where(d => File.Exists(Path.Combine(d, "config.json"))).OrderByDescending(Directory.GetLastWriteTimeUtc).FirstOrDefault()
+        : null;
+    return found ?? throw new DirectoryNotFoundException($"'{folder}' is not a folder and is not in the Hugging Face cache ({snapshots}); download it first "
+        + "(for example: python tools/pytorch/pretrained_reference.py --model " + folder + ").");
+}
+
 PretrainedModel Load(string folder)
 {
+    folder = ResolveModel(folder);
     var watch = Stopwatch.StartNew();
     var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, Int8 = int8, BFloat16 = bf16, Int4 = int4, MaxPositions = context });
     Console.WriteLine($"Loaded {model.Config["architectures"]?[0]} from {folder} in {watch.Elapsed.TotalSeconds:F1} s on {device}{(int8 ? ", int8 weights" : int4 ? ", int4 weights" : bf16 ? ", bf16 weights" : "")}");
@@ -129,7 +149,8 @@ switch (positional[0])
 
         var train = Read(positional[2], "training");
         var evaluation = evalFile is null ? null : Read(evalFile, "evaluation");
-        Console.WriteLine($"assistant turns start with {JsonSerializer.Serialize(encoder.AssistantHeader)} and end with {JsonSerializer.Serialize(encoder.AssistantEnd)}");
+        var readable = new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+        Console.WriteLine($"assistant turns start with {JsonSerializer.Serialize(encoder.AssistantHeader, readable)} and end with {JsonSerializer.Serialize(encoder.AssistantEnd, readable)}");
         if (evaluation is { Count: > 0 })
         {
             Console.WriteLine($"evaluation loss before training: {FineTuner.Evaluate(model, evaluation, tuning.BatchTokens, tuning.LossChunkRows):F4}");
