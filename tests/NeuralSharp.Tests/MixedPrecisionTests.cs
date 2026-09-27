@@ -173,6 +173,74 @@ internal static partial class Tests
         AssertClose(first.ToArray(), second.ToArray(), 0f, "no dropout in evaluation");
     }
 
+    // dotnet run -c Release --project tests/NeuralSharp.Tests -- --bench-gemm
+    // TFLOPS of the training products (a 1.25B GPT's shapes) in every layout, with beta 0 and 1, the transposed
+    // operands handled by the transposing kernels directly or copied first, and a fresh output buffer each call.
+    internal static int BenchGemm()
+    {
+        if (!Device.IsCudaAvailable)
+        {
+            Console.WriteLine("needs a CUDA device");
+            return 1;
+        }
+
+        var device = Device.Cuda();
+        var backend = (CudaBackend)device.Backend;
+        Console.WriteLine($"{device.Name}; tensor cores: {MixedPrecision.TensorCoresUnavailable(device) ?? "yes"}");
+        var random = new Random(1);
+        Tensor Random(int n) => Tensor.From([.. Enumerable.Range(0, n).Select(_ => random.NextSingle() - 0.5f)], [n], device);
+        double Time(Action run, int repeats)
+        {
+            run();
+            device.Synchronize();
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < repeats; i++)
+            {
+                run();
+            }
+
+            device.Synchronize();
+            return watch.Elapsed.TotalMilliseconds / repeats;
+        }
+
+        using var scope = MixedPrecision.BFloat16();
+        Console.WriteLine($"{"m x n x k",-20} {"layout",6} {"beta",4} {"direct",14} {"pretransposed",14} {"fresh output",14}");
+        foreach (var (m, n, k) in new[] { (4096, 2048, 2048), (4096, 8192, 2048), (4096, 2048, 8192), (2048, 2048, 4096), (2048, 8192, 4096), (8192, 2048, 4096) })
+        {
+            using var a = Random(m * k);
+            using var b = Random(k * n);
+            using var c = Random(m * n);
+            double flops = 2.0 * m * n * k;
+            foreach (var (ta, tb) in new[] { (false, false), (false, true), (true, false) })
+            {
+                foreach (float beta in new[] { 0f, 1f })
+                {
+                    string Tflops(double ms) => $"{flops / (ms * 1e9),7:F1} TFLOPS";
+                    CudaBackend.PretransposeForTensorCores = false;
+                    double direct = Time(() => backend.BatchedMatMul(a.Storage, b.Storage, c.Storage, 1, m, n, k, ta, tb, beta), 10);
+                    CudaBackend.PretransposeForTensorCores = true;
+                    double copied = ta || tb ? Time(() => backend.BatchedMatMul(a.Storage, b.Storage, c.Storage, 1, m, n, k, ta, tb, beta), 10) : direct;
+                    double fresh = Time(() =>
+                    {
+                        using var output = Tensor.Zeros([m * n], device);
+                        backend.BatchedMatMul(a.Storage, b.Storage, output.Storage, 1, m, n, k, ta, tb, beta);
+                    }, 10);
+                    Console.WriteLine($"{$"{m}x{n}x{k}",-20} {(ta ? "t" : "n") + (tb ? "t" : "n"),6} {beta,4} {Tflops(direct),14} {Tflops(copied),14} {Tflops(fresh),14}");
+                }
+            }
+        }
+
+        foreach (var (rows, cols) in new[] { (2048, 2048), (2048, 8192), (4096, 2048), (4096, 8192) })
+        {
+            using var x = Random(rows * cols);
+            using var y = Tensor.Zeros([rows * cols], device);
+            double ms = Time(() => backend.TransposeForBenchmark(x.Storage, y.Storage, rows, cols), 20);
+            Console.WriteLine($"transpose {rows}x{cols}: {ms:F3} ms, {2.0 * rows * cols * 4 / (ms * 1e6):F0} GB/s");
+        }
+
+        return 0;
+    }
+
     private static float RoundBFloat16(float x)
     {
         uint bits = BitConverter.SingleToUInt32Bits(x);

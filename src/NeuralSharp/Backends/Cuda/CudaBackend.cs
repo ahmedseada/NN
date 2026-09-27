@@ -81,6 +81,9 @@ internal sealed unsafe partial class CudaBackend : Backend
     /// <summary>Why bfloat16 tensor-core products are unavailable on this GPU (null when they are available or untried).</summary>
     public string? TensorCoreUnavailableReason { get; private set; }
 
+    /// <summary>Tensor-core products copy a transposed operand into [m, k] / [k, n] layout first (benchmarks switch it off).</summary>
+    internal static bool PretransposeForTensorCores = true;
+
     // Dynamic shared memory of the next launch on this thread (consumed by Launch).
     [ThreadStatic]
     private static uint t_sharedBytes;
@@ -730,7 +733,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
         // bfloat16 tensor cores (MixedPrecision): products large enough to fill 128 × 128 tiles.
         var tensorCore = !few && m >= 64 && n >= 64 && k >= 32 && MixedPrecision.Current == MatMulPrecision.BFloat16 ? TensorCoreKernels() : null;
-        if (tensorCore is not null && (transA || transB) && batch <= MaxGridZ)
+        if (tensorCore is not null && (transA || transB) && batch <= MaxGridZ && PretransposeForTensorCores)
         {
             // The tensor-core kernel is fastest with both operands as stored ([m, k] · [k, n]): a transposed operand is
             // copied into that layout first (a memory-bound pass, far cheaper than the product it speeds up).
@@ -801,6 +804,8 @@ internal sealed unsafe partial class CudaBackend : Backend
                 mk, kn, mn);
         }
     }
+
+    internal void TransposeForBenchmark(Storage x, Storage y, int rows, int cols) => TransposeBatched(x, y, 1, rows, cols);
 
     // y[b] = x[b]ᵀ for x [batch][rows, cols].
     private void TransposeBatched(Storage x, Storage y, int batch, int rows, int cols) =>

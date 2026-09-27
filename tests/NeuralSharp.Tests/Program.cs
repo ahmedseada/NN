@@ -13,6 +13,11 @@ using NeuralSharp.Layers;
 using NeuralSharp.Optimizers;
 using NeuralSharp.Training;
 
+if (args is ["--bench-gemm"])
+{
+    return Tests.BenchGemm();
+}
+
 if (args is ["--dump-ptx", var ptxPath])
 {
     File.WriteAllText(ptxPath, PtxKernels.Source);
