@@ -170,9 +170,20 @@ internal static partial class Tests
                 NeuralSharp.Backends.GemmEpilogue.Gelu, pre.Storage), "GELU epilogue runs");
             var acts = act.ToArray();
             var pres = pre.ToArray();
+            // The gradient variant multiplies by a transposed weight (dPre = g · Wᵀ): b stored [n, k].
+            float[] bt = new float[N * K];
+            for (int q = 0; q < K; q++)
+            {
+                for (int j = 0; j < N; j++)
+                {
+                    bt[j * K + q] = b[q * N + j];
+                }
+            }
+
+            using var tbt = Tensor.From(bt, [bt.Length], device);
             using var saved = Tensor.From(pre0, [pre0.Length], device);
             using var grad = Tensor.Zeros([M * N], device);
-            Check(backend.GemmStrided(ta_.Storage, 0, K, false, tb_.Storage, 0, N, false, grad.Storage, 0, N, M, N, K, 0f, null,
+            Check(backend.GemmStrided(ta_.Storage, 0, K, false, tbt.Storage, 0, K, true, grad.Storage, 0, N, M, N, K, 0f, null,
                 NeuralSharp.Backends.GemmEpilogue.GeluGradient, saved.Storage), "GELU-gradient epilogue runs");
             var grads = grad.ToArray();
             for (int i = 0; i < M; i++)
