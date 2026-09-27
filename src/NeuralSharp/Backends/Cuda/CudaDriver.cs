@@ -180,6 +180,21 @@ internal static unsafe partial class CudaDriver
     public static partial int cuStreamSynchronize(IntPtr stream);
 
     [LibraryImport(Library)]
+    public static partial int cuEventCreate(out IntPtr e, uint flags);
+
+    [LibraryImport(Library)]
+    public static partial int cuEventRecord(IntPtr e, IntPtr stream);
+
+    [LibraryImport(Library)]
+    public static partial int cuEventSynchronize(IntPtr e);
+
+    [LibraryImport(Library)]
+    public static partial int cuEventElapsedTime(out float milliseconds, IntPtr start, IntPtr end);
+
+    [LibraryImport(Library, EntryPoint = "cuEventDestroy_v2")]
+    public static partial int cuEventDestroy(IntPtr e);
+
+    [LibraryImport(Library)]
     public static partial int cuMemsetD32Async(ulong destination, uint value, nuint count, IntPtr stream);
 
     [LibraryImport(Library, EntryPoint = "cuMemcpyDtoDAsync_v2")]

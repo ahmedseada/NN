@@ -143,7 +143,7 @@ internal static partial class PtxKernels
                 .reg .f32 %h<8>;
                 .reg .f32 %t<8>;
                 .reg .f32 %bias<8>;
-                .reg .pred %pbias, %paux;
+                .reg .pred %pbias, %paux, %psplit, %pz0;
                 .reg .b32 %gw<8>;
                 .reg .f32 %gs<16>;
                 .reg .f32 %gx<8>;
@@ -189,7 +189,7 @@ internal static partial class PtxKernels
                 and.b32 %r7, %r6, 1;
                 shr.u32 %r8, %r6, 1;
                 // Tile order grouped by 8 row tiles (blocks that run together share B's column tiles in L2): linear
-                // block b, group of 8·gx blocks, row tile first + b % size, column tile (b % (8·gx)) / size.
+                // block b, group of 8*gx blocks, row tile first + b % size, column tile (b % (8*gx)) / size.
                 mov.u32 %r50, %nctaid.x;
                 mov.u32 %r51, %nctaid.y;
                 mov.u32 %r52, %ctaid.y;
@@ -212,6 +212,23 @@ internal static partial class PtxKernels
                 ld.param.u32 %r59, [p_ldb];
                 ld.param.u32 %r60, [p_ldc];
             """);
+        if (packed != 0)
+        {
+            // Split k (packed weights, gridDim.z > 1 with zero batch strides): block z sums k [%r62, %r3) of chunks
+            // rounded to 32 (the int4 scale groups), added into c atomically by the epilogue.
+            s.AppendLine("""
+                    mov.u32 %r49, %nctaid.z;
+                    add.u32 %r61, %r3, %r49;
+                    sub.u32 %r61, %r61, 1;
+                    div.u32 %r61, %r61, %r49;
+                    add.u32 %r61, %r61, 31;
+                    and.b32 %r61, %r61, 0xFFFFFFE0;
+                    mul.lo.u32 %r62, %r40, %r61;
+                    add.u32 %r63, %r62, %r61;
+                    min.u32 %r3, %r63, %r3;
+                """);
+        }
+
 
         // Per-thread load coordinates (row within the tile, first of its two columns) and shared-memory store address.
         // A: %r13 row, %r14 column, %r15 store address; B: %r16, %r17, %r18. Leading dimensions (bytes): %rd9 / %rd10.
@@ -494,8 +511,8 @@ internal static partial class PtxKernels
             }
         }
 
-        s.AppendLine("""
-                mov.u32 %r30, 0;
+        s.AppendLine($"""
+                mov.u32 %r30, {(packed != 0 ? "%r62" : "0")};
                 mov.u32 %r34, 0;
             """);
         Load(a, "%rd1", "%rd9", "%r13", "%r14", "%ga");
@@ -560,7 +577,7 @@ internal static partial class PtxKernels
             KEND:
             """);
 
-        EmitTensorEpilogue(s, mode, packed == 1 ? ColumnScales : null);
+        EmitTensorEpilogue(s, mode, packed == 1 ? ColumnScales : null, splitK: packed != 0);
         s.AppendLine("""
                 ret;
             }
@@ -573,8 +590,10 @@ internal static partial class PtxKernels
     // and +8 of each m16 tile, columns 2 (lane & 3) and +1 of each n8 tile. %r42 = first row, %r43 = first column,
     // %rd14 = its address, %rd15 = a row in bytes. Expects %r1 = m, %r2 = n, %r5 = lane, %r7 / %r8 = the warp's tile row /
     // column, %r9 / %r10 = the block's first row / column, %r60 = ldc, %rd3 = c, %beta / %pbeta, float accumulators %c0-63,
-    // and the parameters p_bias and p_aux. `scale` may rescale the accumulators once %r42 / %r43 are set.
-    private static void EmitTensorEpilogue(StringBuilder s, int mode, Action<StringBuilder>? scale)
+    // and the parameters p_bias and p_aux. `scale` may rescale the accumulators once %r42 / %r43 are set. With `splitK`
+    // (mode 0) and gridDim.z > 1, each block adds its partial sums into c atomically: beta must be 0 (c zeroed first) or
+    // 1, and only block z = 0 adds the bias.
+    private static void EmitTensorEpilogue(StringBuilder s, int mode, Action<StringBuilder>? scale, bool splitK = false)
     {
         // Epilogue: c[row, col] = acc + beta · c (rows (lane >> 2) and +8 of each m16 tile, columns 2 (lane & 3) and +1
         // of each n8 tile). %r42 = first row, %r43 = first column, %rd14 = its address, %rd15 = a row in bytes.
@@ -619,6 +638,19 @@ internal static partial class PtxKernels
                 setp.ne.u64 %pbias, %rd18, 0;
                 cvta.to.global.u64 %rd18, %rd18;
             """);
+        if (splitK)
+        {
+            s.AppendLine("""
+                    mov.u32 %r49, %nctaid.z;
+                    setp.gt.u32 %psplit, %r49, 1;
+                    @%psplit mov.f32 %beta, 0f00000000;
+                    @%psplit setp.ne.u32 %pbeta, %r49, %r49;
+                    mov.u32 %r49, %ctaid.z;
+                    setp.eq.u32 %pz0, %r49, 0;
+                    and.pred %pbias, %pbias, %pz0;
+                """);
+        }
+
         for (int nt = 0; nt < 4; nt++)
         {
             for (int j = 0; j < 2; j++)
@@ -755,6 +787,23 @@ internal static partial class PtxKernels
                     }
                 }
 
+                if (splitK)
+                {
+                    s.AppendLine($"@!%psplit bra EPI_STORE_{group};");
+                    for (int nt = 0; nt < 4; nt++)
+                    {
+                        s.AppendLine($"""
+                                or.pred %p12, %q{3 * nt}, %q{3 * nt + 1};
+                                or.pred %p13, %q{3 * nt}, %q{3 * nt + 2};
+                                @%p12 red.global.add.f32 [%rd17+{nt * 32}], %e{2 * nt};
+                                @%p13 red.global.add.f32 [%rd17+{nt * 32 + 4}], %e{2 * nt + 1};
+                            """);
+                    }
+
+                    s.AppendLine($"bra EPI_DONE_{group};");
+                    s.AppendLine($"EPI_STORE_{group}:");
+                }
+
                 for (int nt = 0; nt < 4; nt++)
                 {
                     s.AppendLine($$"""
@@ -763,9 +812,13 @@ internal static partial class PtxKernels
                             @%q{{3 * nt + 2}} st.global.f32 [%rd17+{{nt * 32 + 4}}], %e{{2 * nt + 1}};
                         """);
                 }
+
+                if (splitK)
+                {
+                    s.AppendLine($"EPI_DONE_{group}:");
+                }
             }
         }
-
     }
 
     // Int8 weights: acc · scale[column] (the per-column scales in p_aux).

@@ -1,3 +1,5 @@
+using static NeuralSharp.Backends.Cuda.CudaDriver;
+
 namespace NeuralSharp.Backends.Cuda;
 
 // Int8 weight-only quantization kernels (see PtxKernels.Quantized.cs).
@@ -134,8 +136,17 @@ internal sealed unsafe partial class CudaBackend
                 _profileFlops = 2.0 * m * n * k;
             }
 
-            Launch(tensor, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
-                1, PtxKernels.TensorThreads, 1, P(x), P(packed), P(y), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, 0UL,
+            // Split k when the output tiles leave SMs idle (prompt-sized m): up to two blocks per SM, chunks of 256 k or
+            // more, partial sums added into the zeroed output.
+            int rowTiles = (m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile, columnTiles = (n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
+            int splits = Math.Clamp(Math.Min(k / 256, 2 * Math.Max(1, _multiprocessors) / (rowTiles * columnTiles)), 1, 8);
+            if (splits > 1)
+            {
+                Check(cuMemsetD32Async(P(y), 0, (nuint)((long)m * n), _stream), nameof(cuMemsetD32Async));
+            }
+
+            Launch(tensor, (uint)columnTiles, (uint)rowTiles,
+                (uint)splits, PtxKernels.TensorThreads, 1, P(x), P(packed), P(y), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, 0UL,
                 U(k), U((n + perWord - 1) / perWord), U(n), scales is null ? 0UL : P(scales));
             return true;
         }

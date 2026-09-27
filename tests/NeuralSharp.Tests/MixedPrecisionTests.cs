@@ -274,36 +274,39 @@ internal static partial class Tests
         }
 
         var random = new Random(22);
-        const int M = 150, K = 256, N = 200;
-        float[] x = [.. Enumerable.Range(0, M * K).Select(_ => random.NextSingle() * 2 - 1)];
-        float[] w = [.. Enumerable.Range(0, K * N).Select(_ => (random.NextSingle() * 2 - 1) * 0.1f)];
-        using var weights = Tensor.From(w, [K, N], device);
-        using var int8 = Int8Weight.Quantize(weights);
-        using var int4 = Int4Weight.Quantize(weights);
-        using var bf16 = BFloat16Weight.Convert(weights);
-        using var input = Tensor.From(x, [M, K], device);
-        foreach (var (name, run) in new (string, Func<Tensor>)[]
+        // k = 1056 splits k over several blocks (few output tiles), with an uneven last chunk.
+        foreach (var (M, K, N) in new[] { (150, 256, 200), (150, 1056, 200) })
         {
-            ("int8", () => input.MatMulInt8(int8)),
-            ("int4", () => input.MatMulInt4(int4)),
-            ("bf16", () => input.MatMulBFloat16(bf16)),
-        })
-        {
-            float[] plain, tensor;
-            using (MixedPrecision.Use(MatMulPrecision.Float32))
-            using (var y = run())
+            float[] x = [.. Enumerable.Range(0, M * K).Select(_ => random.NextSingle() * 2 - 1)];
+            float[] w = [.. Enumerable.Range(0, K * N).Select(_ => (random.NextSingle() * 2 - 1) * 0.1f)];
+            using var weights = Tensor.From(w, [K, N], device);
+            using var int8 = Int8Weight.Quantize(weights);
+            using var int4 = Int4Weight.Quantize(weights);
+            using var bf16 = BFloat16Weight.Convert(weights);
+            using var input = Tensor.From(x, [M, K], device);
+            foreach (var (name, run) in new (string, Func<Tensor>)[]
             {
-                plain = y.ToArray();
-            }
-
-            using (MixedPrecision.BFloat16())
-            using (var y = run())
+                ("int8", () => input.MatMulInt8(int8)),
+                ("int4", () => input.MatMulInt4(int4)),
+                ("bf16", () => input.MatMulBFloat16(bf16)),
+            })
             {
-                tensor = y.ToArray();
-            }
+                float[] plain, tensor;
+                using (MixedPrecision.Use(MatMulPrecision.Float32))
+                using (var y = run())
+                {
+                    plain = y.ToArray();
+                }
 
-            double error = Relative(plain, tensor);
-            Check(error < 0.01, $"{name}: tensor-core prompt product differs from the float32 kernel by {error:G3}");
+                using (MixedPrecision.BFloat16())
+                using (var y = run())
+                {
+                    tensor = y.ToArray();
+                }
+
+                double error = Relative(plain, tensor);
+                Check(error < 0.01, $"{name} {M}x{K}x{N}: tensor-core prompt product differs from the float32 kernel by {error:G3}");
+            }
         }
     }
 

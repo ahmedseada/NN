@@ -99,6 +99,7 @@ internal sealed unsafe partial class CudaBackend : Backend
 
     // Kernel times per name while GpuProfiler runs (null otherwise); matrix products are keyed by kernel and shape.
     private Dictionary<string, (long Calls, long Ticks, double Flops)>? _profile;
+    private (IntPtr Start, IntPtr End) _profileEvents;
 
     [ThreadStatic]
     private static string? _profileLabel;
@@ -1153,12 +1154,20 @@ internal sealed unsafe partial class CudaBackend : Backend
         using var use = UseStream();
         if (_profile is { } profile && _captureFree is null)
         {
-            // Profiling (GpuProfiler): the kernel alone, between two synchronizations.
-            Check(cuStreamSynchronize(_stream), nameof(cuStreamSynchronize));
-            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            // Profiling (GpuProfiler): the kernel's GPU time between two events (host launch overhead excluded).
+            if (_profileEvents.Start == IntPtr.Zero)
+            {
+                Check(cuEventCreate(out var start, 0), nameof(cuEventCreate));
+                Check(cuEventCreate(out var end, 0), nameof(cuEventCreate));
+                _profileEvents = (start, end);
+            }
+
+            Check(cuEventRecord(_profileEvents.Start, _stream), nameof(cuEventRecord));
             Check(cuLaunchKernel(function, gridX, gridY, gridZ, blockX, blockY, 1, shared, _stream, pointers, null), nameof(cuLaunchKernel));
-            Check(cuStreamSynchronize(_stream), nameof(cuStreamSynchronize));
-            long ticks = System.Diagnostics.Stopwatch.GetTimestamp() - started;
+            Check(cuEventRecord(_profileEvents.End, _stream), nameof(cuEventRecord));
+            Check(cuEventSynchronize(_profileEvents.End), nameof(cuEventSynchronize));
+            Check(cuEventElapsedTime(out float elapsed, _profileEvents.Start, _profileEvents.End), nameof(cuEventElapsedTime));
+            long ticks = (long)(elapsed * (System.Diagnostics.Stopwatch.Frequency / 1000.0));
             string key = _profileLabel ?? (_signatures.TryGetValue(function, out var named) ? named.Name : $"0x{function:X}");
             lock (profile)
             {

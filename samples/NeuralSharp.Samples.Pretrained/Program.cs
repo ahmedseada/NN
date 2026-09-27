@@ -389,6 +389,28 @@ int Profile(PretrainedModel model)
     }
 
     Telemetry.SynchronizeForTiming = false;
+
+    // GPU time per kernel (CUDA events around each launch; host launch costs excluded).
+    if (device.Type == DeviceType.Cuda)
+    {
+        GpuProfiler.Start(device);
+        using (var y = model.Network.Predict(input))
+        {
+            device.Synchronize();
+        }
+
+        Console.WriteLine($"\nprompt pass, {ids.Count} tokens, GPU time per kernel:");
+        Console.Write(GpuProfiler.Format(GpuProfiler.Stop(device), rows: 25));
+        var decodeOnly = greedy with { NumPredict = 1, UseGraph = false };
+        generator.Generate(prompt, decodeOnly);
+        GpuProfiler.Start(device);
+        var (_, _, profiled) = generator.Generate(prompt, greedy with { UseGraph = false });
+        var entries = GpuProfiler.Stop(device);
+        Console.WriteLine($"\ngeneration of {profiled.GeneratedTokens} tokens (with the prompt), GPU time per kernel:");
+        Console.Write(GpuProfiler.Format(entries, rows: 25));
+        Console.WriteLine($"(decode steps are {entries.Sum(e => e.Calls) / Math.Max(1, profiled.GeneratedTokens)} launches per token)");
+    }
+
     return 0;
 }
 
