@@ -1076,7 +1076,28 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
 
         const int Chunk = 64;
+        bool delayed = fp8 && DelayedColumnScaling && _captureThread == 0;
+        var key = (x, ld, rows, k);
+        if (delayed)
+        {
+            Storage? kept;
+            lock (_keptMaxima)
+            {
+                _keptMaxima.Remove(key, out kept);
+            }
+
+            if (kept is not null)
+            {
+                var record = Allocate(rows, zeroed: true);
+                QuantizeColumnsDelayed(fp8, x, ld, output, scale, rows, k, kp, kept, record);
+                kept.Release();
+                Keep(key, record);
+                return;
+            }
+        }
+
         var amax = Allocate(rows + 1, zeroed: true);                // + the one-pass kernel's barrier counter
+        bool keepAmax = false;
         try
         {
             if (OnePassColumnQuantizer)
@@ -1088,10 +1109,41 @@ internal sealed unsafe partial class CudaBackend : Backend
             Launch(TensorKernel($"absmax_cols_{format}")!.Value, (uint)((rows + 255) / 256), (uint)((k + Chunk - 1) / Chunk), 1, 256, 1,
                 x, P(amax), U(ld), U(k), U(rows), U(Chunk));
             QuantizeColumnsWithMaxima(fp8, x, ld, output, scale, rows, k, kp, amax, null);
+            if (delayed)
+            {
+                Keep(key, amax);                                    // the first time: exact maxima, kept for the next
+                keepAmax = true;
+            }
         }
         finally
         {
-            amax.Release();
+            if (!keepAmax)
+            {
+                amax.Release();
+            }
+        }
+    }
+
+    private void Keep((ulong X, int Ld, int Rows, int K) key, Storage maxima)
+    {
+        lock (_keptMaxima)
+        {
+            if (_keptMaxima.Count >= 4096)
+            {
+                foreach (var old in _keptMaxima.Values)
+                {
+                    old.Release();
+                }
+
+                _keptMaxima.Clear();
+            }
+
+            if (_keptMaxima.Remove(key, out var previous))
+            {
+                previous.Release();
+            }
+
+            _keptMaxima[key] = maxima;
         }
     }
 
@@ -1117,17 +1169,46 @@ internal sealed unsafe partial class CudaBackend : Backend
     {
         string format = fp8 ? "e4m3" : "s8";
         Launch(TensorKernel($"quant_cols_{format}")!.Value, (uint)((rows + 31) / 32), (uint)(kp / 32), 1, 32, 8,
-            x, P(output), P(maxima), P(scale), U(ld), U(kp), U(k), U(rows), record is null ? 0UL : P(record));
+            x, P(output), P(maxima), P(scale), U(ld), U(kp), U(k), U(rows), record is null ? 0UL : P(record), 0UL);
     }
 
+    // Delayed scaling: quantized with the kept maxima while recording x's own, then the correction pass quantizes again
+    // (with the recorded maxima) the 32-column strips where a value exceeded its kept maximum and saturated. Never
+    // coarser than exact maxima when values grow; when they shrink, FP8's exponent keeps the relative precision.
+    internal void QuantizeColumnsDelayed(bool fp8, ulong x, int ld, Storage output, Storage scale, int rows, int k, int kp, Storage kept,
+        Storage record)
+    {
+        QuantizeColumnsWithMaxima(fp8, x, ld, output, scale, rows, k, kp, kept, record);
+        string format = fp8 ? "e4m3" : "s8";
+        Launch(TensorKernel($"quant_cols_{format}")!.Value, (uint)((rows + 31) / 32), (uint)(kp / 32), 1, 32, 8,
+            x, P(output), P(record), P(scale), U(ld), U(kp), U(k), U(rows), 0UL, P(kept));
+    }
+
+    /// <summary>
+    /// FP8 training: column operands are quantized with the maxima the same operand (address and shape) had the last
+    /// time, measured in the same pass, plus a correction pass for columns that grew (one read of x instead of two).
+    /// Off by default; NEURALSHARP_FP8_DELAYED=1 turns it on.
+    /// </summary>
+    internal static bool DelayedColumnScaling { get; set; } = Environment.GetEnvironmentVariable("NEURALSHARP_FP8_DELAYED") is "1" or "true";
+
+    // Kept column maxima per operand (address, leading dimension, columns, rows), bounded: cleared past 4096 entries.
+    private readonly Dictionary<(ulong X, int Ld, int Rows, int K), Storage> _keptMaxima = [];
+
     // Benchmarks and tests: the column quantization of x [k][ld] (rows = its columns) by the two-launch pair (variant 0),
-    // the one-launch kernel (1), or with given maxima, recording x's own (2: delayed scaling).
+    // the one-launch kernel (1), with given maxima, recording x's own (2), or that plus the correction pass (3: delayed
+    // scaling as training uses it; record zeroed).
     internal void QuantizeColumnsVariant(bool fp8, Storage x, int ld, Storage output, Storage scale, int rows, int k, int variant,
         Storage? maxima = null, Storage? record = null)
     {
         if (variant == 2)
         {
             QuantizeColumnsWithMaxima(fp8, P(x), ld, output, scale, rows, k, PtxKernels.EightBitPaddedK(k), maxima!, record);
+            return;
+        }
+
+        if (variant == 3)
+        {
+            QuantizeColumnsDelayed(fp8, P(x), ld, output, scale, rows, k, PtxKernels.EightBitPaddedK(k), maxima!, record!);
             return;
         }
 

@@ -12,7 +12,7 @@ internal static partial class Tests
         ("layer norm: the fused training kernels match the composed operations (output, input, gamma and beta gradients)", LayerNormTraining),
         ("mixed precision: strided products and GELU epilogues match references (slices, activation, its gradient)", StridedProducts),
         ("mixed precision: 8-bit tensor-core products (fp8, int8; every layout, beta, bias) track float32", EightBitProducts),
-        ("mixed precision: 8-bit column quantizers: the one-launch kernel and delayed scaling (given maxima, recorded maxima) match the two-launch pair", ColumnQuantizers),
+        ("mixed precision: 8-bit column quantizers: the one-launch kernel and delayed scaling (given maxima, recorded maxima, correction of saturated columns) match the two-launch pair", ColumnQuantizers),
         ("mixed precision: prompts through int8 / int4 / bfloat16 weights on tensor cores match the float32 kernels", PackedTensorCoreProducts),
         ("mixed precision: fused decoder blocks (packed q/k/v, attention in place, GELU inside the products) match the composed ones", FusedDecoderBlocks),
         ("mixed precision: product + bias in one pass matches the product and a bias addition (output and gradients)", MatMulBiasPass),
@@ -271,6 +271,16 @@ internal static partial class Tests
                 var (_, staleScales) = Run(2, [.. maxima.Select(m => m / 2)], recordedStale);
                 Check(staleScales.Zip(scales).All(p => MathF.Abs(p.First * 2 - p.Second) <= 1e-6f * p.Second), $"{what}: stale maxima set the scales");
                 Check(recordedStale.ToArray().AsSpan().SequenceEqual(maxima), $"{what}: maxima recorded under stale scales");
+
+                // Delayed scaling as training runs it: kept maxima too small → every strip corrected to the exact result;
+                // kept maxima larger than needed → no correction (coarser scales), the true maxima recorded.
+                using var recordedSmall = Tensor.Zeros([cols], device);
+                var (corrected, correctedScales) = Run(3, [.. maxima.Select(m => m / 2)], recordedSmall);
+                Check(bytes.AsSpan().SequenceEqual(corrected) && scales.AsSpan().SequenceEqual(correctedScales), $"{what}: saturated columns corrected");
+                using var recordedLarge = Tensor.Zeros([cols], device);
+                var (_, largeScales) = Run(3, [.. maxima.Select(m => m * 2)], recordedLarge);
+                Check(largeScales.Zip(scales).All(p => MathF.Abs(p.First - p.Second * 2) <= 1e-6f * p.First), $"{what}: larger kept maxima kept");
+                Check(recordedLarge.ToArray().AsSpan().SequenceEqual(maxima), $"{what}: maxima recorded without correction");
             }
         }
     }
@@ -727,7 +737,7 @@ internal static partial class Tests
             return watch.Elapsed.TotalMilliseconds * 1000 / 100;          // µs per call
         }
 
-        Console.WriteLine($"{"x [k][n]",-16} {"MB",6} {"current (2 launches)",22} {"C: one launch",22} {"D: kept maxima",22} {"rows (reference)",22}");
+        Console.WriteLine($"{"x [k][n]",-16} {"MB",6} {"current (2 launches)",22} {"C: one launch",22} {"D: kept maxima",22} {"D + correction",22} {"rows (reference)",22}");
         foreach (var (k, n) in new[] { (4096, 2048), (4096, 8192), (2048, 8192), (8192, 2048), (2048, 2048), (12288, 768), (12288, 3072) })
         {
             using var x = Tensor.From([.. Enumerable.Range(0, k * n).Select(_ => random.NextSingle() * 2 - 1)], [k * n], device);
@@ -741,13 +751,14 @@ internal static partial class Tests
             double current = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 0));
             double onePass = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 1));
             double delayed = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 2, maxima.Storage, record.Storage));
+            double corrected = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 3, maxima.Storage, record.Storage));
             double rows = Time(() => backend.QuantizeRowsForBenchmark(true, x.Storage, n, output.Storage, scale.Storage, k, n));
-            Console.WriteLine($"{$"{k}x{n}",-16} {mb,6:F0} {Cell(current),22} {Cell(onePass),22} {Cell(delayed),22} {Cell(rows),22}");
+            Console.WriteLine($"{$"{k}x{n}",-16} {mb,6:F0} {Cell(current),22} {Cell(onePass),22} {Cell(delayed),22} {Cell(corrected),22} {Cell(rows),22}");
         }
 
         // Error of delayed scaling (fp8 e4m3), x [4096][2048] of normal values with a few larger columns.
         Console.WriteLine();
-        Console.WriteLine($"{"delayed scaling error",-44} {"exact maxima",14} {"kept maxima",14}");
+        Console.WriteLine($"{"delayed scaling error",-44} {"exact maxima",14} {"kept maxima",14} {"+ correction",14}");
         const int K = 4096, N = 2048;
         double Normal() => Math.Sqrt(-2 * Math.Log(1 - random.NextDouble())) * Math.Cos(2 * Math.PI * random.NextDouble());
         var previous = new float[K * N];
@@ -782,19 +793,12 @@ internal static partial class Tests
             using var kept = Tensor.From(previousMaxima, [N], device);
             using var exactMaxima = Tensor.Zeros([N], device);
             int kp = PtxKernels.EightBitPaddedK(K);
-            double Error(bool stale)
+            double Error(int variant)
             {
                 using var output = Tensor.Zeros([N * kp / 4], device);
                 using var scale = Tensor.Zeros([N], device);
                 using var record = Tensor.Zeros([N], device);
-                if (stale)
-                {
-                    backend.QuantizeColumnsVariant(true, x.Storage, N, output.Storage, scale.Storage, N, K, 2, kept.Storage, record.Storage);
-                }
-                else
-                {
-                    backend.QuantizeColumnsVariant(true, x.Storage, N, output.Storage, scale.Storage, N, K, 0);
-                }
+                backend.QuantizeColumnsVariant(true, x.Storage, N, output.Storage, scale.Storage, N, K, variant, kept.Storage, record.Storage);
 
                 var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(output.ToArray().AsSpan()).ToArray();
                 var scales = scale.ToArray();
@@ -812,7 +816,7 @@ internal static partial class Tests
                 return Math.Sqrt(error / total);
             }
 
-            Console.WriteLine($"{name,-44} {Error(false),14:P3} {Error(true),14:P3}");
+            Console.WriteLine($"{name,-44} {Error(0),14:P3} {Error(2),14:P3} {Error(3),14:P3}");
         }
 
         return 0;

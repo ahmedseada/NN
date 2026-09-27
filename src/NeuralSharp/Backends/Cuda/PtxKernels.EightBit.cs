@@ -241,6 +241,8 @@ internal static partial class PtxKernels
     // through shared memory. Grid (⌈cols / 32⌉, ldo / 32), block 32 × 8. When p_record is not 0, the column maxima of x
     // are also recorded there (atomic max of float bits, zeroed first): with maxima kept from an earlier pass in p_amax
     // (delayed scaling), one read of x quantizes it and measures it for the next time; larger values saturate.
+    // p_only (not 0) turns the kernel into that pass's correction: a block whose 32 columns all have amax[j] ≤ only[j]
+    // (the kept maxima: nothing saturated) returns before reading x, the others quantize again with the recorded maxima.
     //
     // onePass (quant_cols1_…): the maxima and the quantization in one launch, x read twice (the second time largely from
     // L2): a persistent grid (every block resident) first adds 32-column × 256-row maxima into p_amax (zeroed first), waits
@@ -253,7 +255,7 @@ internal static partial class PtxKernels
         s.AppendLine($$"""
             .visible .entry {{name}}(
                 .param .u64 p_x, .param .u64 p_out, .param .u64 p_amax, .param .u64 p_scale, .param .u32 p_ld, .param .u32 p_ldo,
-                .param .u32 p_rows, .param .u32 p_cols, .param .u64 {{(onePass ? "p_counter" : "p_record")}}
+                .param .u32 p_rows, .param .u32 p_cols, .param .u64 {{(onePass ? "p_counter" : "p_record")}}{{(onePass ? "" : ", .param .u64 p_only")}}
             )
             {
                 .reg .pred %p<12>;
@@ -406,6 +408,23 @@ internal static partial class PtxKernels
                     shl.b32 %r7, %r7, 5;
                     mov.u32 %r8, %ctaid.y;
                     shl.b32 %r8, %r8, 5;
+                    ld.param.u64 %rd15, [p_only];
+                    setp.ne.u64 %p9, %rd15, 0;
+                    @!%p9 bra WHOLE;
+                    cvta.to.global.u64 %rd15, %rd15;
+                    add.u32 %r23, %r7, %r5;
+                    setp.lt.u32 %p10, %r23, %r4;
+                    mul.wide.u32 %rd13, %r23, 4;
+                    add.u64 %rd14, %rd13, %rd3;
+                    add.u64 %rd13, %rd13, %rd15;
+                    mov.f32 %f10, 0f00000000;
+                    mov.f32 %f11, 0f00000000;
+                    @%p10 ld.global.f32 %f10, [%rd14];
+                    @%p10 ld.global.f32 %f11, [%rd13];
+                    setp.gt.f32 %p10, %f10, %f11;
+                    bar.red.or.pred %p11, 0, %p10;
+                    @!%p11 bra DONE;
+                WHOLE:
                 """);
         }
 
