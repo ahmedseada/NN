@@ -243,8 +243,8 @@ internal static partial class PtxKernels
             body.AppendLine($"""
                 mul.wide.u32 %rd1, %row, 4;
                 add.u64 %rd6, %b_flags, %rd1;
-                ld.global.f32 %f30, [%rd6];
-                setp.eq.f32 %p14, %f30, {Zero};
+                ld.global.u32 %r28, [%rd6];
+                setp.ne.u32 %p14, %r28, 0xFFFFFFFF;
                 @!%p14 bra FULL_ROW;
                 mul.lo.u32 %r5, %row, %s_slots;
                 mul.wide.u32 %rd1, %r5, 4;
@@ -254,6 +254,7 @@ internal static partial class PtxKernels
                 mov.f32 %f31, {One};
                 bra SOURCE_DONE;
                 FULL_ROW:
+                setp.ne.u32 %p14, 0, 0;
                 """);
         }
         else
@@ -297,6 +298,26 @@ internal static partial class PtxKernels
             add.u32 %r7, %r7, 1;
             bra TK;
             THR_DONE:
+            """);
+        if (candidates)
+        {
+            // A slice that dropped tied scores recorded the largest one dropped (%r28, order-preserving bits): the
+            // candidates are complete only when the top-k threshold is above it; otherwise start over on the full row.
+            body.AppendLine("""
+                @!%p14 bra COMPLETE;
+                setp.eq.u32 %p2, %r28, 0;
+                @%p2 bra COMPLETE;
+                mov.b32 %r24, %f3;
+                shr.s32 %r25, %r24, 31;
+                or.b32 %r25, %r25, 0x80000000;
+                xor.b32 %r24, %r24, %r25;
+                setp.gt.u32 %p2, %r24, %r28;
+                @!%p2 bra FULL_ROW;
+                COMPLETE:
+                """);
+        }
+
+        body.AppendLine($"""
             setp.gt.f32 %p7, %s_minp, {Zero};
             @!%p7 bra MINP_DONE;
             lg2.approx.ftz.f32 %f19, %s_minp;
@@ -576,10 +597,14 @@ internal static partial class PtxKernels
             add.u32 %r12, %r12, 1;
             bra TK;
             TK_END:
+            setp.eq.u32 %p13, 0, 0;
+            COUNT:
             mov.u32 %r13, 0;
             """);
+        // Kept: at or above the threshold (%p13 set), or strictly above it (the retry after ties overflow the slots).
         string Kept(int i) => $"""
-            setp.ge.f32 %p10, %f{10 + i}, %f3;
+            setp.ge.and.f32 %p10, %f{10 + i}, %f3, %p13;
+            setp.gt.or.f32 %p10, %f{10 + i}, %f3, %p10;
             setp.gt.and.f32 %p10, %f{10 + i}, {NegInf}, %p10;
             """;
         for (int i = 0; i < 8; i++)
@@ -615,6 +640,13 @@ internal static partial class PtxKernels
             bar.sync 0;
             ld.shared.u32 %r20, [%r15];
             ld.shared.u32 %r21, [%sb];
+            bar.sync 0;
+            setp.gt.u32 %p15, %r21, {CandidateSlots};
+            and.pred %p15, %p15, %p13;
+            @!%p15 bra COUNTED;
+            setp.ne.u32 %p13, 0, 0;
+            bra COUNT;
+            COUNTED:
             shl.b32 %r22, %row, {(int)Math.Log2(CandidateSlots)};
             mul.wide.u32 %rd4, %r22, 4;
             add.u64 %rd5, %b_candv, %rd4;
@@ -646,11 +678,23 @@ internal static partial class PtxKernels
             @%p10 st.global.f32 [%rd8], {NegInf};
             add.u64 %rd9, %rd7, %rd6;
             @%p10 st.global.f32 [%rd9], {F(-1f)};
-            setp.gt.u32 %p10, %r21, {CandidateSlots};
-            setp.eq.and.u32 %p10, %tx, 0, %p10;
+            setp.ne.u32 %p10, %tx, 0;
+            @%p10 bra FLAGS_DONE;
             mul.wide.u32 %rd7, %r7, 4;
             add.u64 %rd7, %rd7, %b_flags;
-            @%p10 st.global.f32 [%rd7], {One};
+            setp.gt.u32 %p10, %r21, {CandidateSlots};
+            @!%p10 bra STRICT_FLAG;
+            mov.u32 %r24, 0xFFFFFFFF;
+            st.global.u32 [%rd7], %r24;
+            bra FLAGS_DONE;
+            STRICT_FLAG:
+            @%p13 bra FLAGS_DONE;
+            mov.b32 %r24, %f3;
+            shr.s32 %r25, %r24, 31;
+            or.b32 %r25, %r25, 0x80000000;
+            xor.b32 %r24, %r24, %r25;
+            atom.global.max.u32 %r26, [%rd7], %r24;
+            FLAGS_DONE:
             """);
         RowBlock(sb, "topk_candidates_f32", ["logits", "candv", "candi", "flags"],
             [("u32", "vocab"), ("u32", "rowstride"), ("u32", "rowoffset"), ("f32", "invt"), ("u32", "topk"), ("u32", "bpr")],

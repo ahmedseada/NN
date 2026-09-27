@@ -249,7 +249,7 @@ internal static partial class Tests
         }
 
         // A large vocabulary with top-k: the device may pick candidates block by block first. Same tokens as the CPU
-        // sampler, including rows where every score ties (more candidates than fit: the whole row is walked).
+        // sampler, including rows where every score ties, or many do (more candidates than fit a slice's slots).
         const int LargeRows = 48, LargeV = 30000;
         var random = new Random(11);
         var large = new float[LargeRows * LargeV];
@@ -262,6 +262,16 @@ internal static partial class Tests
         {
             large[i] = 0.5f;                                                   // row 0: all tied
         }
+
+        // Row 1: a slice of low scores with 300 ties (like a checkpoint's padding tokens) that top-k never keeps.
+        Array.Fill(large, -5f, LargeV + 3 * 2048, 2048);
+        Array.Fill(large, -4f, LargeV + 3 * 2048, 300);
+        // Row 2: the same ties are among the top-k scores (three higher scores, then the ties, then everything else).
+        Array.Fill(large, -3f, 2 * LargeV, LargeV);
+        Array.Fill(large, -0.5f, 2 * LargeV + 5 * 2048, 300);
+        (large[2 * LargeV + 10], large[2 * LargeV + 11], large[2 * LargeV + 12]) = (2f, 1.5f, 1f);
+        // Row 3: 100 ties at the row's largest score.
+        Array.Fill(large, 10f, 3 * LargeV + 7 * 2048, 100);
 
         using var largeX = Tensor.From(large, [LargeRows, LargeV], device);
         using var largeCpuX = Tensor.From(large, [LargeRows, LargeV], Device.Cpu);

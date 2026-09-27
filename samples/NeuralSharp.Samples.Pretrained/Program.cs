@@ -101,6 +101,9 @@ static string ResolveModel(string folder)
         + "(for example: python tools/pytorch/pretrained_reference.py --model " + folder + ").");
 }
 
+// The sampling chat uses (Qwen3's recommended settings for thinking mode).
+GenerationOptions ChatSampling() => new() { Temperature = 0.6f, TopK = 20, TopP = 0.95f, RepeatPenalty = 1f, NumCtx = context };
+
 PretrainedModel Load(string folder)
 {
     folder = ResolveModel(folder);
@@ -267,7 +270,7 @@ switch (positional[0])
             }
 
             messages.Add(new ChatMessage("user", line));
-            var options = new GenerationOptions { Temperature = 0.6f, TopK = 20, TopP = 0.95f, RepeatPenalty = 1f, NumCtx = context };
+            var options = ChatSampling();
             ChatMessage? reply = null;
             bool thinking = false;
             foreach (var chunk in chat.Stream(new ChatRequest(messages, Think: noThink ? false : null, Options: options)))
@@ -348,6 +351,10 @@ int Profile(PretrainedModel model)
     var greedy = new GenerationOptions { TopK = 1, Temperature = 1f, RepeatPenalty = 1f, NumPredict = 32, NumCtx = context, Seed = 0 };
     var (_, _, stats) = generator.Generate(prompt, greedy);
     Console.WriteLine($"generation: prompt {stats.PromptDuration.TotalMilliseconds:F0} ms, {stats.GeneratedTokens} tokens at {stats.TokensPerSecond:F1} tok/s");
+    var sampled = ChatSampling() with { NumPredict = 128, Seed = 0 };
+    var (_, _, sampledStats) = generator.Generate(prompt, sampled);
+    Console.WriteLine($"generation with chat sampling (temperature {sampled.Temperature}, top-k {sampled.TopK}, top-p {sampled.TopP}): "
+                      + $"{sampledStats.GeneratedTokens} tokens at {sampledStats.TokensPerSecond:F1} tok/s");
 
     var recorder = new ProfileRecorder();
     Telemetry.SynchronizeForTiming = true;
