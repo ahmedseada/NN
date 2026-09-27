@@ -52,7 +52,7 @@ public sealed class RMSNorm : Module
         if (t_handoff is { } handoff && ReferenceEquals(handoff.Norm, this))
         {
             t_handoff = null;
-            if (ReferenceEquals(handoff.Input, input) && !Autograd.IsEnabled)
+            if (ReferenceEquals(handoff.Input, input) && !Autograd.IsEnabled && !handoff.Output.IsDisposed)
             {
                 return handoff.Output;                                          // computed with the residual addition before it
             }

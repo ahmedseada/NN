@@ -399,13 +399,16 @@ public static class FineTuner
                     var batch = group[b];
                     var batchWatch = Stopwatch.StartNew();
                     using var scope = new TensorScope();
+                    trace?.Invoke($"step {step + 1}/{totalSteps}, batch {first + b + 1}/{batches.Count} of epoch {epoch + 1}: {batch.Length} sequences × "
+                        + $"{batch.Max(i => train[i].Tokens.Length) - 1} tokens…");
                     var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing);
+                    float batchLoss = lossTensor.Item();                             // waits for the forward pass
+                    double forward = batchWatch.Elapsed.TotalSeconds;
                     lossTensor.Backward();
-                    float batchLoss = lossTensor.Item();
+                    model.Device.Synchronize();
                     loss += batchLoss;
                     tokens += count;
-                    trace?.Invoke($"step {step + 1}/{totalSteps}, batch {first + b + 1}/{batches.Count} of epoch {epoch + 1}: {batch.Length} sequences × "
-                        + $"{batch.Max(i => train[i].Tokens.Length) - 1} tokens, forward and backward {batchWatch.Elapsed.TotalSeconds:F2} s");
+                    trace?.Invoke($"  forward {forward:F2} s, backward {batchWatch.Elapsed.TotalSeconds - forward:F2} s, loss {batchLoss * normalizer / Math.Max(1, batch.Sum(i => train[i].TrainedTokens)):F4}");
                 }
 
                 if (options.MaxGradientNorm > 0f)
@@ -548,7 +551,30 @@ public static class FineTuner
         var hidden = Tensor.From(inputs, [rows, length], device);
         for (int i = 0; i < modules.Count - 1; i++)
         {
-            hidden = checkpointing && modules[i] is DecoderBlock ? modules[i].ForwardCheckpointed(hidden) : modules[i].Forward(hidden);
+            if (checkpointing && modules[i] is DecoderBlock && Autograd.IsEnabled)
+            {
+                hidden = modules[i].ForwardCheckpointed(hidden);                // keeps only the block's output
+            }
+            else if (!Autograd.IsEnabled)
+            {
+                // Evaluation: each module's intermediate results, and the previous activation, are freed at once.
+                Tensor next;
+                using (var scope = new TensorScope())
+                {
+                    next = scope.Keep(modules[i].Forward(hidden));
+                }
+
+                if (!ReferenceEquals(next, hidden))
+                {
+                    hidden.Dispose();
+                }
+
+                hidden = next;
+            }
+            else
+            {
+                hidden = modules[i].Forward(hidden);
+            }
         }
 
         var loss = Losses.TokenCrossEntropy(hidden.Reshape(rows * length, hidden.Shape[^1]), h => head.Forward(h),

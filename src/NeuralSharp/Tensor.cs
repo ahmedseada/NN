@@ -261,6 +261,9 @@ public sealed partial class Tensor : IDisposable
         return t;
     }
 
+    /// <summary>Whether <see cref="Dispose"/> has released this tensor.</summary>
+    internal bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
     /// <summary>Returns a tensor sharing this tensor's data but cut off from the autograd graph.</summary>
     public Tensor Detach()
     {

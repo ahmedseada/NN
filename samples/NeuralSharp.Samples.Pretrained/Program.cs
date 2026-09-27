@@ -152,7 +152,31 @@ switch (positional[0])
         var evaluation = evalFile is null ? null : Read(evalFile, "evaluation");
         var readable = new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
         Console.WriteLine($"assistant turns start with {JsonSerializer.Serialize(encoder.AssistantHeader, readable)} and end with {JsonSerializer.Serialize(encoder.AssistantEnd, readable)}");
-        void Trace(string line) => Console.WriteLine("  " + line);
+        var lastLine = Stopwatch.StartNew();
+        string phase = "starting";
+        void Say(string line)
+        {
+            lock (lastLine)
+            {
+                Console.WriteLine(line);
+                lastLine.Restart();
+            }
+        }
+
+        void Trace(string line)
+        {
+            phase = line.TrimStart();
+            Say("  " + line);
+        }
+
+        // A heartbeat while a batch runs long without output.
+        using var heartbeat = new Timer(_ =>
+        {
+            if (lastLine.Elapsed.TotalSeconds >= 15)
+            {
+                Say($"  … still working ({phase}), {lastLine.Elapsed.TotalSeconds:F0} s since the last line");
+            }
+        }, null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
         if (evaluation is { Count: > 0 })
         {
             Console.WriteLine($"evaluating {evaluation.Count} transcripts before training…");
@@ -174,9 +198,13 @@ switch (positional[0])
             Console.WriteLine("stopping after the current batch and saving the adapter (Ctrl+C again to quit now)…");
         };
         var watch = Stopwatch.StartNew();
-        var progress = new ConsoleProgress<FineTuningProgress>(p => Console.WriteLine(
-            $"step {p.Step}/{p.TotalSteps} (epoch {p.Epoch}): loss {p.Loss:F4}, lr {p.LearningRate:G3}, {p.TokensPerSecond:F0} tok/s"
-            + (p.EvaluationLoss is { } e ? $", evaluation loss {e:F4}" : "") + $", {watch.Elapsed.TotalMinutes:F1} min"));
+        var progress = new ConsoleProgress<FineTuningProgress>(p =>
+        {
+            var remaining = TimeSpan.FromSeconds(watch.Elapsed.TotalSeconds / p.Step * (p.TotalSteps - p.Step));
+            Say($"step {p.Step}/{p.TotalSteps} (epoch {p.Epoch}): loss {p.Loss:F4}, lr {p.LearningRate:G3}, {p.TokensPerSecond:F0} tok/s"
+                + (p.EvaluationLoss is { } e ? $", evaluation loss {e:F4}" : "")
+                + $", elapsed {watch.Elapsed:hh\\:mm\\:ss}, remaining ~{remaining:hh\\:mm\\:ss}");
+        });
         try
         {
             FineTuner.Train(model, train, evaluation, tuning, output, progress, cancel.Token, Trace);

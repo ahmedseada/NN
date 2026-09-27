@@ -71,10 +71,12 @@ public sealed partial class Tensor
             return forward(input);
         }
 
+        // Only the output survives the first pass: the module's intermediate results are freed at once.
         Tensor output;
         using (Autograd.NoGrad())
+        using (var pass = new TensorScope())
         {
-            output = forward(input);
+            output = pass.Keep(forward(input));
         }
 
         if (ReferenceEquals(output, input))
