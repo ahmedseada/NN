@@ -73,6 +73,8 @@ public sealed partial class Tensor
 
         // Only the output survives the first pass: the module's intermediate results are freed at once.
         Tensor output;
+        var seeds = new List<uint>();                                   // dropout masks are drawn again identically
+        using (Layers.DropoutSeeds.Record(seeds))
         using (Autograd.NoGrad())
         using (var pass = new TensorScope())
         {
@@ -89,7 +91,12 @@ public sealed partial class Tensor
             using var scope = new TensorScope();
             var replay = input.Detach();
             replay.RequiresGrad = input.RequiresGrad;
-            var recomputed = forward(replay);
+            Tensor recomputed;
+            using (Layers.DropoutSeeds.Replay(seeds))
+            {
+                recomputed = forward(replay);
+            }
+
             if (recomputed.RequiresGrad)
             {
                 recomputed.Backward(g);

@@ -584,11 +584,18 @@ public sealed class DecoderBlock : Module, ICachedModule
     /// <param name="feedForward">The feed-forward block.</param>
     /// <param name="postAttentionNorm">Normalization of the attention output before the residual addition, or null.</param>
     /// <param name="postFeedForwardNorm">Normalization of the feed-forward output before the residual addition, or null.</param>
+    /// <param name="residualDropout">Dropout on the attention and feed-forward outputs before each residual addition (training only), or null.</param>
     public DecoderBlock(Module attentionNorm, CausalSelfAttention attention, Module? feedForwardNorm, FeedForward feedForward,
-        Module? postAttentionNorm = null, Module? postFeedForwardNorm = null)
+        Module? postAttentionNorm = null, Module? postFeedForwardNorm = null, Dropout? residualDropout = null)
     {
         (AttentionNorm, Attention, FeedForwardNorm, FeedForward, PostAttentionNorm, PostFeedForwardNorm) =
             (attentionNorm, attention, feedForwardNorm, feedForward, postAttentionNorm, postFeedForwardNorm);
+        ResidualDropout = residualDropout;
+        if (residualDropout is not null)
+        {
+            residualDropout.Name = "drop";
+        }
+
         attentionNorm.Name = "attn_norm";
         attention.Name = "attn";
         feedForward.Name = "mlp";
@@ -626,6 +633,11 @@ public sealed class DecoderBlock : Module, ICachedModule
     /// <summary>Normalization after the feed-forward block, or null.</summary>
     public Module? PostFeedForwardNorm { get; }
 
+    /// <summary>Dropout on each branch's output before its residual addition (active in training mode), or null.</summary>
+    public Dropout? ResidualDropout { get; }
+
+    private bool Dropping => ResidualDropout is { Probability: > 0f } d && d.IsTraining;
+
     /// <summary>
     /// The RMS normalization that follows this block (the next block's attention norm, or the final norm), set by
     /// <see cref="DecoderSpec"/>: when nothing records gradients, the block's last residual addition and that
@@ -638,7 +650,7 @@ public sealed class DecoderBlock : Module, ICachedModule
 
     /// <inheritdoc />
     public override IEnumerable<Module> Children() =>
-        new[] { AttentionNorm, Attention, FeedForwardNorm, FeedForward, PostAttentionNorm, PostFeedForwardNorm }.OfType<Module>();
+        new Module?[] { AttentionNorm, Attention, FeedForwardNorm, FeedForward, PostAttentionNorm, PostFeedForwardNorm, ResidualDropout }.OfType<Module>();
 
     /// <inheritdoc />
     protected override Tensor ForwardCore(Tensor input) => Run(input, x => Attention.Forward(x));
@@ -655,13 +667,19 @@ public sealed class DecoderBlock : Module, ICachedModule
             attended = PostAttentionNorm.Forward(attended);
         }
 
+        if (Dropping)
+        {
+            attended = ResidualDropout!.Forward(attended);
+        }
+
         if (Parallel)
         {
-            return input + attended + FeedForward.Forward(normalized);
+            var parallel = FeedForward.Forward(normalized);
+            return input + attended + (Dropping ? ResidualDropout!.Forward(parallel) : parallel);
         }
 
         Tensor x, fed;
-        if (FeedForwardNorm is RMSNorm norm && !Autograd.IsEnabled)
+        if (FeedForwardNorm is RMSNorm norm && !Autograd.IsEnabled && !Dropping)
         {
             var (sum, fedInput) = Tensor.AddRmsNormAffine(input, attended, norm.Gain, norm.Epsilon, norm.Offset);   // one pass
             x = sum;
@@ -678,7 +696,12 @@ public sealed class DecoderBlock : Module, ICachedModule
             fed = PostFeedForwardNorm.Forward(fed);
         }
 
-        if (NextNorm is { } next && !Autograd.IsEnabled)
+        if (Dropping)
+        {
+            fed = ResidualDropout!.Forward(fed);
+        }
+
+        if (NextNorm is { } next && !Autograd.IsEnabled && !Dropping)
         {
             var (output, nextInput) = Tensor.AddRmsNormAffine(x, fed, next.Gain, next.Epsilon, next.Offset);
             RMSNorm.HandOff(next, output, nextInput);
@@ -690,6 +713,62 @@ public sealed class DecoderBlock : Module, ICachedModule
 
     /// <inheritdoc />
     public override string ToString() => $"DecoderBlock({(Parallel ? "parallel" : "sequential")})";
+}
+
+/// <summary>
+/// Adds a learned vector per position to [batch, time, dim] embeddings (GPT-2 style absolute positions, "pos.weight"
+/// [maxPositions, dim]). Supports sequences up to <see cref="MaxPositions"/>.
+/// </summary>
+public sealed class PositionEmbedding : Module, ICachedModule
+{
+    /// <summary>Wraps a [maxPositions, dim] table; the layer takes ownership.</summary>
+    public PositionEmbedding(Tensor weight)
+    {
+        if (weight.Rank != 2)
+        {
+            throw new ArgumentException($"Position embeddings must be [maxPositions, dim], got {Tensor.FormatShape(weight.Shape)}.");
+        }
+
+        Weight = weight;
+    }
+
+    /// <summary>The [maxPositions, dim] table.</summary>
+    public Tensor Weight { get; private set; }
+
+    /// <summary>Longest supported sequence.</summary>
+    public int MaxPositions => Weight.Shape[0];
+
+    /// <inheritdoc />
+    protected override Tensor ForwardCore(Tensor input)
+    {
+        int t = input.Shape[^2];
+        if (t > MaxPositions)
+        {
+            throw new ArgumentException($"Sequence length {t} exceeds the {MaxPositions} learned positions.");
+        }
+
+        return input + (t == MaxPositions ? Weight : Weight.Narrow(0, 0, t));
+    }
+
+    /// <inheritdoc />
+    public Tensor ForwardCached(Tensor input, DecodingContext context) =>
+        input + Weight.EmbeddingLookup(context.Positions ?? throw new InvalidOperationException("Call DecodingContext.BeginStep first."));
+
+    /// <inheritdoc />
+    public override IEnumerable<Tensor> Parameters() => [Weight];
+
+    /// <inheritdoc />
+    protected internal override void MoveTo(Device device) => Weight = MoveTensor(Weight, device);
+
+    /// <inheritdoc />
+    public override void Dispose()
+    {
+        Weight.Dispose();
+        base.Dispose();
+    }
+
+    /// <inheritdoc />
+    public override string ToString() => $"PositionEmbedding({MaxPositions} x {Weight.Shape[1]})";
 }
 
 /// <summary>Multiplies its input by a constant (for example the √dim embedding scale of some models).</summary>

@@ -165,6 +165,9 @@ public sealed partial class Tensor : IDisposable
     }
 
     /// <summary>Creates a tensor that no <see cref="TensorScope"/> captures, for long-lived state such as parameters.</summary>
+    /// <summary>Zeros allocated on the device (no host copy), outside any <see cref="TensorScope"/>.</summary>
+    internal static Tensor PersistentZeros(ReadOnlySpan<int> shape, Device device) => Empty(shape, device, zeroed: true, track: false);
+
     internal static Tensor Persistent(ReadOnlySpan<float> values, ReadOnlySpan<int> shape, Device device, bool requiresGrad)
     {
         var t = Empty(shape, device, track: false);

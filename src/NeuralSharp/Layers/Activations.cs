@@ -57,7 +57,7 @@ public sealed class Dropout : Module
 
     /// <inheritdoc />
     protected override Tensor ForwardCore(Tensor input) =>
-        IsTraining && Probability > 0f ? input.Dropout(Probability, (uint)_random.Next()) : input;
+        IsTraining && Probability > 0f ? input.Dropout(Probability, DropoutSeeds.Next(_random)) : input;
 
     /// <inheritdoc />
     public override string ToString() => $"Dropout(p={Probability})";
@@ -96,4 +96,52 @@ public sealed class Lambda(Func<Tensor, Tensor> function, string name = "Lambda"
 
     /// <inheritdoc />
     public override string ToString() => name;
+}
+
+/// <summary>
+/// The seeds dropout masks are drawn with. An activation checkpoint records the seeds its first pass draws and replays
+/// them when it recomputes the pass for the backward pass, so both passes drop the same elements.
+/// </summary>
+internal static class DropoutSeeds
+{
+    [ThreadStatic]
+    private static List<uint>? t_record;
+
+    [ThreadStatic]
+    private static Queue<uint>? t_replay;
+
+    public static uint Next(Random random)
+    {
+        if (t_replay is { Count: > 0 } replay)
+        {
+            return replay.Dequeue();
+        }
+
+        uint seed = (uint)random.Next();
+        t_record?.Add(seed);
+        return seed;
+    }
+
+    /// <summary>Records the seeds drawn until disposed into <paramref name="seeds"/>.</summary>
+    public static Restore Record(List<uint> seeds)
+    {
+        var restore = new Restore(t_record, t_replay);
+        t_record = seeds;
+        t_replay = null;
+        return restore;
+    }
+
+    /// <summary>Hands out <paramref name="seeds"/> in order until disposed.</summary>
+    public static Restore Replay(List<uint> seeds)
+    {
+        var restore = new Restore(t_record, t_replay);
+        t_record = null;
+        t_replay = new Queue<uint>(seeds);
+        return restore;
+    }
+
+    public readonly struct Restore(List<uint>? record, Queue<uint>? replay) : IDisposable
+    {
+        public void Dispose() => (t_record, t_replay) = (record, replay);
+    }
 }

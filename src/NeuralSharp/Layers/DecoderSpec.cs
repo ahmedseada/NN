@@ -47,6 +47,13 @@ public sealed record DecoderBuildOptions
     /// </summary>
     public bool Int4 { get; init; }
 
+    /// <summary>
+    /// Standard deviation of a normal initialization of every weight matrix and embedding table (biases zero, norm gains
+    /// one), as GPT-2 and nanoGPT use (0.02). Null keeps the default (uniform Xavier weights, ±0.02 embeddings).
+    /// Ignored when building from weights.
+    /// </summary>
+    public float? InitStd { get; init; }
+
     /// <summary>Longest sequence the model will see (the rotary tables' size); the spec's <see cref="DecoderSpec.MaxPositions"/> when null.</summary>
     public int? MaxPositions { get; init; }
 
@@ -143,6 +150,18 @@ public sealed record DecoderSpec
     /// <summary>A bias on the output head.</summary>
     public bool HeadBias { get; init; }
 
+    /// <summary>
+    /// Learned absolute positions ("pos.weight" [<see cref="MaxPositions"/>, dim], added to the token embeddings, as in
+    /// GPT-2); usually with <see cref="Rope"/> null.
+    /// </summary>
+    public bool LearnedPositions { get; init; }
+
+    /// <summary>
+    /// Dropout probability during training: on the embeddings and on each block's attention and feed-forward outputs
+    /// before the residual additions (GPT-2's embedding and residual dropout). Attention weights are not dropped.
+    /// </summary>
+    public float Dropout { get; init; }
+
     /// <summary>Parameters of the model (weights and biases).</summary>
     public long ParameterCount
     {
@@ -151,7 +170,8 @@ public sealed record DecoderSpec
             long attention = (long)Dim * HeadDim * (Heads + 2 * KvHeads) + (long)Heads * HeadDim * Dim;
             long feedForward = (long)Dim * FfDim * (Gated ? 3 : 2);
             long norms = Dim * (ParallelBlocks ? 1 : 2) * (PostNorms ? 2 : 1) + (QkNorm ? 2 * HeadDim : 0);
-            return (long)Vocabulary * Dim * (TieEmbeddings ? 1 : 2) + Layers * (attention + feedForward + norms) + Dim;
+            return (long)Vocabulary * Dim * (TieEmbeddings ? 1 : 2) + (LearnedPositions ? (long)MaxPositions * Dim : 0)
+                + Layers * (attention + feedForward + norms) + Dim;
         }
     }
 
@@ -176,12 +196,26 @@ public sealed record DecoderSpec
 
             float[] Uniform(int count, float bound) => [.. Enumerable.Range(0, count).Select(_ => (random.NextSingle() * 2f - 1f) * bound)];
 
+            float[] Normal(int count, float std)
+            {
+                var values = new float[count];
+                for (int i = 0; i < count; i++)
+                {
+                    double u1 = 1.0 - random.NextDouble(), u2 = random.NextDouble();
+                    values[i] = (float)(std * Math.Sqrt(-2 * Math.Log(u1)) * Math.Cos(2 * Math.PI * u2));
+                }
+
+                return values;
+            }
+
+            float[] Initial(int count, float uniformBound) => options.InitStd is { } std ? Normal(count, std) : Uniform(count, uniformBound);
+
             Linear Projection(string name, int inputs, int outputs, bool bias, float[]? transposedFrom = null)
             {
                 int[] shape = [inputs, outputs];
                 float[] Values() => transposedFrom is not null ? Transpose(transposedFrom, outputs, inputs)
                     : weights?.Read($"{name}.weight", shape) ?? (weights is null
-                        ? Uniform(inputs * outputs, MathF.Sqrt(6f / (inputs + outputs)))
+                        ? Initial(inputs * outputs, MathF.Sqrt(6f / (inputs + outputs)))
                         : throw new InvalidDataException($"The weights have no '{name}.weight' [{inputs}, {outputs}]."));
                 var b = bias ? Tensor($"{name}.bias", [outputs], () => new float[outputs]) : null;
                 return options.Int8 ? Linear.FromInt8(Int8Weight.Quantize(Values(), inputs, outputs, device), b)
@@ -199,7 +233,7 @@ public sealed record DecoderSpec
             }
 
             var embeddingValues = weights is null
-                ? [.. Enumerable.Range(0, Vocabulary * Dim).Select(_ => (float)(random.NextDouble() * 2 - 1) * 0.02f)]
+                ? (options.InitStd is { } embedStd ? Normal(Vocabulary * Dim, embedStd) : [.. Enumerable.Range(0, Vocabulary * Dim).Select(_ => (float)(random.NextDouble() * 2 - 1) * 0.02f)])
                 : weights.Read("embed.weight", [Vocabulary, Dim]) ?? throw new InvalidDataException($"The weights have no 'embed.weight' [{Vocabulary}, {Dim}].");
             // Frozen-weight builds keep the table as bfloat16 (half the memory; lossless for bfloat16 checkpoints).
             bool frozen = options.Int8 || options.Int4 || options.BFloat16;
@@ -211,6 +245,17 @@ public sealed record DecoderSpec
             if (EmbeddingScale is { } scale)
             {
                 created.Add(new Scale(scale) { Name = "embed_scale" });
+            }
+
+            if (LearnedPositions)
+            {
+                created.Add(new PositionEmbedding(Tensor("pos.weight", [maxPositions, Dim],
+                    () => options.InitStd is { } std ? Normal(maxPositions * Dim, std) : Uniform(maxPositions * Dim, 0.02f))) { Name = "pos" });
+            }
+
+            if (Dropout > 0f)
+            {
+                created.Add(new Dropout(Dropout, new Random(random.Next())) { Name = "embed_drop" });
             }
 
             for (int i = 0; i < Layers; i++)
@@ -233,7 +278,8 @@ public sealed record DecoderSpec
                     Activation);
                 created.Add(new DecoderBlock(attentionNorm, attention, feedForwardNorm, feedForward,
                     PostNorms ? Normalization($"{p}.post_attn_norm", Dim) : null,
-                    PostNorms ? Normalization($"{p}.post_mlp_norm", Dim) : null) { Name = p });
+                    PostNorms ? Normalization($"{p}.post_mlp_norm", Dim) : null,
+                    Dropout > 0f ? new Dropout(Dropout, new Random(random.Next())) : null) { Name = p });
             }
 
             var norm = Normalization("norm", Dim);
@@ -281,6 +327,7 @@ public sealed record DecoderSpec
             ["gated"] = Gated, ["activation"] = Activation.ToString(),
             ["qkvBias"] = QkvBias, ["outputBias"] = OutputBias, ["feedForwardBias"] = FeedForwardBias, ["qkNorm"] = QkNorm,
             ["postNorms"] = PostNorms, ["parallelBlocks"] = ParallelBlocks, ["tieEmbeddings"] = TieEmbeddings, ["headBias"] = HeadBias,
+            ["learnedPositions"] = LearnedPositions, ["dropout"] = Dropout,
         };
         if (EmbeddingScale is { } scale)
         {
@@ -336,7 +383,7 @@ public sealed record DecoderSpec
             QkvBias = (bool)json["qkvBias"]!, OutputBias = (bool)json["outputBias"]!, FeedForwardBias = (bool)json["feedForwardBias"]!,
             QkNorm = (bool)json["qkNorm"]!, PostNorms = (bool)json["postNorms"]!, ParallelBlocks = (bool)json["parallelBlocks"]!,
             TieEmbeddings = (bool)json["tieEmbeddings"]!, HeadBias = (bool)json["headBias"]!, EmbeddingScale = (float?)json["embeddingScale"],
-            Rope = rope,
+            Rope = rope, LearnedPositions = (bool?)json["learnedPositions"] ?? false, Dropout = (float?)json["dropout"] ?? 0f,
         };
     }
 

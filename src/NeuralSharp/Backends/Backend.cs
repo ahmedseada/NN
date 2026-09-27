@@ -253,6 +253,15 @@ internal abstract class Backend
     /// <summary>Adam: m, v moments updated in place; p -= lr * m / (sqrt(v) + eps). lr is already bias-corrected.</summary>
     public abstract void AdamStep(Storage p, Storage g, Storage m, Storage v, int n, float lr, float beta1, float beta2, float eps);
 
+    /// <summary>
+    /// <see cref="AdamStep"/> with 8-bit moments (see <see cref="Optimizers.AdamW8Bit"/>): m and v hold one byte per element
+    /// (n bytes, packed four per float), codes into <paramref name="map"/> (256 signed values for m, then 256 unsigned for
+    /// v, both in [-1, 1]) scaled per block of <see cref="Optimizers.AdamW8Bit.BlockSize"/> elements by
+    /// <paramref name="absMax"/> (the blocks' m scales, then their v scales). The moments are decoded, updated, and
+    /// encoded again to the nearest code with new block scales.
+    /// </summary>
+    public abstract void AdamStep8Bit(Storage p, Storage g, Storage m, Storage v, Storage absMax, Storage map, int n, float lr, float beta1, float beta2, float eps);
+
     /// <summary>Inverted dropout: y = keep(i) ? x / (1 - p) : 0, where keep(i) comes from <see cref="DropoutMask"/>.</summary>
     public abstract void Dropout(Storage x, Storage y, int n, float p, uint seed);
 

@@ -16,6 +16,7 @@ using NeuralSharp.Training;
 if (args is ["--dump-ptx", var ptxPath])
 {
     File.WriteAllText(ptxPath, PtxKernels.Source);
+    File.WriteAllText(Path.ChangeExtension(ptxPath, ".tensorcore.ptx"), PtxKernels.TensorCoreSource);
     Console.WriteLine($"Wrote {PtxKernels.Source.Length} characters of PTX to {ptxPath}");
     return 0;
 }
@@ -80,7 +81,7 @@ return failed == 0 ? 0 : 1;
 
 internal static partial class Tests
 {
-    public static (string Name, Action<Device> Run)[] All => [.. Basic, .. Advanced, .. Decoding, .. Generation, .. Simplified, .. AspNetCore, .. Retrieval, .. Onnx, .. Quantization, .. Decoder, .. Pretrained, .. ChatTemplates, .. FineTuning];
+    public static (string Name, Action<Device> Run)[] All => [.. Basic, .. Advanced, .. Decoding, .. Generation, .. Simplified, .. AspNetCore, .. Retrieval, .. Onnx, .. Quantization, .. Decoder, .. Pretrained, .. ChatTemplates, .. FineTuning, .. MixedPrecisionGroup];
 
     private static readonly (string Name, Action<Device> Run)[] Basic =
     [

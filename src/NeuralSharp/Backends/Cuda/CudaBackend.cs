@@ -72,6 +72,65 @@ internal sealed unsafe partial class CudaBackend : Backend
     private const int BestFitMinimum = 1024;
     private readonly MemoryAccountant _memory;
     private readonly int _multiprocessors;
+    private readonly int _computeMajor;
+
+    // The tensor-core module (compute capability 8.0 and newer), loaded on first use; null when unavailable.
+    private Dictionary<string, IntPtr>? _tensorCore;
+    private bool _tensorCoreTried;
+
+    /// <summary>Why bfloat16 tensor-core products are unavailable on this GPU (null when they are available or untried).</summary>
+    public string? TensorCoreUnavailableReason { get; private set; }
+
+    /// <summary>Number of tensor-core GEMM launches (for tests and diagnostics).</summary>
+    internal long TensorCoreLaunches;
+
+    public string? TensorCoresUnavailable()
+    {
+        lock (_signatures)
+        {
+            return TensorCoreKernels() is null ? TensorCoreUnavailableReason : null;
+        }
+    }
+
+    private Dictionary<string, IntPtr>? TensorCoreKernels()
+    {
+        if (_tensorCoreTried)
+        {
+            return _tensorCore;
+        }
+
+        _tensorCoreTried = true;
+        if (_computeMajor < 8)
+        {
+            TensorCoreUnavailableReason = $"compute capability {_computeMajor}.x has no bfloat16 tensor cores (8.0 or newer needed)";
+            return null;
+        }
+
+        try
+        {
+            MakeCurrent();
+            IntPtr module = LoadModule(PtxKernels.TensorCoreSource);
+            var kernels = new Dictionary<string, IntPtr>();
+            foreach (var kernel in PtxKernels.TensorCoreNames)
+            {
+                byte[] bytes = Encoding.ASCII.GetBytes(kernel + "\0");
+                fixed (byte* p = bytes)
+                {
+                    Check(cuModuleGetFunction(out IntPtr function, module, p), $"cuModuleGetFunction({kernel})");
+                    _signatures[function] = (kernel, PtxKernels.TensorCoreParameterCounts[kernel]);
+                    kernels[kernel] = function;
+                }
+            }
+
+            _tensorCore = kernels;
+        }
+        catch (CudaException e)
+        {
+            TensorCoreUnavailableReason = e.Message;
+        }
+
+        return _tensorCore;
+    }
 
     // Kernel name and declared parameter count per loaded function: a launch with the wrong number of arguments
     // would make the driver read past the argument array (CUDA_ERROR_INVALID_VALUE or silent garbage).
@@ -92,6 +151,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         Check(cuDeviceGetName(name, 256, device), nameof(cuDeviceGetName));
         Check(cuDeviceTotalMem(out nuint memory, device), nameof(cuDeviceTotalMem));
         Check(cuDeviceGetAttribute(out _multiprocessors, AttributeMultiprocessorCount, device), nameof(cuDeviceGetAttribute));
+        Check(cuDeviceGetAttribute(out _computeMajor, AttributeComputeCapabilityMajor, device), nameof(cuDeviceGetAttribute));
         Name = $"{Marshal.PtrToStringAnsi((IntPtr)name)} ({memory / (1024 * 1024)} MiB, {_multiprocessors} SMs)";
         _memory = new MemoryAccountant(() => ComputeResources.GpuMemoryLimit, $"cuda:{ordinal}");
 
@@ -640,6 +700,8 @@ internal sealed unsafe partial class CudaBackend : Backend
             long tiles128 = (long)((m + 127) / 128) * ((n + 127) / 128) * batch;
             gemmTile = tiles128 >= Math.Max(1, _multiprocessors) ? 128 : 64;
         }
+        // bfloat16 tensor cores (MixedPrecision): products large enough to fill 128 × 128 tiles.
+        var tensorCore = !few && m >= 64 && n >= 64 && k >= 32 && MixedPrecision.Current == MatMulPrecision.BFloat16 ? TensorCoreKernels() : null;
         for (int first = 0; first < batch; first += MaxGridZ)
         {
             int count = Math.Min(MaxGridZ, batch - first);
@@ -649,6 +711,16 @@ internal sealed unsafe partial class CudaBackend : Backend
                 uint columnsPerBlock = transB ? 8u : 32u;
                 Launch(K(transB ? "gemv_nt_f32" : "gemv_nn_f32"), (uint)((n + columnsPerBlock - 1) / columnsPerBlock), 1, (uint)count,
                     (uint)(transB ? PtxKernels.RowThreads : PtxKernels.GemvThreads), 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn, U(m), U(n), U(k), F(beta), mk, kn, mn);
+                continue;
+            }
+
+            if (tensorCore is not null)
+            {
+                string kernel = transA ? (transB ? "gemm_tc_tt_f32" : "gemm_tc_tn_f32") : (transB ? "gemm_tc_nt_f32" : "gemm_tc_nn_f32");
+                Launch(tensorCore[kernel], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
+                    (uint)count, PtxKernels.TensorThreads, 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn,
+                    U(m), U(n), U(k), F(beta), mk, kn, mn);
+                Interlocked.Increment(ref TensorCoreLaunches);
                 continue;
             }
 
@@ -680,6 +752,13 @@ internal sealed unsafe partial class CudaBackend : Backend
 
     public override void AdamStep(Storage p, Storage g, Storage m, Storage v, int n, float lr, float beta1, float beta2, float eps) =>
         Launch1D(_adam, n, P(p), P(g), P(m), P(v), F(lr), F(beta1), F(beta2), F(1f - beta1), F(1f - beta2), F(eps), U(n));
+
+    public override void AdamStep8Bit(Storage p, Storage g, Storage m, Storage v, Storage absMax, Storage map, int n, float lr, float beta1, float beta2, float eps)
+    {
+        int blocks = (n + Optimizers.AdamW8Bit.BlockSize - 1) / Optimizers.AdamW8Bit.BlockSize;
+        LaunchRows(K("adam8_f32"), blocks, P(p), P(g), P(m), P(v), P(absMax), P(map),
+            F(lr), F(beta1), F(beta2), F(1f - beta1), F(1f - beta2), F(eps), U(n), U(blocks));
+    }
 
     public override void Dropout(Storage x, Storage y, int n, float p, uint seed) =>
         Launch1D(_dropout, n, P(x), P(y), F(p), F(1f / (1f - p)), seed, 0UL, U(n));

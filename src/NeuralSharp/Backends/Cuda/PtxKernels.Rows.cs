@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "attention_decode_bf16", "attention_flash_bf16", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "attention_decode_bf16", "attention_flash_bf16", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32", "adam8_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -216,8 +216,114 @@ internal static partial class PtxKernels
     /// <summary>Largest head size <c>attention_decode_f32</c> handles (8 dimensions per lane).</summary>
     public const int DecodeMaxDim = 256;
 
+    // 8-bit Adam (see Backend.AdamStep8Bit): one block of 256 threads per quantization block, one element per thread.
+    // The two code tables go to shared memory; after the update the block's new scales are block maxima, and each
+    // moment is encoded to its nearest code by binary search. Parameters: count = elements, n = blocks.
+    private static void Adam8(StringBuilder sb)
+    {
+        string Encode(string label, string value, string table) => $"""
+            mov.u32 %r20, 0;
+            """ + string.Concat(new[] { 128, 64, 32, 16, 8, 4, 2, 1 }.Select(step => $"""
+
+            add.u32 %r21, %r20, {step};
+            shl.b32 %r22, %r21, 2;
+            add.u32 %r22, %r22, {table};
+            ld.shared.f32 %f20, [%r22];
+            setp.le.f32 %p5, %f20, {value};
+            selp.b32 %r20, %r21, %r20, %p5;
+            """)) + $"""
+
+            shl.b32 %r22, %r20, 2;
+            add.u32 %r22, %r22, {table};
+            ld.shared.f32 %f20, [%r22];
+            setp.lt.u32 %p6, %r20, 255;
+            @!%p6 bra {label}_DONE;
+            ld.shared.f32 %f21, [%r22+4];
+            sub.f32 %f21, %f21, {value};
+            sub.f32 %f22, {value}, %f20;
+            setp.lt.f32 %p6, %f21, %f22;
+            @%p6 add.u32 %r20, %r20, 1;
+            {label}_DONE:
+            """;
+
+        RowBlock(sb, "adam8_f32", ["p", "g", "m", "v", "absmax", "map"],
+            [("f32", "lr"), ("f32", "b1"), ("f32", "b2"), ("f32", "c1"), ("f32", "c2"), ("f32", "eps"), ("u32", "count")],
+            $"""
+            mul.wide.u32 %rd1, %tx, 4;
+            add.u64 %rd2, %b_map, %rd1;
+            ld.global.f32 %f1, [%rd2];
+            ld.global.f32 %f2, [%rd2+1024];
+            shl.b32 %r1, %tx, 2;
+            add.u32 %r1, %r1, %spart;
+            st.shared.f32 [%r1], %f1;
+            st.shared.f32 [%r1+1024], %f2;
+            bar.sync 0;
+            add.u32 %r10, %spart, 1024;
+            shl.b32 %r2, %row, 8;
+            add.u32 %r2, %r2, %tx;
+            setp.lt.u32 %p2, %r2, %s_count;
+            cvt.u64.u32 %rd3, %r2;
+            add.u64 %rd4, %b_m, %rd3;
+            add.u64 %rd5, %b_v, %rd3;
+            mul.wide.u32 %rd6, %r2, 4;
+            add.u64 %rd7, %b_p, %rd6;
+            add.u64 %rd8, %b_g, %rd6;
+            ld.global.f32 %f3, [%a_absmax];
+            mul.wide.u32 %rd9, %n, 4;
+            add.u64 %rd10, %a_absmax, %rd9;
+            ld.global.f32 %f4, [%rd10];
+            mov.u32 %r3, 0;
+            mov.u32 %r4, 0;
+            mov.f32 %f5, 0f00000000;
+            mov.f32 %f6, 0f00000000;
+            @%p2 ld.global.u8 %r3, [%rd4];
+            @%p2 ld.global.u8 %r4, [%rd5];
+            @%p2 ld.global.f32 %f5, [%rd8];
+            @%p2 ld.global.f32 %f6, [%rd7];
+            shl.b32 %r5, %r3, 2;
+            add.u32 %r5, %r5, %spart;
+            ld.shared.f32 %f7, [%r5];
+            mul.f32 %f7, %f7, %f3;
+            shl.b32 %r5, %r4, 2;
+            add.u32 %r5, %r5, %r10;
+            ld.shared.f32 %f8, [%r5];
+            mul.f32 %f8, %f8, %f4;
+            mul.f32 %f9, %f5, %s_c1;
+            fma.rn.f32 %f7, %s_b1, %f7, %f9;
+            mul.f32 %f9, %f5, %f5;
+            mul.f32 %f9, %f9, %s_c2;
+            fma.rn.f32 %f8, %s_b2, %f8, %f9;
+            sqrt.rn.f32 %f10, %f8;
+            add.f32 %f10, %f10, %s_eps;
+            div.rn.f32 %f11, %f7, %f10;
+            mul.f32 %f11, %f11, %s_lr;
+            sub.f32 %f6, %f6, %f11;
+            @%p2 st.global.f32 [%rd7], %f6;
+            selp.f32 %f7, %f7, 0f00000000, %p2;
+            selp.f32 %f8, %f8, 0f00000000, %p2;
+            abs.f32 %f12, %f7;
+            {BlockReduce("RM", "%f12", "max", Zero)}
+            mov.f32 %f13, %f8;
+            {BlockReduce("RV", "%f13", "max", Zero)}
+            setp.gt.f32 %p3, %f12, 0f00000000;
+            div.rn.f32 %f14, %f7, %f12;
+            selp.f32 %f14, %f14, 0f00000000, %p3;
+            setp.gt.f32 %p4, %f13, 0f00000000;
+            div.rn.f32 %f15, %f8, %f13;
+            selp.f32 %f15, %f15, 0f00000000, %p4;
+            {Encode("EM", "%f14", "%spart")}
+            @%p2 st.global.u8 [%rd4], %r20;
+            {Encode("EV", "%f15", "%r10")}
+            @%p2 st.global.u8 [%rd5], %r20;
+            setp.eq.u32 %p7, %tx, 0;
+            @%p7 st.global.f32 [%a_absmax], %f12;
+            @%p7 st.global.f32 [%rd10], %f13;
+            """, sharedFloats: 512);
+    }
+
     private static void BuildRows(StringBuilder sb)
     {
+        Adam8(sb);
         GemvNN(sb);
         GemvNN(sb, multi: true);
         GemvNT(sb);

@@ -215,6 +215,43 @@ internal sealed partial class CpuBackend : Backend
     public override void AdamStep(Storage p, Storage g, Storage m, Storage v, int n, float lr, float beta1, float beta2, float eps) =>
         Run(new AdamKernel(D(p), D(g), D(m), D(v), lr, beta1, beta2, eps), n);
 
+    public override void AdamStep8Bit(Storage p, Storage g, Storage m, Storage v, Storage absMax, Storage map, int n, float lr, float beta1, float beta2, float eps)
+    {
+        float[] ps = D(p), gs = D(g), ms = D(m), vs = D(v), scales = D(absMax), codes = D(map);
+        const int B = Optimizers.AdamW8Bit.BlockSize;
+        int blocks = (n + B - 1) / B;
+        Parallel.For(0, blocks, ComputeResources.ParallelOptions, block =>
+        {
+            var mb = MemoryMarshal.AsBytes(ms.AsSpan());
+            var vb = MemoryMarshal.AsBytes(vs.AsSpan());
+            var signedMap = codes.AsSpan(0, 256);
+            var unsignedMap = codes.AsSpan(256, 256);
+            int start = block * B, end = Math.Min(n, start + B);
+            Span<float> mNew = stackalloc float[B], vNew = stackalloc float[B];
+            float mScale = scales[block], vScale = scales[blocks + block], mMax = 0f, vMax = 0f;
+            for (int i = start; i < end; i++)
+            {
+                float grad = gs[i];
+                float mom = MathF.FusedMultiplyAdd(beta1, signedMap[mb[i]] * mScale, (1f - beta1) * grad);
+                float vel = MathF.FusedMultiplyAdd(beta2, unsignedMap[vb[i]] * vScale, grad * grad * (1f - beta2));
+                ps[i] -= mom / (MathF.Sqrt(vel) + eps) * lr;
+                mNew[i - start] = mom;
+                vNew[i - start] = vel;
+                mMax = MathF.Max(mMax, MathF.Abs(mom));
+                vMax = MathF.Max(vMax, vel);
+            }
+
+            for (int i = start; i < end; i++)
+            {
+                mb[i] = Optimizers.AdamW8Bit.Nearest(signedMap, mMax > 0f ? mNew[i - start] / mMax : 0f);
+                vb[i] = Optimizers.AdamW8Bit.Nearest(unsignedMap, vMax > 0f ? vNew[i - start] / vMax : 0f);
+            }
+
+            scales[block] = mMax;
+            scales[blocks + block] = vMax;
+        });
+    }
+
     public override void Dropout(Storage x, Storage y, int n, float p, uint seed) => Run(new DropoutKernel(D(x), D(y), p, seed, accumulate: false), n);
 
     public override void DropoutBackward(Storage dy, Storage dx, int n, float p, uint seed) => Run(new DropoutKernel(D(dy), D(dx), p, seed, accumulate: true), n);

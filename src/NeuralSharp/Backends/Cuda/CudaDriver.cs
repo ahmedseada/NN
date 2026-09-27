@@ -86,6 +86,7 @@ internal static unsafe partial class CudaDriver
     public const int JitErrorLogBufferSizeBytes = 6;
 
     public const int AttributeMultiprocessorCount = 16;
+    public const int AttributeComputeCapabilityMajor = 75;
 
     [LibraryImport(Library)]
     public static partial int cuInit(uint flags);

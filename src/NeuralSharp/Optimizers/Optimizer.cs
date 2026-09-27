@@ -96,7 +96,7 @@ public abstract class Optimizer : IDisposable
     }
 
     /// <summary>Allocates a zeroed state buffer shaped like <paramref name="parameter"/>, outside any <see cref="TensorScope"/>.</summary>
-    protected static Tensor CreateState(Tensor parameter) => Tensor.Persistent(new float[parameter.Size], parameter.Shape, parameter.Device, requiresGrad: false);
+    protected static Tensor CreateState(Tensor parameter) => Tensor.PersistentZeros(parameter.Shape, parameter.Device);
 
     /// <summary>Releases optimizer state (moment buffers).</summary>
     public virtual void Dispose() => GC.SuppressFinalize(this);
