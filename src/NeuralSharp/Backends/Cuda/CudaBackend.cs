@@ -1163,7 +1163,8 @@ internal sealed unsafe partial class CudaBackend : Backend
     }
 
     // The column quantization with given maxima (one per output row: the absmax_cols result, or maxima kept from an
-    // earlier pass for delayed scaling, larger values saturating); `record` (zeroed) receives this x's maxima.
+    // earlier pass for delayed scaling: with `record` set they are doubled as headroom, larger values saturating);
+    // `record` (zeroed) receives this x's maxima.
     internal void QuantizeColumnsWithMaxima(bool fp8, ulong x, int ld, Storage output, Storage scale, int rows, int k, int kp, Storage maxima,
         Storage? record)
     {
@@ -1172,15 +1173,16 @@ internal sealed unsafe partial class CudaBackend : Backend
             x, P(output), P(maxima), P(scale), U(ld), U(kp), U(k), U(rows), record is null ? 0UL : P(record), 0UL);
     }
 
-    // Delayed scaling: quantized with the kept maxima while recording x's own, then the correction pass quantizes again
-    // (with the recorded maxima) the 32-column strips where a value exceeded its kept maximum and saturated. Never
-    // coarser than exact maxima when values grow; when they shrink, FP8's exponent keeps the relative precision.
+    // Delayed scaling: quantized with twice the kept maxima (headroom: step-to-step growth does not saturate) while
+    // recording x's own, then the correction pass quantizes again, with the recorded maxima, the 32-column strips where a
+    // value more than doubled and saturated (a few blocks per strip, which return at once when none did). FP8's exponent
+    // keeps the relative precision the same under the larger scale.
     internal void QuantizeColumnsDelayed(bool fp8, ulong x, int ld, Storage output, Storage scale, int rows, int k, int kp, Storage kept,
         Storage record)
     {
         QuantizeColumnsWithMaxima(fp8, x, ld, output, scale, rows, k, kp, kept, record);
         string format = fp8 ? "e4m3" : "s8";
-        Launch(TensorKernel($"quant_cols_{format}")!.Value, (uint)((rows + 31) / 32), (uint)(kp / 32), 1, 32, 8,
+        Launch(TensorKernel($"quant_cols_{format}")!.Value, (uint)((rows + 31) / 32), (uint)Math.Min(kp / 32, 4), 1, 32, 8,
             x, P(output), P(record), P(scale), U(ld), U(kp), U(k), U(rows), 0UL, P(kept));
     }
 

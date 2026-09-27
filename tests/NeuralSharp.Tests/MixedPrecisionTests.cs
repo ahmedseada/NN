@@ -263,23 +263,24 @@ internal static partial class Tests
                 var (bytes, scales) = Run(0);
                 var (onePass, onePassScales) = Run(1);
                 Check(bytes.AsSpan().SequenceEqual(onePass) && scales.AsSpan().SequenceEqual(onePassScales), $"{what}: one-launch kernel");
+                // Kept maxima get twice their value as headroom: half the true maxima give the exact result.
                 using var recorded = Tensor.Zeros([cols], device);
-                var (delayed, delayedScales) = Run(2, maxima, recorded);
-                Check(bytes.AsSpan().SequenceEqual(delayed) && scales.AsSpan().SequenceEqual(delayedScales), $"{what}: given maxima");
+                var (delayed, delayedScales) = Run(2, [.. maxima.Select(m => m / 2)], recorded);
+                Check(bytes.AsSpan().SequenceEqual(delayed) && scales.AsSpan().SequenceEqual(delayedScales), $"{what}: given maxima (with headroom)");
                 Check(recorded.ToArray().AsSpan().SequenceEqual(maxima), $"{what}: recorded maxima");
                 using var recordedStale = Tensor.Zeros([cols], device);
-                var (_, staleScales) = Run(2, [.. maxima.Select(m => m / 2)], recordedStale);
+                var (_, staleScales) = Run(2, [.. maxima.Select(m => m / 4)], recordedStale);
                 Check(staleScales.Zip(scales).All(p => MathF.Abs(p.First * 2 - p.Second) <= 1e-6f * p.Second), $"{what}: stale maxima set the scales");
                 Check(recordedStale.ToArray().AsSpan().SequenceEqual(maxima), $"{what}: maxima recorded under stale scales");
 
-                // Delayed scaling as training runs it: kept maxima too small → every strip corrected to the exact result;
-                // kept maxima larger than needed → no correction (coarser scales), the true maxima recorded.
+                // Delayed scaling as training runs it: values more than twice the kept maxima → every strip corrected to
+                // the exact result; within the headroom → no correction (scales from the kept maxima), true maxima recorded.
                 using var recordedSmall = Tensor.Zeros([cols], device);
-                var (corrected, correctedScales) = Run(3, [.. maxima.Select(m => m / 2)], recordedSmall);
+                var (corrected, correctedScales) = Run(3, [.. maxima.Select(m => m / 4)], recordedSmall);
                 Check(bytes.AsSpan().SequenceEqual(corrected) && scales.AsSpan().SequenceEqual(correctedScales), $"{what}: saturated columns corrected");
                 using var recordedLarge = Tensor.Zeros([cols], device);
-                var (_, largeScales) = Run(3, [.. maxima.Select(m => m * 2)], recordedLarge);
-                Check(largeScales.Zip(scales).All(p => MathF.Abs(p.First - p.Second * 2) <= 1e-6f * p.First), $"{what}: larger kept maxima kept");
+                var (_, largeScales) = Run(3, maxima, recordedLarge);
+                Check(largeScales.Zip(scales).All(p => MathF.Abs(p.First - p.Second * 2) <= 1e-6f * p.First), $"{what}: kept maxima within the headroom");
                 Check(recordedLarge.ToArray().AsSpan().SequenceEqual(maxima), $"{what}: maxima recorded without correction");
             }
         }

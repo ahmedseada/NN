@@ -240,9 +240,11 @@ internal static partial class PtxKernels
     // out[j, k] = quantized x[k, j] (k-major bytes, rows of ldo, zero past `rows`), scale[j] = amax[j] / max: 32 × 32 tiles
     // through shared memory. Grid (⌈cols / 32⌉, ldo / 32), block 32 × 8. When p_record is not 0, the column maxima of x
     // are also recorded there (atomic max of float bits, zeroed first): with maxima kept from an earlier pass in p_amax
-    // (delayed scaling), one read of x quantizes it and measures it for the next time; larger values saturate.
-    // p_only (not 0) turns the kernel into that pass's correction: a block whose 32 columns all have amax[j] ≤ only[j]
-    // (the kept maxima: nothing saturated) returns before reading x, the others quantize again with the recorded maxima.
+    // (delayed scaling), one read of x quantizes it, with twice the kept maxima as headroom, and measures it for the next
+    // time; values beyond twice the kept maxima saturate. p_only (not 0) turns the kernel into that pass's correction: a
+    // block whose 32 columns all have amax[j] ≤ 2·only[j] (only = the kept maxima: nothing saturated) returns before
+    // reading x, the others quantize again with the recorded maxima (no headroom). Blocks take tiles ctaid.y, +
+    // gridDim.y, … so the correction can run on a few blocks per strip.
     //
     // onePass (quant_cols1_…): the maxima and the quantization in one launch, x read twice (the second time largely from
     // L2): a persistent grid (every block resident) first adds 32-column × 256-row maxima into p_amax (zeroed first), waits
@@ -250,7 +252,7 @@ internal static partial class PtxKernels
     private static void QuantizeColumns(StringBuilder sb, bool fp8, bool onePass = false)
     {
         string name = $"quant_cols{(onePass ? "1" : "")}_{(fp8 ? "e4m3" : "s8")}";
-        string done = onePass ? "TILE_DONE" : "DONE";
+        string done = onePass ? "TILE_DONE" : "YTILE_DONE";
         var s = new StringBuilder();
         s.AppendLine($$"""
             .visible .entry {{name}}(
@@ -421,10 +423,12 @@ internal static partial class PtxKernels
                     mov.f32 %f11, 0f00000000;
                     @%p10 ld.global.f32 %f10, [%rd14];
                     @%p10 ld.global.f32 %f11, [%rd13];
+                    add.f32 %f11, %f11, %f11;
                     setp.gt.f32 %p10, %f10, %f11;
                     bar.red.or.pred %p11, 0, %p10;
                     @!%p11 bra DONE;
                 WHOLE:
+                YTILE:
                 """);
         }
 
@@ -459,6 +463,7 @@ internal static partial class PtxKernels
                 mul.wide.u32 %rd7, %r14, 4;
                 add.u64 %rd8, %rd7, %rd3;
                 {{(onePass ? "ld.global.cg.f32" : "ld.global.f32")}} %f2, [%rd8];
+                {{(onePass ? "" : "@%p8 add.f32 %f2, %f2, %f2;")}}
                 setp.gt.f32 %p3, %f2, 0f00000000;
                 div.rn.f32 %f3, %f2, {{QuantMax(fp8)}};
                 selp.f32 %f3, %f3, 0f3F800000, %p3;
@@ -517,6 +522,20 @@ internal static partial class PtxKernels
                 add.u64 %rd10, %rd10, %rd2;
                 st.global.b32 [%rd10], %r40;
             """);
+        if (!onePass)
+        {
+            // Tiles ctaid.y, + gridDim.y, … (one per block unless the correction pass runs on a few blocks per strip).
+            s.AppendLine("""
+                YTILE_DONE:
+                    bar.sync 0;
+                    mov.u32 %r24, %nctaid.y;
+                    shl.b32 %r24, %r24, 5;
+                    add.u32 %r8, %r8, %r24;
+                    setp.lt.u32 %p5, %r8, %r2;
+                    @%p5 bra YTILE;
+                """);
+        }
+
         if (onePass)
         {
             s.AppendLine("""
