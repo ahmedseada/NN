@@ -14,7 +14,7 @@ internal static partial class Tests
         ("decoder: tiled attention gradients (finite differences through queries, keys and values)", AttentionGradients),
         ("decoder: DecoderSpec variants match a plain reference implementation (GQA, q/k norm, biases, rope, tied, post-norms, parallel)", DecoderMatchesReference),
         ("decoder: cached decoding (float32 and int8 KV) and int8 weights match the full pass; generation", DecoderCachedAndInt8),
-        ("decoder: cached decoding through int8 / int4 / bfloat16 weights (fused head layout, cache writes, split attention, projection + residual + norm) matches the full pass and the CPU", DecoderCachedPacked),
+        ("decoder: cached decoding through int8 / int4 / bfloat16 weights (fused head layout, cache writes, split attention, gate/up + activation, projection + residual + norm) matches the full pass and the CPU", DecoderCachedPacked),
         ("decoder: LoRA by layer name trains; JSON and package round trip", DecoderLoraAndPackage),
         ("decoder: tied head shares the table; last-position prefill; bf16 embedding tables save and load", DecoderMemory),
     ];
@@ -587,9 +587,10 @@ internal static partial class Tests
         var specs = new (string Name, DecoderSpec Spec)[]
         {
             ("q/k norm", SmallSpec with { Dim = 64, HeadDim = 16, FfDim = 128, MaxPositions = 256, QkNorm = true }),
-            ("partial interleaved rope, norm offset", SmallSpec with
+            ("partial interleaved rope, norm offset, GELU", SmallSpec with
             {
                 Dim = 64, HeadDim = 16, FfDim = 128, MaxPositions = 256, NormOffset = 1f, Rope = new RopeSettings(100f, RotaryDim: 8, Interleaved: true),
+                Activation = FeedForwardActivation.Gelu,
             }),
         };
         int[] ids = [1, 4, 9, 16, 2, 7, 11, 3, 8, 20];

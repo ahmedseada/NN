@@ -491,6 +491,76 @@ internal static partial class Tests
     // dotnet run -c Release --project tests/NeuralSharp.Tests -- --bench-gemm
     // TFLOPS of the training products (a 1.25B GPT's shapes) in every layout, with beta 0 and 1, the transposed
     // operands handled by the transposing kernels directly or copied first, and a fresh output buffer each call.
+    // Decoding-sized packed products (one row, Qwen3-0.6B shapes, int8 weights) for each forced number of k splits:
+    // 100 calls recorded in a graph and replayed, so host launch costs are excluded; GB/s counts the weight bytes.
+    internal static int BenchGemv()
+    {
+        if (!Device.IsCudaAvailable)
+        {
+            Console.WriteLine("needs a CUDA device");
+            return 1;
+        }
+
+        var device = Device.Cuda();
+        Console.WriteLine(device.Name);
+        var random = new Random(2);
+        Linear Layer(int k, int n) => Linear.FromInt8(Int8Weight.Quantize([.. Enumerable.Range(0, k * n).Select(_ => random.NextSingle() - 0.5f)], k, n, device));
+        using var x1024 = Tensor.From([.. Enumerable.Range(0, 1024).Select(_ => random.NextSingle() - 0.5f)], [1, 1024], device);
+        using var x2048 = Tensor.From([.. Enumerable.Range(0, 2048).Select(_ => random.NextSingle() - 0.5f)], [1, 2048], device);
+        using var x3072 = Tensor.From([.. Enumerable.Range(0, 3072).Select(_ => random.NextSingle() - 0.5f)], [1, 3072], device);
+        using Linear q = Layer(1024, 2048), k = Layer(1024, 1024), v = Layer(1024, 1024), o = Layer(2048, 1024);
+        using Linear gate = Layer(1024, 3072), up = Layer(1024, 3072), down = Layer(3072, 1024), head = Layer(1024, 151936);
+        var norm = new RMSNorm(1024, device: device);
+        var shapes = new (string Name, long Bytes, Action Run)[]
+        {
+            ("q/k/v 1024 -> 2048+1024+1024", 1024L * 4096, () => Tensor.MatMulPackedMany(x1024, 0, [q, k, v])),
+            ("gate/up + act 1024 -> 2x3072", 1024L * 6144, () => Tensor.MatMulPackedGatedPair(x1024, gate, up, 0)),
+            ("o + add + norm 2048 -> 1024", 2048L * 1024, () => Tensor.MatMulPackedAddRmsNorm(x2048, o, x1024, norm)),
+            ("down + add + norm 3072 -> 1024", 3072L * 1024, () => Tensor.MatMulPackedAddRmsNorm(x3072, down, x1024, norm)),
+            ("head 1024 -> 151936", 1024L * 151936, () => x1024.MatMulInt8(head.Int8!)),
+        };
+        int?[] splits = [null, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+        Console.WriteLine($"{"product",-32} " + string.Join(" ", splits.Select(s => $"{(s is null ? "auto" : s.ToString()),15}")));
+        foreach (var (name, bytes, run) in shapes)
+        {
+            var line = new System.Text.StringBuilder($"{name,-32} ");
+            foreach (var split in splits)
+            {
+                CudaBackend.GemvSplits = split;
+                try
+                {
+                    using var graph = ComputeGraph.Capture(device, () =>
+                    {
+                        for (int i = 0; i < 100; i++)
+                        {
+                            using var calls = new TensorScope();
+                            run();
+                        }
+                    });
+                    graph.Replay();
+                    device.Synchronize();
+                    var watch = System.Diagnostics.Stopwatch.StartNew();
+                    for (int r = 0; r < 10; r++)
+                    {
+                        graph.Replay();
+                    }
+
+                    device.Synchronize();
+                    double us = watch.Elapsed.TotalMilliseconds * 1000 / 1000;
+                    line.Append($"{$"{us:F1}us {bytes / (us * 1e3):F0}GB/s",15} ");
+                }
+                finally
+                {
+                    CudaBackend.GemvSplits = null;
+                }
+            }
+
+            Console.WriteLine(line);
+        }
+
+        return 0;
+    }
+
     internal static int BenchGemm()
     {
         if (!Device.IsCudaAvailable)

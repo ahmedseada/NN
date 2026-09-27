@@ -83,6 +83,9 @@ internal sealed unsafe partial class CudaBackend
         Launch1D(K("bf16_dequant_f32"), k * words, P(packed), P(w), U(words), U(n), U(k * words));
     }
 
+    /// <summary>Benchmarks only: the number of k splits of the few-row packed products instead of the heuristic's.</summary>
+    internal static int? GemvSplits { get; set; }
+
     // Few rows (decoding) through packed weights: read each weight word once, with enough blocks to keep every
     // multiprocessor busy; narrow matrices split k, and the last block of each column range adds the splits in order.
     // `align`: split boundaries fall on multiples of it (int4 splits start on a 64-row block).
@@ -91,7 +94,8 @@ internal sealed unsafe partial class CudaBackend
         Storage? up = null, ulong[]? tail = null)
     {
         int columnBlocks = (words + 31) / 32;
-        int splits = Math.Clamp((4 * Math.Max(1, _multiprocessors) + columnBlocks - 1) / columnBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
+        int splits = GemvSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 16))
+            : Math.Clamp((4 * Math.Max(1, _multiprocessors) + columnBlocks - 1) / columnBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
         int chunk = ((k + splits - 1) / splits + align - 1) / align * align;
         splits = (k + chunk - 1) / chunk;
         var counters = SplitCounters(columnBlocks + 1);
@@ -192,7 +196,17 @@ internal sealed unsafe partial class CudaBackend
     }
 
     public override bool PackedMatMulMany(int kind, Storage x, int m, int k,
-        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products)
+        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products) =>
+        PackedMany(kind, x, m, k, products, -1, null);
+
+    public override bool PackedMatMulGatedPair(int kind, int activation, Storage x, int m, int k,
+        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products, Storage hidden) =>
+        products.Length == 2 && products[0].Columns == products[1].Columns && activation is >= 0 and <= 2
+        && PackedMany(kind, x, m, k, products, activation, hidden);
+
+    // activation >= 0: the gate/up pair, with hidden = act(gate) · up written by the same launch.
+    private bool PackedMany(int kind, Storage x, int m, int k,
+        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products, int activation, Storage? hidden)
     {
         if (m > PtxKernels.GemvRows || k == 0 || products.Length is 0 or > 3)
         {
@@ -200,7 +214,7 @@ internal sealed unsafe partial class CudaBackend
         }
 
         int cpw = kind switch { 0 => 4, 1 => 8, _ => 2 };
-        string kernel = kind switch { 0 => "int8_gemv_multi_f32", 1 => "int4_gemv_multi_f32", _ => "bf16_gemv_multi_f32" };
+        string kernel = (kind switch { 0 => "int8_gemv_multi", 1 => "int4_gemv_multi", _ => "bf16_gemv_multi" }) + (hidden is null ? "_f32" : "_act_f32");
         int nmax = 0, totalBlocks = 0;
         foreach (var product in products)
         {
@@ -209,15 +223,16 @@ internal sealed unsafe partial class CudaBackend
         }
 
         int columnBlocks = ((nmax + cpw - 1) / cpw + 31) / 32;
-        int splits = Math.Clamp((4 * Math.Max(1, _multiprocessors) + totalBlocks - 1) / totalBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
+        int splits = GemvSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 16))
+            : Math.Clamp((4 * Math.Max(1, _multiprocessors) + totalBlocks - 1) / totalBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
         int align = kind == 1 ? 64 : 1;
         int chunk = ((k + splits - 1) / splits + align - 1) / align * align;
         splits = (k + chunk - 1) / chunk;
-        var counters = SplitCounters(columnBlocks * products.Length);
+        var counters = SplitCounters(columnBlocks * (products.Length + (hidden is null ? 0 : 1)));
         var part = splits > 1 ? Allocate(products.Length * splits * m * nmax, zeroed: false) : null;
         try
         {
-            Span<ulong> args = stackalloc ulong[9 + 3 * 5];
+            Span<ulong> args = stackalloc ulong[9 + 3 * 5 + 2];
             args[0] = P(x);
             args[1] = part is null ? P(products[0].Output) : P(part);
             args[2] = U(m);
@@ -237,7 +252,9 @@ internal sealed unsafe partial class CudaBackend
                 args[13 + 5 * j] = U(j < products.Length ? product.Columns : 0);
             }
 
-            Launch(K(kernel), (uint)columnBlocks, (uint)splits, (uint)products.Length, PtxKernels.Int8GemvThreads, 1, args);
+            args[24] = U(activation);
+            args[25] = hidden is null ? 0UL : P(hidden);
+            Launch(K(kernel), (uint)columnBlocks, (uint)splits, (uint)products.Length, PtxKernels.Int8GemvThreads, 1, hidden is null ? args[..24] : args);
         }
         finally
         {

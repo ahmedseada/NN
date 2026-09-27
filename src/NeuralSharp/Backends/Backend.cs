@@ -158,6 +158,14 @@ internal abstract class Backend
         ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products) => false;
 
     /// <summary>
+    /// <see cref="PackedMatMulMany"/> for a feed-forward block's gate and up projections (two products of equal widths),
+    /// also writing hidden = act(gate) · up (activation 0 = SiLU, 1 = GELU tanh, 2 = ReLU) in the same pass. Returns
+    /// false when the device has no fused version.
+    /// </summary>
+    public virtual bool PackedMatMulGatedPair(int kind, int activation, Storage x, int m, int k,
+        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products, Storage hidden) => false;
+
+    /// <summary>
     /// Several products sharing one input: y_j = a · w_j (+ bias_j) for a [m, k] and w_j [k, n_j] (the query, key and
     /// value projections, say). The default computes them one by one; devices may do them in one pass.
     /// </summary>

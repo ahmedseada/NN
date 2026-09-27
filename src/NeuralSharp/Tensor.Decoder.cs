@@ -257,6 +257,55 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// act(input · gate) · (input · up) for packed gate and up layers of one kind with few rows (no biases or adapters),
+    /// the activation applied by the product's own last blocks (inference: not recorded), or null when the layers do
+    /// not fit or the device has no fused version.
+    /// </summary>
+    internal static Tensor? MatMulPackedGatedPair(Tensor input, Layers.Linear gate, Layers.Linear up, int activation)
+    {
+        input.ThrowIfDisposed();
+        int kind = gate.Int8 is not null ? 0 : gate.Int4 is not null ? 1 : gate.BFloat16 is not null ? 2 : -1;
+        int k = input._shape[^1], m = input.Size / Math.Max(1, k), n = gate.OutFeatures;
+        if (kind < 0 || m > Backends.Cuda.PtxKernels.GemvRows || input.Device.Type != DeviceType.Cuda || up.OutFeatures != n
+            || gate.InFeatures != k || up.InFeatures != k || gate.Bias is not null || up.Bias is not null || gate.Adapter is not null
+            || up.Adapter is not null || (kind == 0 ? up.Int8 is null : kind == 1 ? up.Int4 is null : up.BFloat16 is null))
+        {
+            return null;
+        }
+
+        (Tensor Packed, Tensor? Scales) Weights(Layers.Linear layer) => kind switch
+        {
+            0 => (layer.Int8!.Packed, layer.Int8.Scales),
+            1 => (layer.Int4!.Packed, layer.Int4.Scales),
+            _ => (layer.BFloat16!.Packed, null),
+        };
+
+        var (gatePacked, gateScales) = Weights(gate);
+        var (upPacked, upScales) = Weights(up);
+        if (gatePacked.Device != input.Device || upPacked.Device != input.Device)
+        {
+            return null;
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var gateOut = Empty([m * n], input.Device, track: false);
+        var upOut = Empty([m * n], input.Device, track: false);
+        var hidden = Empty([.. input._shape[..^1], n], input.Device);
+        bool done = input.Backend.PackedMatMulGatedPair(kind, activation, input.Storage, m, k,
+            [(gatePacked.Storage, gateScales?.Storage, null, gateOut.Storage, n), (upPacked.Storage, upScales?.Storage, null, upOut.Storage, n)],
+            hidden.Storage);
+        gateOut.Dispose();                                           // stream-ordered: freed after the kernel read them
+        upOut.Dispose();
+        if (!done)
+        {
+            hidden.Dispose();
+            return null;
+        }
+
+        return Traced("matmul_gated_pair_packed", hidden, start);
+    }
+
+    /// <summary>
     /// The layers' packed products of one input in one device pass (few rows, not recorded), or null when the device has
     /// no single-pass version.
     /// </summary>

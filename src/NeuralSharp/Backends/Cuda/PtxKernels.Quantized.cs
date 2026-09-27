@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // row padded to n4 = ceil(n / 4) words), with one float scale per column: w[k, j] = q[k, j] · scale[j].
 internal static partial class PtxKernels
 {
-    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32", "int4_gemv_f32", "int4_dequant_f32", "int8_gemv_multi_f32", "bf16_gemv_multi_f32", "int4_gemv_multi_f32", "int8_gemv_silu_f32", "bf16_gemv_silu_f32", "int4_gemv_silu_f32", "int8_gemv_gelu_f32", "bf16_gemv_gelu_f32", "int4_gemv_gelu_f32", "int8_gemv_addnorm_f32", "bf16_gemv_addnorm_f32", "int4_gemv_addnorm_f32"];
+    public static readonly string[] QuantizedNames = ["int8_matmul_f32", "int8_dequant_f32", "kv_write_int8", "attn_scores_int8", "attn_context_int8", "int8_gemv_f32", "int8_gemv_finish_f32", "bf16_gemv_f32", "bf16_dequant_f32", "int4_gemv_f32", "int4_dequant_f32", "int8_gemv_multi_f32", "bf16_gemv_multi_f32", "int4_gemv_multi_f32", "int8_gemv_silu_f32", "bf16_gemv_silu_f32", "int4_gemv_silu_f32", "int8_gemv_gelu_f32", "bf16_gemv_gelu_f32", "int4_gemv_gelu_f32", "int8_gemv_addnorm_f32", "bf16_gemv_addnorm_f32", "int4_gemv_addnorm_f32", "int8_gemv_multi_act_f32", "bf16_gemv_multi_act_f32", "int4_gemv_multi_act_f32"];
 
     /// <summary>Rows of an int4 weight matrix that share one scale per column.</summary>
     public const int Int4Group = 32;
@@ -30,6 +30,9 @@ internal static partial class PtxKernels
         Int8Gemv(sb, bf16: true, multi: true);
         Int8Gemv(sb, int4: true, multi: true);
         Int8Gemv(sb, addNorm: true);
+        Int8Gemv(sb, multi: true, gatedPair: true);
+        Int8Gemv(sb, bf16: true, multi: true, gatedPair: true);
+        Int8Gemv(sb, int4: true, multi: true, gatedPair: true);
         Int8Gemv(sb, bf16: true, addNorm: true);
         Int8Gemv(sb, int4: true, addNorm: true);
 
@@ -387,13 +390,19 @@ internal static partial class PtxKernels
     // residual addition and the next normalization): the last block to finish its column range (counted in
     // counters[gridDim.x], reset afterwards) computes them over whole rows. p_res, p_sum, p_gain, p_norm, p_eps and
     // p_offset follow p_counters.
-    private static void Int8Gemv(StringBuilder sb, bool bf16 = false, bool int4 = false, bool multi = false, int gated = 0, bool addNorm = false)
+    //
+    // gatedPair (…_gemv_multi_act_f32): the multi kernel for the gate (product 0) and up (product 1) projections of
+    // equal widths, then hidden = act(gate) · up (p_act as gated_act_f32's kind): the second product to finish a column
+    // range (counted in counters[2·cstride + column block], reset afterwards) computes it for those columns. p_act and
+    // p_hidden follow p_n2.
+    private static void Int8Gemv(StringBuilder sb, bool bf16 = false, bool int4 = false, bool multi = false, int gated = 0, bool addNorm = false,
+        bool gatedPair = false)
     {
         int cpw = bf16 ? 2 : int4 ? 8 : 4, columns = 32 * cpw;
         int acc = GemvRows * cpw, dec = Math.Max(32, acc), xr = dec + 8, sc = dec + 9, red = dec + 20;
         string part = bf16 ? "h_part" : int4 ? "i4_part" : "i8_part";
-        string name = (bf16 ? "bf16_gemv" : int4 ? "int4_gemv" : "int8_gemv") + (multi ? "_multi_f32" : gated == 1 ? "_silu_f32" : gated == 2 ? "_gelu_f32" : addNorm ? "_addnorm_f32" : "_f32");
-        string finished = addNorm ? "COLS_DONE" : "DONE";
+        string name = (bf16 ? "bf16_gemv" : int4 ? "int4_gemv" : "int8_gemv") + (multi ? (gatedPair ? "_multi_act_f32" : "_multi_f32") : gated == 1 ? "_silu_f32" : gated == 2 ? "_gelu_f32" : addNorm ? "_addnorm_f32" : "_f32");
+        string finished = addNorm ? "COLS_DONE" : gatedPair ? "PAIR" : "DONE";
         int gu = red + 8, gt = red + 9;
         bool scaled = !bf16 && !int4;
         var s = new StringBuilder();
@@ -404,7 +413,7 @@ internal static partial class PtxKernels
                 .param .u64 p_q0, .param .u64 p_s0, .param .u64 p_y0, .param .u64 p_b0, .param .u32 p_n0,
                 .param .u64 p_q1, .param .u64 p_s1, .param .u64 p_y1, .param .u64 p_b1, .param .u32 p_n1,
                 .param .u64 p_q2, .param .u64 p_s2, .param .u64 p_y2, .param .u64 p_b2, .param .u32 p_n2
-              """
+              """ + (gatedPair ? ", .param .u32 p_act, .param .u64 p_hidden" : "")
             : """
                 .param .u64 p_x, .param .u64 p_q, .param .u64 p_s, .param .u64 p_y, .param .u64 p_part,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .u32 p_n4, .param .u32 p_chunk, .param .u32 p_splits,
@@ -930,6 +939,94 @@ internal static partial class PtxKernels
                 AN_NORM_END:
                     add.u32 %r32, %r32, 1;
                     bra AN_ROW;
+                """);
+        }
+
+        if (gatedPair)
+        {
+            // Every thread of every block gets here once its columns of its product are final; the second of the two
+            // products to finish a column range computes act(gate) · up for it (activation formulas of gated_act_f32).
+            int g = red + 6, u = red + 7, a = red + 8, t1 = red + 9, t2 = red + 10, t3 = red + 11;
+            s.AppendLine($$"""
+                PAIR:
+                    membar.gl;
+                    bar.sync 0;
+                    ld.param.u64 %rd17, [p_counters];
+                    cvta.to.global.u64 %rd17, %rd17;
+                    ld.param.u32 %r26, [p_cstride];
+                    shl.b32 %r26, %r26, 1;
+                    mov.u32 %r27, %ctaid.x;
+                    add.u32 %r26, %r26, %r27;
+                    mul.wide.u32 %rd18, %r26, 4;
+                    add.u64 %rd17, %rd17, %rd18;
+                    setp.eq.u32 %p14, %r5, 0;
+                    mov.u32 %r27, 0;
+                    @%p14 atom.global.add.u32 %r27, [%rd17], 1;
+                    setp.eq.u32 %p15, %r27, 1;
+                    selp.u32 %r29, 1, 0, %p15;
+                    @%p14 st.shared.u32 [%r14], %r29;
+                    bar.sync 0;
+                    ld.shared.u32 %r29, [%r14];
+                    setp.eq.u32 %p15, %r29, 0;
+                    @%p15 bra DONE;
+                    membar.gl;
+                    @%p14 st.global.u32 [%rd17], 0;
+                    setp.ge.u32 %p16, %r5, {{columns}};
+                    @%p16 bra DONE;
+                    mov.u32 %r20, %ctaid.x;
+                    shl.b32 %r20, %r20, {{(int)Math.Log2(columns)}};
+                    add.u32 %r20, %r20, %r5;
+                    setp.ge.u32 %p16, %r20, %r2;
+                    @%p16 bra DONE;
+                    ld.param.u64 %rd18, [p_y0];
+                    ld.param.u64 %rd19, [p_y1];
+                    ld.param.u64 %rd20, [p_hidden];
+                    cvta.to.global.u64 %rd18, %rd18;
+                    cvta.to.global.u64 %rd19, %rd19;
+                    cvta.to.global.u64 %rd20, %rd20;
+                    ld.param.u32 %r21, [p_act];
+                    setp.eq.u32 %p17, %r21, 1;
+                    setp.eq.u32 %p18, %r21, 2;
+                    mov.u32 %r32, 0;
+                PR_ROW:
+                    setp.ge.u32 %p16, %r32, %r1;
+                    @%p16 bra DONE;
+                    mad.lo.u32 %r22, %r32, %r2, %r20;
+                    mul.wide.u32 %rd21, %r22, 4;
+                    add.u64 %rd22, %rd21, %rd18;
+                    ld.global.cg.f32 %f{{g}}, [%rd22];
+                    add.u64 %rd22, %rd21, %rd19;
+                    ld.global.cg.f32 %f{{u}}, [%rd22];
+                    @%p17 bra PR_GELU;
+                    @%p18 bra PR_RELU;
+                    mul.f32 %f{{t1}}, %f{{g}}, {{F(-1.4426950408889634f)}};
+                    ex2.approx.ftz.f32 %f{{t1}}, %f{{t1}};
+                    add.f32 %f{{t1}}, %f{{t1}}, {{One}};
+                    rcp.rn.f32 %f{{t1}}, %f{{t1}};
+                    mul.f32 %f{{a}}, %f{{g}}, %f{{t1}};
+                    bra PR_ACT;
+                PR_GELU:
+                    mul.f32 %f{{t1}}, %f{{g}}, %f{{g}};
+                    mul.f32 %f{{t2}}, %f{{t1}}, %f{{g}};
+                    fma.rn.f32 %f{{t2}}, %f{{t2}}, {{F(0.044715f)}}, %f{{g}};
+                    mul.f32 %f{{t2}}, %f{{t2}}, {{F(0.7978845608f)}};
+                    mul.f32 %f{{t3}}, %f{{t2}}, {{F(2.8853900817779268f)}};
+                    ex2.approx.ftz.f32 %f{{t3}}, %f{{t3}};
+                    add.f32 %f{{t3}}, %f{{t3}}, {{One}};
+                    rcp.rn.f32 %f{{t3}}, %f{{t3}};
+                    fma.rn.f32 %f{{t3}}, %f{{t3}}, {{F(-2f)}}, {{One}};
+                    add.f32 %f{{t3}}, %f{{t3}}, {{One}};
+                    mul.f32 %f{{a}}, %f{{t3}}, %f{{g}};
+                    mul.f32 %f{{a}}, %f{{a}}, {{F(0.5f)}};
+                    bra PR_ACT;
+                PR_RELU:
+                    max.f32 %f{{a}}, %f{{g}}, 0f00000000;
+                PR_ACT:
+                    mul.f32 %f{{a}}, %f{{a}}, %f{{u}};
+                    add.u64 %rd22, %rd21, %rd20;
+                    st.global.f32 [%rd22], %f{{a}};
+                    add.u32 %r32, %r32, 1;
+                    bra PR_ROW;
                 """);
         }
 

@@ -590,6 +590,10 @@ public sealed class FeedForward : Module
         {
             hidden = Activate(Up.Forward(input));
         }
+        else if (!Autograd.IsEnabled && Down.Int4 is null && Tensor.MatMulPackedGatedPair(input, Gate, Up, (int)Activation) is { } pair)
+        {
+            hidden = pair;                                          // act(gate) · up written by the gate/up product
+        }
         else
         {
             var projected = Linear.ForwardMany(input, Gate, Up);
@@ -616,6 +620,11 @@ public sealed class FeedForward : Module
         if (Gate is null)
         {
             return Activate(Up.Forward(input));
+        }
+
+        if (Tensor.MatMulPackedGatedPair(input, Gate, Up, (int)Activation) is { } pair)
+        {
+            return pair;                                            // act(gate) · up written by the gate/up product
         }
 
         var projected = Linear.ForwardMany(input, Gate, Up);
