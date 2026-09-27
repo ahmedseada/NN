@@ -294,9 +294,24 @@ public sealed class CausalSelfAttention : Module, ICachedModule
             throw new ArgumentException($"{t} positions exceed the layer's maximum of {MaxPositions}.");
         }
 
+        float scale = 1f / MathF.Sqrt(HeadDim);
+        if (Rope is null && QueryNorm is null && KeyNorm is null && FusedTraining.Enabled && Backends.Cuda.PtxKernels.FlashTensorDim(HeadDim)
+            && input.Device.Type == DeviceType.Cuda && MixedPrecision.Current == MatMulPrecision.BFloat16
+            && Linear.PlainFloat(Query) && Linear.PlainFloat(Key) && Linear.PlainFloat(Value)
+            && Tensor.ProjectPacked(input, [Query, Key, Value]) is { } packed)
+        {
+            // Queries, keys and values side by side per position, read in place by the attention kernels, which write
+            // [n, t, heads·dim] for the output projection: no head rearrangement either way.
+            if (Tensor.CausalAttentionPacked(packed, Heads, KvHeads, HeadDim, scale) is { } attended)
+            {
+                return Output.Forward(attended);
+            }
+
+            packed.Dispose();
+        }
+
         var positions = Positions(t);
         var (q, k, v) = Project(input, positions);
-        float scale = 1f / MathF.Sqrt(HeadDim);
         if (HeadDim <= Backends.Cuda.PtxKernels.FlashMaxDim)
         {
             // Tiled attention, forward and backward: no [t, t] weights stored (positions[0] = 0 is the causal offset).
@@ -542,6 +557,13 @@ public sealed class FeedForward : Module
     protected override Tensor ForwardCore(Tensor input)
     {
         Tensor hidden;
+        if (Gate is null && Activation == FeedForwardActivation.Gelu && FusedTraining.Enabled && Linear.PlainFloat(Up) && Linear.PlainFloat(Down)
+            && input.Device.Type == DeviceType.Cuda && MixedPrecision.Current == MatMulPrecision.BFloat16
+            && Tensor.FeedForwardGelu(input, Up, Down) is { } geluBlock)
+        {
+            return geluBlock;                                       // GELU inside the products (tensor cores)
+        }
+
         if (Gate is null)
         {
             hidden = Activate(Up.Forward(input));
@@ -769,6 +791,12 @@ public sealed class PositionEmbedding : Module, ICachedModule
 
     /// <inheritdoc />
     public override string ToString() => $"PositionEmbedding({MaxPositions} x {Weight.Shape[1]})";
+}
+
+/// <summary>Switch for the fused tensor-core training paths of the decoder layers (tests compare them with the composed ones).</summary>
+internal static class FusedTraining
+{
+    public static bool Enabled = true;
 }
 
 /// <summary>Multiplies its input by a constant (for example the √dim embedding scale of some models).</summary>

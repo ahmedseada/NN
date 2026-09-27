@@ -111,6 +111,9 @@ public sealed class Linear : Module
     /// </summary>
     public LoraAdapter? Adapter { get; internal set; }
 
+    /// <summary>A float32 weight of its own, no adapter: the layer is x·W (+ b), which fused operations may compute themselves.</summary>
+    internal static bool PlainFloat(Linear layer) => layer._weight is not null && layer._tiedTo is null && layer.Adapter is null;
+
     /// <inheritdoc />
     protected override Tensor ForwardCore(Tensor input)
     {

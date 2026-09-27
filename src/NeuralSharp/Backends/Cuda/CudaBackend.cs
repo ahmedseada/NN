@@ -789,7 +789,7 @@ internal sealed unsafe partial class CudaBackend : Backend
                 string kernel = transA ? (transB ? "gemm_tc_tt_f32" : "gemm_tc_tn_f32") : (transB ? "gemm_tc_nt_f32" : "gemm_tc_nn_f32");
                 Launch(tensorCore[kernel], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
                     (uint)count, PtxKernels.TensorThreads, 1, P(a) + offset * mk, P(b) + offset * kn, P(c) + offset * mn,
-                    U(m), U(n), U(k), F(beta), mk, kn, mn, 0UL);
+                    U(m), U(n), U(k), F(beta), mk, kn, mn, 0UL, U(transA ? m : k), U(transB ? k : n), U(n), 0UL, 0UL);
                 Interlocked.Increment(ref TensorCoreLaunches);
                 continue;
             }
@@ -829,7 +829,31 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
 
         Launch(tensorCore["gemm_tc_nn_f32"], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
-            1, PtxKernels.TensorThreads, 1, P(a), P(b), P(c), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, P(bias));
+            1, PtxKernels.TensorThreads, 1, P(a), P(b), P(c), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, P(bias), U(k), U(n), U(n), 0UL, 0UL);
+        Interlocked.Increment(ref TensorCoreLaunches);
+        return true;
+    }
+
+    public override bool GemmStrided(Storage a, long aOffset, int lda, bool transA, Storage b, long bOffset, int ldb, bool transB,
+        Storage c, long cOffset, int ldc, int m, int n, int k, float beta, Storage? bias = null, GemmEpilogue epilogue = GemmEpilogue.None,
+        Storage? aux = null, long auxOffset = 0)
+    {
+        if (m == 0 || n == 0 || TensorCoreKernels() is not { } tensorCore)
+        {
+            return false;
+        }
+
+        if (_profile is not null)
+        {
+            _profileLabel = $"gemm_tc_{(transA ? 't' : 'n')}{(transB ? 't' : 'n')}{(epilogue == GemmEpilogue.None ? "" : epilogue == GemmEpilogue.Gelu ? "+gelu" : "+gelu'")}"
+                            + $"{(bias is null ? "" : "+bias")} {m}x{n}x{k}";
+            _profileFlops = 2.0 * m * n * k;
+        }
+
+        string kernel = transA ? (transB ? "gemm_tc_tt_f32" : "gemm_tc_tn_f32") : (transB ? "gemm_tc_nt_f32" : "gemm_tc_nn_f32");
+        Launch(tensorCore[kernel], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
+            1, PtxKernels.TensorThreads, 1, P(a) + (ulong)aOffset * 4, P(b) + (ulong)bOffset * 4, P(c) + (ulong)cOffset * 4, U(m), U(n), U(k), F(beta),
+            0UL, 0UL, 0UL, bias is null ? 0UL : P(bias), U(lda), U(ldb), U(ldc), U((int)epilogue), aux is null ? 0UL : P(aux) + (ulong)auxOffset * 4);
         Interlocked.Increment(ref TensorCoreLaunches);
         return true;
     }

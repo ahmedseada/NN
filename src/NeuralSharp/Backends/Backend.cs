@@ -171,6 +171,42 @@ internal abstract class Backend
     /// </summary>
     public virtual bool MatMulBias(Storage a, Storage b, Storage bias, Storage c, int m, int n, int k) => false;
 
+    /// <summary>
+    /// c = beta·c + op(a)·op(b) on bfloat16 tensor cores, with row strides: a [m, k] stored with <paramref name="lda"/>
+    /// floats per row (transposed: [k, m] rows), b [k, n] with <paramref name="ldb"/> (transposed: [n, k] rows), c [m, n]
+    /// with <paramref name="ldc"/>; offsets in elements. <paramref name="bias"/> [n] is added to every row (modes None and
+    /// Gelu). <see cref="GemmEpilogue.Gelu"/> writes gelu(product + bias) and, when <paramref name="aux"/> is given, the
+    /// pre-activations into it (same layout as c); <see cref="GemmEpilogue.GeluGradient"/> multiplies the product by
+    /// gelu'(aux). Returns false when the device has no tensor cores (callers use the composed operations).
+    /// </summary>
+    public virtual bool GemmStrided(Storage a, long aOffset, int lda, bool transA, Storage b, long bOffset, int ldb, bool transB,
+        Storage c, long cOffset, int ldc, int m, int n, int k, float beta, Storage? bias = null, GemmEpilogue epilogue = GemmEpilogue.None,
+        Storage? aux = null, long auxOffset = 0) => false;
+
+    /// <summary>
+    /// Causal attention (positions c ≤ t) read in place from [batch, steps, *] rows: head h (= kv · group + g) of the
+    /// queries at q[qOffset + (b·steps + t)·qRow + h·dim], keys and values of kv head kv at k / v[offset + (b·steps + c)·kRow
+    /// + kv·dim]; writes y [batch, steps, heads·dim] and, when given, the log-sum-exp [batch·kvHeads, group·steps] for the
+    /// backward pass. Returns false when the device has no such kernels (callers rearrange the heads and use
+    /// <see cref="AttentionTiled"/>).
+    /// </summary>
+    public virtual bool AttentionStrided(Storage q, long qOffset, Storage k, long kOffset, Storage v, long vOffset, int qRow, int kRow,
+        Storage y, Storage? logSumExp, int batch, int kvHeads, int group, int steps, int dim, float scale) => false;
+
+    /// <summary>
+    /// Gradients of <see cref="AttentionStrided"/>: adds to dq, dk, dv laid out as q, k, v (same row strides, their own
+    /// offsets) given y, the log-sum-exp and dOutput (y's layout).
+    /// </summary>
+    public virtual bool AttentionStridedBackward(Storage q, long qOffset, Storage k, long kOffset, Storage v, long vOffset, int qRow, int kRow,
+        Storage y, Storage logSumExp, Storage dOutput, Storage dq, long dqOffset, Storage dk, long dkOffset, Storage dv, long dvOffset,
+        int batch, int kvHeads, int group, int steps, int dim, float scale) => false;
+
+    /// <summary>y[j] += Σ_r x[offset + r·ld + j] for j &lt; cols (column sums of a strided block; the bias gradient of a slice).</summary>
+    public virtual void SumColumns(Storage x, long offset, int ld, Storage y, int rows, int cols)
+    {
+        throw new NotSupportedException($"{GetType().Name} has no strided column sums.");
+    }
+
     /// <summary><see cref="MatMul"/> for <paramref name="batch"/> independent, contiguous matrix triples.</summary>
     public abstract void BatchedMatMul(Storage a, Storage b, Storage c, int batch, int m, int n, int k, bool transA, bool transB, float beta);
 
@@ -572,4 +608,17 @@ internal sealed class MemoryAccountant(Func<long?> limit, string deviceName)
     }
 
     public void Freed(long bytes) => Interlocked.Add(ref _cached, -bytes);
+}
+
+/// <summary>What <see cref="Backend.GemmStrided"/> does with each product before storing it.</summary>
+public enum GemmEpilogue
+{
+    /// <summary>Store it (plus the bias).</summary>
+    None = 0,
+
+    /// <summary>Store gelu(product + bias) (tanh approximation), keeping product + bias in the auxiliary tensor when given.</summary>
+    Gelu = 1,
+
+    /// <summary>Store product · gelu'(auxiliary): the gradient through a GELU whose inputs the auxiliary tensor holds.</summary>
+    GeluGradient = 2,
 }

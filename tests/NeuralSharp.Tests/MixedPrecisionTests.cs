@@ -10,6 +10,8 @@ internal static partial class Tests
         ("mixed precision: bfloat16 tensor-core products (every transpose, edges, batches, beta) match bfloat16-rounded references", TensorCoreProducts),
         ("mixed precision: tensor-core flash attention (forward, log-sum-exp, dq, dk, dv; head sizes 64 and 128) matches float32", TensorCoreAttention),
         ("layer norm: the fused training kernels match the composed operations (output, input, gamma and beta gradients)", LayerNormTraining),
+        ("mixed precision: strided products and GELU epilogues match references (slices, activation, its gradient)", StridedProducts),
+        ("mixed precision: fused decoder blocks (packed q/k/v, attention in place, GELU inside the products) match the composed ones", FusedDecoderBlocks),
         ("mixed precision: product + bias in one pass matches the product and a bias addition (output and gradients)", MatMulBiasPass),
         ("optimizer: 8-bit AdamW (dynamic code map, nearest codes, tracks 32-bit AdamW, CPU parity)", EightBitAdam),
         ("decoder: GPT-2 style (learned positions, LayerNorm, GELU, dropout): checkpointed blocks replay the dropout masks", GptStyleDecoder),
@@ -101,6 +103,149 @@ internal static partial class Tests
         AssertClose(separate.Dx, fusedRun.Dx, 1e-4f, "input gradient");
         AssertClose(separate.Dw, fusedRun.Dw, 1e-4f, "weight gradient");
         AssertClose(separate.Db, fusedRun.Db, 1e-4f, "bias gradient");
+    }
+
+    private static float GeluTanh(float x) => 0.5f * x * (1f + MathF.Tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+
+    private static float GeluTanhGradient(float x)
+    {
+        float t = MathF.Tanh(0.7978845608f * (x + 0.044715f * x * x * x));
+        return 0.5f * (1f + t) + 0.5f * x * (1f - t * t) * 0.7978845608f * (1f + 3f * 0.044715f * x * x);
+    }
+
+    private static void StridedProducts(Device device)
+    {
+        if (MixedPrecision.TensorCoresUnavailable(device) is not null)
+        {
+            return;                                                          // CPU and older GPUs: the fused paths do not run
+        }
+
+        var backend = device.Backend;
+        var random = new Random(12);
+        float[] Values(int n) => [.. Enumerable.Range(0, n).Select(_ => random.NextSingle() * 2 - 1)];
+        // c[:, 5:5+n] of a [m, ldc] block = a[:, 3:3+k] (lda) · b[2:2+k rows, 7:7+n] (ldb), every transpose.
+        const int M = 70, N = 90, K = 50, Lda = 64, Ldb = 101, Ldc = 104;
+        foreach (bool ta in new[] { false, true })
+        {
+            foreach (bool tb in new[] { false, true })
+            {
+                int aRows = ta ? K : M, bRows = tb ? N : K;
+                float[] a = Values((aRows + 3) * Lda), b = Values((bRows + 2) * Ldb), c = Values(M * Ldc), bias = Values(N);
+                using var ta_ = Tensor.From(a, [a.Length], device);
+                using var tb_ = Tensor.From(b, [b.Length], device);
+                using var tc_ = Tensor.From(c, [c.Length], device);
+                using var tbias = Tensor.From(bias, [N], device);
+                Check(backend.GemmStrided(ta_.Storage, 3, Lda, ta, tb_.Storage, 2L * Ldb + 7, Ldb, tb, tc_.Storage, 5, Ldc, M, N, K, 0.5f, tbias.Storage),
+                    "strided product runs");
+                var got = tc_.ToArray();
+                for (int i = 0; i < M; i++)
+                {
+                    for (int j = 0; j < N; j++)
+                    {
+                        double sum = 0;
+                        for (int q = 0; q < K; q++)
+                        {
+                            float x = ta ? a[3 + q * Lda + i] : a[3 + i * Lda + q], y = tb ? b[2 * Ldb + 7 + j * Ldb + q] : b[2 * Ldb + 7 + q * Ldb + j];
+                            sum += (double)RoundBFloat16(x) * RoundBFloat16(y);
+                        }
+
+                        double want = sum + 0.5 * c[5 + i * Ldc + j] + bias[j];
+                        Check(Math.Abs(got[5 + i * Ldc + j] - want) < 1e-3 * Math.Max(1, Math.Abs(want)), $"{(ta ? 't' : 'n')}{(tb ? 't' : 'n')} [{i}, {j}]: {got[5 + i * Ldc + j]} vs {want}");
+                    }
+                }
+
+                Check(got[4] == c[4] && got[5 + N] == c[5 + N], "outside the slice untouched");
+            }
+        }
+
+        // GELU epilogue (with the pre-activations kept) and the GELU-gradient epilogue.
+        {
+            float[] a = Values(M * K), b = Values(K * N), bias = Values(N), pre0 = Values(M * N);
+            using var ta_ = Tensor.From(a, [a.Length], device);
+            using var tb_ = Tensor.From(b, [b.Length], device);
+            using var tbias = Tensor.From(bias, [N], device);
+            using var act = Tensor.Zeros([M * N], device);
+            using var pre = Tensor.Zeros([M * N], device);
+            Check(backend.GemmStrided(ta_.Storage, 0, K, false, tb_.Storage, 0, N, false, act.Storage, 0, N, M, N, K, 0f, tbias.Storage,
+                NeuralSharp.Backends.GemmEpilogue.Gelu, pre.Storage), "GELU epilogue runs");
+            var acts = act.ToArray();
+            var pres = pre.ToArray();
+            using var saved = Tensor.From(pre0, [pre0.Length], device);
+            using var grad = Tensor.Zeros([M * N], device);
+            Check(backend.GemmStrided(ta_.Storage, 0, K, false, tb_.Storage, 0, N, false, grad.Storage, 0, N, M, N, K, 0f, null,
+                NeuralSharp.Backends.GemmEpilogue.GeluGradient, saved.Storage), "GELU-gradient epilogue runs");
+            var grads = grad.ToArray();
+            for (int i = 0; i < M; i++)
+            {
+                for (int j = 0; j < N; j++)
+                {
+                    double sum = 0;
+                    for (int q = 0; q < K; q++)
+                    {
+                        sum += (double)RoundBFloat16(a[i * K + q]) * RoundBFloat16(b[q * N + j]);
+                    }
+
+                    float p = (float)(sum + bias[j]);
+                    int o = i * N + j;
+                    Check(Math.Abs(pres[o] - p) < 1e-3f * Math.Max(1, Math.Abs(p)), $"pre-activation [{i}, {j}]");
+                    Check(Math.Abs(acts[o] - GeluTanh(p)) < 2e-3f * Math.Max(1, Math.Abs(p)), $"gelu [{i}, {j}]: {acts[o]} vs {GeluTanh(p)}");
+                    float want = (float)sum * GeluTanhGradient(pre0[o]);
+                    Check(Math.Abs(grads[o] - want) < 2e-3f * Math.Max(1, Math.Abs(want)), $"gelu gradient [{i}, {j}]: {grads[o]} vs {want}");
+                }
+            }
+        }
+    }
+
+    private static void FusedDecoderBlocks(Device device)
+    {
+        if (MixedPrecision.TensorCoresUnavailable(device) is not null)
+        {
+            return;
+        }
+
+        foreach (var (heads, kvHeads) in new[] { (2, 2), (4, 2) })
+        {
+            var spec = new DecoderSpec
+            {
+                Vocabulary = 50, Dim = 128, Layers = 2, Heads = heads, KvHeads = kvHeads, HeadDim = 64, FfDim = 256, MaxPositions = 80,
+                Norm = DecoderNorm.Layer, NormEpsilon = 1e-5f, Gated = false, Activation = FeedForwardActivation.Gelu, Rope = null,
+                QkvBias = true, OutputBias = true, FeedForwardBias = true, TieEmbeddings = true, LearnedPositions = true,
+            };
+            float[] ids = [.. Enumerable.Range(0, 2 * 70).Select(i => (float)(i * 7 % 50))];
+            (float[] Loss, float[][] Grads) Run(bool fused)
+            {
+                NeuralSharp.Layers.FusedTraining.Enabled = fused;
+                try
+                {
+                    using var model = spec.Build(options: new DecoderBuildOptions { Device = device, Seed = 3, InitStd = 0.05f });
+                    model.Train();
+                    using var precision = MixedPrecision.BFloat16();
+                    using var scope = new TensorScope();
+                    var h = Tensor.From(ids, [2, 70], device);
+                    foreach (var module in model)
+                    {
+                        h = module is DecoderBlock block ? block.ForwardCheckpointed(h) : module.Forward(h);
+                    }
+
+                    var loss = (h * Tensor.From([.. Enumerable.Range(0, h.Size).Select(i => MathF.Sin(i))], h.Shape, device)).Sum();
+                    loss.Backward();
+                    return ([loss.Item()], [.. model.Parameters().Select(p => p.Grad!.ToArray())]);
+                }
+                finally
+                {
+                    NeuralSharp.Layers.FusedTraining.Enabled = true;
+                }
+            }
+
+            var composed = Run(false);
+            var fusedRun = Run(true);
+            AssertClose(composed.Loss, fusedRun.Loss, 2e-3f, $"heads {heads}/{kvHeads}: loss");
+            for (int i = 0; i < composed.Grads.Length; i++)
+            {
+                double norm = Math.Sqrt(composed.Grads[i].Sum(v => (double)v * v)), diff = Math.Sqrt(composed.Grads[i].Zip(fusedRun.Grads[i]).Sum(p => (double)(p.First - p.Second) * (p.First - p.Second)));
+                Check(diff <= 2e-2 * norm + 1e-6, $"heads {heads}/{kvHeads}: gradient {i} differs by {diff:G3} (norm {norm:G3})");
+            }
+        }
     }
 
     private static void LayerNormTraining(Device device)
@@ -307,7 +452,7 @@ internal static partial class Tests
 
     private static void TensorCoreProducts(Device device)
     {
-        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == 11)
+        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == 16)
               && PtxKernels.TensorCoreNames.All(PtxKernels.TensorCoreParameterCounts.ContainsKey), "tensor-core kernel signatures");
         var random = new Random(3);
         // A GPU that has tensor cores must load the module: a JIT error would otherwise fall back to float32 silently.

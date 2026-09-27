@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cuda;
 // such as a softmax over a 150k-token vocabulary), and matrix products with few rows (token-by-token decoding).
 internal static partial class PtxKernels
 {
-    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "attention_decode_bf16", "attention_flash_bf16", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32", "adam8_f32", "transpose_f32", "sumsq_f32"];
+    public static readonly string[] RowNames = ["gemv_nn_f32", "gemv_nt_f32", "attention_decode_f32", "attention_decode_int8", "gemm128_f32", "gemm64_f32", "gemv_multi_f32", "attention_flash_f32", "attention_flash_int8", "attn_bwd_d_f32", "attn_bwd_kv_f32", "attn_bwd_q_f32", "attention_combine_f32", "attention_decode_bf16", "attention_flash_bf16", "gemm128_int8_f32", "gemm64_int8_f32", "gemm128_int4_f32", "gemm64_int4_f32", "gemm128_bf16_f32", "gemm64_bf16_f32", "adam8_f32", "transpose_f32", "sumsq_f32", "sum_cols_strided_f32"];
 
     /// <summary>Threads of a <c>gemm128_f32</c> / <c>gemm64_f32</c> block.</summary>
     public const int GemmThreads = 256;
@@ -438,8 +438,58 @@ internal static partial class PtxKernels
             @%p2 red.global.add.f32 [%b_total], %f1;
             """);
 
+    // y[j] += Σ_r x[r·ld + j]: thread = column (x = blocks of 256 columns), grid y = chunks of rows, added atomically.
+    private static void SumColumnsStrided(StringBuilder sb) => sb.AppendLine("""
+        .visible .entry sum_cols_strided_f32(
+            .param .u64 p_x, .param .u64 p_y, .param .u32 p_rows, .param .u32 p_cols, .param .u32 p_ld, .param .u32 p_chunk
+        )
+        {
+            .reg .pred %p<4>;
+            .reg .b32 %r<16>;
+            .reg .b64 %rd<8>;
+            .reg .f32 %f<4>;
+            ld.param.u64 %rd1, [p_x];
+            ld.param.u64 %rd2, [p_y];
+            cvta.to.global.u64 %rd1, %rd1;
+            cvta.to.global.u64 %rd2, %rd2;
+            ld.param.u32 %r1, [p_rows];
+            ld.param.u32 %r2, [p_cols];
+            ld.param.u32 %r3, [p_ld];
+            ld.param.u32 %r4, [p_chunk];
+            mov.u32 %r5, %ctaid.x;
+            mov.u32 %r6, %tid.x;
+            mad.lo.u32 %r7, %r5, 256, %r6;
+            setp.ge.u32 %p1, %r7, %r2;
+            @%p1 bra DONE;
+            mov.u32 %r8, %ctaid.y;
+            mul.lo.u32 %r9, %r8, %r4;
+            add.u32 %r10, %r9, %r4;
+            min.u32 %r10, %r10, %r1;
+            mov.f32 %f1, 0f00000000;
+        ROWS:
+            setp.ge.u32 %p2, %r9, %r10;
+            @%p2 bra ROWS_END;
+            mul.wide.u32 %rd3, %r9, %r3;
+            cvt.u64.u32 %rd4, %r7;
+            add.u64 %rd3, %rd3, %rd4;
+            shl.b64 %rd3, %rd3, 2;
+            add.u64 %rd3, %rd3, %rd1;
+            ld.global.f32 %f2, [%rd3];
+            add.f32 %f1, %f1, %f2;
+            add.u32 %r9, %r9, 1;
+            bra ROWS;
+        ROWS_END:
+            mul.wide.u32 %rd5, %r7, 4;
+            add.u64 %rd5, %rd5, %rd2;
+            red.global.add.f32 [%rd5], %f1;
+        DONE:
+            ret;
+        }
+        """);
+
     private static void BuildRows(StringBuilder sb)
     {
+        SumColumnsStrided(sb);
         SumSquares(sb);
         Transpose(sb);
         Adam8(sb);

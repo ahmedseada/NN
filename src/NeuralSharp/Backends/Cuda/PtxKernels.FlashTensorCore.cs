@@ -30,10 +30,11 @@ internal static partial class PtxKernels
 
     // A property, not a field: TensorCoreNames (another file) reads it during its own static initialization.
     private static string[] FlashTensorKernels =>
-        [.. new[] { 64, 128 }.SelectMany(d => new[] { $"flash_tc_fwd_d{d}", $"flash_tc_bwd_q_d{d}", $"flash_tc_bwd_kv_d{d}" })];
+        [.. new[] { 64, 128 }.SelectMany(d => new[] { $"flash_tc_fwd_d{d}", $"flash_tc_bwd_q_d{d}", $"flash_tc_bwd_kv_d{d}" }), "flash_tc_delta"];
 
     private static void BuildFlashTensorCore(StringBuilder sb)
     {
+        FlashDelta(sb);
         foreach (int d in new[] { 64, 128 })
         {
             FlashForward(sb, d);
@@ -84,10 +85,64 @@ internal static partial class PtxKernels
             add.u32 %r7, %r7, %r10;
         """;
 
-    // Stages `rows` rows of a [*, d] float32 tile starting at global byte address `global` into shared memory at
-    // `shared` as bfloat16 ([rows][d + 8]); rows at or beyond `valid` (a signed register) become zeros. 128 threads,
-    // four floats each per step. Uses %r11-%r14, %rd1-%rd2, %f0-%f3, %p1.
-    private static string FlashStage(string label, string global, string shared, int rows, int d, string valid)
+    // Layout of q-like tensors (q, dq; also the output and dOutput with their own strides): head hh = b · kv + h, row
+    // i = g · steps + t sits at base + b·sB + h·sH + g·sG + t·sT (elements); key-like tensors (k, v, dk, dv): position c at
+    // base + b·sB + h·sH + c·sT. Parameters common to the three kernels.
+    private const string FlashLayoutParameters =
+        ".param .u32 p_kv, .param .u32 p_qsb, .param .u32 p_qsh, .param .u32 p_qsg, .param .u32 p_qst, "
+        + ".param .u32 p_ysb, .param .u32 p_ysh, .param .u32 p_ysg, .param .u32 p_yst, .param .u32 p_ksb, .param .u32 p_ksh, .param .u32 p_kst";
+
+    // Loads the strides (%r60 = kv, %r61-%r64 q, %r65-%r68 output, %r69-%r71 keys) and splits head %r24 into
+    // %r72 = b, %r73 = h.
+    private const string FlashLayout = """
+            ld.param.u32 %r60, [p_kv];
+            ld.param.u32 %r61, [p_qsb];
+            ld.param.u32 %r62, [p_qsh];
+            ld.param.u32 %r63, [p_qsg];
+            ld.param.u32 %r64, [p_qst];
+            ld.param.u32 %r65, [p_ysb];
+            ld.param.u32 %r66, [p_ysh];
+            ld.param.u32 %r67, [p_ysg];
+            ld.param.u32 %r68, [p_yst];
+            ld.param.u32 %r69, [p_ksb];
+            ld.param.u32 %r70, [p_ksh];
+            ld.param.u32 %r71, [p_kst];
+            div.u32 %r72, %r24, %r60;
+            rem.u32 %r73, %r24, %r60;
+        """;
+
+    // pointer += (b·sB + h·sH) · 4.
+    private static string HeadBase(string pointer, string sB, string sH) => $"""
+            mul.wide.u32 %rd40, %r72, {sB};
+            mul.wide.u32 %rd41, %r73, {sH};
+            add.u64 %rd40, %rd40, %rd41;
+            shl.b64 %rd40, %rd40, 2;
+            add.u64 {pointer}, {pointer}, %rd40;
+        """;
+
+    // dst = base + ((row / steps)·sG + (row % steps)·sT) · 4 (q-like rows; steps in %r21). Uses %r76-%r77, %rd42-%rd43.
+    private static string QRow(string dst, string baseAddress, string row, string sG, string sT) => $"""
+            div.u32 %r76, {row}, %r21;
+            mul.lo.u32 %r77, %r76, %r21;
+            sub.u32 %r77, {row}, %r77;
+            mul.wide.u32 %rd42, %r76, {sG};
+            mul.wide.u32 %rd43, %r77, {sT};
+            add.u64 %rd42, %rd42, %rd43;
+            shl.b64 %rd42, %rd42, 2;
+            add.u64 {dst}, {baseAddress}, %rd42;
+        """;
+
+    // dst = base + row · sT · 4 (key-like rows, stride %r71).
+    private static string KRow(string dst, string baseAddress, string row) => $"""
+            mul.wide.u32 %rd42, {row}, %r71;
+            shl.b64 %rd42, %rd42, 2;
+            add.u64 {dst}, {baseAddress}, %rd42;
+        """;
+
+    // Stages `rows` rows (absolute rows first + 0 … rows - 1; those at or past `limit` become zeros) of a float32 tensor
+    // into shared memory at `shared` as bfloat16 ([rows][d + 8]); `address(row, dst)` emits the row's address. 128
+    // threads, four floats each per step. Uses %r11-%r14, %rd1-%rd2, %f0-%f3, %p1 (and what `address` uses).
+    private static string FlashStage(int rows, int d, string shared, string first, string limit, Func<string, string, string> address)
     {
         int quadsPerRow = d / 4, rowStep = 128 / quadsPerRow, stride = FlashStride(d);
         var s = new StringBuilder();
@@ -95,25 +150,25 @@ internal static partial class PtxKernels
                 shr.u32 %r11, %r1, {(int)Math.Log2(quadsPerRow)};
                 and.b32 %r12, %r1, {quadsPerRow - 1};
                 shl.b32 %r12, %r12, 2;
-                mul.lo.u32 %r13, %r11, {d};
-                add.u32 %r13, %r13, %r12;
-                mul.wide.u32 %rd1, %r13, 4;
-                add.u64 %rd1, %rd1, {global};
+                mul.wide.u32 %rd2, %r12, 4;
                 mul.lo.u32 %r14, %r11, {stride};
                 shl.b32 %r13, %r12, 1;
                 add.u32 %r14, %r14, %r13;
                 add.u32 %r14, %r14, {shared};
+                add.u32 %r11, %r11, {first};
             """);
         for (int it = 0; it < rows / rowStep; it++)
         {
+            s.AppendLine($"    add.u32 %r13, %r11, {it * rowStep};");
+            s.AppendLine(address("%r13", "%rd1"));
             s.AppendLine($$"""
-                    add.u32 %r13, %r11, {{it * rowStep}};
-                    setp.lt.s32 %p1, %r13, {{valid}};
+                    add.u64 %rd1, %rd1, %rd2;
+                    setp.lt.u32 %p1, %r13, {{limit}};
                     mov.f32 %f0, 0f00000000;
                     mov.f32 %f1, 0f00000000;
                     mov.f32 %f2, 0f00000000;
                     mov.f32 %f3, 0f00000000;
-                    @%p1 ld.global.v4.f32 {%f0, %f1, %f2, %f3}, [%rd1+{{it * rowStep * d * 4}}];
+                    @%p1 ld.global.v4.f32 {%f0, %f1, %f2, %f3}, [%rd1];
                     cvt.rn.bf16x2.f32 %r12, %f1, %f0;
                     cvt.rn.bf16x2.f32 %r13, %f3, %f2;
                     st.shared.v2.b32 [%r14+{{it * rowStep * stride}}], {%r12, %r13};
@@ -144,6 +199,79 @@ internal static partial class PtxKernels
 
     private static string Zeros(string acc, int count) => string.Concat(Enumerable.Range(0, count).Select(i => $"mov.f32 {acc}{i}, 0f00000000;\n"));
 
+    // D[r] = Σ_d o[r, d] · dOutput[r, d] for rows r = hh · rowsPerHead + i (hh = b · kv + h) of output-layout tensors
+    // (strides p_ysb … p_yst); one thread per row, four floats per load (dim a multiple of 4).
+    private static void FlashDelta(StringBuilder sb) => sb.AppendLine("""
+        .visible .entry flash_tc_delta(
+            .param .u64 p_o, .param .u64 p_do, .param .u64 p_delta, .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_dim,
+            .param .u32 p_total, .param .u32 p_kv, .param .u32 p_ysb, .param .u32 p_ysh, .param .u32 p_ysg, .param .u32 p_yst
+        )
+        {
+            .reg .pred %p<4>;
+            .reg .b32 %r<24>;
+            .reg .b64 %rd<16>;
+            .reg .f32 %f<12>;
+            mov.u32 %r1, %ctaid.x;
+            mov.u32 %r2, %ntid.x;
+            mov.u32 %r3, %tid.x;
+            mad.lo.u32 %r4, %r1, %r2, %r3;
+            ld.param.u32 %r5, [p_total];
+            setp.ge.u32 %p1, %r4, %r5;
+            @%p1 bra DONE;
+            ld.param.u64 %rd1, [p_o];
+            ld.param.u64 %rd2, [p_do];
+            ld.param.u64 %rd3, [p_delta];
+            cvta.to.global.u64 %rd1, %rd1;
+            cvta.to.global.u64 %rd2, %rd2;
+            cvta.to.global.u64 %rd3, %rd3;
+            ld.param.u32 %r6, [p_rows];
+            ld.param.u32 %r7, [p_steps];
+            ld.param.u32 %r8, [p_dim];
+            ld.param.u32 %r9, [p_kv];
+            ld.param.u32 %r10, [p_ysb];
+            ld.param.u32 %r11, [p_ysh];
+            ld.param.u32 %r12, [p_ysg];
+            ld.param.u32 %r13, [p_yst];
+            div.u32 %r14, %r4, %r6;
+            rem.u32 %r15, %r4, %r6;
+            div.u32 %r16, %r14, %r9;
+            rem.u32 %r17, %r14, %r9;
+            div.u32 %r18, %r15, %r7;
+            rem.u32 %r19, %r15, %r7;
+            mul.wide.u32 %rd4, %r16, %r10;
+            mul.wide.u32 %rd5, %r17, %r11;
+            add.u64 %rd4, %rd4, %rd5;
+            mul.wide.u32 %rd5, %r18, %r12;
+            add.u64 %rd4, %rd4, %rd5;
+            mul.wide.u32 %rd5, %r19, %r13;
+            add.u64 %rd4, %rd4, %rd5;
+            shl.b64 %rd4, %rd4, 2;
+            add.u64 %rd6, %rd1, %rd4;
+            add.u64 %rd7, %rd2, %rd4;
+            mov.f32 %f1, 0f00000000;
+            mov.u32 %r20, 0;
+        DOT:
+            setp.ge.u32 %p2, %r20, %r8;
+            @%p2 bra DOT_END;
+            ld.global.v4.f32 {%f2, %f3, %f4, %f5}, [%rd6];
+            ld.global.v4.f32 {%f6, %f7, %f8, %f9}, [%rd7];
+            fma.rn.f32 %f1, %f2, %f6, %f1;
+            fma.rn.f32 %f1, %f3, %f7, %f1;
+            fma.rn.f32 %f1, %f4, %f8, %f1;
+            fma.rn.f32 %f1, %f5, %f9, %f1;
+            add.u64 %rd6, %rd6, 16;
+            add.u64 %rd7, %rd7, 16;
+            add.u32 %r20, %r20, 4;
+            bra DOT;
+        DOT_END:
+            mul.wide.u32 %rd8, %r4, 4;
+            add.u64 %rd8, %rd8, %rd3;
+            st.global.f32 [%rd8], %f1;
+        DONE:
+            ret;
+        }
+        """);
+
     // ------------------------------------------------------------------ forward
 
     // Block: 64 query rows of one head (warp w: rows 16w .. 16w + 15), walking the visible keys in tiles of 64: S = Q·Kᵀ
@@ -157,7 +285,7 @@ internal static partial class PtxKernels
         s.AppendLine($$"""
             .visible .entry {{name}}(
                 .param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_pos, .param .u64 p_y, .param .u64 p_lse,
-                .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_cap, .param .f32 p_scale2
+                .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_cap, .param .f32 p_scale2, {{FlashLayoutParameters}}
             )
             {
             {{FlashRegisters(d, 4 * dTiles)}}
@@ -184,22 +312,16 @@ internal static partial class PtxKernels
                 mov.u32 %r24, %ctaid.y;
                 mov.u32 %r25, %ctaid.x;
                 shl.b32 %r25, %r25, 6;
-                mul.wide.u32 %rd16, %r24, %r20;
-                mul.lo.u64 %rd16, %rd16, {{d * 4}};
-                add.u64 %rd10, %rd10, %rd16;
-                add.u64 %rd14, %rd14, %rd16;
-                mul.wide.u32 %rd17, %r24, %r22;
-                mul.lo.u64 %rd17, %rd17, {{d * 4}};
-                add.u64 %rd11, %rd11, %rd17;
-                add.u64 %rd12, %rd12, %rd17;
+            {{FlashLayout}}
+            {{HeadBase("%rd10", "%r61", "%r62")}}
+            {{HeadBase("%rd14", "%r65", "%r66")}}
+            {{HeadBase("%rd11", "%r69", "%r70")}}
+            {{HeadBase("%rd12", "%r69", "%r70")}}
                 mov.u32 %r26, {{name}}_k;
                 mov.u32 %r27, {{name}}_v;
-                mul.wide.u32 %rd18, %r25, {{d * 4}};
-                add.u64 %rd18, %rd18, %rd10;
-                sub.u32 %r28, %r20, %r25;
             """);
         // Q tile → shared (the K buffer) → fragments.
-        s.AppendLine(FlashStage("QS", "%rd18", "%r26", FlashTensorRows, d, "%r28"));
+        s.AppendLine(FlashStage(FlashTensorRows, d, "%r26", "%r25", "%r20", (row, dst) => QRow(dst, "%rd10", row, "%r63", "%r64")));
         s.AppendLine($"""
                 bar.sync 0;
                 shl.b32 %r29, %r3, 4;
@@ -255,13 +377,9 @@ internal static partial class PtxKernels
             TILE:
                 setp.ge.u32 %p3, %r43, %r34;
                 @%p3 bra TILE_END;
-                mul.wide.u32 %rd19, %r43, {d * 4};
-                add.u64 %rd20, %rd19, %rd11;
-                add.u64 %rd21, %rd19, %rd12;
-                sub.u32 %r44, %r22, %r43;
             """);
-        s.AppendLine(FlashStage("KS", "%rd20", "%r26", FlashTensorRows, d, "%r44"));
-        s.AppendLine(FlashStage("VS", "%rd21", "%r27", FlashTensorRows, d, "%r44"));
+        s.AppendLine(FlashStage(FlashTensorRows, d, "%r26", "%r43", "%r22", (row, dst) => KRow(dst, "%rd11", row)));
+        s.AppendLine(FlashStage(FlashTensorRows, d, "%r27", "%r43", "%r22", (row, dst) => KRow(dst, "%rd12", row)));
         s.AppendLine("bar.sync 0;");
         s.AppendLine(Zeros("%s", 32));
         for (int ks = 0; ks < kSteps; ks++)
@@ -390,13 +508,13 @@ internal static partial class PtxKernels
                 selp.f32 %f56, %f56, 0f00000000, %p9;
                 setp.lt.u32 %p10, %r30, %r20;
                 setp.lt.u32 %p11, %r31, %r20;
-                mul.wide.u32 %rd22, %r30, 4;
-                mul.lo.u64 %rd22, %rd22, {{D}};
-            """.Replace("{{D}}", d.ToString(System.Globalization.CultureInfo.InvariantCulture)));
-        s.AppendLine($"""
-                add.u64 %rd22, %rd22, %rd14;
+            """);
+        s.AppendLine(QRow("%rd22", "%rd14", "%r30", "%r67", "%r68"));
+        s.AppendLine(QRow("%rd26", "%rd14", "%r31", "%r67", "%r68"));
+        s.AppendLine("""
                 mul.wide.u32 %rd23, %r42, 4;
                 add.u64 %rd22, %rd22, %rd23;
+                add.u64 %rd26, %rd26, %rd23;
             """);
         for (int nt = 0; nt < dTiles; nt++)
         {
@@ -406,7 +524,7 @@ internal static partial class PtxKernels
                     @%p10 st.global.v2.f32 [%rd22+{{nt * 32}}], {%f57, %f58};
                     mul.f32 %f57, %acc{{4 * nt + 2}}, %f56;
                     mul.f32 %f58, %acc{{4 * nt + 3}}, %f56;
-                    @%p11 st.global.v2.f32 [%rd22+{{nt * 32 + 8 * d * 4}}], {%f57, %f58};
+                    @%p11 st.global.v2.f32 [%rd26+{{nt * 32}}], {%f57, %f58};
                 """);
         }
 
@@ -452,7 +570,7 @@ internal static partial class PtxKernels
             .extern .shared .align 16 .b8 {{name}}_smem[];
             .visible .entry {{name}}(
                 .param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_do, .param .u64 p_lse, .param .u64 p_delta, .param .u64 p_dq,
-                .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_cap, .param .f32 p_scale, .param .f32 p_scale2
+                .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_cap, .param .f32 p_scale, .param .f32 p_scale2, {{FlashLayoutParameters}}
             )
             {
             {{FlashRegisters(d, 4 * dTiles)}}
@@ -480,28 +598,22 @@ internal static partial class PtxKernels
                 mov.u32 %r25, %ctaid.x;
                 shl.b32 %r25, %r25, 6;
                 mul.wide.u32 %rd17, %r24, %r20;
-                mul.lo.u64 %rd18, %rd17, {{d * 4}};
-                add.u64 %rd10, %rd10, %rd18;
-                add.u64 %rd13, %rd13, %rd18;
-                add.u64 %rd16, %rd16, %rd18;
                 shl.b64 %rd17, %rd17, 2;
                 add.u64 %rd14, %rd14, %rd17;
                 add.u64 %rd15, %rd15, %rd17;
-                mul.wide.u32 %rd19, %r24, %r22;
-                mul.lo.u64 %rd19, %rd19, {{d * 4}};
-                add.u64 %rd11, %rd11, %rd19;
-                add.u64 %rd12, %rd12, %rd19;
+            {{FlashLayout}}
+            {{HeadBase("%rd10", "%r61", "%r62")}}
+            {{HeadBase("%rd16", "%r61", "%r62")}}
+            {{HeadBase("%rd13", "%r65", "%r66")}}
+            {{HeadBase("%rd11", "%r69", "%r70")}}
+            {{HeadBase("%rd12", "%r69", "%r70")}}
                 mov.u32 %r26, {{name}}_smem;
                 add.u32 %r27, %r26, {{tile}};
                 add.u32 %r28, %r26, {{2 * tile}};
                 add.u32 %r29, %r26, {{3 * tile}};
-                mul.wide.u32 %rd20, %r25, {{d * 4}};
-                add.u64 %rd21, %rd20, %rd10;
-                add.u64 %rd22, %rd20, %rd13;
-                sub.u32 %r30, %r20, %r25;
             """);
-        s.AppendLine(FlashStage("QS", "%rd21", "%r26", FlashTensorRows, d, "%r30"));
-        s.AppendLine(FlashStage("OS", "%rd22", "%r27", FlashTensorRows, d, "%r30"));
+        s.AppendLine(FlashStage(FlashTensorRows, d, "%r26", "%r25", "%r20", (row, dst) => QRow(dst, "%rd10", row, "%r63", "%r64")));
+        s.AppendLine(FlashStage(FlashTensorRows, d, "%r27", "%r25", "%r20", (row, dst) => QRow(dst, "%rd13", row, "%r67", "%r68")));
         // Rows, visible limits (causal offset 0), -lse·log2 e and D per row; keys to walk %r34.
         s.AppendLine($"""
                 shl.b32 %r31, %r3, 4;
@@ -556,13 +668,9 @@ internal static partial class PtxKernels
                 setp.ge.u32 %p5, %r43, %r34;
                 @%p5 bra TILE_END;
                 bar.sync 0;
-                mul.wide.u32 %rd26, %r43, {d * 4};
-                add.u64 %rd27, %rd26, %rd11;
-                add.u64 %rd28, %rd26, %rd12;
-                sub.u32 %r47, %r22, %r43;
             """);
-        s.AppendLine(FlashStage("KS", "%rd27", "%r28", FlashTensorRows, d, "%r47"));
-        s.AppendLine(FlashStage("VS", "%rd28", "%r29", FlashTensorRows, d, "%r47"));
+        s.AppendLine(FlashStage(FlashTensorRows, d, "%r28", "%r43", "%r22", (row, dst) => KRow(dst, "%rd11", row)));
+        s.AppendLine(FlashStage(FlashTensorRows, d, "%r29", "%r43", "%r22", (row, dst) => KRow(dst, "%rd12", row)));
         s.AppendLine("bar.sync 0;");
         s.AppendLine(Zeros("%s", 32));
         s.AppendLine(Zeros("%dp", 32));
@@ -623,10 +731,11 @@ internal static partial class PtxKernels
             TILE_END:
                 setp.lt.u32 %p10, %r31, %r20;
                 setp.lt.u32 %p11, %r32, %r20;
-                mul.wide.u32 %rd29, %r31, {d * 4};
-                add.u64 %rd29, %rd29, %rd16;
+            {QRow("%rd29", "%rd16", "%r31", "%r63", "%r64")}
+            {QRow("%rd31", "%rd16", "%r32", "%r63", "%r64")}
                 mul.wide.u32 %rd30, %r42, 4;
                 add.u64 %rd29, %rd29, %rd30;
+                add.u64 %rd31, %rd31, %rd30;
             """);
         for (int nt = 0; nt < dTiles; nt++)
         {
@@ -635,10 +744,10 @@ internal static partial class PtxKernels
                     fma.rn.f32 %f45, %acc{{4 * nt}}, %f39, %f45;
                     fma.rn.f32 %f46, %acc{{4 * nt + 1}}, %f39, %f46;
                     @%p10 st.global.v2.f32 [%rd29+{{nt * 32}}], {%f45, %f46};
-                    @%p11 ld.global.v2.f32 {%f47, %f48}, [%rd29+{{nt * 32 + 8 * d * 4}}];
+                    @%p11 ld.global.v2.f32 {%f47, %f48}, [%rd31+{{nt * 32}}];
                     fma.rn.f32 %f47, %acc{{4 * nt + 2}}, %f39, %f47;
                     fma.rn.f32 %f48, %acc{{4 * nt + 3}}, %f39, %f48;
-                    @%p11 st.global.v2.f32 [%rd29+{{nt * 32 + 8 * d * 4}}], {%f47, %f48};
+                    @%p11 st.global.v2.f32 [%rd31+{{nt * 32}}], {%f47, %f48};
                 """);
         }
 
@@ -667,7 +776,8 @@ internal static partial class PtxKernels
             .visible .entry {{name}}(
                 .param .u64 p_q, .param .u64 p_k, .param .u64 p_v, .param .u64 p_do, .param .u64 p_lse, .param .u64 p_delta,
                 .param .u64 p_dk, .param .u64 p_dv,
-                .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_cap, .param .f32 p_scale, .param .f32 p_scale2, .param .u32 p_skip
+                .param .u32 p_rows, .param .u32 p_steps, .param .u32 p_cap, .param .f32 p_scale, .param .f32 p_scale2, .param .u32 p_skip,
+                {{FlashLayoutParameters}}
             )
             {
             {{FlashRegisters(d, 4 * dTiles)}}
@@ -698,30 +808,24 @@ internal static partial class PtxKernels
                 mov.u32 %r25, %ctaid.x;
                 shl.b32 %r25, %r25, 6;
                 mul.wide.u32 %rd18, %r24, %r20;
-                mul.lo.u64 %rd19, %rd18, {{d * 4}};
-                add.u64 %rd10, %rd10, %rd19;
-                add.u64 %rd13, %rd13, %rd19;
                 shl.b64 %rd18, %rd18, 2;
                 add.u64 %rd14, %rd14, %rd18;
                 add.u64 %rd15, %rd15, %rd18;
-                mul.wide.u32 %rd20, %r24, %r22;
-                mul.lo.u64 %rd20, %rd20, {{d * 4}};
-                add.u64 %rd11, %rd11, %rd20;
-                add.u64 %rd12, %rd12, %rd20;
-                add.u64 %rd16, %rd16, %rd20;
-                add.u64 %rd17, %rd17, %rd20;
+            {{FlashLayout}}
+            {{HeadBase("%rd10", "%r61", "%r62")}}
+            {{HeadBase("%rd13", "%r65", "%r66")}}
+            {{HeadBase("%rd11", "%r69", "%r70")}}
+            {{HeadBase("%rd12", "%r69", "%r70")}}
+            {{HeadBase("%rd16", "%r69", "%r70")}}
+            {{HeadBase("%rd17", "%r69", "%r70")}}
                 mov.u32 %r26, {{name}}_smem;
                 add.u32 %r27, %r26, {{keyTile}};
                 add.u32 %r28, %r26, {{2 * keyTile}};
                 add.u32 %r29, %r28, {{rowTile}};
                 add.u32 %r30, %r29, {{rowTile}};
-                mul.wide.u32 %rd21, %r25, {{d * 4}};
-                add.u64 %rd22, %rd21, %rd11;
-                add.u64 %rd23, %rd21, %rd12;
-                sub.u32 %r31, %r22, %r25;
             """);
-        s.AppendLine(FlashStage("KS", "%rd22", "%r26", FlashTensorRows, d, "%r31"));
-        s.AppendLine(FlashStage("VS", "%rd23", "%r27", FlashTensorRows, d, "%r31"));
+        s.AppendLine(FlashStage(FlashTensorRows, d, "%r26", "%r25", "%r22", (row, dst) => KRow(dst, "%rd11", row)));
+        s.AppendLine(FlashStage(FlashTensorRows, d, "%r27", "%r25", "%r22", (row, dst) => KRow(dst, "%rd12", row)));
         // Keys of this thread (%r32 = key g, %r33 = key g + 8; -1 when past the end so every row masks them... handled by
         // the capacity check), fragment addresses, first row tile.
         s.AppendLine($"""
@@ -749,13 +853,9 @@ internal static partial class PtxKernels
                 setp.ge.u32 %p3, %r43, %r20;
                 @%p3 bra ROWS_END;
                 bar.sync 0;
-                mul.wide.u32 %rd24, %r43, {d * 4};
-                add.u64 %rd25, %rd24, %rd10;
-                add.u64 %rd26, %rd24, %rd13;
-                sub.u32 %r48, %r20, %r43;
             """);
-        s.AppendLine(FlashStage("QS", "%rd25", "%r28", R, d, "%r48"));
-        s.AppendLine(FlashStage("OS", "%rd26", "%r29", R, d, "%r48"));
+        s.AppendLine(FlashStage(R, d, "%r28", "%r43", "%r20", (row, dst) => QRow(dst, "%rd10", row, "%r63", "%r64")));
+        s.AppendLine(FlashStage(R, d, "%r29", "%r43", "%r20", (row, dst) => QRow(dst, "%rd13", row, "%r67", "%r68")));
         // lse·log2 e (+inf past the end, so P = 0) and D of the tile's rows, by threads 0-31.
         s.AppendLine($"""
                 setp.lt.u32 %p4, %r1, {R};
@@ -857,25 +957,29 @@ internal static partial class PtxKernels
             ROWS_END:
                 setp.lt.u32 %p10, %r32, %r22;
                 setp.lt.u32 %p11, %r33, %r22;
-                mul.wide.u32 %rd30, %r32, {d * 4};
+            {KRow("%rd32", "%rd16", "%r32")}
+            {KRow("%rd33", "%rd17", "%r32")}
+            {KRow("%rd34", "%rd16", "%r33")}
+            {KRow("%rd35", "%rd17", "%r33")}
                 mul.wide.u32 %rd31, %r42, 4;
-                add.u64 %rd30, %rd30, %rd31;
-                add.u64 %rd32, %rd30, %rd16;
-                add.u64 %rd33, %rd30, %rd17;
+                add.u64 %rd32, %rd32, %rd31;
+                add.u64 %rd33, %rd33, %rd31;
+                add.u64 %rd34, %rd34, %rd31;
+                add.u64 %rd35, %rd35, %rd31;
             """);
         for (int nt = 0; nt < dTiles; nt++)
         {
-            foreach (var (half, predicate, offset) in new[] { (0, "%p10", nt * 32), (2, "%p11", nt * 32 + 8 * d * 4) })
+            foreach (var (half, predicate, dk, dv) in new[] { (0, "%p10", "%rd32", "%rd33"), (2, "%p11", "%rd34", "%rd35") })
             {
                 s.AppendLine($$"""
-                        @{{predicate}} ld.global.v2.f32 {%f45, %f46}, [%rd32+{{offset}}];
+                        @{{predicate}} ld.global.v2.f32 {%f45, %f46}, [{{dk}}+{{nt * 32}}];
                         fma.rn.f32 %f45, %acc{{4 * nt + half}}, %f39, %f45;
                         fma.rn.f32 %f46, %acc{{4 * nt + half + 1}}, %f39, %f46;
-                        @{{predicate}} st.global.v2.f32 [%rd32+{{offset}}], {%f45, %f46};
-                        @{{predicate}} ld.global.v2.f32 {%f47, %f48}, [%rd33+{{offset}}];
+                        @{{predicate}} st.global.v2.f32 [{{dk}}+{{nt * 32}}], {%f45, %f46};
+                        @{{predicate}} ld.global.v2.f32 {%f47, %f48}, [{{dv}}+{{nt * 32}}];
                         add.f32 %f47, %f47, %dv{{4 * nt + half}};
                         add.f32 %f48, %f48, %dv{{4 * nt + half + 1}};
-                        @{{predicate}} st.global.v2.f32 [%rd33+{{offset}}], {%f47, %f48};
+                        @{{predicate}} st.global.v2.f32 [{{dv}}+{{nt * 32}}], {%f47, %f48};
                     """);
             }
         }

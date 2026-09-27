@@ -69,6 +69,19 @@ internal static partial class PtxKernels
         public int Stride => Width == TensorK ? NarrowStride : WideStride;
     }
 
+    // GELU (tanh approximation, as gelu_f32): %t0 = x², %t5 = tanh(√(2/π) (x + 0.044715 x³)); uses %t0-%t5.
+    private static string GeluTerms(string x) => $"""
+            mul.f32 %t0, {x}, {x};
+            mul.f32 %t1, %t0, {x};
+            fma.rn.f32 %t2, %t1, {F(0.044715f)}, {x};
+            mul.f32 %t2, %t2, {F(0.7978845608f)};
+            mul.f32 %t3, %t2, {F(2.8853900817779268f)};
+            ex2.approx.ftz.f32 %t3, %t3;
+            add.f32 %t3, %t3, 0f3F800000;
+            rcp.rn.f32 %t4, %t3;
+            fma.rn.f32 %t5, %t4, 0fC0000000, 0f3F800000;
+        """;
+
     private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb)
     {
         string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}_f32";
@@ -80,15 +93,18 @@ internal static partial class PtxKernels
             .visible .entry {{name}}(
                 .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .f32 p_beta,
-                .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc, .param .u64 p_bias
+                .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc, .param .u64 p_bias,
+                .param .u32 p_lda, .param .u32 p_ldb, .param .u32 p_ldc, .param .u32 p_mode, .param .u64 p_aux
             )
             {
                 .reg .pred %p<16>;
                 .reg .pred %pbeta, %peven, %qnot;
                 .reg .pred %q<12>;
                 .reg .f32 %e<8>;
+                .reg .f32 %h<8>;
+                .reg .f32 %t<8>;
                 .reg .f32 %bias<8>;
-                .reg .pred %pbias;
+                .reg .pred %pbias, %paux, %pm1, %pm2;
                 .reg .f32 %c<64>;
                 .reg .b32 %fa<16>;
                 .reg .b32 %fb<8>;
@@ -150,11 +166,15 @@ internal static partial class PtxKernels
                 shl.b32 %r10, %r10, 7;
                 mov.u32 %r11, {{name}}_as;
                 mov.u32 %r12, {{name}}_bs;
+                ld.param.u32 %r58, [p_lda];
+                ld.param.u32 %r59, [p_ldb];
+                ld.param.u32 %r60, [p_ldc];
+                ld.param.u32 %r61, [p_mode];
             """);
 
         // Per-thread load coordinates (row within the tile, first of its two columns) and shared-memory store address.
         // A: %r13 row, %r14 column, %r15 store address; B: %r16, %r17, %r18. Leading dimensions (bytes): %rd9 / %rd10.
-        void Coordinates(TileLoad t, string row, string column, string store, string smem, string leading)
+        void Coordinates(TileLoad t, string row, string column, string store, string smem, string leading, string ld)
         {
             s.AppendLine($"""
                     shr.u32 {row}, %r4, {(int)Math.Log2(t.PairsPerRow)};
@@ -164,12 +184,12 @@ internal static partial class PtxKernels
                     shl.b32 %r19, {column}, 1;
                     add.u32 {store}, {store}, %r19;
                     add.u32 {store}, {store}, {smem};
-                    mul.wide.u32 {leading}, {t.InnerLimit}, 4;
+                    mul.wide.u32 {leading}, {ld}, 4;
                 """);
         }
 
-        Coordinates(a, "%r13", "%r14", "%r15", "%r11", "%rd9");
-        Coordinates(b, "%r16", "%r17", "%r18", "%r12", "%rd10");
+        Coordinates(a, "%r13", "%r14", "%r15", "%r11", "%rd9", "%r58");
+        Coordinates(b, "%r16", "%r17", "%r18", "%r12", "%rd10", "%r59");
 
         // ldmatrix lane addresses (without the stage offset), %r20 for A and %r21 for B; see the fragment layouts of
         // mma.m16n8k16 (row-major A 16 × 16, column-major B 16 × 8).
@@ -371,7 +391,7 @@ internal static partial class PtxKernels
                 shl.b32 %r44, %r8, 5;
                 add.u32 %r43, %r43, %r44;
                 add.u32 %r43, %r43, %r10;
-                mul.wide.u32 %rd15, %r2, 4;
+                mul.wide.u32 %rd15, %r60, 4;
                 cvt.u64.u32 %rd14, %r42;
                 mul.lo.u64 %rd14, %rd14, %rd15;
                 mul.wide.u32 %rd16, %r43, 4;
@@ -382,9 +402,23 @@ internal static partial class PtxKernels
         // even, so both columns share an aligned pair), then add and store. Reading them one by one between the stores
         // made the epilogue wait on memory 64 times per thread, halving the speed of beta ≠ 0 products.
         // Bias (optional, one value per column): this thread's 8 columns, loaded once.
+        // Pairs are 8-byte aligned when ldc is even and c (and the auxiliary tensor, same layout) start 8-byte aligned.
+        // Modes: 0 plain; 1 GELU: aux (if any) = acc + bias, c = beta·c + gelu(acc + bias); 2 GELU gradient:
+        // c = beta·c + acc · gelu'(aux) (no bias).
         s.AppendLine("""
-                and.b32 %r47, %r2, 1;
+                ld.param.u64 %rd21, [p_aux];
+                setp.ne.u64 %paux, %rd21, 0;
+                @%paux cvta.to.global.u64 %rd21, %rd21;
+                setp.eq.u32 %pm1, %r61, 1;
+                setp.eq.u32 %pm2, %r61, 2;
+                and.b32 %r47, %r60, 1;
                 setp.eq.u32 %peven, %r47, 0;
+                cvt.u32.u64 %r47, %rd3;
+                cvt.u32.u64 %r48, %rd21;
+                or.b32 %r47, %r47, %r48;
+                and.b32 %r47, %r47, 7;
+                setp.eq.and.u32 %peven, %r47, 0, %peven;
+                sub.u64 %rd22, %rd21, %rd3;
                 ld.param.u64 %rd18, [p_bias];
                 setp.ne.u64 %pbias, %rd18, 0;
             """);
@@ -435,7 +469,8 @@ internal static partial class PtxKernels
                         """);
                 }
 
-                s.AppendLine("@!%pbeta bra EPI_ADD_" + (mt * 2 + half) + ";");
+                int group = mt * 2 + half;
+                s.AppendLine($"@!%pbeta bra EPI_AUX_{group};");
                 for (int nt = 0; nt < 4; nt++)
                 {
                     s.AppendLine($$"""
@@ -445,7 +480,25 @@ internal static partial class PtxKernels
                         """);
                 }
 
-                s.AppendLine("EPI_ADD_" + (mt * 2 + half) + ":");
+                // Mode 2 reads the pre-activations (same layout as c, at c + %rd22).
+                s.AppendLine($"""
+                    EPI_AUX_{group}:
+                        @!%pm2 bra EPI_ADD_{group};
+                        add.u64 %rd23, %rd17, %rd22;
+                    """);
+                for (int nt = 0; nt < 4; nt++)
+                {
+                    s.AppendLine($$"""
+                            @%q{{3 * nt}} ld.global.v2.f32 {%h{{2 * nt}}, %h{{2 * nt + 1}}}, [%rd23+{{nt * 32}}];
+                            @%q{{3 * nt + 1}} ld.global.f32 %h{{2 * nt}}, [%rd23+{{nt * 32}}];
+                            @%q{{3 * nt + 2}} ld.global.f32 %h{{2 * nt + 1}}, [%rd23+{{nt * 32 + 4}}];
+                        """);
+                }
+
+                s.AppendLine($"EPI_ADD_{group}:");
+                s.AppendLine($"@%pm1 bra EPI_GELU_{group};");
+                s.AppendLine($"@%pm2 bra EPI_GRAD_{group};");
+                // Mode 0.
                 for (int nt = 0; nt < 4; nt++)
                 {
                     int c = (mt * 4 + nt) * 4 + half * 2;
@@ -454,6 +507,69 @@ internal static partial class PtxKernels
                             fma.rn.f32 %e{{2 * nt + 1}}, %e{{2 * nt + 1}}, %beta, %c{{c + 1}};
                             add.f32 %e{{2 * nt}}, %e{{2 * nt}}, %bias{{2 * nt}};
                             add.f32 %e{{2 * nt + 1}}, %e{{2 * nt + 1}}, %bias{{2 * nt + 1}};
+                        """);
+                }
+
+                s.AppendLine($"bra EPI_STORE_{group};");
+                // Mode 1: pre = acc + bias (stored when aux is given), c = beta·c + gelu(pre).
+                s.AppendLine($"EPI_GELU_{group}:");
+                s.AppendLine("add.u64 %rd23, %rd17, %rd22;");
+                for (int nt = 0; nt < 4; nt++)
+                {
+                    int c = (mt * 4 + nt) * 4 + half * 2;
+                    s.AppendLine($$"""
+                            add.f32 %h{{2 * nt}}, %c{{c}}, %bias{{2 * nt}};
+                            add.f32 %h{{2 * nt + 1}}, %c{{c + 1}}, %bias{{2 * nt + 1}};
+                            and.pred %p12, %q{{3 * nt}}, %paux;
+                            and.pred %p13, %q{{3 * nt + 1}}, %paux;
+                            and.pred %p14, %q{{3 * nt + 2}}, %paux;
+                            @%p12 st.global.v2.f32 [%rd23+{{nt * 32}}], {%h{{2 * nt}}, %h{{2 * nt + 1}}};
+                            @%p13 st.global.f32 [%rd23+{{nt * 32}}], %h{{2 * nt}};
+                            @%p14 st.global.f32 [%rd23+{{nt * 32 + 4}}], %h{{2 * nt + 1}};
+                        """);
+                    for (int j = 0; j < 2; j++)
+                    {
+                        s.AppendLine(GeluTerms($"%h{2 * nt + j}"));
+                        s.AppendLine($"""
+                                add.f32 %t6, %t5, 0f3F800000;
+                                mul.f32 %t6, %t6, %h{2 * nt + j};
+                                mul.f32 %t6, %t6, 0f3F000000;
+                                fma.rn.f32 %e{2 * nt + j}, %e{2 * nt + j}, %beta, %t6;
+                            """);
+                    }
+                }
+
+                s.AppendLine($"bra EPI_STORE_{group};");
+                // Mode 2: c = beta·c + acc · gelu'(pre).
+                s.AppendLine($"EPI_GRAD_{group}:");
+                for (int nt = 0; nt < 4; nt++)
+                {
+                    int c = (mt * 4 + nt) * 4 + half * 2;
+                    for (int j = 0; j < 2; j++)
+                    {
+                        string x = $"%h{2 * nt + j}";
+                        s.AppendLine(GeluTerms(x));
+                        s.AppendLine($"""
+                                add.f32 %t6, %t5, 0f3F800000;
+                                mul.f32 %t6, %t6, 0f3F000000;
+                                mul.f32 %t7, %t5, %t5;
+                                sub.f32 %t7, 0f3F800000, %t7;
+                                mul.f32 %t0, %t0, {F(3f * 0.044715f)};
+                                add.f32 %t0, %t0, 0f3F800000;
+                                mul.f32 %t0, %t0, {F(0.7978845608f)};
+                                mul.f32 %t7, %t7, %t0;
+                                mul.f32 %t7, %t7, {x};
+                                fma.rn.f32 %t6, %t7, 0f3F000000, %t6;
+                                mul.f32 %t6, %t6, %c{c + j};
+                                fma.rn.f32 %e{2 * nt + j}, %e{2 * nt + j}, %beta, %t6;
+                            """);
+                    }
+                }
+
+                s.AppendLine($"EPI_STORE_{group}:");
+                for (int nt = 0; nt < 4; nt++)
+                {
+                    s.AppendLine($$"""
                             @%q{{3 * nt}} st.global.v2.f32 [%rd17+{{nt * 32}}], {%e{{2 * nt}}, %e{{2 * nt + 1}}};
                             @%q{{3 * nt + 1}} st.global.f32 [%rd17+{{nt * 32}}], %e{{2 * nt}};
                             @%q{{3 * nt + 2}} st.global.f32 [%rd17+{{nt * 32 + 4}}], %e{{2 * nt + 1}};
