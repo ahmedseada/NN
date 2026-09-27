@@ -86,6 +86,16 @@ internal sealed unsafe partial class CudaBackend
     /// <summary>Benchmarks only: the number of k splits of the few-row packed products instead of the heuristic's.</summary>
     internal static int? GemvSplits { get; set; }
 
+    // k splits of a few-row packed product with `blocks` column blocks: about two blocks per SM, rounded to a power of
+    // two so the chunks stay multiples of the 64-row unrolled step (measured on an RTX 5070 Ti with --bench-gemv: the
+    // best or within 3% of it for the Qwen3-0.6B decoding shapes; four blocks per SM was up to 40% slower).
+    private int GemvSplitCount(int blocks, int k)
+    {
+        int wanted = (2 * Math.Max(1, _multiprocessors) + blocks - 1) / blocks;
+        int splits = 1 << (int)Math.Round(Math.Log2(Math.Max(1, wanted)));
+        return Math.Clamp(splits, 1, Math.Max(1, Math.Min(64, k / 64)));
+    }
+
     // Few rows (decoding) through packed weights: read each weight word once, with enough blocks to keep every
     // multiprocessor busy; narrow matrices split k, and the last block of each column range adds the splits in order.
     // `align`: split boundaries fall on multiples of it (int4 splits start on a 64-row block).
@@ -94,8 +104,7 @@ internal sealed unsafe partial class CudaBackend
         Storage? up = null, ulong[]? tail = null)
     {
         int columnBlocks = (words + 31) / 32;
-        int splits = GemvSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 16))
-            : Math.Clamp((4 * Math.Max(1, _multiprocessors) + columnBlocks - 1) / columnBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
+        int splits = GemvSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 16)) : GemvSplitCount(columnBlocks, k);
         int chunk = ((k + splits - 1) / splits + align - 1) / align * align;
         splits = (k + chunk - 1) / chunk;
         var counters = SplitCounters(columnBlocks + 1);
@@ -223,8 +232,7 @@ internal sealed unsafe partial class CudaBackend
         }
 
         int columnBlocks = ((nmax + cpw - 1) / cpw + 31) / 32;
-        int splits = GemvSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 16))
-            : Math.Clamp((4 * Math.Max(1, _multiprocessors) + totalBlocks - 1) / totalBlocks, 1, Math.Max(1, Math.Min(64, k / 64)));
+        int splits = GemvSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 16)) : GemvSplitCount(totalBlocks, k);
         int align = kind == 1 ? 64 : 1;
         int chunk = ((k + splits - 1) / splits + align - 1) / align * align;
         splits = (k + chunk - 1) / chunk;
