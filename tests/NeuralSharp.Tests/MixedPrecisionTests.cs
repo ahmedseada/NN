@@ -678,7 +678,7 @@ internal static partial class Tests
         Console.WriteLine();
         int?[] splitCounts = [null, 1, 2, 3, 4, 6, 8];
         Console.WriteLine($"{"m x n x k (tn)",-20} " + string.Join(" ", splitCounts.Select(s => $"{(s is null ? "auto" : $"split {s}"),13}")));
-        foreach (var (m, n, k) in new[] { (768, 768, 12288), (3072, 768, 12288), (768, 3072, 12288), (1024, 1024, 8192), (1024, 3072, 8192) })
+        foreach (var (m, n, k) in new[] { (768, 768, 12288), (3072, 768, 12288), (768, 3072, 12288), (1024, 1024, 8192), (1024, 3072, 8192), (2048, 2048, 4096), (2048, 8192, 4096) })
         {
             using var a = Random(k * m);
             using var b = Random(k * n);

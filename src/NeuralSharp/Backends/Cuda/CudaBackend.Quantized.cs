@@ -160,7 +160,7 @@ internal sealed unsafe partial class CudaBackend
             // more, partial sums added into the zeroed output.
             int rowTiles = (m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile, columnTiles = (n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
             int splits = PackedSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 32))
-                : Math.Clamp(Math.Min(k / 256, 2 * Math.Max(1, _multiprocessors) / (rowTiles * columnTiles)), 1, 8);
+                : Math.Clamp(Math.Min(k / 256, 4 * Math.Max(1, _multiprocessors) / (rowTiles * columnTiles)), 1, 8);
             if (splits > 1)
             {
                 Check(cuMemsetD32Async(P(y), 0, (nuint)((long)m * n), _stream), nameof(cuMemsetD32Async));
@@ -345,13 +345,14 @@ internal sealed unsafe partial class CudaBackend
     }
 
     // Decoding attention has one block per query row (few rows: the heads of one token), so the cached positions are
-    // split over enough blocks to fill the GPU; each writes (max, sum, weighted values) for its chunk and the last
-    // block of a row to finish merges them (counted in the split counters). The split count depends only on the shapes,
+    // split over about five blocks per SM (--bench-gemv, 16 rows → 22 splits: 4000 positions 75.9 → ~35 µs, 1000
+    // positions 22 → ~15 µs); each writes (max, sum, weighted values) for its chunk and the last block of a row to finish
+    // merges them (counted in the split counters). The split count depends only on the shapes,
     // so recorded graphs stay valid as the cache fills (chunks are computed on the device from the current length).
     private void DecodeSplit(int rows, int capacity, int dim, Storage y, Action<int, Storage, Storage> launch)
     {
         int splits = DecodeSplits is int forced ? Math.Clamp(forced, 1, 64)
-            : Math.Clamp((2 * Math.Max(1, _multiprocessors) + rows - 1) / rows, 1, Math.Clamp(capacity / 64, 1, 32));
+            : Math.Clamp((5 * Math.Max(1, _multiprocessors) + rows - 1) / rows, 1, Math.Clamp(capacity / 64, 1, 32));
         var counters = SplitCounters(rows);
         if (splits == 1)
         {

@@ -937,9 +937,10 @@ internal sealed unsafe partial class CudaBackend : Backend
     /// <summary>Benchmarks only: the k splits of plain tensor-core products instead of the heuristic's (1: none).</summary>
     internal static int? TensorSplitsOverride { get; set; }
 
-    // k splits of a plain tensor-core product whose output tiles leave SMs idle (small m·n, long k: weight gradients):
-    // about two blocks per SM, chunks of 1024 k or more. The blocks add their partial sums into c atomically, so beta must
-    // be 1, or 0 with c zeroed here (only when its rows are contiguous: ldc = n).
+    // k splits of a plain tensor-core product with fewer than 4 output tiles per SM and a long k (weight gradients):
+    // about 16 blocks per SM, at most 8 splits, chunks of 1024 k or more (measured with --bench-gemm on an RTX 5070 Ti:
+    // 768×768×12288 tn 28.6 → 59.5 TFLOPS, 3072×768×12288 49.3 → 72.5, 1024×3072×8192 65.1 → 74.2). The blocks add their
+    // partial sums into c atomically, so beta must be 1, or 0 with c zeroed here (only when its rows are contiguous).
     private int TensorSplits(int m, int n, int k, float beta, ulong c, int ldc)
     {
         if (beta != 1f && (beta != 0f || ldc != n))
@@ -947,8 +948,10 @@ internal sealed unsafe partial class CudaBackend : Backend
             return 1;
         }
 
+        int sms = Math.Max(1, _multiprocessors);
         int tiles = ((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile) * ((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile);
-        int splits = Math.Clamp(TensorSplitsOverride ?? (int)Math.Round(2.0 * Math.Max(1, _multiprocessors) / tiles), 1, Math.Max(1, Math.Min(8, k / 1024)));
+        int wanted = TensorSplitsOverride ?? (tiles >= 4 * sms ? 1 : (16 * sms + tiles - 1) / tiles);
+        int splits = Math.Clamp(wanted, 1, Math.Max(1, Math.Min(8, k / 1024)));
         if (splits > 1 && beta == 0f)
         {
             Check(cuMemsetD32Async(c, 0, (nuint)((long)m * n), _stream), nameof(cuMemsetD32Async));
