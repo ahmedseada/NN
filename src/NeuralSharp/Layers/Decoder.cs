@@ -296,7 +296,7 @@ public sealed class CausalSelfAttention : Module, ICachedModule
 
         float scale = 1f / MathF.Sqrt(HeadDim);
         if (Rope is null && QueryNorm is null && KeyNorm is null && FusedTraining.Enabled && Backends.Cuda.PtxKernels.FlashTensorDim(HeadDim)
-            && input.Device.Type == DeviceType.Cuda && MixedPrecision.Current == MatMulPrecision.BFloat16
+            && input.Device.Type == DeviceType.Cuda && MixedPrecision.UsesTensorCores
             && Linear.PlainFloat(Query) && Linear.PlainFloat(Key) && Linear.PlainFloat(Value)
             && Tensor.ProjectPacked(input, [Query, Key, Value]) is { } packed)
         {
@@ -558,7 +558,7 @@ public sealed class FeedForward : Module
     {
         Tensor hidden;
         if (Gate is null && Activation == FeedForwardActivation.Gelu && FusedTraining.Enabled && Linear.PlainFloat(Up) && Linear.PlainFloat(Down)
-            && input.Device.Type == DeviceType.Cuda && MixedPrecision.Current == MatMulPrecision.BFloat16
+            && input.Device.Type == DeviceType.Cuda && MixedPrecision.UsesTensorCores
             && Tensor.FeedForwardGelu(input, Up, Down) is { } geluBlock)
         {
             return geluBlock;                                       // GELU inside the products (tensor cores)

@@ -12,6 +12,14 @@ public enum MatMulPrecision
     /// later, A100, H100). Tensors stay float32; devices without such hardware (and the CPU) keep computing in float32.
     /// </summary>
     BFloat16,
+
+    /// <summary>
+    /// Operands quantized to FP8 (e4m3: 4 exponent, 3 mantissa bits) with one scale per row of the left operand and per
+    /// column of the right one, multiplied on FP8 tensor cores (twice the bfloat16 rate; NVIDIA compute capability 8.9
+    /// and newer: RTX 40xx / 50xx, H100) and summed in float32. Attention and devices without FP8 use bfloat16. Faster but
+    /// coarser than <see cref="BFloat16"/>: compare training curves before relying on it.
+    /// </summary>
+    Float8,
 }
 
 /// <summary>
@@ -32,9 +40,14 @@ public static class MixedPrecision
     [ThreadStatic]
     private static MatMulPrecision? t_current;
 
-    /// <summary>The precision outside any scope (initially from NEURALSHARP_MATMUL=bf16, else float32).</summary>
+    /// <summary>The precision outside any scope (initially from NEURALSHARP_MATMUL=bf16 or fp8, else float32).</summary>
     public static MatMulPrecision Default { get; set; } =
-        Environment.GetEnvironmentVariable("NEURALSHARP_MATMUL") is "bf16" or "bfloat16" ? MatMulPrecision.BFloat16 : MatMulPrecision.Float32;
+        Environment.GetEnvironmentVariable("NEURALSHARP_MATMUL") switch
+        {
+            "bf16" or "bfloat16" => MatMulPrecision.BFloat16,
+            "fp8" or "float8" => MatMulPrecision.Float8,
+            _ => MatMulPrecision.Float32,
+        };
 
     /// <summary>The precision matrix products use on the current thread.</summary>
     public static MatMulPrecision Current => t_current ?? Default;
@@ -54,6 +67,9 @@ public static class MixedPrecision
     public static string? TensorCoresUnavailable(Device device) => device.Type == DeviceType.Cpu
         ? "the CPU computes matrix products in float32"
         : ((Backends.Cuda.CudaBackend)device.Backend).TensorCoresUnavailable();
+
+    /// <summary>True when matrix products run on tensor cores (any precision other than float32).</summary>
+    internal static bool UsesTensorCores => Current != MatMulPrecision.Float32;
 
     /// <summary>Uses <see cref="MatMulPrecision.BFloat16"/> on this thread until the returned scope is disposed.</summary>
     public static Scope BFloat16() => Use(MatMulPrecision.BFloat16);

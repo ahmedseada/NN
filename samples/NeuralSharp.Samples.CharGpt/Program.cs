@@ -6,7 +6,8 @@
 //                    --block 384 --batch 32 --dmodel 768 --heads 12 --layers 12 --dropout 0.1
 //                    --lr 3e-4 --min-lr 3e-5 --warmup 1000 --steps 80000 --eval-every 500 --eval-steps 40
 //                    --save-every 1000 --seed 42 --resume <out>/last.nsw --grad-checkpoint --optim8bit
-//                    NeuralSharp only: --fp32 (no bfloat16 tensor cores), --cpu, --gpu-memory GiB, --offload,
+//                    NeuralSharp only: --fp32 (no bfloat16 tensor cores), --fp8 (FP8 tensor-core products, compute
+//                    capability 8.9+: faster, coarser; compare the loss curve), --cpu, --gpu-memory GiB, --offload,
 //                    --log-every N (a new progress line every N steps; default: one line redrawn in place),
 //                    --profile (time every kernel of one step, after three warm-up steps, and exit)
 //   generate         --out <checkpoint dir> [--checkpoint best|last] --prompt "text" --tokens 500
@@ -31,7 +32,7 @@ using NeuralSharp.Optimizers;
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
 var flags = new HashSet<string>(StringComparer.Ordinal);
 string command = "train";
-string[] flagNames = ["--skip-clean", "--grad-checkpoint", "--optim8bit", "--fp32", "--cpu", "--cuda", "--offload", "--profile"];
+string[] flagNames = ["--skip-clean", "--grad-checkpoint", "--optim8bit", "--fp32", "--cpu", "--cuda", "--offload", "--profile", "--fp8"];
 string[] valueNames = ["--corpus", "--clean-out", "--out", "--block", "--batch", "--dmodel", "--heads", "--layers", "--dropout", "--lr", "--min-lr",
     "--warmup", "--steps", "--eval-every", "--eval-steps", "--save-every", "--seed", "--resume", "--bin", "--vocab-file", "--gpu-memory",
     "--log-every", "--checkpoint", "--prompt", "--tokens", "--temperature", "--top-k", "--top-p", "--repeat-penalty"];
@@ -82,7 +83,7 @@ int Train()
     int saveEvery = Int("--save-every", 1000), seed = Int("--seed", 42), logEvery = Int("--log-every", 0);
     float dropout = Float("--dropout", 0.1f), baseLr = Float("--lr", 3e-4f), minLr = Float("--min-lr", 3e-5f);
     bool checkpointing = flags.Contains("--grad-checkpoint"), eightBit = flags.Contains("--optim8bit");
-    var precision = flags.Contains("--fp32") ? MatMulPrecision.Float32 : MatMulPrecision.BFloat16;
+    var precision = flags.Contains("--fp32") ? MatMulPrecision.Float32 : flags.Contains("--fp8") ? MatMulPrecision.Float8 : MatMulPrecision.BFloat16;
     Directory.CreateDirectory(outDir);
 
     // ---------------------------------------------------------------- data
@@ -131,7 +132,7 @@ int Train()
     int tokensPerStep = batch * block;
     Console.WriteLine($"params={parameters:N0}  block={block}  batch={batch}  steps={steps}  tok/step={tokensPerStep:N0}  "
                       + $"seen≈{(double)steps * tokensPerStep / 1e6:F1}M  grad_checkpoint={checkpointing}  optim8bit={eightBit}  "
-                      + $"matmul={(precision == MatMulPrecision.Float32 ? "float32" : MixedPrecision.TensorCoresUnavailable(device) is { } why ? $"float32 ({why})" : "bfloat16 tensor cores")}");
+                      + $"matmul={(precision == MatMulPrecision.Float32 ? "float32" : MixedPrecision.TensorCoresUnavailable(device) is { } why ? $"float32 ({why})" : precision == MatMulPrecision.Float8 ? "fp8 tensor cores" : "bfloat16 tensor cores")}");
 
     var trainable = model.Parameters().ToList();
     using Optimizer optimizer = eightBit

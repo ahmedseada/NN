@@ -87,6 +87,7 @@ internal static unsafe partial class CudaDriver
 
     public const int AttributeMultiprocessorCount = 16;
     public const int AttributeComputeCapabilityMajor = 75;
+    public const int AttributeComputeCapabilityMinor = 76;
 
     [LibraryImport(Library)]
     public static partial int cuInit(uint flags);

@@ -28,11 +28,13 @@ using NeuralSharp.Pretrained;
 //
 // Options: --offload (when the GPU is full, keep tensors in system memory: slower, but larger models and batches fit),
 //          --gpu-memory GiB (cap the GPU memory used), --adapter <dir> (chat, check, profile: load a PEFT adapter), --cuda / --cpu, --int8 (int8 weights), --int4 (4-bit weights), --bf16 (bfloat16 weights), --kv8 (int8 KV cache), --kv16 (bfloat16 KV cache), --context N (default 4096),
-//          --folder F (check: read the model from F instead of the folder named in the reference), --no-think.
+//          --folder F (check: read the model from F instead of the folder named in the reference), --no-think,
+//          --matmul fp32|bf16|fp8 (precision of the larger matrix products: bf16 tensor cores by default, fp32 for check).
 var positional = new List<string>();
 bool int8 = false, bf16 = false, int4 = false, kv8 = false, kv16 = false, noThink = false;
 int context = 4096;
 string? folderOverride = null, output = null, evalFile = null, adapterFolder = null;
+MatMulPrecision? matmul = null;
 var tuning = new FineTuningOptions();
 Device device = Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu;
 for (int i = 0; i < args.Length; i++)
@@ -61,6 +63,15 @@ for (int i = 0; i < args.Length; i++)
         case "--accumulate": tuning = tuning with { GradientAccumulation = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--save-every": tuning = tuning with { SaveEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--offload": ComputeResources.OffloadToHostMemory = true; break;
+        case "--matmul":
+            matmul = args[++i] switch
+            {
+                "fp32" or "float32" => MatMulPrecision.Float32,
+                "bf16" or "bfloat16" => MatMulPrecision.BFloat16,
+                "fp8" or "float8" => MatMulPrecision.Float8,
+                var other => throw new ArgumentException($"--matmul {other}: use fp32, bf16 or fp8"),
+            };
+            break;
         case "--gpu-memory": ComputeResources.GpuMemoryLimit = (long)(double.Parse(args[++i], CultureInfo.InvariantCulture) * (1L << 30)); break;
         case "--no-checkpointing": tuning = tuning with { Checkpointing = false }; break;
         case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
@@ -76,9 +87,13 @@ if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or
     || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
 {
     Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir>");
-    Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] (fine-tuning options: see the top of Program.cs)");
+    Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] [--matmul fp32|bf16|fp8] (fine-tuning options: see the top of Program.cs)");
     return 1;
 }
+
+// Tensor cores for prompts, fine-tuning and larger products (bfloat16) unless asked otherwise; check compares with
+// transformers' float32 logits, so it stays float32 by default.
+MixedPrecision.Default = matmul ?? (positional[0] == "check" ? MatMulPrecision.Float32 : MatMulPrecision.BFloat16);
 
 Device.Default = device;
 var cacheFormat = kv8 ? KeyValueFormat.Int8 : kv16 ? KeyValueFormat.BFloat16 : KeyValueFormat.Float32;

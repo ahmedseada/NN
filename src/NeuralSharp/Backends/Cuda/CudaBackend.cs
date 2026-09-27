@@ -72,7 +72,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     private const int BestFitMinimum = 1024;
     private readonly MemoryAccountant _memory;
     private readonly int _multiprocessors;
-    private readonly int _computeMajor;
+    private readonly int _computeMajor, _computeMinor;
 
     // The tensor-core module (compute capability 8.0 and newer), loaded on first use; null when unavailable.
     private Dictionary<string, IntPtr>? _tensorCore;
@@ -153,6 +153,11 @@ internal sealed unsafe partial class CudaBackend : Backend
         var errors = new List<string>();
         foreach (var (moduleName, names, source) in PtxKernels.TensorCoreModules)
         {
+            if (moduleName.StartsWith("fp8", StringComparison.Ordinal) && _computeMajor * 10 + _computeMinor < 89)
+            {
+                continue;                                           // FP8 tensor cores: compute capability 8.9 and newer
+            }
+
             try
             {
                 IntPtr module = LoadModule(source);
@@ -168,6 +173,11 @@ internal sealed unsafe partial class CudaBackend : Backend
                             int dim = kernel.EndsWith("d64", StringComparison.Ordinal) ? 64 : 128;
                             int sharedBytes = kernel.Contains("_kv_", StringComparison.Ordinal) ? PtxKernels.FlashTensorBackwardKvShared(dim) : PtxKernels.FlashTensorBackwardQShared(dim);
                             Check(cuFuncSetAttribute(function, FunctionAttributeMaxDynamicSharedSizeBytes, sharedBytes), $"cuFuncSetAttribute({kernel})");
+                        }
+
+                        if (kernel.StartsWith("gemm8_", StringComparison.Ordinal))
+                        {
+                            Check(cuFuncSetAttribute(function, FunctionAttributeMaxDynamicSharedSizeBytes, PtxKernels.EightBitShared), $"cuFuncSetAttribute({kernel})");
                         }
 
                         kernels[kernel] = function;
@@ -211,6 +221,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         Check(cuDeviceTotalMem(out nuint memory, device), nameof(cuDeviceTotalMem));
         Check(cuDeviceGetAttribute(out _multiprocessors, AttributeMultiprocessorCount, device), nameof(cuDeviceGetAttribute));
         Check(cuDeviceGetAttribute(out _computeMajor, AttributeComputeCapabilityMajor, device), nameof(cuDeviceGetAttribute));
+        Check(cuDeviceGetAttribute(out _computeMinor, AttributeComputeCapabilityMinor, device), nameof(cuDeviceGetAttribute));
         Name = $"{Marshal.PtrToStringAnsi((IntPtr)name)} ({memory / (1024 * 1024)} MiB, {_multiprocessors} SMs)";
         _memory = new MemoryAccountant(() => ComputeResources.GpuMemoryLimit, $"cuda:{ordinal}");
 
@@ -760,7 +771,18 @@ internal sealed unsafe partial class CudaBackend : Backend
             gemmTile = tiles128 >= Math.Max(1, _multiprocessors) ? 128 : 64;
         }
         // bfloat16 tensor cores (MixedPrecision): products large enough to fill 128 × 128 tiles.
-        var tensorCore = !few && m >= 64 && n >= 64 && k >= 32 && MixedPrecision.Current == MatMulPrecision.BFloat16 ? TensorCoreKernels() : null;
+        var tensorCore = !few && m >= 64 && n >= 64 && k >= 32 && MixedPrecision.UsesTensorCores ? TensorCoreKernels() : null;
+        if (tensorCore is not null && MixedPrecision.Current == MatMulPrecision.Float8 && EightBitReady(fp8: true) && batch <= 64)
+        {
+            for (int i = 0; i < batch; i++)
+            {
+                ulong at = (ulong)i * mk * 4, bt = (ulong)i * kn * 4, ct = (ulong)i * mn * 4;
+                Gemm8(true, P(a) + at, transA ? m : k, transA, P(b) + bt, transB ? k : n, transB, P(c) + ct, n, m, n, k, beta, 0UL, GemmEpilogue.None, 0UL);
+            }
+
+            return;
+        }
+
         if (tensorCore is not null && (transA || transB) && batch <= MaxGridZ && PretransposeForTensorCores)
         {
             // The tensor-core kernel is fastest with both operands as stored ([m, k] · [k, n]): a transposed operand is
@@ -842,9 +864,15 @@ internal sealed unsafe partial class CudaBackend : Backend
 
     public override bool MatMulBias(Storage a, Storage b, Storage bias, Storage c, int m, int n, int k)
     {
-        if (m < 64 || n < 64 || k < 32 || MixedPrecision.Current != MatMulPrecision.BFloat16 || TensorCoreKernels() is not { } tensorCore)
+        if (m < 64 || n < 64 || k < 32 || !MixedPrecision.UsesTensorCores || TensorCoreKernels() is not { } tensorCore)
         {
             return false;
+        }
+
+        if (MixedPrecision.Current == MatMulPrecision.Float8 && EightBitReady(fp8: true))
+        {
+            Gemm8(true, P(a), k, false, P(b), n, false, P(c), n, m, n, k, 0f, P(bias), GemmEpilogue.None, 0UL);
+            return true;
         }
 
         if (_profile is not null)
@@ -875,6 +903,13 @@ internal sealed unsafe partial class CudaBackend : Backend
             _profileFlops = 2.0 * m * n * k;
         }
 
+        if (MixedPrecision.Current == MatMulPrecision.Float8 && EightBitReady(fp8: true) && k >= 16)
+        {
+            Gemm8(true, P(a) + (ulong)aOffset * 4, lda, transA, P(b) + (ulong)bOffset * 4, ldb, transB, P(c) + (ulong)cOffset * 4, ldc, m, n, k, beta,
+                bias is null ? 0UL : P(bias), epilogue, aux is null ? 0UL : P(aux) + (ulong)auxOffset * 4);
+            return true;
+        }
+
         if (PtxKernels.GemmKernel(transA, transB, epilogue) is not { } kernel || !tensorCore.TryGetValue(kernel, out var function))
         {
             return false;
@@ -885,6 +920,77 @@ internal sealed unsafe partial class CudaBackend : Backend
             0UL, 0UL, 0UL, bias is null ? 0UL : P(bias), U(lda), U(ldb), U(ldc), aux is null ? 0UL : P(aux) + (ulong)auxOffset * 4);
         Interlocked.Increment(ref TensorCoreLaunches);
         return true;
+    }
+
+    // The 8-bit products and their quantizers loaded (FP8: compute capability 8.9+; INT8: 8.0+).
+    internal bool EightBitReady(bool fp8)
+    {
+        string format = fp8 ? "e4m3" : "s8";
+        return TensorKernel($"gemm8_{format}_f32") is not null && TensorKernel($"quant_rows_{format}") is not null;
+    }
+
+    // c = beta·c + f(op(a)·op(b)) on 8-bit tensor cores (addresses in bytes, strides in floats): op(a) is quantized per row
+    // and op(b) per column into k-major bytes (padded to a multiple of 64 k), then the 8-bit product applies the scales.
+    internal void Gemm8(bool fp8, ulong a, int lda, bool transA, ulong b, int ldb, bool transB, ulong c, int ldc, int m, int n, int k,
+        float beta, ulong bias, GemmEpilogue epilogue, ulong aux)
+    {
+        int kp = PtxKernels.EightBitPaddedK(k);
+        var a8 = Allocate(Math.Max(1, m * kp / 4), zeroed: false);
+        var b8 = Allocate(Math.Max(1, n * kp / 4), zeroed: false);
+        var sa = Allocate(m, zeroed: false);
+        var sb = Allocate(n, zeroed: false);
+        try
+        {
+            // op(a) [m, k]: stored [m][lda] (rows) or, transposed, [k][lda] (columns). op(b) needs [n][k]: stored
+            // transposed [n][ldb] (rows) or as is, [k][ldb] (columns).
+            QuantizeOperand(fp8, a, lda, byRows: !transA, a8, sa, m, k, kp);
+            QuantizeOperand(fp8, b, ldb, byRows: transB, b8, sb, n, k, kp);
+            if (_profile is not null)
+            {
+                _profileLabel = $"gemm8_{(fp8 ? "e4m3" : "s8")}_{(transA ? 't' : 'n')}{(transB ? 't' : 'n')}"
+                                + $"{(epilogue == GemmEpilogue.None ? "" : epilogue == GemmEpilogue.Gelu ? "+gelu" : "+gelu'")}{(bias == 0 ? "" : "+bias")} {m}x{n}x{k}";
+                _profileFlops = 2.0 * m * n * k;
+            }
+
+            t_sharedBytes = PtxKernels.EightBitShared;
+            Launch(TensorKernel(PtxKernels.EightBitKernel(fp8, epilogue))!.Value, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
+                (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), 1, PtxKernels.TensorThreads, 1,
+                P(a8), P(b8), c, U(m), U(n), U(kp), F(beta), P(sa), P(sb), bias, U(kp), U(kp), U(ldc), aux);
+            Interlocked.Increment(ref TensorCoreLaunches);
+        }
+        finally
+        {
+            a8.Release();
+            b8.Release();
+            sa.Release();
+            sb.Release();
+        }
+    }
+
+    // out [rows][kp] bytes (k-major) + scale [rows] from x: byRows: x rows [rows][ld] of `k` values; else x [k][ld] whose
+    // `rows` columns become the output rows.
+    private void QuantizeOperand(bool fp8, ulong x, int ld, bool byRows, Storage output, Storage scale, int rows, int k, int kp)
+    {
+        string format = fp8 ? "e4m3" : "s8";
+        if (byRows)
+        {
+            Launch(TensorKernel($"quant_rows_{format}")!.Value, (uint)rows, 1, 1, 256, 1, x, P(output), P(scale), U(ld), U(kp), U(rows), U(k));
+            return;
+        }
+
+        const int Chunk = 64;
+        var amax = Allocate(rows, zeroed: true);
+        try
+        {
+            Launch(TensorKernel($"absmax_cols_{format}")!.Value, (uint)((rows + 255) / 256), (uint)((k + Chunk - 1) / Chunk), 1, 256, 1,
+                x, P(amax), U(ld), U(k), U(rows), U(Chunk));
+            Launch(TensorKernel($"quant_cols_{format}")!.Value, (uint)((rows + 31) / 32), (uint)(kp / 32), 1, 32, 8,
+                x, P(output), P(amax), P(scale), U(ld), U(kp), U(k), U(rows));
+        }
+        finally
+        {
+            amax.Release();
+        }
     }
 
     public override void SgdStep(Storage p, Storage g, Storage? v, int n, float lr, float momentum)

@@ -11,6 +11,8 @@ internal static partial class Tests
         ("mixed precision: tensor-core flash attention (forward, log-sum-exp, dq, dk, dv; head sizes 64 and 128) matches float32", TensorCoreAttention),
         ("layer norm: the fused training kernels match the composed operations (output, input, gamma and beta gradients)", LayerNormTraining),
         ("mixed precision: strided products and GELU epilogues match references (slices, activation, its gradient)", StridedProducts),
+        ("mixed precision: 8-bit tensor-core products (fp8, int8; every layout, beta, bias) track float32", EightBitProducts),
+        ("mixed precision: prompts through int8 / int4 / bfloat16 weights on tensor cores match the float32 kernels", PackedTensorCoreProducts),
         ("mixed precision: fused decoder blocks (packed q/k/v, attention in place, GELU inside the products) match the composed ones", FusedDecoderBlocks),
         ("mixed precision: product + bias in one pass matches the product and a bias addition (output and gradients)", MatMulBiasPass),
         ("optimizer: 8-bit AdamW (dynamic code map, nearest codes, tracks 32-bit AdamW, CPU parity)", EightBitAdam),
@@ -204,6 +206,104 @@ internal static partial class Tests
                     Check(Math.Abs(grads[o] - want) < 2e-3f * Math.Max(1, Math.Abs(want)), $"gelu gradient [{i}, {j}]: {grads[o]} vs {want}");
                 }
             }
+        }
+    }
+
+    private static double Relative(float[] expected, float[] actual) =>
+        Math.Sqrt(expected.Zip(actual).Sum(p => (double)(p.First - p.Second) * (p.First - p.Second)) / Math.Max(1e-30, expected.Sum(v => (double)v * v)));
+
+    private static void EightBitProducts(Device device)
+    {
+        if (device.Type != DeviceType.Cuda || MixedPrecision.TensorCoresUnavailable(device) is not null)
+        {
+            return;
+        }
+
+        var backend = (CudaBackend)device.Backend;
+        var random = new Random(21);
+        float[] Values(int n) => [.. Enumerable.Range(0, n).Select(_ => random.NextSingle() * 2 - 1)];
+        foreach (bool fp8 in new[] { true, false })
+        {
+            if (!backend.EightBitReady(fp8))
+            {
+                Console.WriteLine($"    ({(fp8 ? "fp8" : "int8")} products unavailable on this GPU)");
+                continue;
+            }
+
+            foreach (var (m, n, k) in new[] { (100, 70, 90), (256, 130, 200), (129, 256, 64) })
+            {
+                foreach (bool ta in new[] { false, true })
+                {
+                    foreach (bool tb in new[] { false, true })
+                    {
+                        float[] a = Values(m * k), b = Values(k * n), c0 = Values(m * n), bias = Values(n);
+                        using var ta_ = Tensor.From(a, [a.Length], device);
+                        using var tb_ = Tensor.From(b, [b.Length], device);
+                        using var tc_ = Tensor.From(c0, [c0.Length], device);
+                        using var tbias = Tensor.From(bias, [n], device);
+                        backend.Gemm8(fp8, P(ta_), ta ? m : k, ta, P(tb_), tb ? k : n, tb, P(tc_), n, m, n, k, 0.5f, P(tbias), NeuralSharp.Backends.GemmEpilogue.None, 0UL);
+                        var got = tc_.ToArray();
+                        var want = new float[m * n];
+                        for (int i = 0; i < m; i++)
+                        {
+                            for (int j = 0; j < n; j++)
+                            {
+                                double sum = 0;
+                                for (int q = 0; q < k; q++)
+                                {
+                                    sum += (double)(ta ? a[q * m + i] : a[i * k + q]) * (tb ? b[j * k + q] : b[q * n + j]);
+                                }
+
+                                want[i * n + j] = (float)(sum + 0.5 * c0[i * n + j] + bias[j]);
+                            }
+                        }
+
+                        double error = Relative(want, got);
+                        Check(error < (fp8 ? 0.05 : 0.01), $"{(fp8 ? "fp8" : "int8")} {m}×{n}×{k} {(ta ? 't' : 'n')}{(tb ? 't' : 'n')}: relative error {error:G3}");
+                    }
+                }
+            }
+        }
+    }
+
+    private static void PackedTensorCoreProducts(Device device)
+    {
+        if (MixedPrecision.TensorCoresUnavailable(device) is not null)
+        {
+            return;
+        }
+
+        var random = new Random(22);
+        const int M = 150, K = 256, N = 200;
+        float[] x = [.. Enumerable.Range(0, M * K).Select(_ => random.NextSingle() * 2 - 1)];
+        float[] w = [.. Enumerable.Range(0, K * N).Select(_ => (random.NextSingle() * 2 - 1) * 0.1f)];
+        using var weights = Tensor.From(w, [K, N], device);
+        using var int8 = Int8Weight.Quantize(weights);
+        using var int4 = Int4Weight.Quantize(weights);
+        using var bf16 = BFloat16Weight.Convert(weights);
+        using var input = Tensor.From(x, [M, K], device);
+        foreach (var (name, run) in new (string, Func<Tensor>)[]
+        {
+            ("int8", () => input.MatMulInt8(int8)),
+            ("int4", () => input.MatMulInt4(int4)),
+            ("bf16", () => input.MatMulBFloat16(bf16)),
+        })
+        {
+            float[] plain, tensor;
+            using (MixedPrecision.Use(MatMulPrecision.Float32))
+            using (var y = run())
+            {
+                plain = y.ToArray();
+            }
+
+            using (MixedPrecision.BFloat16())
+            using (var y = run())
+            {
+                tensor = y.ToArray();
+            }
+
+            double error = Relative(plain, tensor);
+            Check(error < 0.01, $"{name}: tensor-core prompt product differs from the float32 kernel by {error:G3}");
         }
     }
 
@@ -443,6 +543,30 @@ internal static partial class Tests
             }
         }
 
+        // 8-bit products (quantization of both operands included) against bfloat16.
+        Console.WriteLine();
+        Console.WriteLine($"{"m x n x k",-20} {"layout",6} {"bf16",14} {"fp8",14} {"int8",14}");
+        foreach (var (m, n, k) in new[] { (4096, 2048, 2048), (4096, 8192, 2048), (4096, 2048, 8192), (2048, 8192, 4096), (8192, 8192, 8192) })
+        {
+            using var a = Random(m * k);
+            using var b = Random(k * n);
+            using var c = Random(m * n);
+            double flops = 2.0 * m * n * k;
+            foreach (var (ta, tb) in new[] { (false, false), (false, true), (true, false) })
+            {
+                string Tflops(double ms) => double.IsNaN(ms) ? $"{"n/a",14}" : $"{flops / (ms * 1e9),7:F1} TFLOPS";
+                double bf16 = Time(() => backend.GemmStrided(a.Storage, 0, ta ? m : k, ta, b.Storage, 0, tb ? k : n, tb, c.Storage, 0, n, m, n, k, 0f), 10);
+                double fp8 = backend.EightBitReady(fp8: true)
+                    ? Time(() => backend.Gemm8(true, P(a), ta ? m : k, ta, P(b), tb ? k : n, tb, P(c), n, m, n, k, 0f, 0UL, NeuralSharp.Backends.GemmEpilogue.None, 0UL), 10)
+                    : double.NaN;
+                double int8 = backend.EightBitReady(fp8: false)
+                    ? Time(() => backend.Gemm8(false, P(a), ta ? m : k, ta, P(b), tb ? k : n, tb, P(c), n, m, n, k, 0f, 0UL, NeuralSharp.Backends.GemmEpilogue.None, 0UL), 10)
+                    : double.NaN;
+                Console.WriteLine($"{$"{m}x{n}x{k}",-20} {(ta ? "t" : "n") + (tb ? "t" : "n"),6} {Tflops(bf16),14} {Tflops(fp8),14} {Tflops(int8),14}");
+            }
+        }
+
+        Console.WriteLine();
         foreach (var (rows, cols) in new[] { (2048, 2048), (2048, 8192), (4096, 2048), (4096, 8192) })
         {
             using var x = Random(rows * cols);
@@ -454,6 +578,8 @@ internal static partial class Tests
         return 0;
     }
 
+    private static ulong P(Tensor t) => ((NeuralSharp.Backends.Cuda.CudaStorage)t.Storage).Pointer;
+
     private static float RoundBFloat16(float x)
     {
         uint bits = BitConverter.SingleToUInt32Bits(x);
@@ -463,7 +589,7 @@ internal static partial class Tests
 
     private static void TensorCoreProducts(Device device)
     {
-        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == 15)
+        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm_tc")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == 15)
               && PtxKernels.TensorCoreNames.All(PtxKernels.TensorCoreParameterCounts.ContainsKey), "tensor-core kernel signatures");
         var random = new Random(3);
         // A GPU that has tensor cores must load the module: a JIT error would otherwise fall back to float32 silently.

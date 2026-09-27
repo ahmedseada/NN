@@ -123,6 +123,23 @@ internal sealed unsafe partial class CudaBackend
             return false;
         }
 
+        // Tensor cores (MixedPrecision): the weights unpacked into the bfloat16 tiles as they are loaded.
+        string packedKernel = kind switch { 0 => "gemm_tc_nn_int8w_f32", 1 => "gemm_tc_nn_int4w_f32", _ => "gemm_tc_nn_bf16w_f32" };
+        if (MixedPrecision.UsesTensorCores && m >= 32 && k >= 32 && TensorKernel(packedKernel) is { } tensor)
+        {
+            int perWord = kind switch { 0 => 4, 1 => 8, _ => 2 };
+            if (_profile is not null)
+            {
+                _profileLabel = $"gemm_tc_nn_{(kind switch { 0 => "int8w", 1 => "int4w", _ => "bf16w" })} {m}x{n}x{k}";
+                _profileFlops = 2.0 * m * n * k;
+            }
+
+            Launch(tensor, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
+                1, PtxKernels.TensorThreads, 1, P(x), P(packed), P(y), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, 0UL,
+                U(k), U((n + perWord - 1) / perWord), U(n), scales is null ? 0UL : P(scales));
+            return true;
+        }
+
         string format = kind switch { 0 => "int8", 1 => "int4", _ => "bf16" };
         long tiles128 = (long)((m + 127) / 128) * ((n + 127) / 128);
         int tile = tiles128 >= Math.Max(1, _multiprocessors) ? 128 : 64;
@@ -400,7 +417,7 @@ internal sealed unsafe partial class CudaBackend
 
     // The tensor-core flash kernels when MixedPrecision asks for bfloat16 and the head size and GPU allow them.
     private Dictionary<string, IntPtr>? FlashTensorCore(int dim) =>
-        MixedPrecision.Current == MatMulPrecision.BFloat16 && PtxKernels.FlashTensorDim(dim) && FlashKernelsLoaded(dim) ? _tensorCoreAny : null;
+        MixedPrecision.UsesTensorCores && PtxKernels.FlashTensorDim(dim) && FlashKernelsLoaded(dim) ? _tensorCoreAny : null;
 
     private bool FlashKernelsLoaded(int dim) =>
         TensorKernel($"flash_tc_fwd_d{dim}") is not null && TensorKernel($"flash_tc_bwd_q_d{dim}") is not null

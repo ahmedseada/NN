@@ -44,17 +44,22 @@ internal static partial class PtxKernels
 
             TensorCoreGemm(sb, false, false, 1);
             TensorCoreGemm(sb, false, true, 2);
+            TensorCoreGemm(sb, false, false, 0, packed: 1);
+            TensorCoreGemm(sb, false, false, 0, packed: 2);
+            TensorCoreGemm(sb, false, false, 0, packed: 3);
         }),
         Module("attention d64", sb => { FlashForward(sb, 64); FlashBackwardQ(sb, 64); FlashBackwardKv(sb, 64); }),
         Module("attention d128", sb => { FlashForward(sb, 128); FlashBackwardQ(sb, 128); FlashBackwardKv(sb, 128); }),
         Module("attention row sums", FlashDelta),
+        Module("int8 products", sb => BuildEightBit(sb, fp8: false)),
+        Module("fp8 products", sb => BuildEightBit(sb, fp8: true), version: "8.4", target: "sm_89"),
     ]);
 
-    private static (string Name, string[] Kernels, string Source) Module(string name, Action<StringBuilder> build)
+    private static (string Name, string[] Kernels, string Source) Module(string name, Action<StringBuilder> build, string version = "7.0", string target = "sm_80")
     {
         var sb = new StringBuilder();
-        sb.AppendLine(".version 7.0");
-        sb.AppendLine(".target sm_80");
+        sb.AppendLine($".version {version}");
+        sb.AppendLine($".target {target}");
         sb.AppendLine(".address_size 64");
         sb.AppendLine();
         build(sb);
@@ -110,9 +115,15 @@ internal static partial class PtxKernels
         """;
 
     // mode (compile time): 0 plain, 1 GELU (aux = pre-activations when given), 2 GELU gradient (· gelu'(aux)).
-    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode)
+    // packed (nn, mode 0 only): 1 = int8 weights (4 per word, per-column scales in p_aux, applied in the epilogue),
+    // 2 = 4-bit weights (8 per word, scales per 32 rows and column in p_aux, applied as the tile is unpacked), 3 = bfloat16
+    // weights (2 per word); ldb is then the row length in words. The weights are unpacked into the bfloat16 tile.
+    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode, int packed = 0)
     {
-        string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}{mode switch { 1 => "_gelu", 2 => "_gelugrad", _ => "" }}_f32";
+        string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}{mode switch { 1 => "_gelu", 2 => "_gelugrad", _ => "" }}"
+                      + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}_f32";
+        int cpw = packed switch { 1 => 4, 2 => 8, _ => 2 }, tileWords = TensorTile / cpw, wordRows = TensorThreads / tileWords;
+        int wordsPerThread = TensorK * tileWords / TensorThreads;
         // Registers: %rd1..3 = a, b, c; %r1..3 = m, n, k; %r9 / %r10 = the tile's first row / column.
         var a = new TileLoad("a", KIsOuter: ta, Width: ta ? TensorTile : TensorK, OuterLimit: ta ? "%r3" : "%r1", InnerLimit: ta ? "%r1" : "%r3", Tile: "%r9");
         var b = new TileLoad("b", KIsOuter: !tb, Width: tb ? TensorK : TensorTile, OuterLimit: tb ? "%r2" : "%r3", InnerLimit: tb ? "%r3" : "%r2", Tile: "%r10");
@@ -133,6 +144,9 @@ internal static partial class PtxKernels
                 .reg .f32 %t<8>;
                 .reg .f32 %bias<8>;
                 .reg .pred %pbias, %paux;
+                .reg .b32 %gw<8>;
+                .reg .f32 %gs<16>;
+                .reg .f32 %gx<8>;
                 .reg .f32 %c<64>;
                 .reg .b32 %fa<16>;
                 .reg .b32 %fb<8>;
@@ -216,7 +230,25 @@ internal static partial class PtxKernels
         }
 
         Coordinates(a, "%r13", "%r14", "%r15", "%r11", "%rd9", "%r58");
-        Coordinates(b, "%r16", "%r17", "%r18", "%r12", "%rd10", "%r59");
+        if (packed == 0)
+        {
+            Coordinates(b, "%r16", "%r17", "%r18", "%r12", "%rd10", "%r59");
+        }
+        else
+        {
+            // Packed B: %r16 = row in the tile, %r17 = word within the tile's row, %r18 = its shared-memory address.
+            s.AppendLine($"""
+                    shr.u32 %r16, %r4, {(int)Math.Log2(tileWords)};
+                    and.b32 %r17, %r4, {tileWords - 1};
+                    mul.lo.u32 %r18, %r16, {WideStride};
+                    shl.b32 %r19, %r17, {(int)Math.Log2(cpw * 2)};
+                    add.u32 %r18, %r18, %r19;
+                    add.u32 %r18, %r18, %r12;
+                    mul.wide.u32 %rd10, %r59, 4;
+                    ld.param.u64 %rd26, [p_aux];
+                    cvta.to.global.u64 %rd26, %rd26;
+                """);
+        }
 
         // ldmatrix lane addresses (without the stage offset), %r20 for A and %r21 for B; see the fragment layouts of
         // mma.m16n8k16 (row-major A 16 × 16, column-major B 16 × 8).
@@ -340,14 +372,136 @@ internal static partial class PtxKernels
             }
         }
 
+        // Packed B: the words of rows k0 + row (+ wordRows · i), word bn / cpw + %r17; zero past the matrix.
+        void LoadPacked()
+        {
+            s.AppendLine($"""
+                    add.u32 %r31, %r30, %r16;
+                    shr.u32 %r32, %r10, {(int)Math.Log2(cpw)};
+                    add.u32 %r32, %r32, %r17;
+                    setp.lt.u32 %p1, %r32, %r59;
+                    cvt.u64.u32 %rd11, %r31;
+                    mul.lo.u64 %rd11, %rd11, %rd10;
+                    mul.wide.u32 %rd12, %r32, 4;
+                    add.u64 %rd11, %rd11, %rd12;
+                    add.u64 %rd11, %rd11, %rd2;
+                    mul.lo.u64 %rd13, %rd10, {wordRows};
+                """);
+            for (int i = 0; i < wordsPerThread; i++)
+            {
+                s.AppendLine($"""
+                        setp.lt.u32 %p3, %r31, %r3;
+                        and.pred %p4, %p3, %p1;
+                        mov.b32 %gw{i}, 0;
+                        @%p4 ld.global.b32 %gw{i}, [%rd11];
+                        add.u32 %r31, %r31, {wordRows};
+                        add.u64 %rd11, %rd11, %rd13;
+                    """);
+            }
+
+            if (packed == 2)
+            {
+                // The tile's rows share one scale group (k0 is a multiple of 32): 8 scales per word, one word per 16 rows.
+                s.AppendLine($$"""
+                        shr.u32 %r33, %r30, 5;
+                        shl.b32 %r36, %r59, 3;
+                        mul.lo.u32 %r33, %r33, %r36;
+                        shl.b32 %r36, %r32, 3;
+                        add.u32 %r33, %r33, %r36;
+                        mul.wide.u32 %rd12, %r33, 4;
+                        add.u64 %rd12, %rd12, %rd26;
+                        setp.lt.u32 %p3, %r30, %r3;
+                        and.pred %p4, %p3, %p1;
+                        mov.f32 %gs0, 0f00000000;
+                        mov.f32 %gs1, 0f00000000;
+                        mov.f32 %gs2, 0f00000000;
+                        mov.f32 %gs3, 0f00000000;
+                        mov.f32 %gs4, 0f00000000;
+                        mov.f32 %gs5, 0f00000000;
+                        mov.f32 %gs6, 0f00000000;
+                        mov.f32 %gs7, 0f00000000;
+                        @%p4 ld.global.v4.f32 {%gs0, %gs1, %gs2, %gs3}, [%rd12];
+                        @%p4 ld.global.v4.f32 {%gs4, %gs5, %gs6, %gs7}, [%rd12+16];
+                    """);
+            }
+        }
+
+        void StorePacked()
+        {
+            s.AppendLine("    add.u32 %r35, %r18, %r34;");
+            for (int i = 0; i < wordsPerThread; i++)
+            {
+                int offset = i * wordRows * WideStride;
+                if (packed == 3)
+                {
+                    s.AppendLine($"    st.shared.b32 [%r35+{offset}], %gw{i};");
+                    continue;
+                }
+
+                int values = packed == 1 ? 4 : 8, bits = packed == 1 ? 8 : 4;
+                for (int j = 0; j < values; j++)
+                {
+                    s.AppendLine($"""
+                            bfe.s32 %r36, %gw{i}, {j * bits}, {bits};
+                            cvt.rn.f32.s32 %gx{j}, %r36;
+                        """);
+                    if (packed == 2)
+                    {
+                        s.AppendLine($"    mul.f32 %gx{j}, %gx{j}, %gs{j};");
+                    }
+                }
+
+                s.AppendLine("""
+                        cvt.rn.bf16x2.f32 %r36, %gx1, %gx0;
+                        cvt.rn.bf16x2.f32 %r37, %gx3, %gx2;
+                    """);
+                if (packed == 1)
+                {
+                    s.AppendLine($$"""    st.shared.v2.b32 [%r35+{{offset}}], {%r36, %r37};""");
+                }
+                else
+                {
+                    s.AppendLine($$"""
+                            cvt.rn.bf16x2.f32 %r38, %gx5, %gx4;
+                            cvt.rn.bf16x2.f32 %r57, %gx7, %gx6;
+                            st.shared.v4.b32 [%r35+{{offset}}], {%r36, %r37, %r38, %r57};
+                        """);
+                }
+            }
+        }
+
+        void LoadB()
+        {
+            if (packed == 0)
+            {
+                Load(b, "%rd2", "%rd10", "%r16", "%r17", "%gb");
+            }
+            else
+            {
+                LoadPacked();
+            }
+        }
+
+        void StoreB()
+        {
+            if (packed == 0)
+            {
+                Store(b, "%r18", "%gb");
+            }
+            else
+            {
+                StorePacked();
+            }
+        }
+
         s.AppendLine("""
                 mov.u32 %r30, 0;
                 mov.u32 %r34, 0;
             """);
         Load(a, "%rd1", "%rd9", "%r13", "%r14", "%ga");
-        Load(b, "%rd2", "%rd10", "%r16", "%r17", "%gb");
+        LoadB();
         Store(a, "%r15", "%ga");
-        Store(b, "%r18", "%gb");
+        StoreB();
         s.AppendLine("""
                 bar.sync 0;
             KLOOP:
@@ -359,7 +513,7 @@ internal static partial class PtxKernels
                 @!%p11 bra NOLOAD;
             """);
         Load(a, "%rd1", "%rd9", "%r13", "%r14", "%ga");
-        Load(b, "%rd2", "%rd10", "%r16", "%r17", "%gb");
+        LoadB();
         s.AppendLine("""
             NOLOAD:
                 add.u32 %r39, %r20, %r34;
@@ -398,7 +552,7 @@ internal static partial class PtxKernels
                 xor.b32 %r34, %r34, {StageBytes};
             """);
         Store(a, "%r15", "%ga");
-        Store(b, "%r18", "%gb");
+        StoreB();
         s.AppendLine("""
             NOSTORE:
                 bar.sync 0;
@@ -406,6 +560,22 @@ internal static partial class PtxKernels
             KEND:
             """);
 
+        EmitTensorEpilogue(s, mode, packed == 1 ? ColumnScales : null);
+        s.AppendLine("""
+                ret;
+            }
+            """);
+        sb.Append(s);
+        sb.AppendLine();
+    }
+
+    // The epilogue of the tensor-core products (and of the 8-bit ones): c[row, col] = beta·c + f(acc), rows (lane >> 2)
+    // and +8 of each m16 tile, columns 2 (lane & 3) and +1 of each n8 tile. %r42 = first row, %r43 = first column,
+    // %rd14 = its address, %rd15 = a row in bytes. Expects %r1 = m, %r2 = n, %r5 = lane, %r7 / %r8 = the warp's tile row /
+    // column, %r9 / %r10 = the block's first row / column, %r60 = ldc, %rd3 = c, %beta / %pbeta, float accumulators %c0-63,
+    // and the parameters p_bias and p_aux. `scale` may rescale the accumulators once %r42 / %r43 are set.
+    private static void EmitTensorEpilogue(StringBuilder s, int mode, Action<StringBuilder>? scale)
+    {
         // Epilogue: c[row, col] = acc + beta · c (rows (lane >> 2) and +8 of each m16 tile, columns 2 (lane & 3) and +1
         // of each n8 tile). %r42 = first row, %r43 = first column, %rd14 = its address, %rd15 = a row in bytes.
         s.AppendLine("""
@@ -465,6 +635,7 @@ internal static partial class PtxKernels
             }
         }
 
+        scale?.Invoke(s);
         for (int mt = 0; mt < 4; mt++)
         {
             for (int half = 0; half < 2; half++)
@@ -595,11 +766,34 @@ internal static partial class PtxKernels
             }
         }
 
+    }
+
+    // Int8 weights: acc · scale[column] (the per-column scales in p_aux).
+    private static void ColumnScales(StringBuilder s)
+    {
         s.AppendLine("""
-                ret;
-            }
+                ld.param.u64 %rd25, [p_aux];
+                cvta.to.global.u64 %rd25, %rd25;
             """);
-        sb.Append(s);
-        sb.AppendLine();
+        for (int nt = 0; nt < 4; nt++)
+        {
+            for (int j = 0; j < 2; j++)
+            {
+                s.AppendLine($$"""
+                        mov.f32 %t{{0}}, 0f3F800000;
+                        add.u32 %r46, %r43, {{nt * 8 + j}};
+                        setp.lt.u32 %p9, %r46, %r2;
+                        mul.wide.u32 %rd20, %r46, 4;
+                        add.u64 %rd19, %rd25, %rd20;
+                        @%p9 ld.global.f32 %t0, [%rd19];
+                    """);
+                for (int mt = 0; mt < 4; mt++)
+                {
+                    int c = (mt * 4 + nt) * 4 + j;
+                    s.AppendLine($"mul.f32 %c{c}, %c{c}, %t0;");
+                    s.AppendLine($"mul.f32 %c{c + 2}, %c{c + 2}, %t0;");
+                }
+            }
+        }
     }
 }
