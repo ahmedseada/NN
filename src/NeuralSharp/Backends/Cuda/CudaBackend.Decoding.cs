@@ -166,7 +166,15 @@ internal sealed unsafe partial class CudaBackend
                 foreach (ulong pointer in bucket)
                 {
                     // Re-count them as in use; releasing the storage later returns them to the shared pool.
-                    _memory.Reused(BlockBytes(length));
+                    if (_hostBlocks.ContainsKey(pointer))
+                    {
+                        _memory.Offloaded(BlockBytes(length));
+                    }
+                    else
+                    {
+                        _memory.Reused(BlockBytes(length));
+                    }
+
                     owned.Add(new CudaStorage(this, pointer, length));
                 }
             }

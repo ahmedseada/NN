@@ -26,7 +26,8 @@ using NeuralSharp.Pretrained;
 //   export <folder> <adapter> --out <dir>
 //                                   merges a PEFT adapter into the float weights and writes a Hugging Face checkpoint
 //
-// Options: --adapter <dir> (chat, check, profile: load a PEFT adapter), --cuda / --cpu, --int8 (int8 weights), --int4 (4-bit weights), --bf16 (bfloat16 weights), --kv8 (int8 KV cache), --kv16 (bfloat16 KV cache), --context N (default 4096),
+// Options: --offload (when the GPU is full, keep tensors in system memory: slower, but larger models and batches fit),
+//          --gpu-memory GiB (cap the GPU memory used), --adapter <dir> (chat, check, profile: load a PEFT adapter), --cuda / --cpu, --int8 (int8 weights), --int4 (4-bit weights), --bf16 (bfloat16 weights), --kv8 (int8 KV cache), --kv16 (bfloat16 KV cache), --context N (default 4096),
 //          --folder F (check: read the model from F instead of the folder named in the reference), --no-think.
 var positional = new List<string>();
 bool int8 = false, bf16 = false, int4 = false, kv8 = false, kv16 = false, noThink = false;
@@ -59,6 +60,8 @@ for (int i = 0; i < args.Length; i++)
         case "--batch-tokens": tuning = tuning with { BatchTokens = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--accumulate": tuning = tuning with { GradientAccumulation = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--save-every": tuning = tuning with { SaveEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
+        case "--offload": ComputeResources.OffloadToHostMemory = true; break;
+        case "--gpu-memory": ComputeResources.GpuMemoryLimit = (long)(double.Parse(args[++i], CultureInfo.InvariantCulture) * (1L << 30)); break;
         case "--no-checkpointing": tuning = tuning with { Checkpointing = false }; break;
         case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
@@ -203,6 +206,7 @@ switch (positional[0])
             var remaining = TimeSpan.FromSeconds(watch.Elapsed.TotalSeconds / p.Step * (p.TotalSteps - p.Step));
             Say($"step {p.Step}/{p.TotalSteps} (epoch {p.Epoch}): loss {p.Loss:F4}, lr {p.LearningRate:G3}, {p.TokensPerSecond:F0} tok/s"
                 + (p.EvaluationLoss is { } e ? $", evaluation loss {e:F4}" : "")
+                + $", GPU memory {ComputeResources.GetMemoryUsage(device)}"
                 + $", elapsed {watch.Elapsed:hh\\:mm\\:ss}, remaining ~{remaining:hh\\:mm\\:ss}");
         });
         try

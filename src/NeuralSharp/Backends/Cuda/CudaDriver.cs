@@ -126,6 +126,20 @@ internal static unsafe partial class CudaDriver
     [LibraryImport(Library, EntryPoint = "cuMemFree_v2")]
     public static partial int cuMemFree(ulong pointer);
 
+    [LibraryImport(Library, EntryPoint = "cuMemGetInfo_v2")]
+    public static partial int cuMemGetInfo(out nuint free, out nuint total);
+
+    [LibraryImport(Library)]
+    public static partial int cuMemHostAlloc(out IntPtr pointer, nuint bytes, uint flags);
+
+    [LibraryImport(Library, EntryPoint = "cuMemHostGetDevicePointer_v2")]
+    public static partial int cuMemHostGetDevicePointer(out ulong device, IntPtr host, uint flags);
+
+    [LibraryImport(Library)]
+    public static partial int cuMemFreeHost(IntPtr pointer);
+
+    public const uint HostAllocPortable = 1, HostAllocDeviceMap = 2;
+
     [LibraryImport(Library, EntryPoint = "cuMemcpyHtoD_v2")]
     public static partial int cuMemcpyHtoD(ulong destination, void* source, nuint bytes);
 

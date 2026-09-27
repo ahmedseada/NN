@@ -4,14 +4,16 @@ namespace NeuralSharp;
 /// <param name="InUse">Bytes held by live tensors.</param>
 /// <param name="Cached">Bytes of freed blocks kept for reuse (returned to the system by <see cref="ComputeResources.ReleaseCachedMemory"/>).</param>
 /// <param name="Limit">The configured cap, or null when unlimited.</param>
-public readonly record struct MemoryUsage(long InUse, long Cached, long? Limit)
+/// <param name="Offloaded">Bytes of this GPU's tensors kept in system memory (see <see cref="ComputeResources.OffloadToHostMemory"/>).</param>
+public readonly record struct MemoryUsage(long InUse, long Cached, long? Limit, long Offloaded = 0)
 {
     /// <summary>InUse + Cached: what the library currently holds from the system.</summary>
     public long Reserved => InUse + Cached;
 
     /// <inheritdoc />
     public override string ToString() =>
-        $"in use {Format(InUse)}, cached {Format(Cached)}" + (Limit is { } l ? $", limit {Format(l)}" : "");
+        $"in use {Format(InUse)}, cached {Format(Cached)}" + (Limit is { } l ? $", limit {Format(l)}" : "")
+        + (Offloaded > 0 ? $", offloaded to system memory {Format(Offloaded)}" : "");
 
     private static string Format(long bytes) => bytes switch
     {
@@ -58,6 +60,21 @@ public static class ComputeResources
 
     /// <summary>Maximum bytes of tensor memory on each GPU (null = unlimited, up to what the card has).</summary>
     public static long? GpuMemoryLimit { get; set; }
+
+    /// <summary>
+    /// GPU memory left free for the display and other programs (default 512 MiB): a new GPU allocation that would leave
+    /// less free is treated as not fitting, so the driver never has to page GPU memory out to system memory on its own
+    /// (on Windows that makes long kernels, which the watchdog resets as a hung GPU).
+    /// </summary>
+    public static long GpuMemoryReserve { get; set; } = 512L << 20;
+
+    /// <summary>
+    /// When a GPU is full (or at <see cref="GpuMemoryLimit"/>), place new tensors in pinned system memory that the GPU
+    /// reads and writes directly over PCIe, instead of failing: larger models and training runs work, slower for the data
+    /// kept there. Off by default (then a full GPU raises <see cref="ResourceLimitExceededException"/>); the environment
+    /// variable NEURALSHARP_OFFLOAD=1 turns it on.
+    /// </summary>
+    public static bool OffloadToHostMemory { get; set; } = Environment.GetEnvironmentVariable("NEURALSHARP_OFFLOAD") is "1" or "true";
 
     internal static ParallelOptions ParallelOptions => s_parallelOptions;
 

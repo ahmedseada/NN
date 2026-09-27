@@ -9,9 +9,59 @@ internal static partial class Tests
     private static readonly (string Name, Action<Device> Run)[] FineTuning =
     [
         ("fine-tuning: chunked token cross-entropy matches the dense loss, its input gradient and a head adapter's gradient", TokenLoss),
+        ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("fine-tuning: agent transcripts through the chat template, assistant-only tokens, LoRA and QLoRA training, PEFT adapters, merged export", AgentFineTuning),
     ];
+
+    private static void HostOffload(Device device)
+    {
+        if (device.Type != DeviceType.Cuda)
+        {
+            return;                                                              // the CPU's memory is system memory already
+        }
+
+        var r = new Random(95);
+        float[] Values(int n) => [.. Enumerable.Range(0, n).Select(_ => (float)(r.NextDouble() * 2 - 1))];
+        var (av, bv) = (Values(512 * 512), Values(512 * 512));
+        using var ca = Tensor.From(av, [512, 512], Device.Cpu);
+        using var cb = Tensor.From(bv, [512, 512], Device.Cpu);
+        var expected = ca.MatMul(cb).ToArray();
+        long? limit = ComputeResources.GpuMemoryLimit;
+        bool offload = ComputeResources.OffloadToHostMemory;
+        ComputeResources.ReleaseCachedMemory(device);
+        try
+        {
+            ComputeResources.GpuMemoryLimit = ComputeResources.GetMemoryUsage(device).InUse + (1L << 20);   // 1 MiB to spare
+            ComputeResources.OffloadToHostMemory = false;
+            try
+            {
+                using var tooBig = Tensor.From(av, [512, 512], device);
+                Check(false, "a tensor beyond the limit is refused");
+            }
+            catch (ResourceLimitExceededException)
+            {
+            }
+
+            ComputeResources.OffloadToHostMemory = true;
+            using (var scope = new TensorScope())
+            {
+                var a = Tensor.From(av, [512, 512], device);
+                var b = Tensor.From(bv, [512, 512], device);
+                var c = a.MatMul(b) + 0f;
+                Check(ComputeResources.GetMemoryUsage(device).Offloaded >= 3L * 512 * 512 * 4, $"offloaded: {ComputeResources.GetMemoryUsage(device)}");
+                AssertClose(expected, c.ToArray(), 1e-3f, "a product computed in system memory");
+            }
+
+            Check(ComputeResources.GetMemoryUsage(device).Offloaded == 0, "offloaded blocks are returned");
+        }
+        finally
+        {
+            ComputeResources.GpuMemoryLimit = limit;
+            ComputeResources.OffloadToHostMemory = offload;
+            ComputeResources.ReleaseCachedMemory(device);
+        }
+    }
 
     private static void CheckpointingGradients(Device device)
     {

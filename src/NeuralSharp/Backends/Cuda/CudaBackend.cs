@@ -223,7 +223,16 @@ internal sealed unsafe partial class CudaBackend : Backend
         MakeCurrent();
         using var use = UseStream();
         long bytes = BlockBytes(length);
-        bool releaseCache = _memory.MustReleaseCacheFor(bytes); // throws when over the in-use limit
+        bool releaseCache;
+        try
+        {
+            releaseCache = _memory.MustReleaseCacheFor(bytes); // throws when over the in-use limit
+        }
+        catch (ResourceLimitExceededException) when (ComputeResources.OffloadToHostMemory)
+        {
+            return AllocateHost(length, zeroed);
+        }
+
         ulong pointer = 0;
         int capacity = length;
         lock (_pool)
@@ -232,7 +241,14 @@ internal sealed unsafe partial class CudaBackend : Backend
             {
                 // Reuse a block freed earlier in this capture: stream order keeps the recorded uses apart.
                 pointer = captured.Pop();
-                _memory.Reused(bytes);
+                if (_hostBlocks.ContainsKey(pointer))
+                {
+                    _memory.Offloaded(bytes);
+                }
+                else
+                {
+                    _memory.Reused(bytes);
+                }
             }
             else if (TakeCached(length, out capacity) is var cached && cached != 0)
             {
@@ -249,6 +265,11 @@ internal sealed unsafe partial class CudaBackend : Backend
             }
 
             pointer = AllocateDevice(length);
+            if (pointer == 0)
+            {
+                return AllocateHost(length, zeroed);
+            }
+
             _memory.Allocated(bytes);
         }
 
@@ -291,22 +312,81 @@ internal sealed unsafe partial class CudaBackend : Backend
         return pointer;
     }
 
+    // New GPU memory, or 0 when the GPU is full and offloading is on (the caller then uses system memory). A block
+    // "fits" when the GPU keeps ComputeResources.GpuMemoryReserve free afterwards, so the driver never pages GPU
+    // memory out on its own.
     private ulong AllocateDevice(int length)
     {
         nuint bytes = (nuint)BlockBytes(length);
-        int result = cuMemAlloc(out ulong pointer, bytes);
+        bool Fits() => cuMemGetInfo(out nuint free, out _) != 0 || (long)free - (long)bytes >= ComputeResources.GpuMemoryReserve;
+        int result = ErrorOutOfMemory;
+        ulong pointer = 0;
+        for (int attempt = 0; attempt < 2 && result == ErrorOutOfMemory; attempt++)
+        {
+            if (attempt == 1)
+            {
+                // Give back cached blocks and anything held only by unreachable tensors, then retry once.
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                ReleaseCachedMemory();
+            }
+
+            result = Fits() ? cuMemAlloc(out pointer, bytes) : ErrorOutOfMemory;
+        }
+
         if (result == ErrorOutOfMemory)
         {
-            // Give back cached blocks and anything held only by unreachable tensors, then retry once.
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            ReleaseCachedMemory();
-            result = cuMemAlloc(out pointer, bytes);
+            if (ComputeResources.OffloadToHostMemory)
+            {
+                return 0;
+            }
+
+            cuMemGetInfo(out nuint free, out nuint total);
+            throw new ResourceLimitExceededException(
+                $"{Name} is out of memory: {bytes:N0} more bytes needed, {free:N0} of {total:N0} free with {ComputeResources.GpuMemoryReserve:N0} kept in reserve " +
+                $"({_memory.Usage}). Use smaller batches or shorter sequences, or set ComputeResources.OffloadToHostMemory (NEURALSHARP_OFFLOAD=1) " +
+                "to keep what does not fit in system memory (slower).");
         }
 
         Check(result, nameof(cuMemAlloc));
         return pointer;
     }
+
+    // Pinned system memory the GPU reads and writes over PCIe, addressed by the kernels like GPU memory (unified
+    // addressing): used when the GPU is full and ComputeResources.OffloadToHostMemory is on.
+    private CudaStorage AllocateHost(int length, bool zeroed)
+    {
+        ulong pointer = 0;
+        lock (_pool)
+        {
+            if (_hostPool.TryGetValue(length, out var bucket) && bucket.Count > 0)
+            {
+                pointer = bucket.Pop();
+            }
+        }
+
+        if (pointer == 0)
+        {
+            Check(cuMemHostAlloc(out IntPtr host, (nuint)BlockBytes(length), HostAllocPortable | HostAllocDeviceMap), nameof(cuMemHostAlloc));
+            Check(cuMemHostGetDevicePointer(out pointer, host, 0), nameof(cuMemHostGetDevicePointer));
+            lock (_pool)
+            {
+                _hostBlocks[pointer] = host;
+            }
+        }
+
+        _memory.Offloaded(BlockBytes(length));
+        if (zeroed && length > 0)
+        {
+            Check(cuMemsetD32Async(pointer, 0, (nuint)length, _stream), nameof(cuMemsetD32Async));
+        }
+
+        return new CudaStorage(this, pointer, length, length);
+    }
+
+    // System-memory blocks by device address (to their host address), and the unused ones by size.
+    private readonly Dictionary<ulong, IntPtr> _hostBlocks = [];
+    private readonly Dictionary<int, Stack<ulong>> _hostPool = [];
 
     private static long BlockBytes(int length) => (long)Math.Max(length, 1) * sizeof(float);
 
@@ -332,6 +412,15 @@ internal sealed unsafe partial class CudaBackend : Backend
             }
 
             _poolSizes.Clear();
+            foreach (var (_, bucket) in _hostPool)
+            {
+                while (bucket.Count > 0)
+                {
+                    ulong pointer = bucket.Pop();
+                    Check(cuMemFreeHost(_hostBlocks[pointer]), nameof(cuMemFreeHost));
+                    _hostBlocks.Remove(pointer);
+                }
+            }
         }
     }
 
@@ -342,6 +431,32 @@ internal sealed unsafe partial class CudaBackend : Backend
         var s = (CudaStorage)storage;
         lock (_pool)
         {
+            bool recording = _captureFree is not null && Environment.CurrentManagedThreadId == _captureThread;
+            if (_hostBlocks.ContainsKey(s.Pointer) && recording)
+            {
+                // Freed while a graph is recorded: the graph owns it (see TakeCaptureBlocks).
+                if (!_captureFree!.TryGetValue(s.Capacity, out var captured))
+                {
+                    _captureFree[s.Capacity] = captured = new Stack<ulong>();
+                }
+
+                captured.Push(s.Pointer);
+                _memory.Offloaded(-BlockBytes(s.Capacity));
+                return;
+            }
+
+            if (_hostBlocks.ContainsKey(s.Pointer))
+            {
+                if (!_hostPool.TryGetValue(s.Capacity, out var hostBucket))
+                {
+                    _hostPool[s.Capacity] = hostBucket = new Stack<ulong>();
+                }
+
+                hostBucket.Push(s.Pointer);
+                _memory.Offloaded(-BlockBytes(s.Capacity));
+                return;
+            }
+
             // While recording a graph, blocks the recording frees belong to the graph: returning them to the shared pool
             // would let unrelated tensors reuse memory the graph writes on every replay. (Other threads' blocks,
             // including the finalizer's, go back to the pool.)

@@ -499,8 +499,12 @@ internal sealed class MemoryAccountant(Func<long?> limit, string deviceName)
 {
     private long _inUse;
     private long _cached;
+    private long _offloaded;
 
-    public MemoryUsage Usage => new(Interlocked.Read(ref _inUse), Interlocked.Read(ref _cached), limit());
+    public MemoryUsage Usage => new(Interlocked.Read(ref _inUse), Interlocked.Read(ref _cached), limit(), Interlocked.Read(ref _offloaded));
+
+    /// <summary>Counts bytes placed in system memory for this device (negative when released).</summary>
+    public void Offloaded(long bytes) => Interlocked.Add(ref _offloaded, bytes);
 
     /// <summary>
     /// Called before allocating <paramref name="bytes"/> of new memory. Returns true when the cache
