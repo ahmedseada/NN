@@ -1,7 +1,7 @@
 // Self-contained test runner (no test framework dependency).
 //   dotnet run --project tests/NeuralSharp.Tests                  run every test on every available device
 //   dotnet run --project tests/NeuralSharp.Tests -- --dump-ptx f  write the generated CUDA kernels to f
-//   … -- --bench-gemm / --bench-gemv                               time large products / decoding-sized packed products
+//   … -- --bench-gemm / --bench-gemv / --bench-fp8                               time large products / decoding-sized packed products
 //   NS_FILTER=retrieval dotnet run --project tests/NeuralSharp.Tests   only tests whose name contains the text
 //   NS_TIMEOUT=60 …    a test still running after this many seconds (default 300) is reported as HANG and the run stops
 
@@ -22,6 +22,11 @@ if (args is ["--bench-gemm"])
 if (args is ["--bench-gemv"])
 {
     return Tests.BenchGemv();
+}
+
+if (args is ["--bench-fp8"])
+{
+    return Tests.BenchFp8Quantizers();
 }
 
 if (args is ["--dump-ptx", var ptxPath])

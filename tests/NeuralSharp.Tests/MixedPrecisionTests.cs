@@ -12,6 +12,7 @@ internal static partial class Tests
         ("layer norm: the fused training kernels match the composed operations (output, input, gamma and beta gradients)", LayerNormTraining),
         ("mixed precision: strided products and GELU epilogues match references (slices, activation, its gradient)", StridedProducts),
         ("mixed precision: 8-bit tensor-core products (fp8, int8; every layout, beta, bias) track float32", EightBitProducts),
+        ("mixed precision: 8-bit column quantizers: the one-launch kernel and delayed scaling (given maxima, recorded maxima) match the two-launch pair", ColumnQuantizers),
         ("mixed precision: prompts through int8 / int4 / bfloat16 weights on tensor cores match the float32 kernels", PackedTensorCoreProducts),
         ("mixed precision: fused decoder blocks (packed q/k/v, attention in place, GELU inside the products) match the composed ones", FusedDecoderBlocks),
         ("mixed precision: product + bias in one pass matches the product and a bias addition (output and gradients)", MatMulBiasPass),
@@ -211,6 +212,68 @@ internal static partial class Tests
 
     private static double Relative(float[] expected, float[] actual) =>
         Math.Sqrt(expected.Zip(actual).Sum(p => (double)(p.First - p.Second) * (p.First - p.Second)) / Math.Max(1e-30, expected.Sum(v => (double)v * v)));
+
+    private static void ColumnQuantizers(Device device)
+    {
+        if (device.Type != DeviceType.Cuda)
+        {
+            return;                                                  // CUDA kernels only
+        }
+
+        var backend = (CudaBackend)device.Backend;
+        var random = new Random(12);
+        foreach (bool fp8 in new[] { true, false })
+        {
+            if (!backend.EightBitReady(fp8))
+            {
+                Console.WriteLine($"    ({(fp8 ? "fp8" : "int8")} products unavailable on this GPU; skipped)");
+                continue;
+            }
+
+            // x [k][ld] with `cols` used columns, one outlier column; the columns become the quantized rows.
+            foreach (var (k, cols, ld) in new[] { (700, 290, 300), (1100, 64, 64), (33, 5, 7) })
+            {
+                var values = new float[k * ld];
+                for (int i = 0; i < values.Length; i++)
+                {
+                    values[i] = (random.NextSingle() * 2 - 1) * (i % ld == 3 ? 40f : 1f);
+                }
+
+                var maxima = new float[cols];
+                for (int r = 0; r < k; r++)
+                {
+                    for (int c = 0; c < cols; c++)
+                    {
+                        maxima[c] = MathF.Max(maxima[c], MathF.Abs(values[r * ld + c]));
+                    }
+                }
+
+                int kp = PtxKernels.EightBitPaddedK(k);
+                using var x = Tensor.From(values, [values.Length], device);
+                (byte[] Bytes, float[] Scales) Run(int variant, float[]? given = null, Tensor? record = null)
+                {
+                    using var output = Tensor.Zeros([cols * kp / 4], device);
+                    using var scale = Tensor.Zeros([cols], device);
+                    using var maximaTensor = given is null ? null : Tensor.From(given, [cols], device);
+                    backend.QuantizeColumnsVariant(fp8, x.Storage, ld, output.Storage, scale.Storage, cols, k, variant, maximaTensor?.Storage, record?.Storage);
+                    return (System.Runtime.InteropServices.MemoryMarshal.AsBytes(output.ToArray().AsSpan()).ToArray(), scale.ToArray());
+                }
+
+                string what = $"{(fp8 ? "fp8" : "int8")} {k}x{cols} (ld {ld})";
+                var (bytes, scales) = Run(0);
+                var (onePass, onePassScales) = Run(1);
+                Check(bytes.AsSpan().SequenceEqual(onePass) && scales.AsSpan().SequenceEqual(onePassScales), $"{what}: one-launch kernel");
+                using var recorded = Tensor.Zeros([cols], device);
+                var (delayed, delayedScales) = Run(2, maxima, recorded);
+                Check(bytes.AsSpan().SequenceEqual(delayed) && scales.AsSpan().SequenceEqual(delayedScales), $"{what}: given maxima");
+                Check(recorded.ToArray().AsSpan().SequenceEqual(maxima), $"{what}: recorded maxima");
+                using var recordedStale = Tensor.Zeros([cols], device);
+                var (_, staleScales) = Run(2, [.. maxima.Select(m => m / 2)], recordedStale);
+                Check(staleScales.Zip(scales).All(p => MathF.Abs(p.First * 2 - p.Second) <= 1e-6f * p.Second), $"{what}: stale maxima set the scales");
+                Check(recordedStale.ToArray().AsSpan().SequenceEqual(maxima), $"{what}: maxima recorded under stale scales");
+            }
+        }
+    }
 
     private static void EightBitProducts(Device device)
     {
@@ -617,6 +680,155 @@ internal static partial class Tests
         }
 
         return 0;
+    }
+
+    // FP8 operand quantizers for x [k][n] (n columns → n quantized rows): the two-launch column pair (absmax_cols +
+    // quant_cols, current), the one-launch kernel (option C), delayed scaling (quant_cols with maxima kept from an earlier
+    // pass, recording x's own: option D), and the row quantizer of the same tensor for reference. 20 calls per graph;
+    // GB/s counts one read of x. Then the error of delayed scaling: x' = x drifted (next step), quantized with x's maxima
+    // (stale) against its own (exact), relative RMS after dequantizing, without and with a new outlier.
+    internal static int BenchFp8Quantizers()
+    {
+        if (!Device.IsCudaAvailable)
+        {
+            Console.WriteLine("needs a CUDA device");
+            return 1;
+        }
+
+        var device = Device.Cuda();
+        var backend = (CudaBackend)device.Backend;
+        if (!backend.EightBitReady(fp8: true))
+        {
+            Console.WriteLine("needs FP8 tensor cores (compute capability 8.9+)");
+            return 1;
+        }
+
+        Console.WriteLine(device.Name);
+        var random = new Random(4);
+        double Time(Action run)
+        {
+            using var graph = ComputeGraph.Capture(device, () =>
+            {
+                for (int i = 0; i < 20; i++)
+                {
+                    using var calls = new TensorScope();
+                    run();
+                }
+            });
+            graph.Replay();
+            device.Synchronize();
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            for (int r = 0; r < 5; r++)
+            {
+                graph.Replay();
+            }
+
+            device.Synchronize();
+            return watch.Elapsed.TotalMilliseconds * 1000 / 100;          // µs per call
+        }
+
+        Console.WriteLine($"{"x [k][n]",-16} {"MB",6} {"current (2 launches)",22} {"C: one launch",22} {"D: kept maxima",22} {"rows (reference)",22}");
+        foreach (var (k, n) in new[] { (4096, 2048), (4096, 8192), (2048, 8192), (8192, 2048), (2048, 2048), (12288, 768), (12288, 3072) })
+        {
+            using var x = Tensor.From([.. Enumerable.Range(0, k * n).Select(_ => random.NextSingle() * 2 - 1)], [k * n], device);
+            int kp = PtxKernels.EightBitPaddedK(k), np = PtxKernels.EightBitPaddedK(n);
+            using var output = Tensor.Zeros([Math.Max(n * kp, k * np) / 4], device);
+            using var scale = Tensor.Zeros([Math.Max(n, k)], device);
+            using var maxima = Tensor.Ones([n], device);
+            using var record = Tensor.Zeros([n], device);
+            double mb = 4.0 * k * n / 1e6;
+            string Cell(double us) => $"{us,8:F1}us {mb * 1e-3 / (us * 1e-6),7:F0}GB/s";
+            double current = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 0));
+            double onePass = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 1));
+            double delayed = Time(() => backend.QuantizeColumnsVariant(true, x.Storage, n, output.Storage, scale.Storage, n, k, 2, maxima.Storage, record.Storage));
+            double rows = Time(() => backend.QuantizeRowsForBenchmark(true, x.Storage, n, output.Storage, scale.Storage, k, n));
+            Console.WriteLine($"{$"{k}x{n}",-16} {mb,6:F0} {Cell(current),22} {Cell(onePass),22} {Cell(delayed),22} {Cell(rows),22}");
+        }
+
+        // Error of delayed scaling (fp8 e4m3), x [4096][2048] of normal values with a few larger columns.
+        Console.WriteLine();
+        Console.WriteLine($"{"delayed scaling error",-44} {"exact maxima",14} {"kept maxima",14}");
+        const int K = 4096, N = 2048;
+        double Normal() => Math.Sqrt(-2 * Math.Log(1 - random.NextDouble())) * Math.Cos(2 * Math.PI * random.NextDouble());
+        var previous = new float[K * N];
+        for (int i = 0; i < previous.Length; i++)
+        {
+            previous[i] = (float)(Normal() * (i % N % 97 == 0 ? 8 : 1));
+        }
+
+        var previousMaxima = new float[N];
+        for (int i = 0; i < previous.Length; i++)
+        {
+            previousMaxima[i % N] = MathF.Max(previousMaxima[i % N], MathF.Abs(previous[i]));
+        }
+
+        foreach (var (name, drift, outlier) in new[] { ("next step: x·1.02 + 1% noise", 1.02f, 0f), ("same, one new outlier ×20 per column", 1.02f, 20f) })
+        {
+            var current = new float[K * N];
+            for (int i = 0; i < current.Length; i++)
+            {
+                current[i] = previous[i] * drift + (float)(0.01 * Normal());
+            }
+
+            if (outlier > 0)
+            {
+                for (int c = 0; c < N; c++)
+                {
+                    current[random.Next(K) * N + c] = outlier * previousMaxima[c];
+                }
+            }
+
+            using var x = Tensor.From(current, [current.Length], device);
+            using var kept = Tensor.From(previousMaxima, [N], device);
+            using var exactMaxima = Tensor.Zeros([N], device);
+            int kp = PtxKernels.EightBitPaddedK(K);
+            double Error(bool stale)
+            {
+                using var output = Tensor.Zeros([N * kp / 4], device);
+                using var scale = Tensor.Zeros([N], device);
+                using var record = Tensor.Zeros([N], device);
+                if (stale)
+                {
+                    backend.QuantizeColumnsVariant(true, x.Storage, N, output.Storage, scale.Storage, N, K, 2, kept.Storage, record.Storage);
+                }
+                else
+                {
+                    backend.QuantizeColumnsVariant(true, x.Storage, N, output.Storage, scale.Storage, N, K, 0);
+                }
+
+                var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(output.ToArray().AsSpan()).ToArray();
+                var scales = scale.ToArray();
+                double error = 0, total = 0;
+                for (int c = 0; c < N; c++)
+                {
+                    for (int r = 0; r < K; r++)
+                    {
+                        double value = current[r * N + c], back = DecodeE4M3(bytes[c * kp + r]) * scales[c];
+                        error += (back - value) * (back - value);
+                        total += value * value;
+                    }
+                }
+
+                return Math.Sqrt(error / total);
+            }
+
+            Console.WriteLine($"{name,-44} {Error(false),14:P3} {Error(true),14:P3}");
+        }
+
+        return 0;
+    }
+
+    // An FP8 e4m3 byte as a float (bias 7, subnormals, 0x7F / 0xFF NaN).
+    private static float DecodeE4M3(byte b)
+    {
+        int sign = b >> 7, exponent = (b >> 3) & 15, mantissa = b & 7;
+        if (exponent == 15 && mantissa == 7)
+        {
+            return float.NaN;
+        }
+
+        float magnitude = exponent == 0 ? mantissa / 8f * MathF.Pow(2, -6) : (1 + mantissa / 8f) * MathF.Pow(2, exponent - 7);
+        return sign == 1 ? -magnitude : magnitude;
     }
 
     internal static int BenchGemm()
