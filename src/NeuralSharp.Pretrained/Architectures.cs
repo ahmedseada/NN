@@ -187,7 +187,7 @@ public static class PretrainedArchitectures
 }
 
 /// <summary>Reads a model's weights from a safetensors checkpoint through an architecture's name mapping.</summary>
-internal sealed class CheckpointWeights(SafeTensorsReader reader, PretrainedArchitecture architecture) : IWeightSource
+internal sealed class CheckpointWeights(ITensorStore reader, PretrainedArchitecture architecture) : IWeightSource
 {
     public HashSet<string> Used { get; } = [];
 
@@ -202,18 +202,18 @@ internal sealed class CheckpointWeights(SafeTensorsReader reader, PretrainedArch
         }
 
         Used.Add(stored);
-        var info = reader.Tensors[stored];
+        var storedShape = reader.ShapeOf(stored);
         var values = reader.Read(stored);
         bool transposed = architecture.Transposed(name);
         int[] expected = transposed ? [.. shape.Reverse()] : [.. shape];
-        if (!info.Shape.SequenceEqual(expected))
+        if (!storedShape.SequenceEqual(expected))
         {
-            throw new InvalidDataException($"'{stored}' is [{string.Join(", ", info.Shape)}]; the model expects [{string.Join(", ", expected)}] for {name}.");
+            throw new InvalidDataException($"'{stored}' is [{string.Join(", ", storedShape)}]; the model expects [{string.Join(", ", expected)}] for {name}.");
         }
 
         if (transposed)
         {
-            values = NeuralSharp.HostParallel.Transpose(values, info.Shape[0], info.Shape[1]);
+            values = NeuralSharp.HostParallel.Transpose(values, storedShape[0], storedShape[1]);
         }
 
         if (transposed && Adapter is not null && stored.EndsWith(".weight", StringComparison.Ordinal))

@@ -94,6 +94,11 @@ public sealed class PretrainedModel : IDisposable
     public static PretrainedModel Load(string folder, PretrainedOptions? options = null)
     {
         options ??= new PretrainedOptions();
+        if (File.Exists(folder) && folder.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase))
+        {
+            folder = GgufModel.Prepare(folder);                     // config, tokenizer and template from the file's metadata
+        }
+
         var config = JsonNode.Parse(File.ReadAllText(Path.Combine(folder, "config.json")))!.AsObject();
         string name = options.Architecture ?? (string?)config["architectures"]?[0]
             ?? throw new InvalidDataException("config.json names no architecture; pass PretrainedOptions.Architecture.");
@@ -101,11 +106,11 @@ public sealed class PretrainedModel : IDisposable
         var notes = new List<string>();
         var spec = architecture.Spec(config, notes);
         int maxPositions = Math.Min(options.MaxPositions ?? spec.MaxPositions, spec.MaxPositions);
-        using var reader = SafeTensorsReader.Open(folder);
+        using ITensorStore reader = GgufModel.IsPrepared(folder) ? GgufModel.OpenTensors(folder) : SafeTensorsReader.Open(folder);
         using var adapter = options.MergeAdapter is { } adapterFolder ? new AdapterMerge(adapterFolder) : null;
         var weights = new CheckpointWeights(reader, architecture) { Adapter = adapter };
         var network = spec.Build(weights, new DecoderBuildOptions { Device = options.Device, Int8 = options.Int8, BFloat16 = options.BFloat16, Int4 = options.Int4, MaxPositions = maxPositions });
-        var unused = reader.Tensors.Keys.Where(k => !weights.Used.Contains(k) && !k.EndsWith("rotary_emb.inv_freq", StringComparison.Ordinal)).ToList();
+        var unused = reader.Names.Where(k => !weights.Used.Contains(k) && !k.EndsWith("rotary_emb.inv_freq", StringComparison.Ordinal)).ToList();
         if (unused.Count > 0)
         {
             notes.Add($"{unused.Count} checkpoint tensors were not used (for example {string.Join(", ", unused.Take(3))}).");
@@ -118,6 +123,12 @@ public sealed class PretrainedModel : IDisposable
             {
                 throw new InvalidDataException($"The adapter in {options.MergeAdapter} matches none of the model's weights.");
             }
+        }
+
+        if (GgufModel.IsPrepared(folder))
+        {
+            notes.Insert(0, $"weights read from {GgufModel.SourceOf(folder)}");
+            notes.AddRange(GgufModel.NotesOf(folder));
         }
 
         var tokenizer = File.Exists(Path.Combine(folder, "tokenizer.json")) ? BpeTokenizer.Load(folder) : null;

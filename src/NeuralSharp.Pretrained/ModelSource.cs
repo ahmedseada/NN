@@ -4,7 +4,8 @@ using NeuralSharp.Datasets;
 namespace NeuralSharp.Pretrained;
 
 /// <summary>
-/// Where a model comes from: a local folder, or a Hugging Face model id such as "Qwen/Qwen3-0.6B". An id is looked up in
+/// Where a model comes from: a local folder, a GGUF file, an Ollama model ("ollama:qwen3:8b", read from Ollama's own
+/// store), or a Hugging Face model id such as "Qwen/Qwen3-0.6B". An id is looked up in
 /// Hugging Face's own cache (models fetched with transformers or huggingface-cli), then in NeuralSharp's download cache,
 /// and downloaded otherwise: only the files the library reads (config, tokenizer, chat template, generation config and
 /// the safetensors weights), into downloads/huggingface/models/&lt;owner&gt;/&lt;name&gt;/&lt;commit&gt;/. Gated and private models
@@ -14,6 +15,43 @@ public static class ModelSource
 {
     private static readonly string[] Wanted = ["config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
         "added_tokens.json", "chat_template.jinja", "chat_template.json", "model.safetensors.index.json"];
+
+    /// <summary>
+    /// The GGUF file of an Ollama model ("qwen3:8b", "llama3.2" for :latest, "user/model:tag", "hf.co/owner/repo:tag") in
+    /// Ollama's store (OLLAMA_MODELS, or ~/.ollama/models): the manifest names the model layer's blob.
+    /// </summary>
+    public static string OllamaModel(string name)
+    {
+        string store = Environment.GetEnvironmentVariable("OLLAMA_MODELS")
+                       ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ollama", "models");
+        int colon = name.LastIndexOf(':');
+        string tag = colon > name.LastIndexOf('/') && colon > 0 ? name[(colon + 1)..] : "latest";
+        string model = colon > name.LastIndexOf('/') && colon > 0 ? name[..colon] : name;
+        var parts = model.Split('/');
+        string[] path = parts.Length switch
+        {
+            1 => ["registry.ollama.ai", "library", parts[0]],
+            2 => ["registry.ollama.ai", parts[0], parts[1]],
+            _ => parts,
+        };
+        string manifest = Path.Combine([store, "manifests", .. path, tag]);
+        if (!File.Exists(manifest))
+        {
+            string known = Directory.Exists(Path.Combine(store, "manifests"))
+                ? string.Join(", ", Directory.EnumerateFiles(Path.Combine(store, "manifests"), "*", SearchOption.AllDirectories)
+                    .Select(f => Path.GetRelativePath(Path.Combine(store, "manifests"), f).Replace('\\', '/'))
+                    .Select(f => f.StartsWith("registry.ollama.ai/library/", StringComparison.Ordinal) ? f["registry.ollama.ai/library/".Length..] : f)
+                    .Select(f => f[..f.LastIndexOf('/')] + ":" + f[(f.LastIndexOf('/') + 1)..]).Order().Take(30))
+                : "none";
+            throw new FileNotFoundException($"Ollama model '{name}' not found ({manifest}). Models in {store}: {known}.");
+        }
+
+        var layers = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(manifest))?["layers"] as System.Text.Json.Nodes.JsonArray ?? [];
+        string digest = layers.Where(l => (string?)l?["mediaType"] == "application/vnd.ollama.image.model").Select(l => (string?)l!["digest"]).FirstOrDefault()
+                        ?? throw new InvalidDataException($"The manifest of Ollama model '{name}' has no model layer.");
+        string blob = Path.Combine(store, "blobs", digest.Replace(':', '-'));
+        return File.Exists(blob) ? blob : throw new FileNotFoundException($"Ollama model '{name}': its weights {blob} are missing (pull the model again).");
+    }
 
     /// <summary>Whether <paramref name="model"/> reads as a Hugging Face id ("owner/name") rather than a folder.</summary>
     public static bool IsModelId(string model) =>
@@ -28,6 +66,18 @@ public static class ModelSource
         if (Directory.Exists(model))
         {
             return model;
+        }
+
+        if (model.StartsWith("ollama:", StringComparison.OrdinalIgnoreCase))
+        {
+            string blob = OllamaModel(model[7..]);
+            (downloader ?? Downloader.Shared).Log?.Invoke($"{model}: Ollama's model file {blob}");
+            return GgufModel.Prepare(blob);
+        }
+
+        if (File.Exists(model) && model.EndsWith(".gguf", StringComparison.OrdinalIgnoreCase))
+        {
+            return GgufModel.Prepare(model);
         }
 
         if (!IsModelId(model))

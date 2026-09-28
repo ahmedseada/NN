@@ -24,7 +24,8 @@ using NeuralSharp.Pretrained;
 //                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
 //                                   --eval-every N, --no-checkpointing; with --int4 / --int8 / --bf16 the base stays quantized)
 //   (<folder> may also be a Hugging Face model id, for example Qwen/Qwen3-0.6B: taken from the Hugging Face cache or
-//   NeuralSharp's, else downloaded once; HF_TOKEN or huggingface-cli login for gated models)
+//   NeuralSharp's, else downloaded once; HF_TOKEN or huggingface-cli login for gated models; a .gguf file; or an Ollama
+//   model such as ollama:qwen3:8b, read from Ollama's own store)
 //   download <model id>             download a model (config, tokenizer, chat template, safetensors) and print its folder
 //
 //   (<data…> specs, recipes and the dataset tool: see src/NeuralSharp.Datasets.Cli, command nsdata)

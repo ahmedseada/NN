@@ -26,12 +26,28 @@ public sealed record SafeTensorInfo(string Name, SafeTensorType Type, int[] Shap
     public long Count => Shape.Aggregate(1L, (a, b) => a * b);
 }
 
+/// <summary>Tensors by name (Hugging Face names), read as float32: a safetensors checkpoint or a GGUF file.</summary>
+internal interface ITensorStore : IDisposable
+{
+    IEnumerable<string> Names { get; }
+
+    bool Contains(string name);
+
+    int[] ShapeOf(string name);
+
+    float[] Read(string name);
+}
+
 /// <summary>
 /// Reads safetensors weights: one file, or a sharded checkpoint (<c>model.safetensors.index.json</c> naming the file of
 /// each tensor). Tensors are read one at a time, straight from disk, and converted to float32.
 /// </summary>
-public sealed class SafeTensorsReader : IDisposable
+public sealed class SafeTensorsReader : IDisposable, ITensorStore
 {
+    IEnumerable<string> ITensorStore.Names => _tensors.Keys;
+
+    int[] ITensorStore.ShapeOf(string name) => _tensors[name].Shape;
+
     private readonly Dictionary<string, SafeTensorInfo> _tensors = [];
     private readonly Dictionary<string, FileStream> _files = [];
 
