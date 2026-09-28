@@ -10,7 +10,7 @@ const string Usage = """
 
       nsdata show <spec…>                 columns, detected layout and the first rows, as read and as conversations
       nsdata count <spec…>                rows per source
-      nsdata download <spec…>             fetch every file of the sources into the cache (for offline use later)
+      nsdata download <spec…>             fetch every file of the sources into the cache and list them (--refresh: again)
       nsdata build <spec…|recipe.json> --out <file.jsonl>
                                           assemble a training set (conversations {"messages"} and / or texts {"text"})
       nsdata cache [--clear]              where downloads are kept (and remove them)
@@ -147,11 +147,14 @@ try
         case "download":
             foreach (var text in specs)
             {
+                var watch = Stopwatch.StartNew();
                 var spec = DatasetSpec.Parse(text);
-                var data = spec.Open(downloads);
-                using var rows = data.GetEnumerator();
-                rows.MoveNext();                                    // resolves and downloads every file of the source
-                Console.WriteLine($"{spec}: ready in {downloads.CacheFolder}");
+                var files = spec.Download(downloads);
+                Console.WriteLine($"{spec}: {files.Count} file{(files.Count == 1 ? "" : "s")}, {Downloader.Size(files.Sum(f => new FileInfo(f).Length))} ({watch.Elapsed.TotalSeconds:F1} s)");
+                foreach (var file in files)
+                {
+                    Console.WriteLine($"  {Downloader.Size(new FileInfo(file).Length),10}  {file}");
+                }
             }
 
             return 0;

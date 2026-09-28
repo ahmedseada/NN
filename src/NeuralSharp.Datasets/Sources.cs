@@ -34,7 +34,7 @@ internal static class RemoteFiles
                 return DataFiles.Read(f, options ?? ReadOptions.Default);
             });
             return post is null ? rows : rows.Select(post);
-        }, name);
+        }, name) { Files = () => files.Value };
     }
 
     public static Dictionary<string, string> Bearer(string? token, Dictionary<string, string>? extra = null)

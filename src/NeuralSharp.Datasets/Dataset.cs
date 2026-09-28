@@ -37,6 +37,16 @@ public sealed class Dataset : IEnumerable<JsonObject>
     /// <summary>A name for messages and reports (the source it was read from).</summary>
     public string Name { get; }
 
+    // The files a source reads (downloading remote ones first), when the dataset is a source rather than derived from one.
+    internal Func<IReadOnlyList<string>>? Files { get; init; }
+
+    /// <summary>
+    /// The local files this dataset reads, downloading remote ones into the cache first (without reading rows). Only for
+    /// datasets created directly from a source (files, folders, URLs, Hugging Face, GitHub, Kaggle, Zenodo).
+    /// </summary>
+    public IReadOnlyList<string> Download() =>
+        Files?.Invoke() ?? throw new InvalidOperationException($"{Name} is derived from another dataset; download its source instead.");
+
     /// <summary>Rows kept in memory.</summary>
     public static Dataset FromRows(IEnumerable<JsonObject> rows, string name = "rows")
     {
@@ -56,7 +66,7 @@ public sealed class Dataset : IEnumerable<JsonObject>
             throw new FileNotFoundException($"'{full}' does not exist.", full);
         }
 
-        return new Dataset(() => DataFiles.Read(full, options ?? ReadOptions.Default), Path.GetFileName(full));
+        return new Dataset(() => DataFiles.Read(full, options ?? ReadOptions.Default), Path.GetFileName(full)) { Files = () => [full] };
     }
 
     /// <summary>Several files, one after another.</summary>
@@ -68,7 +78,7 @@ public sealed class Dataset : IEnumerable<JsonObject>
             throw new FileNotFoundException($"'{file}' does not exist.", file);
         }
 
-        return new Dataset(() => list.SelectMany(f => DataFiles.Read(f, options ?? ReadOptions.Default)), name ?? $"{list.Count} files");
+        return new Dataset(() => list.SelectMany(f => DataFiles.Read(f, options ?? ReadOptions.Default)), name ?? $"{list.Count} files") { Files = () => list };
     }
 
     /// <summary>
@@ -84,7 +94,10 @@ public sealed class Dataset : IEnumerable<JsonObject>
         }
 
         var effective = (options ?? ReadOptions.Default) with { Root = (options ?? ReadOptions.Default).Root ?? root };
-        return new Dataset(() => DataFiles.InFolder(root, pattern, effective).SelectMany(f => DataFiles.Read(f, effective)), Path.GetFileName(root));
+        return new Dataset(() => DataFiles.InFolder(root, pattern, effective).SelectMany(f => DataFiles.Read(f, effective)), Path.GetFileName(root))
+        {
+            Files = () => [.. DataFiles.InFolder(root, pattern, effective)],
+        };
     }
 
     /// <summary>A file downloaded from <paramref name="url"/> (once: it is cached, see <see cref="Downloader"/>).</summary>
@@ -92,11 +105,8 @@ public sealed class Dataset : IEnumerable<JsonObject>
     {
         var uri = new Uri(url);
         string name = Path.GetFileName(uri.LocalPath);
-        return new Dataset(() =>
-        {
-            string file = (downloader ?? Downloader.Shared).Download(url, headers, name.Length > 0 ? name : null);
-            return DataFiles.Read(file, options ?? ReadOptions.Default);
-        }, url);
+        string Fetch() => (downloader ?? Downloader.Shared).Download(url, headers, name.Length > 0 ? name : null);
+        return new Dataset(() => DataFiles.Read(Fetch(), options ?? ReadOptions.Default), url) { Files = () => [Fetch()] };
     }
 
     /// <summary>Datasets one after another.</summary>

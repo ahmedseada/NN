@@ -78,6 +78,30 @@ public sealed class DatasetSpec
     /// <summary>The rows of this source, with take / skip / columns applied (not yet normalized to chat or text).</summary>
     public Dataset Open(Downloader? downloader = null)
     {
+        var data = OpenSource(downloader);
+        if (Long("skip") is { } skip)
+        {
+            data = data.Skip(skip);
+        }
+
+        if (Long("take") is { } take)
+        {
+            data = data.Take(take);
+        }
+
+        if (String("columns") is { } columns)
+        {
+            data = data.SelectColumns([.. columns.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)]);
+        }
+
+        return data;
+    }
+
+    /// <summary>Downloads the source's files into the cache (without reading rows) and returns their local paths.</summary>
+    public IReadOnlyList<string> Download(Downloader? downloader = null) => OpenSource(downloader).Download();
+
+    private Dataset OpenSource(Downloader? downloader)
+    {
         foreach (var key in Options.Keys.Where(k => !Known.Contains(k)))
         {
             throw new ArgumentException($"{Source}: unknown option '{key}'. Known: {string.Join(", ", Known.Order())}.");
@@ -144,21 +168,6 @@ public sealed class DatasetSpec
         else
         {
             throw new FileNotFoundException($"'{source}' is not a file, a folder or a known source (hf:, github:, kaggle:, zenodo:, http(s)://).");
-        }
-
-        if (Long("skip") is { } skip)
-        {
-            data = data.Skip(skip);
-        }
-
-        if (Long("take") is { } take)
-        {
-            data = data.Take(take);
-        }
-
-        if (String("columns") is { } columns)
-        {
-            data = data.SelectColumns([.. columns.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)]);
         }
 
         return data;
