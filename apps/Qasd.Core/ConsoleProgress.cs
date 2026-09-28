@@ -23,7 +23,7 @@ public sealed class ConsoleProgress
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly bool _redraw = !Console.IsOutputRedirected;
     private readonly object _gate = new();
-    private long _lastDraw = long.MinValue;
+    private long _lastDraw = -1000;           // draws on the first report
     private int _lastTenth = -1;
     private int _drawnWidth;
     private int _done;
