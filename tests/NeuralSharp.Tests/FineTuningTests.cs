@@ -173,6 +173,17 @@ internal static partial class Tests
             Check(Trained(sequences[1]).EndsWith("hi<|im_end|>") && sequences.All(s => s.Tokens.Length <= 1001), "short transcripts");
             Check(encoder.Encode(transcripts[0], 20) is null || encoder.Encode(transcripts[0], 20)!.Tokens.Length == 21, "cut to the maximum length");
 
+            // Rows from datasets: conversations as before; plain text trains every token, long texts in chunks.
+            var row = JsonNode.Parse(File.ReadLines(data).First())!.AsObject();
+            Check(encoder.EncodeRow(row, 1000).Single().Tokens.SequenceEqual(sequences[0].Tokens), "a conversation row encodes as its transcript");
+            string text = string.Concat(Enumerable.Repeat("the quick brown fox jumps over the lazy dog. ", 6));
+            var whole = encoder.EncodeText(text, 10_000).Single();
+            var chunks = encoder.EncodeRow(new JsonObject { ["text"] = text }, 16).ToList();
+            Check(whole.Trained.All(t => t) && chunks.Count > 1 && chunks.All(c => c.Tokens.Length <= 17 && c.Trained.All(t => t))
+                  && chunks.Sum(c => c.TrainedTokens) == whole.TrainedTokens && chunks[0].Tokens.Concat(chunks[1].Tokens.Skip(1)).SequenceEqual(whole.Tokens.Take(chunks[0].Tokens.Length + chunks[1].Tokens.Length - 1)),
+                $"text rows: {chunks.Count} chunks predict each of the {whole.TrainedTokens} tokens once");
+            Check(!encoder.EncodeRow(new JsonObject { ["label"] = 3 }, 100).Any(), "rows without text or messages give nothing");
+
             // LoRA: the transcripts are learned (loss falls), and the adapters round-trip through the PEFT files.
             var options = new FineTuningOptions { Rank = 4, Alpha = 8, LearningRate = 1e-2f, Epochs = 40, BatchTokens = 1024, WarmupFraction = 0f, Seed = 5 };
             float before = FineTuner.Evaluate(model, sequences);

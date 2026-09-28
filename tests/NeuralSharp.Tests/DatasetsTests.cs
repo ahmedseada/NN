@@ -15,8 +15,77 @@ internal static partial class Tests
         ("datasets: JSON Lines, JSON, CSV/TSV, text and code files, also in .gz, .zip and .tar.gz", DatasetFormats),
         ("datasets: select, filter, shuffle, deduplicate, split and mix are lazy, streamed and reproducible", DatasetOperations),
         ("datasets: downloads are cached, resumed, retried, and explain missing access", DatasetDownloads),
+        ("datasets: rows of common layouts (messages, ShareGPT, Alpaca, question/answer, TRL, templates) become conversations or text; specs and recipes", DatasetChatAndRecipes),
         ("datasets: Hugging Face (splits, pages, tokens, Parquet fallback), GitHub (repositories, files, releases), Kaggle and Zenodo against a fake server", DatasetSources),
     ];
+
+    private static void DatasetChatAndRecipes(Device device)
+    {
+        _ = device;
+        JsonObject Row(string json) => JsonNode.Parse(json)!.AsObject();
+        string? Chat(string json, ChatMapping? mapping = null, RowKind kind = RowKind.Auto, string? system = null) =>
+            ChatRows.Normalize(Row(json), kind, mapping, system)?.ToJsonString();
+
+        Check(Chat("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"yo\",\"reasoning_content\":\"r\"}],\"tools\":\"[{\\\"type\\\":\\\"function\\\",\\\"function\\\":{\\\"name\\\":\\\"f\\\"}}]\"}")
+              == "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":\"yo\",\"reasoning_content\":\"r\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}]}",
+            "messages kept, reasoning kept, tools parsed from a JSON string");
+        Check(Chat("{\"conversations\":[{\"from\":\"system\",\"value\":\"s\"},{\"from\":\"human\",\"value\":\"q\"},{\"from\":\"gpt\",\"value\":\"a\"}]}")
+              == "{\"messages\":[{\"role\":\"system\",\"content\":\"s\"},{\"role\":\"user\",\"content\":\"q\"},{\"role\":\"assistant\",\"content\":\"a\"}]}", "ShareGPT");
+        Check(Chat("{\"instruction\":\"Translate\",\"input\":\"hola\",\"output\":\"hello\"}")
+              == "{\"messages\":[{\"role\":\"user\",\"content\":\"Translate\\n\\nhola\"},{\"role\":\"assistant\",\"content\":\"hello\"}]}", "Alpaca");
+        Check(Chat("{\"instruction\":\"Say hi\",\"input\":\"\",\"output\":\"hi\"}")!.Contains("\"content\":\"Say hi\"", StringComparison.Ordinal), "Alpaca without input");
+        Check(Chat("{\"question\":\"two and two?\",\"answer\":\"4\"}", system: "Be exact.")
+              == "{\"messages\":[{\"role\":\"system\",\"content\":\"Be exact.\"},{\"role\":\"user\",\"content\":\"two and two?\"},{\"role\":\"assistant\",\"content\":\"4\"}]}", "question/answer with a system prompt");
+        Check(Chat("{\"prompt\":[{\"role\":\"user\",\"content\":\"p\"}],\"completion\":[{\"role\":\"assistant\",\"content\":\"c\"}]}")!.Contains("\"content\":\"c\"", StringComparison.Ordinal), "TRL prompt/completion");
+        Check(Chat("{\"text\":\"plain words\"}") == "{\"text\":\"plain words\"}" && Chat("{\"text\":\"plain\"}", kind: RowKind.Chat) is null, "text rows");
+        Check(Chat("{\"question\":\"q\",\"answer\":\"a\"}", kind: RowKind.Text) == "{\"text\":\"q\\n\\na\"}", "conversations as text");
+        Check(Chat("{\"label\":1}") is null, "unrecognized rows are dropped");
+        var mapping = new ChatMapping { User = "Title: {title}\n\n{body}\n\n{missing_col}", Assistant = "{summary}", System = "{nothing}" };
+        Check(Chat("{\"title\":\"T\",\"body\":\"B\",\"summary\":\"S\",\"nothing\":\"\"}", mapping)
+              == "{\"messages\":[{\"role\":\"user\",\"content\":\"Title: T\\n\\nB\\n\\n{missing_col}\"},{\"role\":\"assistant\",\"content\":\"S\"}]}", "templates");
+        Check(ChatRows.Describe(Row("{\"instruction\":\"i\",\"output\":\"o\"}")) == "alpaca" && ChatRows.Describe(Row("{\"conversations\":[{\"from\":\"human\",\"value\":\"x\"}]}")) == "sharegpt (conversations)",
+            "layouts described");
+
+        var spec = DatasetSpec.Parse("hf:openai/gsm8k?config=main&split=test&user={question}&assistant={answer}&weight=0.5&take=10");
+        Check(spec.Source == "hf:openai/gsm8k" && spec.Options["split"] == "test" && spec.Weight == 0.5 && spec.Mapping is { User: "{question}", Assistant: "{answer}" }, "spec options");
+        Check(DatasetSpec.Parse("https://host/data.jsonl?sig=abc").Source == "https://host/data.jsonl?sig=abc" && DatasetSpec.Parse("https://host/d.jsonl?take=5").Source == "https://host/d.jsonl",
+            "URLs keep their own query");
+
+        string root = Path.Combine(Path.GetTempPath(), "ns-recipe-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            File.WriteAllLines(Path.Combine(root, "qa.jsonl"), Enumerable.Range(0, 300).Select(i => $"{{\"q\":\"question {i % 250}\",\"a\":\"answer {i % 250}\"}}"));
+            File.WriteAllLines(Path.Combine(root, "chat.jsonl"), Enumerable.Range(0, 100).Select(i => $"{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi {i}\"}},{{\"role\":\"assistant\",\"content\":\"hello {i}\"}}]}}"));
+            File.WriteAllLines(Path.Combine(root, "notes.txt"), ["short", "a line long enough to keep", "another line long enough"]);
+            File.WriteAllText(Path.Combine(root, "recipe.json"), """
+                {
+                  "sources": [
+                    {"source": "qa.jsonl", "user": "{q}", "assistant": "{a}"},
+                    "chat.jsonl?take=50",
+                    "notes.txt"
+                  ],
+                  "system": "Be kind.", "seed": 4, "min_chars": 10, "eval_fraction": 0.1
+                }
+                """);
+            var recipe = DatasetRecipe.Load(Path.Combine(root, "recipe.json"));
+            var (train, evaluation) = recipe.Build();
+            var trainRows = train.ToList();
+            var evalRows = evaluation!.ToList();
+            int total = trainRows.Count + evalRows.Count;
+            Check(total == 250 + 50 + 2, $"recipe rows: {total} (duplicates and short rows dropped)");
+            Check(evalRows.Count is > 10 and < 60 && !trainRows.Select(r => r.ToJsonString()).Intersect(evalRows.Select(r => r.ToJsonString())).Any(), $"held out {evalRows.Count}");
+            Check(trainRows.Where(r => r.ContainsKey("messages")).All(r => (string?)r["messages"]![0]!["content"] == "Be kind.") && trainRows.Count(r => r.ContainsKey("text")) <= 2, "system prompt, text rows");
+            Check(recipe.Build().Train.Select(r => r.ToJsonString()).SequenceEqual(trainRows.Select(r => r.ToJsonString())), "a recipe builds the same rows each time");
+            var weighted = DatasetRecipe.Of(Path.Combine(root, "qa.jsonl") + "?weight=3&user={q}&assistant={a}", Path.Combine(root, "chat.jsonl") + "?weight=1") with { Deduplicate = false, Stop = MixStop.FirstExhausted };
+            var mixed = weighted.Build().Train.ToList();
+            Check(mixed.Count < 400 && mixed.Count(r => ((string)r["messages"]![0]!["content"]!).StartsWith("question", StringComparison.Ordinal)) > mixed.Count / 2, "weights mix the sources");
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
 
     private static void DatasetSources(Device device)
     {

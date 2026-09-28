@@ -12,12 +12,27 @@ public sealed record RepoFile(string Path, long Size);
 // A dataset over files a source resolves and downloads once (on first use), then reads from the cache.
 internal static class RemoteFiles
 {
-    public static Dataset Over(string name, Func<IReadOnlyList<string>> resolve, ReadOptions? options, Func<JsonObject, JsonObject>? post = null)
+    public static Dataset Over(string name, Func<IReadOnlyList<string>> resolve, ReadOptions? options, Func<JsonObject, JsonObject>? post = null,
+        Downloader? downloader = null)
     {
-        var files = new Lazy<IReadOnlyList<string>>(resolve, LazyThreadSafetyMode.ExecutionAndPublication);
+        var files = new Lazy<IReadOnlyList<string>>(() =>
+        {
+            downloader?.Log?.Invoke($"{name}: resolving files");
+            var list = resolve();
+            downloader?.Log?.Invoke($"{name}: {list.Count} file{(list.Count == 1 ? "" : "s")} ready ({Downloader.Size(list.Sum(f => new FileInfo(f).Length))})");
+            return list;
+        }, LazyThreadSafetyMode.ExecutionAndPublication);
         return new Dataset(() =>
         {
-            var rows = files.Value.SelectMany(f => DataFiles.Read(f, options ?? ReadOptions.Default));
+            var rows = files.Value.SelectMany((f, i) =>
+            {
+                if (files.Value.Count > 1)
+                {
+                    downloader?.Log?.Invoke($"{name}: reading {Path.GetFileName(f)} ({i + 1} of {files.Value.Count})");
+                }
+
+                return DataFiles.Read(f, options ?? ReadOptions.Default);
+            });
             return post is null ? rows : rows.Select(post);
         }, name);
     }
@@ -131,7 +146,7 @@ public static class HuggingFace
     {
         var d = downloader ?? Downloader.Shared;
         string name = $"hf:{repo}{(config is null ? "" : "/" + config)}[{split}]";
-        return RemoteFiles.Over(name, () => ResolveAsync(repo, config, split, files, revision, token, maxFiles, d).GetAwaiter().GetResult(), options);
+        return RemoteFiles.Over(name, () => ResolveAsync(repo, config, split, files, revision, token, maxFiles, d).GetAwaiter().GetResult(), options, downloader: d);
     }
 
     /// <summary>The files of a repository (<paramref name="kind"/>: "datasets" or "models").</summary>
@@ -189,8 +204,11 @@ public static class HuggingFace
             chosen = RemoteFiles.BestFormat(RemoteFiles.ForSplit(data, split));
         }
 
+        downloader.Log?.Invoke($"hf:{repo}: {all.Count} files in the repository; {chosen.Count} data file{(chosen.Count == 1 ? "" : "s")} for split '{split}'"
+                               + (maxFiles is { } m && m < chosen.Count ? $", reading the first {m}" : ""));
         if (chosen.Count == 0)
         {
+            downloader.Log?.Invoke($"hf:{repo}: no plain data files for '{split}'; using the Hub's Parquet copy");
             return await ConvertedParquetAsync(repo, config, split, token, maxFiles, downloader).ConfigureAwait(false);
         }
 
@@ -261,7 +279,7 @@ public static class GitHub
         return RemoteFiles.Over($"github:{repo}{(reference is null ? "" : "@" + reference)}",
             () => [d.DownloadAsync(url, Headers(token), $"{repo.Replace('/', '-')}{(reference is null ? "" : "-" + reference)}.tar.gz").GetAwaiter().GetResult()],
             options,
-            row =>
+            post: row =>
             {
                 // GitHub's tarballs hold everything under "<owner>-<repo>-<commit>/".
                 if ((string?)row["path"] is { } path && path.IndexOf('/') is var slash and > 0)
@@ -271,21 +289,22 @@ public static class GitHub
 
                 row["repo"] = repo;
                 return row;
-            });
+            },
+            downloader: d);
     }
 
     /// <summary>The data files of a repository matching <paramref name="pattern"/> (e.g. "data/*.jsonl"), read as data.</summary>
     public static Dataset Files(string repo, string pattern, string? reference = null, string? token = null, ReadOptions? options = null, Downloader? downloader = null)
     {
         var d = downloader ?? Downloader.Shared;
-        return RemoteFiles.Over($"github:{repo}/{pattern}", () => ResolveFilesAsync(repo, pattern, reference, token, d).GetAwaiter().GetResult(), options);
+        return RemoteFiles.Over($"github:{repo}/{pattern}", () => ResolveFilesAsync(repo, pattern, reference, token, d).GetAwaiter().GetResult(), options, downloader: d);
     }
 
     /// <summary>The assets of a release (<paramref name="tag"/>, or the latest) whose names match <paramref name="assetPattern"/>.</summary>
     public static Dataset Release(string repo, string assetPattern, string? tag = null, string? token = null, ReadOptions? options = null, Downloader? downloader = null)
     {
         var d = downloader ?? Downloader.Shared;
-        return RemoteFiles.Over($"github:{repo} release {tag ?? "latest"}", () => ResolveReleaseAsync(repo, assetPattern, tag, token, d).GetAwaiter().GetResult(), options);
+        return RemoteFiles.Over($"github:{repo} release {tag ?? "latest"}", () => ResolveReleaseAsync(repo, assetPattern, tag, token, d).GetAwaiter().GetResult(), options, downloader: d);
     }
 
     private static async Task<IReadOnlyList<string>> ResolveFilesAsync(string repo, string pattern, string? reference, string? token, Downloader downloader)
@@ -344,7 +363,7 @@ public static class Kaggle
         string url = $"https://www.kaggle.com/api/v1/datasets/download/{dataset}{(version is null ? "" : $"?datasetVersionNumber={version}")}";
         return RemoteFiles.Over($"kaggle:{dataset}",
             () => [d.DownloadAsync(url, Credentials(), $"{dataset.Replace('/', '-')}{(version is null ? "" : $"-v{version}")}.zip").GetAwaiter().GetResult()],
-            (options ?? ReadOptions.Default) with { Pattern = pattern ?? options?.Pattern });
+            (options ?? ReadOptions.Default) with { Pattern = pattern ?? options?.Pattern }, downloader: d);
     }
 
     private static Dictionary<string, string> Credentials()
@@ -378,7 +397,7 @@ public static class Zenodo
     public static Dataset Record(string record, string? pattern = null, string? token = null, ReadOptions? options = null, Downloader? downloader = null)
     {
         var d = downloader ?? Downloader.Shared;
-        return RemoteFiles.Over($"zenodo:{record}", () => ResolveAsync(record, pattern, token, d).GetAwaiter().GetResult(), options);
+        return RemoteFiles.Over($"zenodo:{record}", () => ResolveAsync(record, pattern, token, d).GetAwaiter().GetResult(), options, downloader: d);
     }
 
     private static async Task<IReadOnlyList<string>> ResolveAsync(string record, string? pattern, string? token, Downloader downloader)

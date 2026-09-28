@@ -16,13 +16,29 @@ using NeuralSharp.Pretrained;
 //   check <reference.json>          compare with transformers: token ids, chat templates, logits, greedy output
 //                                   (make the reference with tools/pytorch/pretrained_reference.py)
 //
-//   finetune <folder> <train.jsonl> --out <dir>      (try: data/agent-demo-train.jsonl, data/agent-demo-eval.jsonl)
-//                                   LoRA / QLoRA on chat transcripts (JSON Lines: {"messages": [...], "tools": [...]});
-//                                   only the assistant's turns are trained; writes a PEFT adapter to <dir>
-//                                   (--eval F, --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048,
+//   finetune <folder> <data…> --out <dir>            (try: data/agent-demo-train.jsonl, data/agent-demo-eval.jsonl)
+//                                   LoRA / QLoRA on datasets: files, folders, hf:, github:, kaggle:, zenodo:, URLs or a
+//                                   recipe (see "dataset" below); conversations train the assistant's turns, text rows
+//                                   every token; writes a PEFT adapter to <dir>
+//                                   (--eval F|spec, --eval-fraction 0.02, --system S, --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048,
 //                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
 //                                   --eval-every N, --no-checkpointing; with --int4 / --int8 / --bf16 the base stays quantized)
 //   (<folder> may also be a Hugging Face model id already downloaded, for example Qwen/Qwen3-0.6B)
+//
+//   dataset show <spec…>            columns, detected layout and the first rows (--take N) as read and as normalized
+//   dataset count <spec…>           rows per source
+//   dataset build <spec…|recipe.json> --out <train.jsonl>
+//                                   assembles a training set: conversations ({"messages"}) and / or texts ({"text"});
+//                                   --eval F with --eval-fraction 0.02, --kind auto|chat|text, --system S, --seed N,
+//                                   --max-rows N, --min-chars N, --max-chars N, --no-shuffle, --no-dedup, --mix
+//                                   A spec is a source with options after '?':
+//                                     hf:HuggingFaceH4/ultrachat_200k?split=train_sft&take=5000  (config, files, max_files,
+//                                       revision; HF_TOKEN or huggingface-cli login for gated / private datasets)
+//                                     github:owner/repo[@ref][?files=src/**/*.cs]   (files as documents; GITHUB_TOKEN)
+//                                     github:owner/repo?files=data/*.jsonl | ?release=latest&asset=*.csv
+//                                     kaggle:owner/dataset, zenodo:123456, https://host/file.jsonl.gz, a file or folder
+//                                   and for any source: take, skip, weight, columns, text=lines|paragraphs|document,
+//                                   user=..&assistant=..&system=.. (chat templates over columns, e.g. user={question})
 //   agent <folder> <task…> --workspace <dir>
 //                                   a coding agent (read, search, edit, write, run dotnet / npm …) working in <dir>
 //   agent-run <folder> <suite> --out <runs.jsonl>
@@ -42,7 +58,12 @@ var positional = new List<string>();
 bool int8 = false, bf16 = false, int4 = false, kv8 = false, kv16 = false, noThink = false;
 int context = 4096;
 string? folderOverride = null, output = null, evalFile = null, adapterFolder = null;
-string? workspace = null, workRoot = null, filter = null;
+string? workspace = null, workRoot = null, filter = null, systemPrompt = null;
+double evalFraction = 0;
+long take = 3, maxRows = 0;
+int seed = 0, minChars = 0, maxChars = 0;
+bool shuffleRows = true, dedupRows = true, mixByWeight = false;
+var rowKind = NeuralSharp.Datasets.RowKind.Auto;
 int attempts = 1, maxRounds = 40;
 float? temperature = null;
 MatMulPrecision? matmul = null;
@@ -88,6 +109,17 @@ for (int i = 0; i < args.Length; i++)
         case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
         case "--workspace": workspace = args[++i]; break;
+        case "--eval-fraction": evalFraction = double.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--system": systemPrompt = args[++i]; break;
+        case "--take": take = long.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--max-rows": maxRows = long.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--seed": seed = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--min-chars": minChars = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--max-chars": maxChars = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--no-shuffle": shuffleRows = false; break;
+        case "--no-dedup": dedupRows = false; break;
+        case "--mix": mixByWeight = true; break;
+        case "--kind": rowKind = Enum.Parse<NeuralSharp.Datasets.RowKind>(args[++i], ignoreCase: true); break;
         case "--work": workRoot = args[++i]; break;
         case "--filter": filter = args[++i]; break;
         case "--attempts": attempts = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
@@ -100,11 +132,13 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run" or "agent-check")
+if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run" or "agent-check" or "dataset")
+    || positional[0] is "dataset" && (positional.Count < 3 || positional[1] is not ("show" or "count" or "build") || positional[1] == "build" && output is null)
     || positional[0] is "agent" && (positional.Count < 3 || workspace is null) || positional[0] is "agent-run" && (positional.Count < 3 || output is null)
     || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
 {
     Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir>");
+    Console.WriteLine("       dataset show|count <spec…> | dataset build <spec…|recipe.json> --out <train.jsonl> [--eval F --eval-fraction 0.02]");
     Console.WriteLine("       agent <folder> <task…> --workspace <dir> | agent-run <folder> <suite> --out <runs.jsonl> [--attempts N] | agent-check <suite>");
     Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] [--matmul fp32|bf16|fp8] (fine-tuning options: see the top of Program.cs)");
     return 1;
@@ -180,37 +214,192 @@ PretrainedModel Load(string folder)
     return model;
 }
 
+// A training set from the command line: one recipe file, or sources with the recipe options given as flags.
+NeuralSharp.Datasets.DatasetRecipe Recipe(IReadOnlyList<string> specs, bool forTraining)
+{
+    if (specs is [var single] && single.EndsWith(".json", StringComparison.OrdinalIgnoreCase) && File.Exists(single)
+        && JsonNode.Parse(File.ReadAllText(single)) is JsonObject json && json.ContainsKey("sources"))
+    {
+        var loaded = NeuralSharp.Datasets.DatasetRecipe.Load(single);
+        return evalFraction > 0 ? loaded with { EvaluationFraction = evalFraction } : loaded;
+    }
+
+    return new NeuralSharp.Datasets.DatasetRecipe
+    {
+        Sources = [.. specs.Select(NeuralSharp.Datasets.DatasetSpec.Parse)],
+        Kind = rowKind,
+        System = systemPrompt,
+        MixByWeight = mixByWeight ? true : null,
+        Seed = seed,
+        Shuffle = shuffleRows && !forTraining,          // fine-tuning orders its batches itself
+        Deduplicate = dedupRows,
+        MinCharacters = minChars,
+        MaxCharacters = maxChars,
+        MaxRows = maxRows,
+        EvaluationFraction = evalFraction,
+    };
+}
+
+var status = new ConsoleStatus();
+var downloads = new NeuralSharp.Datasets.Downloader
+{
+    Log = line => status.Log("  " + line),
+    Progress = new ConsoleProgress<NeuralSharp.Datasets.DownloadProgress>(p =>
+    {
+        if (p.Completed)
+        {
+            status.Clear();
+            status.Log($"  downloaded {p.File} ({NeuralSharp.Datasets.Downloader.Size(p.Received)} in {p.Elapsed.TotalSeconds:F1} s, {p.BytesPerSecond / (1 << 20):F1} MB/s)");
+        }
+        else
+        {
+            status.Bar(p.File, p.Received, p.Total, p.Elapsed, NeuralSharp.Datasets.Downloader.Size(p.Received)
+                + (p.Total is { } t ? " / " + NeuralSharp.Datasets.Downloader.Size(t) : "") + $"  {p.BytesPerSecond / (1 << 20):F1} MB/s");
+        }
+    }),
+};
+
+// Rows as they stream, with a live count, rate and (when known) a bar.
+IEnumerable<JsonObject> Counting(IEnumerable<JsonObject> rows, string label, long? total = null, Func<string>? extra = null)
+{
+    var clock = Stopwatch.StartNew();
+    long count = 0;
+    foreach (var row in rows)
+    {
+        count++;
+        if ((count & 63) == 0)
+        {
+            status.Bar(label, count, total, clock.Elapsed, $"{count:N0}{(total is { } t ? $" / {t:N0}" : "")} rows  {count / Math.Max(clock.Elapsed.TotalSeconds, 1e-3):N0} rows/s{extra?.Invoke()}");
+        }
+
+        yield return row;
+    }
+
+    status.Clear();
+}
+
 switch (positional[0])
 {
+    case "dataset":
+    {
+        var readableJsonOptions = new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+        var specs = positional.Skip(2).ToList();
+        string ShortJson(JsonNode? node)
+        {
+            // Long strings cut so a row fits on screen.
+            switch (node)
+            {
+                case JsonObject o:
+                    return "{ " + string.Join(", ", o.Select(p => $"\"{p.Key}\": {ShortJson(p.Value)}")) + " }";
+                case JsonArray a:
+                    return "[" + string.Join(", ", a.Take(6).Select(n => ShortJson(n))) + (a.Count > 6 ? $", … {a.Count - 6} more" : "") + "]";
+                case JsonValue v when v.TryGetValue<string>(out var text):
+                    string flat = text.Replace("\n", "⏎", StringComparison.Ordinal);
+                    return JsonSerializer.Serialize(flat.Length > 160 ? flat[..160] + $"… ({text.Length} chars)" : flat, readableJsonOptions);
+                default:
+                    return node?.ToJsonString() ?? "null";
+            }
+        }
+
+        switch (positional[1])
+        {
+            case "show":
+                foreach (var text in specs)
+                {
+                    var spec = NeuralSharp.Datasets.DatasetSpec.Parse(text);
+                    var rows = spec.Open(downloads).Take(take).ToList();
+                    Console.WriteLine($"{spec}");
+                    Console.WriteLine($"  columns: {string.Join(", ", rows.SelectMany(r => r.Select(p => p.Key)).Distinct())}");
+                    Console.WriteLine($"  layout: {(rows.Count > 0 ? NeuralSharp.Datasets.ChatRows.Describe(rows[0]) ?? "not recognized (use user=/assistant= templates)" : "no rows")}");
+                    foreach (var row in rows)
+                    {
+                        Console.WriteLine($"  row:        {ShortJson(row)}");
+                        var normalized = NeuralSharp.Datasets.ChatRows.Normalize((JsonObject)row.DeepClone(), rowKind, spec.Mapping, systemPrompt);
+                        Console.WriteLine($"  normalized: {(normalized is null ? "(dropped)" : ShortJson(normalized))}");
+                    }
+                }
+
+                return 0;
+            case "count":
+                foreach (var text in specs)
+                {
+                    var watch = Stopwatch.StartNew();
+                    var spec = NeuralSharp.Datasets.DatasetSpec.Parse(text);
+                    long rows = Counting(spec.Open(downloads), "counting").LongCount();
+                    Console.WriteLine($"{spec}: {rows:N0} rows ({watch.Elapsed.TotalSeconds:F1} s)");
+                }
+
+                return 0;
+            default:
+            {
+                var recipe = Recipe(specs, forTraining: false);
+                Console.WriteLine($"building from {recipe.Sources.Count} source{(recipe.Sources.Count == 1 ? "" : "s")}: {string.Join(", ", recipe.Sources)}");
+                Console.WriteLine($"  kind {recipe.Kind}, {(recipe.MixByWeight ?? recipe.Sources.Any(x => x.Options.ContainsKey("weight")) ? "mixed by weight" : "one after another")}, "
+                                  + $"{(recipe.Deduplicate ? "deduplicated" : "duplicates kept")}, {(recipe.Shuffle ? $"shuffled (seed {recipe.Seed})" : "in order")}"
+                                  + (recipe.EvaluationFraction > 0 ? $", {recipe.EvaluationFraction:P1} held out for evaluation" : ""));
+                var (train, evaluation) = recipe.Build(downloads);
+                var watch = Stopwatch.StartNew();
+                long written = new NeuralSharp.Datasets.Dataset(() => Counting(train, "writing")).WriteJsonLines(output!);
+                Console.WriteLine($"{written:N0} rows written to {output} ({watch.Elapsed.TotalSeconds:F1} s)");
+                if (evaluation is not null)
+                {
+                    string evalOut = evalFile ?? Path.ChangeExtension(output!, null) + ".eval.jsonl";
+                    long held = new NeuralSharp.Datasets.Dataset(() => Counting(evaluation, "evaluation rows")).WriteJsonLines(evalOut);
+                    Console.WriteLine($"{held:N0} evaluation rows written to {evalOut}");
+                }
+
+                return 0;
+            }
+        }
+    }
+
     case "finetune":
     {
         using var model = Load(positional[1]);
         var encoder = new ChatTranscriptEncoder(model.ChatTemplate ?? throw new InvalidOperationException("The model has no chat template."),
             model.Tokenizer ?? throw new InvalidOperationException("The model has no tokenizer."));
-        List<TrainingSequence> Read(string path, string what)
+        List<TrainingSequence> Read(NeuralSharp.Datasets.Dataset rows, string what)
         {
+            var watch = Stopwatch.StartNew();
             var sequences = new List<TrainingSequence>();
-            int skipped = 0, cut = 0;
-            foreach (var transcript in ChatTranscript.ReadJsonLines(path))
+            long read = 0, skipped = 0, cut = 0, chats = 0, texts = 0, tokens = 0;
+            Console.WriteLine($"{what}: reading and tokenizing {rows.Name}");
+            foreach (var row in Counting(rows, what, extra: () => $"  {tokens:N0} tokens"))
             {
-                var sequence = encoder.Encode(transcript, tuning.MaxLength);
-                if (sequence is null)
+                read++;
+                int before = sequences.Count;
+                foreach (var sequence in encoder.EncodeRow(row, tuning.MaxLength))
                 {
-                    skipped++;
-                    continue;
+                    tokens += sequence.Tokens.Length;
+                    cut += row.ContainsKey("messages") && sequence.Tokens.Length > tuning.MaxLength ? 1 : 0;
+                    sequences.Add(sequence);
                 }
 
-                cut += sequence.Tokens.Length > tuning.MaxLength ? 1 : 0;
-                sequences.Add(sequence);
+                if (sequences.Count == before)
+                {
+                    skipped++;
+                }
+                else if (row.ContainsKey("messages"))
+                {
+                    chats++;
+                }
+                else
+                {
+                    texts++;
+                }
             }
 
-            Console.WriteLine($"{what}: {sequences.Count} transcripts, {sequences.Sum(q => (long)q.Tokens.Length)} tokens, "
-                              + $"{sequences.Sum(q => (long)q.TrainedTokens)} trained (assistant) tokens; {cut} cut to {tuning.MaxLength} tokens, {skipped} without assistant tokens skipped");
+            Console.WriteLine($"{what}: {read:N0} rows ({chats:N0} conversations, {texts:N0} texts) → {sequences.Count:N0} sequences, "
+                              + $"{sequences.Sum(q => (long)q.Tokens.Length):N0} tokens, {sequences.Sum(q => (long)q.TrainedTokens):N0} trained; "
+                              + $"{cut:N0} conversations cut to {tuning.MaxLength} tokens, {skipped:N0} rows without trainable tokens skipped ({watch.Elapsed.TotalSeconds:F1} s)");
             return sequences;
         }
 
-        var train = Read(positional[2], "training");
-        var evaluation = evalFile is null ? null : Read(evalFile, "evaluation");
+        var recipe = Recipe(positional.Skip(2).ToList(), forTraining: true);
+        var (trainRows, heldOut) = recipe.Build(downloads);
+        var train = Read(trainRows, "training");
+        var evaluationRows = evalFile is not null ? Recipe([evalFile], forTraining: true) with { EvaluationFraction = 0 } is var e ? e.Build(downloads).Train : null : heldOut;
+        var evaluation = evaluationRows is null ? null : Read(evaluationRows, "evaluation");
         var readable = new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
         Console.WriteLine($"assistant turns start with {JsonSerializer.Serialize(encoder.AssistantHeader, readable)} and end with {JsonSerializer.Serialize(encoder.AssistantEnd, readable)}");
         var lastLine = Stopwatch.StartNew();
@@ -766,4 +955,88 @@ sealed class ProfileRecorder : ITelemetryHook
 internal sealed class ConsoleProgress<T>(Action<T> report) : IProgress<T>
 {
     public void Report(T value) => report(value);
+}
+
+// One status line redrawn in place (a progress bar), with log lines printed above it. When the output goes to a file,
+// the bar becomes a plain line every few seconds.
+internal sealed class ConsoleStatus
+{
+    private readonly object _lock = new();
+    private readonly bool _interactive = !Console.IsOutputRedirected;
+    private readonly Stopwatch _sinceDraw = Stopwatch.StartNew();
+    private int _shown;
+
+    public void Log(string line)
+    {
+        lock (_lock)
+        {
+            Erase();
+            Console.WriteLine(line);
+        }
+    }
+
+    public void Bar(string label, long done, long? total, TimeSpan elapsed, string detail)
+    {
+        lock (_lock)
+        {
+            if (_sinceDraw.ElapsedMilliseconds < (_interactive ? 100 : 5000))
+            {
+                return;
+            }
+
+            _sinceDraw.Restart();
+            string text;
+            if (total is > 0 and var t)
+            {
+                double fraction = Math.Clamp(done / (double)t, 0, 1);
+                int filled = (int)(fraction * 24);
+                var eta = fraction > 0 ? TimeSpan.FromSeconds(elapsed.TotalSeconds / fraction * (1 - fraction)) : TimeSpan.Zero;
+                text = $"  {label} [{new string('█', filled)}{new string('░', 24 - filled)}] {fraction,4:P0}  {detail}  ETA {eta:hh\\:mm\\:ss}";
+            }
+            else
+            {
+                text = $"  {label}  {detail}  {elapsed:hh\\:mm\\:ss}";
+            }
+
+            if (!_interactive)
+            {
+                Console.WriteLine(text);
+                return;
+            }
+
+            int width = Math.Max(20, SafeWidth() - 1);
+            text = text.Length > width ? text[..width] : text;
+            Console.Write("\r" + text.PadRight(Math.Max(_shown, text.Length)));
+            _shown = text.Length;
+        }
+    }
+
+    public void Clear()
+    {
+        lock (_lock)
+        {
+            Erase();
+        }
+    }
+
+    private void Erase()
+    {
+        if (_shown > 0)
+        {
+            Console.Write("\r" + new string(' ', _shown) + "\r");
+            _shown = 0;
+        }
+    }
+
+    private static int SafeWidth()
+    {
+        try
+        {
+            return Console.WindowWidth;
+        }
+        catch (IOException)
+        {
+            return 120;
+        }
+    }
 }

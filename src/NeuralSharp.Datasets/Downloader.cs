@@ -10,7 +10,14 @@ namespace NeuralSharp.Datasets;
 /// <param name="Url">What is downloaded.</param>
 /// <param name="Received">Bytes so far.</param>
 /// <param name="Total">Size, when the server tells it.</param>
-public sealed record DownloadProgress(string Url, long Received, long? Total);
+/// <param name="File">The file's name.</param>
+/// <param name="Elapsed">Time since this download (or its resumption) started.</param>
+/// <param name="Completed">True on the last report of a finished download.</param>
+public sealed record DownloadProgress(string Url, long Received, long? Total, string File = "", TimeSpan Elapsed = default, bool Completed = false)
+{
+    /// <summary>Bytes per second so far.</summary>
+    public double BytesPerSecond => Elapsed.TotalSeconds > 0 ? Received / Elapsed.TotalSeconds : 0;
+}
 
 /// <summary>
 /// Downloads files once into a cache folder and returns the local path: interrupted downloads resume (HTTP ranges),
@@ -44,8 +51,14 @@ public sealed class Downloader
     /// <summary>Where files are kept.</summary>
     public string CacheFolder { get; }
 
-    /// <summary>Called as downloads progress (about every megabyte).</summary>
+    /// <summary>Called as downloads progress (several times a second) and once more when each completes.</summary>
     public IProgress<DownloadProgress>? Progress { get; init; }
+
+    /// <summary>
+    /// Called with a line for each step: what a source resolved (files, splits, fallbacks), files found in the cache,
+    /// downloads started, resumed and retried.
+    /// </summary>
+    public Action<string>? Log { get; init; }
 
     /// <summary>Re-download files even when cached.</summary>
     public bool Refresh { get; init; }
@@ -75,6 +88,7 @@ public sealed class Downloader
         string target = Path.Combine(folder, fileName.Length > 0 ? fileName : "download");
         if (File.Exists(target) && !Refresh)
         {
+            Log?.Invoke($"cached {Path.GetFileName(target)} ({Size(new FileInfo(target).Length)})");
             return target;
         }
 
@@ -93,6 +107,7 @@ public sealed class Downloader
             catch (Exception ex) when (attempt < Attempts && ex is HttpRequestException { StatusCode: null or >= HttpStatusCode.InternalServerError or HttpStatusCode.TooManyRequests }
                                            or IOException && ex is not FileNotFoundException)
             {
+                Log?.Invoke($"{Path.GetFileName(target)}: {ex.Message.Split('\n')[0]}; retrying in {Backoff(attempt).TotalSeconds:0.#} s (attempt {attempt + 1} of {Attempts})");
                 await Task.Delay(Backoff(attempt), cancellationToken).ConfigureAwait(false);
             }
         }
@@ -178,19 +193,24 @@ public sealed class Downloader
 
         bool resumed = existing > 0 && response.StatusCode == HttpStatusCode.PartialContent;
         long? total = response.Content.Headers.ContentLength is { } length ? length + (resumed ? existing : 0) : null;
+        string name = Path.GetFileName(partial)[..^5];
+        Log?.Invoke(resumed ? $"resuming {name} at {Size(existing)} of {(total is { } t0 ? Size(t0) : "?")}"
+                            : $"downloading {name}{(total is { } t1 ? $" ({Size(t1)})" : "")}");
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         await using var file = new FileStream(partial, resumed ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, useAsync: true);
         var buffer = new byte[1 << 20];
-        long received = resumed ? existing : 0, reported = 0;
+        long received = resumed ? existing : 0;
+        long lastReport = 0;
         int read;
         while ((read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
         {
             await file.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
             received += read;
-            if (received - reported >= 1 << 20)
+            if (clock.ElapsedMilliseconds - lastReport >= 100)
             {
-                reported = received;
-                Progress?.Report(new DownloadProgress(url, received, total));
+                lastReport = clock.ElapsedMilliseconds;
+                Progress?.Report(new DownloadProgress(url, received, total, name, clock.Elapsed));
             }
         }
 
@@ -199,8 +219,17 @@ public sealed class Downloader
             throw new IOException($"{url}: received {received} of {expected} bytes.");
         }
 
-        Progress?.Report(new DownloadProgress(url, received, total));
+        Progress?.Report(new DownloadProgress(url, received, total, name, clock.Elapsed, Completed: true));
     }
+
+    /// <summary>A byte count for people: 512 B, 3.4 MB, 1.20 GB.</summary>
+    public static string Size(long bytes) => bytes switch
+    {
+        < 1024 => $"{bytes} B",
+        < 1 << 20 => $"{bytes / 1024.0:0.#} KB",
+        < 1 << 30 => $"{bytes / (double)(1 << 20):0.#} MB",
+        _ => $"{bytes / (double)(1 << 30):0.00} GB",
+    };
 
     private TimeSpan Backoff(int attempt) => TimeSpan.FromTicks(Math.Min(TimeSpan.FromSeconds(30).Ticks, RetryDelay.Ticks << Math.Min(attempt - 1, 20)));
 

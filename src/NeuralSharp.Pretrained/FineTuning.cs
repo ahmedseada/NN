@@ -262,6 +262,49 @@ public sealed class ChatTranscriptEncoder
         var sequence = new TrainingSequence([.. tokens.Take(keep)], [.. trained.Take(keep)]);
         return sequence.TrainedTokens > 0 ? sequence : null;
     }
+
+    /// <summary>
+    /// Plain text for continued pre-training or domain adaptation: the template's BOS token, the text and its EOS token,
+    /// every token trained. Longer texts become several sequences of at most <paramref name="maxLength"/> + 1 tokens that
+    /// together predict every token once.
+    /// </summary>
+    public IEnumerable<TrainingSequence> EncodeText(string text, int maxLength)
+    {
+        var ids = Tokenizer.Encode(Template.BosToken + text + Template.EosToken);
+        for (int start = 0; start + 1 < ids.Count; start += maxLength)
+        {
+            int count = Math.Min(maxLength + 1, ids.Count - start);
+            if (count < 2)
+            {
+                yield break;
+            }
+
+            yield return new TrainingSequence([.. ids.Skip(start).Take(count)], [.. Enumerable.Repeat(true, count)]);
+        }
+    }
+
+    /// <summary>
+    /// A dataset row as training sequences: a conversation (<c>{"messages": [...], "tools": [...]}</c>, see
+    /// <see cref="ChatTranscript.FromJson"/>) trains the assistant's turns; a text row (<c>{"text": ...}</c>) trains every
+    /// token. Other rows give nothing.
+    /// </summary>
+    public IEnumerable<TrainingSequence> EncodeRow(JsonObject row, int maxLength)
+    {
+        if (row.ContainsKey("messages") || row.ContainsKey("conversations"))
+        {
+            if (Encode(ChatTranscript.FromJson(row), maxLength) is { } sequence)
+            {
+                yield return sequence;
+            }
+        }
+        else if (row["text"] is JsonValue v && v.TryGetValue<string>(out var text) && text.Length > 0)
+        {
+            foreach (var sequence in EncodeText(text, maxLength))
+            {
+                yield return sequence;
+            }
+        }
+    }
 }
 
 /// <summary>Settings for <see cref="FineTuner"/>.</summary>
