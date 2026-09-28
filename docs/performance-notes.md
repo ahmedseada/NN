@@ -2,25 +2,25 @@
 
 Measured on an RTX 5070 Ti (70 SMs, 16 GB). Resume from here when returning to optimization.
 
-## Before relying on the current state
+## Checks done (2026-09-28)
 
-1. **Pretrained check against transformers.** Split k with atomic additions, the fused decoding kernels and the new
-   split heuristics all change the order of floating-point sums. The unit tests pass (272), but the end-to-end check on
-   a real model has not been run since:
+1. **Pretrained check against transformers** (Qwen3-0.6B, `qwen3.json` from `tools/pytorch/pretrained_reference.py`):
+   - float32 (`check qwen3.json --cuda`): everything matches; max |Δlogit| 4e-5 to 1.4e-4, greedy output identical.
+   - int8 weights, bfloat16 KV cache (`--int8 --kv16`): top-1 the same everywhere, greedy identical on 3 of 4 prompts
+     (one C# continuation diverges after 12 characters into another plausible one); max |Δlogit| 0.5 to 1.4, as int8
+     weights give. Decoding 486–575 tok/s in the check.
+2. **FP8 against bfloat16 loss curves**, quick version (100.9M-parameter char model: d_model 768, 12 layers, batch 32,
+   block 384; 600 steps, same seed and schedule; `--loss-log` and `compare`):
 
-   ```
-   python tools/pytorch/pretrained_reference.py --model Qwen/Qwen3-0.6B --out qwen3.json
-   dotnet run -c Release --project samples/NeuralSharp.Samples.Pretrained -- check qwen3.json --cuda
-   dotnet run -c Release --project samples/NeuralSharp.Samples.Pretrained -- check qwen3.json --cuda --int8 --kv16
-   ```
+   | | bf16 | fp8 | fp8 + delayed scaling |
+   |---|---|---|---|
+   | validation loss, step 600 | 2.7425 | 2.7388 (-0.13%) | 2.7250 (-0.64%) |
+   | training loss, last fifth | 2.6703 | 2.6693 (-0.03%) | 2.6589 (-0.43%) |
+   | largest gap at any validation step | | 0.43% (step 100) | 0.64% |
+   | steps/s | 5.64 | 5.75 | 5.76 |
 
-   The first compares float32 products with transformers exactly as before. The second goes through the packed-weight
-   decoding kernels (int8 GEMVs with the residual and norm, gate/up with the activation, the fused head layout and cache
-   writes); int8 weights move logits a little, so compare its greedy text and the size of the differences, not
-   exact equality.
-
-2. **FP8 against bfloat16 loss curves**, before training for real with `--fp8`. Two runs from the same seed and
-   schedule, then the comparison (short runs: `--no-save` skips the checkpoints, `--steps` sets the schedule):
+   Both FP8 variants stay within 1% of bfloat16 throughout. Not yet run: the long comparison on the 1.25B model (3000
+   steps, about 36 + 28 minutes), advisable once before a long `--fp8` run of that size:
 
    ```
    $common = "--bin D:\TF.NET\POC\TinyCharTransformer\python\data\final_corpus.bin --vocab-file D:\TF.NET\POC\TinyCharTransformer\python\data\final_corpus.vocab --block 512 --batch 8 --dmodel 2048 --heads 16 --layers 24 --steps 3000 --warmup 300 --eval-every 250 --eval-steps 20 --grad-checkpoint --optim8bit --no-save --log-every 250".Split(' ')
@@ -29,8 +29,8 @@ Measured on an RTX 5070 Ti (70 SMs, 16 GB). Resume from here when returning to o
    dotnet run -c Release --project samples/NeuralSharp.Samples.CharGpt -- compare bf16.csv fp8.csv --window 250
    ```
 
-   FP8 is usable when its training and validation losses stay within about 1% of bfloat16 through the run. Delayed
-   scaling gets the same test (a third run with `$env:NEURALSHARP_FP8_DELAYED=1`) before it can be turned on by default.
+   At this model size FP8 is barely faster than bfloat16 (2%): the quantization passes cost about what the 8-bit
+   products save. The gain grows with the model (1.25B: 560 against 712 ms per step).
 
 ## Results so far
 
@@ -67,7 +67,8 @@ What changed:
    `--grad-checkpoint` the same buffer address holds different tensors in the forward pass, the recompute and the
    backward pass, so kept maxima belong to another tensor and the correction fires. Key the kept maxima by the
    position of the quantization within the step (reset at each optimizer step) plus the shape, and count corrections
-   to confirm. Then the loss-curve test above, then consider turning it on by default.
+   to confirm. The quick loss-curve test already passes with it (within 0.64% of bfloat16); after the fix, rerun it
+   and the 1.25B comparison, then consider turning it on by default.
 2. **FP8 quantization fused into its producers** (the larger payoff of delayed scaling): with scales known before a
    tensor exists, layer norm, GELU and the product epilogues can write FP8 directly, removing most of the remaining
    ~100 ms of `quant_rows` / `quant_cols` per 1.25B step.
