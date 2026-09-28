@@ -11,6 +11,7 @@ internal static partial class Tests
         ("fine-tuning: chunked token cross-entropy matches the dense loss, its input gradient and a head adapter's gradient", TokenLoss),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
+        ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
         ("fine-tuning: agent transcripts through the chat template, assistant-only tokens, LoRA and QLoRA training, PEFT adapters, merged export", AgentFineTuning),
     ];
 
@@ -101,6 +102,81 @@ internal static partial class Tests
     }
 
     // A tiny Qwen3-style model folder: byte-level tokenizer with ChatML tokens, Qwen3's chat template, random weights.
+    private static void ModelDownload(Device device)
+    {
+        var spec = new DecoderSpec
+        {
+            Vocabulary = 260, Dim = 32, Layers = 2, Heads = 4, KvHeads = 2, HeadDim = 8, FfDim = 64, MaxPositions = 256,
+            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, QkNorm = true, TieEmbeddings = true,
+        };
+        string source = WriteChatModel(spec);
+        string cache = Path.Combine(Path.GetTempPath(), "ns-models-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            // Re-save the weights as two shards with an index, as larger models ship.
+            foreach (var file in Directory.GetFiles(source, "*.safetensors"))
+            {
+                File.Delete(file);
+            }
+
+            var weights = new RandomWeights(91);
+            using (spec.Build(weights, new DecoderBuildOptions { Device = Device.Cpu }))
+            {
+            }
+
+            WriteCheckpoint(source, spec, weights, "Qwen3ForCausalLM", SafeTensorType.F32, sharded: true);
+            var served = Directory.GetFiles(source).Select(Path.GetFileName).ToList();
+            Check(served.Contains("model.safetensors.index.json") && served.Count(f => f!.EndsWith(".safetensors", StringComparison.Ordinal)) >= 2, "sharded source");
+
+            const string hf = "https://huggingface.co", commit = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+            var web = new FakeRouter();
+            web.Json($"{hf}/api/models/org/tiny/revision/main", $"{{\"sha\":\"{commit}\"}}");
+            var listing = new JsonArray();
+            foreach (var name in served.Concat(["pytorch_model.bin", "README.md", "onnx/model.onnx", "original/consolidated.safetensors"]))
+            {
+                listing.Add((JsonNode)new JsonObject { ["type"] = "file", ["path"] = name, ["size"] = 10 });
+            }
+
+            web.Json($"{hf}/api/models/org/tiny/tree/{commit}?recursive=true", listing.ToJsonString());
+            foreach (var name in served)
+            {
+                web.Bytes($"{hf}/org/tiny/resolve/{commit}/{name}", File.ReadAllBytes(Path.Combine(source, name!)), requireToken: "hf_model");
+            }
+
+            var downloader = new NeuralSharp.Datasets.Downloader(new HttpClient(web), cache) { Attempts = 1 };
+            string folder = ModelSource.DownloadAsync("org/tiny", token: "hf_model", downloader: downloader).GetAwaiter().GetResult();
+            Check(folder == Path.Combine(cache, "huggingface", "models", "org", "tiny", commit[..12]), $"model folder {folder}");
+            Check(Directory.GetFiles(folder).Select(Path.GetFileName).Order().SequenceEqual(served.Order()), "only the files the library reads");
+
+            using (var original = PretrainedModel.Load(source, new PretrainedOptions { Device = device }))
+            using (var downloaded = PretrainedModel.Load(folder, new PretrainedOptions { Device = device }))
+            {
+                int[] ids = [.. downloaded.Tokenizer!.Encode("hello there, general kenobi")];
+                TrainingSequence[] probe = [new TrainingSequence(ids, [.. ids.Select(_ => true)])];
+                AssertClose([FineTuner.Evaluate(original, probe)], [FineTuner.Evaluate(downloaded, probe)], 0f, "same loss as the original folder");
+            }
+
+            // Without a network, the downloaded copy is used.
+            var offline = new NeuralSharp.Datasets.Downloader(new HttpClient(new Unreachable()), cache) { Attempts = 1 };
+            Check(ModelSource.Resolve("org/tiny", downloader: offline) == folder, "offline: the cached copy");
+            Check(ModelSource.IsModelId("Qwen/Qwen3-0.6B") && !ModelSource.IsModelId(source) && !ModelSource.IsModelId("a/b/c"), "ids and folders");
+        }
+        finally
+        {
+            Directory.Delete(source, true);
+            if (Directory.Exists(cache))
+            {
+                Directory.Delete(cache, true);
+            }
+        }
+    }
+
+    private sealed class Unreachable : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            throw new HttpRequestException("No such host is known.");
+    }
+
     private static string WriteChatModel(DecoderSpec spec)
     {
         string folder = TempFolder();

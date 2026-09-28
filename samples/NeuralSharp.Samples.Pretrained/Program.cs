@@ -23,7 +23,9 @@ using NeuralSharp.Pretrained;
 //                                   (--eval F|spec, --eval-fraction 0.02, --system S, --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048,
 //                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
 //                                   --eval-every N, --no-checkpointing; with --int4 / --int8 / --bf16 the base stays quantized)
-//   (<folder> may also be a Hugging Face model id already downloaded, for example Qwen/Qwen3-0.6B)
+//   (<folder> may also be a Hugging Face model id, for example Qwen/Qwen3-0.6B: taken from the Hugging Face cache or
+//   NeuralSharp's, else downloaded once; HF_TOKEN or huggingface-cli login for gated models)
+//   download <model id>             download a model (config, tokenizer, chat template, safetensors) and print its folder
 //
 //   (<data…> specs, recipes and the dataset tool: see src/NeuralSharp.Datasets.Cli, command nsdata)
 //   agent <folder> <task…> --workspace <dir>
@@ -118,11 +120,11 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run" or "agent-check")
+if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run" or "agent-check" or "download")
     || positional[0] is "agent" && (positional.Count < 3 || workspace is null) || positional[0] is "agent-run" && (positional.Count < 3 || output is null)
     || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
 {
-    Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir>");
+    Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir> | download <model id>");
     Console.WriteLine("       agent <folder> <task…> --workspace <dir> | agent-run <folder> <suite> --out <runs.jsonl> [--attempts N] | agent-check <suite>");
     Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] [--matmul fp32|bf16|fp8] (fine-tuning options: see the top of Program.cs)");
     return 1;
@@ -135,23 +137,9 @@ MixedPrecision.Default = matmul ?? (positional[0] == "check" ? MatMulPrecision.F
 Device.Default = device;
 var cacheFormat = kv8 ? KeyValueFormat.Int8 : kv16 ? KeyValueFormat.BFloat16 : KeyValueFormat.Float32;
 
-// A model folder, or a Hugging Face model id (Org/Name) already in the local cache (HF_HOME or ~/.cache/huggingface).
-static string ResolveModel(string folder)
-{
-    if (Directory.Exists(folder) || !folder.Contains('/'))
-    {
-        return folder;
-    }
-
-    string home = Environment.GetEnvironmentVariable("HF_HOME")
-        ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache", "huggingface");
-    string snapshots = Path.Combine(home, "hub", "models--" + folder.Replace("/", "--", StringComparison.Ordinal), "snapshots");
-    var found = Directory.Exists(snapshots)
-        ? Directory.GetDirectories(snapshots).Where(d => File.Exists(Path.Combine(d, "config.json"))).OrderByDescending(Directory.GetLastWriteTimeUtc).FirstOrDefault()
-        : null;
-    return found ?? throw new DirectoryNotFoundException($"'{folder}' is not a folder and is not in the Hugging Face cache ({snapshots}); download it first "
-        + "(for example: python tools/pytorch/pretrained_reference.py --model " + folder + ").");
-}
+// A model folder, or a Hugging Face model id (owner/name): found in a cache or downloaded (with progress) on first use.
+static string ResolveModel(string model) =>
+    ModelSource.Resolve(model, downloader: new NeuralSharp.Datasets.ConsoleStatus().CreateDownloader());
 
 // npm packages of the tasks' shared projects, installed once (each run links them instead of installing).
 static async Task InstallDependencies(IEnumerable<AgentTask> tasks)
@@ -229,6 +217,21 @@ var downloads = status.CreateDownloader();
 
 switch (positional[0])
 {
+    case "download":
+    {
+        foreach (var id in positional.Skip(1))
+        {
+            string folder = ResolveModel(id);
+            Console.WriteLine($"{id}: {folder}");
+            foreach (var file in Directory.GetFiles(folder).Order(StringComparer.Ordinal))
+            {
+                Console.WriteLine($"  {NeuralSharp.Datasets.Downloader.Size(new FileInfo(file).Length),10}  {Path.GetFileName(file)}");
+            }
+        }
+
+        return 0;
+    }
+
     case "finetune":
     {
         using var model = Load(positional[1]);
