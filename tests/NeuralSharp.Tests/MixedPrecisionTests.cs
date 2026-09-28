@@ -13,7 +13,7 @@ internal static partial class Tests
         ("mixed precision: strided products and GELU epilogues match references (slices, activation, its gradient)", StridedProducts),
         ("mixed precision: 8-bit tensor-core products (fp8, int8; every layout, beta, bias) track float32", EightBitProducts),
         ("mixed precision: 8-bit column quantizers: delayed scaling (given maxima with headroom, recorded maxima, correction of saturated columns) matches the two-launch pair", ColumnQuantizers),
-        ("mixed precision: prompts through int8 / int4 / bfloat16 weights on tensor cores match the float32 kernels", PackedTensorCoreProducts),
+        ("mixed precision: prompts through int8 / int4 / bfloat16 weights on tensor cores match the float32 kernels; several layers in one launch match their own products", PackedTensorCoreProducts),
         ("mixed precision: fused decoder blocks (packed q/k/v, attention in place, GELU inside the products) match the composed ones", FusedDecoderBlocks),
         ("mixed precision: product + bias in one pass matches the product and a bias addition (output and gradients)", MatMulBiasPass),
         ("optimizer: 8-bit AdamW (dynamic code map, nearest codes, tracks 32-bit AdamW, CPU parity)", EightBitAdam),
@@ -380,6 +380,49 @@ internal static partial class Tests
                 Check(error < 0.01, $"{name} {M}x{K}x{N}: tensor-core prompt product differs from the float32 kernel by {error:G3}");
             }
         }
+
+        // Several layers of one input in one launch (queries/keys/values, gate/up): widths 256 + 128 + 384 and 128 + 128,
+        // k 1056 (split); each output must equal that layer's own prompt product.
+        foreach (var widths in new[] { new[] { 256, 128, 384 }, new[] { 128, 128 } })
+        {
+            const int M = 150, K = 1056;
+            using var input = Tensor.From([.. Enumerable.Range(0, M * K).Select(_ => random.NextSingle() * 2 - 1)], [M, K], device);
+            foreach (string format in new[] { "int8", "int4", "bf16" })
+            {
+                var layers = widths.Select(n =>
+                {
+                    using var weights = Tensor.From([.. Enumerable.Range(0, K * n).Select(_ => (random.NextSingle() * 2 - 1) * 0.1f)], [K, n], device);
+                    return format switch
+                    {
+                        "int8" => Linear.FromInt8(Int8Weight.Quantize(weights)),
+                        "int4" => Linear.FromInt4(Int4Weight.Quantize(weights)),
+                        _ => Linear.FromBFloat16(BFloat16Weight.Convert(weights)),
+                    };
+                }).ToArray();
+                try
+                {
+                    using (MixedPrecision.BFloat16())
+                    using (Autograd.NoGrad())
+                    using (var scope = new TensorScope())
+                    {
+                        var together = Tensor.MatMulPackedMany(input, format switch { "int8" => 0, "int4" => 1, _ => 2 }, layers);
+                        Check(together is not null, $"{format} {string.Join('+', widths)}: one launch");
+                        for (int j = 0; j < layers.Length; j++)
+                        {
+                            double error = Relative(layers[j].Forward(input).ToArray(), together![j].ToArray());
+                            Check(error < 1e-5, $"{format} {string.Join('+', widths)}: layer {j} differs from its own product by {error:G3}");
+                        }
+                    }
+                }
+                finally
+                {
+                    foreach (var layer in layers)
+                    {
+                        layer.Dispose();
+                    }
+                }
+            }
+        }
     }
 
     private static void FusedDecoderBlocks(Device device)
@@ -686,6 +729,15 @@ internal static partial class Tests
                 Console.WriteLine($"{$"{kIn} -> {nOut}",-32} " + string.Join(" ", promptSplits.Select(split =>
                     $"{Timed(() => x.MatMulInt8(layer.Int8!), v => CudaBackend.PackedSplits = v, split),9}")));
             }
+
+            // The layers sharing an input in one launch, against their separate launches (auto splits).
+            using var prompt = Tensor.From([.. Enumerable.Range(0, 180 * 1024).Select(_ => random.NextSingle() - 0.5f)], [180, 1024], device);
+            foreach (var (name, layers) in new[] { ("q+k+v one launch (1024 -> 4096)", new[] { q, k, v }), ("gate+up one launch (1024 -> 6144)", new[] { gate, up }) })
+            {
+                Console.WriteLine($"{name,-32} " + string.Join(" ", promptSplits.Select(split =>
+                    $"{Timed(() => Tensor.MatMulPackedMany(prompt, 0, layers), v => CudaBackend.PackedSplits = v, split),9}")));
+                Console.WriteLine($"{"  same, separate launches",-32} {Timed(() => { foreach (var layer in layers) { prompt.MatMulInt8(layer.Int8!); } }, _ => { }, null),9}");
+            }
         }
 
         return 0;
@@ -956,7 +1008,7 @@ internal static partial class Tests
 
     private static void TensorCoreProducts(Device device)
     {
-        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm_tc")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == 15)
+        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm_tc")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == (k.Contains("_multi") ? 23 : 15))
               && PtxKernels.TensorCoreNames.All(PtxKernels.TensorCoreParameterCounts.ContainsKey), "tensor-core kernel signatures");
         var random = new Random(3);
         // A GPU that has tensor cores must load the module: a JIT error would otherwise fall back to float32 silently.

@@ -142,9 +142,11 @@ public sealed class Linear : Module
             return Tensor.MatMulMany(input, [.. layers.Select(l => l.Weight)], [.. layers.Select(l => l.Bias)]);
         }
 
-        // Packed weights of one kind (int8, int4, bfloat16) with few rows: one pass where the device has one.
+        // Packed weights of one kind (int8, int4, bfloat16): one pass where the device has one (few rows; for prompts, one
+        // tensor-core launch over all the layers' columns).
         int kind = layers[0].Int8 is not null ? 0 : layers[0].Int4 is not null ? 1 : layers[0].BFloat16 is not null ? 2 : -1;
-        bool packed = kind >= 0 && !Autograd.IsEnabled && layers.Length is > 1 and <= 3 && rows <= Backends.Cuda.PtxKernels.GemvRows
+        bool packed = kind >= 0 && !Autograd.IsEnabled && layers.Length is > 1 and <= 3
+            && (rows <= Backends.Cuda.PtxKernels.GemvRows || layers.All(l => l.Bias is null))                  // prompts: one launch
             && layers.All(l => l.Adapter is null && l.InFeatures == k && (kind == 0 ? l.Int8 is not null : kind == 1 ? l.Int4 is not null : l.BFloat16 is not null));
         if (packed && Tensor.MatMulPackedMany(input, kind, layers) is { } outputs)
         {

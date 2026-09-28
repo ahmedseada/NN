@@ -180,6 +180,65 @@ internal sealed unsafe partial class CudaBackend
         return true;
     }
 
+    // Prompt-sized products of one input through 2-3 packed layers (queries/keys/values, gate/up) in one tensor-core
+    // launch: the column tiles of every product side by side, so a few rows still fill the GPU (180 rows are 2 row
+    // tiles: q/k/v alone gave 32 tiles, 16 and 16 in separate launches). Widths must be multiples of the 128-column tile,
+    // and the layers must have no bias (the caller adds none).
+    private bool PackedManyLarge(int kind, Storage x, int m, int k,
+        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products)
+    {
+        if (products.Length is < 2 or > 3 || m < 64 || k < 32 || !MixedPrecision.UsesTensorCores || kind is < 0 or > 2)
+        {
+            return false;
+        }
+
+        int columnTiles = 0;
+        foreach (var product in products)
+        {
+            if (product.Bias is not null || product.Columns % PtxKernels.TensorTile != 0 || product.Columns == 0)
+            {
+                return false;
+            }
+
+            columnTiles += product.Columns / PtxKernels.TensorTile;
+        }
+
+        string format = kind switch { 0 => "int8w", 1 => "int4w", _ => "bf16w" };
+        if (TensorKernel($"gemm_tc_nn_{format}_multi_f32") is not { } tensor)
+        {
+            return false;
+        }
+
+        int perWord = kind switch { 0 => 4, 1 => 8, _ => 2 };
+        int rowTiles = (m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
+        int splits = PackedSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 32))
+            : Math.Clamp(Math.Min(k / 256, 4 * Math.Max(1, _multiprocessors) / (rowTiles * columnTiles)), 1, 8);
+        if (_profile is not null)
+        {
+            _profileLabel = $"gemm_tc_nn_{format}_multi {m}x{string.Join('+', products.ToArray().Select(p => p.Columns))}x{k}";
+            _profileFlops = 2.0 * m * columnTiles * PtxKernels.TensorTile * k;
+        }
+
+        if (splits > 1)
+        {
+            foreach (var product in products)
+            {
+                Check(cuMemsetD32Async(P(product.Output), 0, (nuint)((long)m * product.Columns), _stream), nameof(cuMemsetD32Async));
+            }
+        }
+
+        static ulong Scales(Storage? scales) => scales is null ? 0UL : P(scales);
+        var p1 = products[1];
+        var p2 = products.Length == 3 ? products[2] : products[1];
+        int n2 = products.Length == 3 ? products[2].Columns : 0;
+        Launch(tensor, (uint)columnTiles, (uint)rowTiles, (uint)splits, PtxKernels.TensorThreads, 1,
+            P(x), P(products[0].Packed), P(products[0].Output), U(m), U(products[0].Columns), U(k), F(0f), 0UL, 0UL, 0UL, 0UL,
+            U(k), U(products[0].Columns / perWord), U(products[0].Columns), Scales(products[0].Scales),
+            P(p1.Packed), P(p1.Output), Scales(p1.Scales), U(p1.Columns),
+            P(p2.Packed), P(p2.Output), Scales(p2.Scales), U(n2));
+        return true;
+    }
+
     public override bool PackedMatMulGated(int kind, int activation, Storage gate, Storage up, Storage packed, Storage? scales, Storage y,
         int m, int n, int k)
     {
@@ -224,6 +283,11 @@ internal sealed unsafe partial class CudaBackend
     private bool PackedMany(int kind, Storage x, int m, int k,
         ReadOnlySpan<(Storage Packed, Storage? Scales, Storage? Bias, Storage Output, int Columns)> products, int activation, Storage? hidden)
     {
+        if (m > PtxKernels.GemvRows && hidden is null)
+        {
+            return PackedManyLarge(kind, x, m, k, products);
+        }
+
         if (m > PtxKernels.GemvRows || k == 0 || products.Length is 0 or > 3)
         {
             return false;

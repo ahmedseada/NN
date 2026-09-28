@@ -47,6 +47,9 @@ internal static partial class PtxKernels
             TensorCoreGemm(sb, false, false, 0, packed: 1);
             TensorCoreGemm(sb, false, false, 0, packed: 2);
             TensorCoreGemm(sb, false, false, 0, packed: 3);
+            TensorCoreGemm(sb, false, false, 0, packed: 1, multi: true);
+            TensorCoreGemm(sb, false, false, 0, packed: 2, multi: true);
+            TensorCoreGemm(sb, false, false, 0, packed: 3, multi: true);
         }),
         Module("attention d64", sb => { FlashForward(sb, 64); FlashBackwardQ(sb, 64); FlashBackwardKv(sb, 64); }),
         Module("attention d128", sb => { FlashForward(sb, 128); FlashBackwardQ(sb, 128); FlashBackwardKv(sb, 128); }),
@@ -118,10 +121,14 @@ internal static partial class PtxKernels
     // packed (nn, mode 0 only): 1 = int8 weights (4 per word, per-column scales in p_aux, applied in the epilogue),
     // 2 = 4-bit weights (8 per word, scales per 32 rows and column in p_aux, applied as the tile is unpacked), 3 = bfloat16
     // weights (2 per word); ldb is then the row length in words. The weights are unpacked into the bfloat16 tile.
-    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode, int packed = 0)
+    //
+    // multi (packed, …_multi_f32): up to three products of the same input (queries/keys/values, gate/up), each with its
+    // own weights, scales and output: p_b/p_c/p_aux/p_n for the first, then p_b1… and p_b2… (p_n2 = 0 for two). Column
+    // tiles of product 0 come first, then 1, then 2 (widths multiples of 128); ldb and ldc follow each product's width.
+    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode, int packed = 0, bool multi = false)
     {
         string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}{mode switch { 1 => "_gelu", 2 => "_gelugrad", _ => "" }}"
-                      + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}_f32";
+                      + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}{(multi ? "_multi" : "")}_f32";
         int cpw = packed switch { 1 => 4, 2 => 8, _ => 2 }, tileWords = TensorTile / cpw, wordRows = TensorThreads / tileWords;
         int wordsPerThread = TensorK * tileWords / TensorThreads;
         // Registers: %rd1..3 = a, b, c; %r1..3 = m, n, k; %r9 / %r10 = the tile's first row / column.
@@ -133,10 +140,16 @@ internal static partial class PtxKernels
                 .param .u64 p_a, .param .u64 p_b, .param .u64 p_c,
                 .param .u32 p_m, .param .u32 p_n, .param .u32 p_k, .param .f32 p_beta,
                 .param .u64 p_sa, .param .u64 p_sb, .param .u64 p_sc, .param .u64 p_bias,
-                .param .u32 p_lda, .param .u32 p_ldb, .param .u32 p_ldc, .param .u64 p_aux
+                .param .u32 p_lda, .param .u32 p_ldb, .param .u32 p_ldc, .param .u64 p_aux{{(multi ? """
+                ,
+                                .param .u64 p_b1, .param .u64 p_c1, .param .u64 p_aux1, .param .u32 p_n1,
+                                .param .u64 p_b2, .param .u64 p_c2, .param .u64 p_aux2, .param .u32 p_n2
+                """ : "")}}
             )
             {
                 .reg .pred %p<16>;
+                .reg .u64 %rdaux;
+                .reg .pred %pm0;
                 .reg .pred %pbeta, %peven, %qnot;
                 .reg .pred %q<12>;
                 .reg .f32 %e<8>;
@@ -211,7 +224,35 @@ internal static partial class PtxKernels
                 ld.param.u32 %r58, [p_lda];
                 ld.param.u32 %r59, [p_ldb];
                 ld.param.u32 %r60, [p_ldc];
+                ld.param.u64 %rdaux, [p_aux];
             """);
+        if (multi)
+        {
+            // This block's product: its column tile %r10 past the widths of the products before it.
+            s.AppendLine($"""
+                    setp.ge.u32 %pm0, %r10, %r2;
+                    @!%pm0 bra PRODUCT_SET;
+                    sub.u32 %r10, %r10, %r2;
+                    ld.param.u64 %rd2, [p_b1];
+                    ld.param.u64 %rd3, [p_c1];
+                    ld.param.u64 %rdaux, [p_aux1];
+                    ld.param.u32 %r2, [p_n1];
+                    setp.ge.u32 %pm0, %r10, %r2;
+                    @!%pm0 bra PRODUCT_POINTERS;
+                    sub.u32 %r10, %r10, %r2;
+                    ld.param.u64 %rd2, [p_b2];
+                    ld.param.u64 %rd3, [p_c2];
+                    ld.param.u64 %rdaux, [p_aux2];
+                    ld.param.u32 %r2, [p_n2];
+                PRODUCT_POINTERS:
+                    cvta.to.global.u64 %rd2, %rd2;
+                    cvta.to.global.u64 %rd3, %rd3;
+                    add.u32 %r59, %r2, {cpw - 1};
+                    shr.u32 %r59, %r59, {(int)Math.Log2(cpw)};
+                    mov.u32 %r60, %r2;
+                PRODUCT_SET:
+                """);
+        }
         if (mode == 0)
         {
             // Split k (gridDim.z > 1 on packed weights, or with p_sc = 0 on plain ones, whose z otherwise indexes a
@@ -588,6 +629,15 @@ internal static partial class PtxKernels
                 ret;
             }
             """);
+        if (multi)
+        {
+            // Every read of the scales (and the epilogue's auxiliary pointer) takes the selected product's.
+            foreach (string register in new[] { "%rd21", "%rd24", "%rd25", "%rd26" })
+            {
+                s.Replace($"ld.param.u64 {register}, [p_aux];", $"mov.u64 {register}, %rdaux;");
+            }
+        }
+
         sb.Append(s);
         sb.AppendLine();
     }
