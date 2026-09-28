@@ -130,7 +130,7 @@ try
                 Console.WriteLine(spec.ToString());
                 var rows = status.Track(spec.Open(downloads), "reading").Take((int)Math.Min(take, int.MaxValue)).ToList();
                 Console.WriteLine($"  columns: {string.Join(", ", rows.SelectMany(r => r.Select(p => p.Key)).Distinct())}");
-                Console.WriteLine($"  layout:  {(rows.Count > 0 ? ChatRows.Describe(rows[0]) ?? "not recognized (map columns with user=…&assistant=…)" : "no rows")}");
+                Console.WriteLine($"  layout:  {(rows.Count == 0 ? "no rows" : spec.Mapping is not null ? "mapped with user= / assistant=" : ChatRows.Describe(rows[0]) ?? "not recognized (map columns with user=…&assistant=…)")}");
                 if (rows.Count == 0)
                 {
                     Console.WriteLine(spec.Source.StartsWith("github:", StringComparison.OrdinalIgnoreCase)
