@@ -14,7 +14,8 @@ dotnet tool install --global --add-source artifacts NeuralSharp.Datasets.Cli
 nsdata --help
 ```
 
-Update after a `git pull`: `dotnet tool update --global --add-source artifacts NeuralSharp.Datasets.Cli` (after packing again).
+Update after a `git pull`: pack again, then `dotnet tool update --global --add-source artifacts NeuralSharp.Datasets.Cli`
+(each pack gets a new version number, so the update always installs it).
 
 As one executable that runs without .NET (Native AOT; `win-x64`, `linux-x64` or `osx-arm64`):
 
