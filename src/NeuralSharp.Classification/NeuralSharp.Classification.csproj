@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>NeuralSharp.Classification</RootNamespace>
+    <AssemblyName>NeuralSharp.Classification</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsAotCompatible>true</IsAotCompatible>
+    <PackageId>NeuralSharp.Classification</PackageId>
+    <Description>Text classification for NeuralSharp (no dependencies): intents, topics or routing for short texts in any language (Arabic and Latin text normalized), trained on a GPU or CPU from labeled texts in any dataset source (CSV, JSON Lines, Parquet, Hugging Face, …), with an evaluation report, batched thread-safe prediction and one-file models.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NeuralSharp\NeuralSharp.csproj" />
+    <ProjectReference Include="..\NeuralSharp.Datasets\NeuralSharp.Datasets.csproj" />
+  </ItemGroup>
+
+</Project>

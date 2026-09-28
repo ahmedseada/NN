@@ -1,12 +1,13 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
+using NeuralSharp.Datasets;
 using NeuralSharp.Inference;
 using NeuralSharp.Layers;
 using NeuralSharp.Optimizers;
 using NeuralSharp.Training;
 
-namespace NeuralSharp.Text;
+namespace NeuralSharp.Classification;
 
 /// <summary>Settings of <see cref="TextClassifier.Train"/>.</summary>
 public sealed record TextClassifierOptions
@@ -112,7 +113,7 @@ public sealed record TextClassifierReport(IReadOnlyList<string> Labels, int[,] C
 /// </summary>
 /// <example>
 /// <code>
-/// var examples = TextClassifier.ReadCsv("queries.csv", textColumn: "raw_question", labelColumn: "intent");
+/// var examples = TextClassifier.Read("queries.csv", textColumn: "raw_question", labelColumn: "intent");
 /// var (train, test) = TextClassifier.Split(examples, 0.2);
 /// using var classifier = TextClassifier.Train(train, new TextClassifierOptions { Device = Device.Cuda() });
 /// Console.WriteLine(classifier.Evaluate(test));
@@ -202,7 +203,7 @@ public sealed class TextClassifier : IDisposable
         var x = new float[batchSize * buckets];
         var y = new float[batchSize * classes];
         double bestScore = double.NegativeInfinity;
-        float[][]? best = null;
+        byte[]? best = null;
         int sinceBest = 0;
         for (int epoch = 1; epoch <= Math.Max(1, options.Epochs); epoch++)
         {
@@ -243,7 +244,9 @@ public sealed class TextClassifier : IDisposable
                 sinceBest = 0;
                 if (validation.Count > 0)
                 {
-                    best = [.. _model.Parameters().Select(p => p.ToArray())];
+                    using var copy = new MemoryStream();
+                    _model.Save(copy);
+                    best = copy.ToArray();
                 }
             }
             else
@@ -260,10 +263,8 @@ public sealed class TextClassifier : IDisposable
 
         if (best is not null)
         {
-            foreach (var (parameter, values) in _model.Parameters().Zip(best))
-            {
-                parameter.Load(values);
-            }
+            using var copy = new MemoryStream(best);
+            _model.Load(copy);
         }
 
         _model.Eval();
@@ -393,24 +394,39 @@ public sealed class TextClassifier : IDisposable
         return ([.. groups.Skip(test).SelectMany(g => g)], [.. groups.Take(test).SelectMany(g => g)]);
     }
 
-    /// <summary>Labeled texts from a CSV file (header row; quoted fields with commas, quotes and line breaks).</summary>
-    public static List<LabeledText> ReadCsv(string path, string textColumn = "text", string labelColumn = "label")
+    /// <summary>
+    /// Labeled texts from any dataset source NeuralSharp.Datasets reads: a CSV, JSON Lines, JSON or Parquet file or folder,
+    /// a URL, or a spec such as <c>hf:owner/name?split=train</c> (see <see cref="DatasetSpec"/>). Rows without a text or
+    /// label are skipped; numbers and booleans are read as their text.
+    /// </summary>
+    public static List<LabeledText> Read(string source, string textColumn = "text", string labelColumn = "label", Downloader? downloader = null)
     {
-        var rows = Csv.Parse(File.ReadAllText(path, Encoding.UTF8));
-        if (rows.Count == 0)
+        ArgumentNullException.ThrowIfNull(source);
+        var examples = new List<LabeledText>();
+        bool any = false;
+        foreach (var row in DatasetSpec.Parse(source).Open(downloader))
         {
-            return [];
+            if (!any && (!row.ContainsKey(textColumn) || !row.ContainsKey(labelColumn)))
+            {
+                throw new ArgumentException($"{source} needs columns '{textColumn}' and '{labelColumn}'; its rows have {string.Join(", ", row.Select(p => p.Key))}.");
+            }
+
+            any = true;
+            string? text = Cell(row[textColumn]), label = Cell(row[labelColumn]);
+            if (!string.IsNullOrWhiteSpace(text) && !string.IsNullOrWhiteSpace(label))
+            {
+                examples.Add(new LabeledText(text, label));
+            }
         }
 
-        var header = rows[0].Select(h => h.Trim()).ToArray();
-        int text = Array.IndexOf(header, textColumn), label = Array.IndexOf(header, labelColumn);
-        if (text < 0 || label < 0)
-        {
-            throw new ArgumentException($"{path} needs columns '{textColumn}' and '{labelColumn}'; it has {string.Join(", ", header)}.");
-        }
+        return examples;
 
-        return [.. rows.Skip(1).Where(r => r.Length > Math.Max(text, label)).Select(r => new LabeledText(r[text], r[label]))
-            .Where(e => !string.IsNullOrWhiteSpace(e.Text) && !string.IsNullOrWhiteSpace(e.Label))];
+        static string? Cell(JsonNode? node) => node switch
+        {
+            null => null,
+            JsonValue value when value.TryGetValue<string>(out var text) => text,
+            _ => node.ToJsonString(),
+        };
     }
 
     /// <inheritdoc />
@@ -557,71 +573,5 @@ internal sealed class TextFeatures(int buckets, float[] idf)
         }
 
         return (int)(hash % (uint)buckets);
-    }
-}
-
-/// <summary>RFC 4180 CSV: quoted fields with commas, doubled quotes and line breaks; a leading byte-order mark is skipped.</summary>
-internal static class Csv
-{
-    public static List<string[]> Parse(string text)
-    {
-        text = text.TrimStart('﻿');
-        var rows = new List<string[]>();
-        var row = new List<string>();
-        var field = new StringBuilder();
-        bool quoted = false;
-        for (int i = 0; i < text.Length; i++)
-        {
-            char c = text[i];
-            if (quoted)
-            {
-                if (c == '"' && i + 1 < text.Length && text[i + 1] == '"')
-                {
-                    field.Append('"');
-                    i++;
-                }
-                else if (c == '"')
-                {
-                    quoted = false;
-                }
-                else
-                {
-                    field.Append(c);
-                }
-            }
-            else if (c == '"')
-            {
-                quoted = true;
-            }
-            else if (c == ',')
-            {
-                row.Add(field.ToString());
-                field.Clear();
-            }
-            else if (c is '\n' or '\r')
-            {
-                if (c == '\r' && i + 1 < text.Length && text[i + 1] == '\n')
-                {
-                    i++;
-                }
-
-                row.Add(field.ToString());
-                field.Clear();
-                rows.Add([.. row]);
-                row.Clear();
-            }
-            else
-            {
-                field.Append(c);
-            }
-        }
-
-        if (field.Length > 0 || row.Count > 0)
-        {
-            row.Add(field.ToString());
-            rows.Add([.. row]);
-        }
-
-        return rows;
     }
 }
