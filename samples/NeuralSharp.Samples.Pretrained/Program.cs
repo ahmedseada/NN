@@ -23,6 +23,15 @@ using NeuralSharp.Pretrained;
 //                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
 //                                   --eval-every N, --no-checkpointing; with --int4 / --int8 / --bf16 the base stays quantized)
 //   (<folder> may also be a Hugging Face model id already downloaded, for example Qwen/Qwen3-0.6B)
+//   agent <model> <task…> --workspace <dir>
+//                                   a coding agent (read, search, edit, write, run dotnet / npm / ng …) working in <dir>
+//   agent-run <model> <suite> --out <runs.jsonl>
+//                                   runs every task of a suite (folders with task.json, workspace/, verify/) in a fresh
+//                                   copy, verifies it with the task's commands and writes one transcript per run; with
+//                                   a teacher this makes training data (--train F: passing runs only), with the model
+//                                   under test it is the evaluation (--attempts N, --filter S, --work DIR, --rounds N)
+//   (<model> may be a model folder or an OpenAI-compatible server: http://localhost:11434/v1 with --model-name N for
+//   Ollama, http://localhost:8080/v1 for llama-server; --api-key K, --temperature T)
 //   export <folder> <adapter> --out <dir>
 //                                   merges a PEFT adapter into the float weights and writes a Hugging Face checkpoint
 //
@@ -34,6 +43,9 @@ var positional = new List<string>();
 bool int8 = false, bf16 = false, int4 = false, kv8 = false, kv16 = false, noThink = false;
 int context = 4096;
 string? folderOverride = null, output = null, evalFile = null, adapterFolder = null;
+string? workspace = null, modelName = null, apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY"), trainOut = null, workRoot = null, filter = null;
+int attempts = 1, maxRounds = 40;
+float? temperature = null;
 MatMulPrecision? matmul = null;
 var tuning = new FineTuningOptions();
 Device device = Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu;
@@ -76,6 +88,15 @@ for (int i = 0; i < args.Length; i++)
         case "--no-checkpointing": tuning = tuning with { Checkpointing = false }; break;
         case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
+        case "--workspace": workspace = args[++i]; break;
+        case "--model-name": modelName = args[++i]; break;
+        case "--api-key": apiKey = args[++i]; break;
+        case "--train": trainOut = args[++i]; break;
+        case "--work": workRoot = args[++i]; break;
+        case "--filter": filter = args[++i]; break;
+        case "--attempts": attempts = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--rounds": maxRounds = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--temperature": temperature = float.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case ['-', '-', ..]:
             Console.Error.WriteLine($"Unknown option {args[i]}.");
             return 1;
@@ -83,10 +104,12 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export")
+if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run")
+    || positional[0] is "agent" && (positional.Count < 3 || workspace is null) || positional[0] is "agent-run" && (positional.Count < 3 || output is null)
     || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
 {
     Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir>");
+    Console.WriteLine("       agent <model> <task…> --workspace <dir> | agent-run <model> <suite> --out <runs.jsonl> [--train F] [--attempts N]  (<model>: folder or http://server/v1 [--model-name N])");
     Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] [--matmul fp32|bf16|fp8] (fine-tuning options: see the top of Program.cs)");
     return 1;
 }
@@ -259,6 +282,133 @@ switch (positional[0])
         model.SaveHuggingFace(output!);
         Console.WriteLine($"merged model written to {output} (bfloat16 safetensors, config and tokenizer files)");
         return 0;
+    }
+
+    case "agent" or "agent-run":
+    {
+        // The model: a local one (any family, in its own chat template), or an OpenAI-compatible server (a teacher).
+        bool remote = positional[1].StartsWith("http://", StringComparison.OrdinalIgnoreCase) || positional[1].StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+        using var local = remote ? null : Load(positional[1]);
+        using var server = remote ? new OpenAIChatModel(positional[1], modelName ?? "default", apiKey) { SendSampling = temperature is not null } : null;
+        IChatModel chatModel = remote ? server! : local!.CreateChat(cacheFormat, context);
+        var sampling = remote ? new GenerationOptions { Temperature = temperature ?? 0.6f } : ChatSampling() with { Temperature = temperature ?? 0.6f };
+        var agentOptions = new AgentOptions { Think = noThink ? false : null, Sampling = sampling, MaxRounds = maxRounds };
+        bool live = positional[0] == "agent";
+        bool inThinking = false;
+        void Show(ChatDelta delta)
+        {
+            if (delta.Thinking.Length > 0)
+            {
+                Console.ForegroundColor = ConsoleColor.DarkGray;
+                inThinking = true;
+                Console.Write(delta.Thinking);
+            }
+
+            if (delta.Content.Length > 0)
+            {
+                if (inThinking)
+                {
+                    Console.ResetColor();
+                    Console.WriteLine();
+                    inThinking = false;
+                }
+
+                Console.Write(delta.Content);
+            }
+        }
+
+        void ShowTool(ToolResult result)
+        {
+            Console.ResetColor();
+            inThinking = false;
+            string arguments = result.Call.Arguments.ToJsonString();
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"\n> {result.Call.Name} {(arguments.Length > 160 ? arguments[..160] + "…" : arguments)}");
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            var lines = (result.Succeeded ? result.Content : "Error: " + result.Error).Split('\n');
+            Console.WriteLine(string.Join('\n', lines.Take(8)) + (lines.Length > 8 ? $"\n… {lines.Length - 8} more lines" : ""));
+            Console.ResetColor();
+        }
+
+        using var cancel = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = !cancel.IsCancellationRequested;
+            cancel.Cancel();
+        };
+
+        if (live)
+        {
+            var task = new AgentTask("interactive", string.Join(' ', positional.Skip(2)));
+            var agent = new CodingAgent(chatModel, agentOptions) { OnDelta = Show, OnToolResult = ShowTool };
+            var run = await agent.RunAsync(task, new CodingTools(workspace!, agentOptions.Tools), cancel.Token);
+            Console.ResetColor();
+            Console.WriteLine($"\n[{run.Outcome}{(run.Outcome == AgentOutcome.Passed ? "" : ": " + run.VerifyOutput)}; {run.Rounds} replies, {run.ToolCalls} tool calls ({run.ToolErrors} errors), "
+                              + $"{run.GeneratedTokens} tokens; model {run.ModelTime.TotalSeconds:F1} s, tools {run.ToolTime.TotalSeconds:F1} s]");
+            if (output is not null)
+            {
+                File.AppendAllText(output, run.ToJson().ToJsonString() + "\n");
+                Console.WriteLine($"transcript appended to {output}");
+            }
+
+            return 0;
+        }
+
+        var suite = AgentTask.LoadSuite(positional[2]).Where(t => filter is null || t.Id.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();
+        string work = Path.GetFullPath(workRoot ?? Path.Combine(Path.GetTempPath(), "neuralsharp-agent", DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)));
+        Console.WriteLine($"{suite.Count} tasks × {attempts} attempts; work folders under {work}");
+        var outcomes = new List<(AgentTask Task, AgentRun Run)>();
+        var total = Stopwatch.StartNew();
+        foreach (var task in suite)
+        {
+            for (int attempt = 1; attempt <= attempts && !cancel.IsCancellationRequested; attempt++)
+            {
+                var agent = new CodingAgent(chatModel, agentOptions with { Sampling = sampling with { Seed = attempt } })
+                {
+                    OnStatus = s => Console.WriteLine($"    {s}"),
+                };
+                var watch = Stopwatch.StartNew();
+                AgentRun run;
+                try
+                {
+                    run = await agent.RunAsync(task, Path.Combine(work, task.Id.Replace('/', Path.DirectorySeparatorChar), $"attempt-{attempt}"), cancel.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                outcomes.Add((task, run));
+                Console.WriteLine($"  {task.Id} #{attempt}: {run.Outcome} — {run.Rounds} replies, {run.ToolCalls} tool calls ({run.ToolErrors} errors), {run.GeneratedTokens} tokens, "
+                                  + $"{watch.Elapsed.TotalSeconds:F0} s (model {run.ModelTime.TotalSeconds:F0} s, tools {run.ToolTime.TotalSeconds:F0} s)");
+                if (run.Outcome is AgentOutcome.SetupFailed or AgentOutcome.Error)
+                {
+                    Console.WriteLine("    " + run.VerifyOutput.Trim().Replace("\n", "\n    ", StringComparison.Ordinal));
+                }
+
+                string line = run.ToJson().ToJsonString() + "\n";
+                File.AppendAllText(output!, line);
+                if (trainOut is not null && run.Outcome == AgentOutcome.Passed)
+                {
+                    File.AppendAllText(trainOut, line);
+                }
+            }
+        }
+
+        var scored = outcomes.Where(o => o.Run.Outcome is not (AgentOutcome.SetupFailed or AgentOutcome.Error)).ToList();
+        int passed = scored.Count(o => o.Run.Outcome == AgentOutcome.Passed);
+        Console.WriteLine($"\n{passed}/{scored.Count} runs passed ({(scored.Count == 0 ? 0 : 100.0 * passed / scored.Count):F1}%), "
+                          + $"{outcomes.Count - scored.Count} not scored (setup failed or model error), {total.Elapsed:hh\\:mm\\:ss}");
+        foreach (var group in scored.GroupBy(o => o.Task.Language ?? "other").OrderBy(g => g.Key, StringComparer.Ordinal))
+        {
+            int p = group.Count(o => o.Run.Outcome == AgentOutcome.Passed);
+            Console.WriteLine($"  {group.Key}: {p}/{group.Count()} ({100.0 * p / group.Count():F1}%), "
+                              + $"median {group.Select(o => o.Run.Rounds).Order().ElementAt(group.Count() / 2)} replies, {group.Average(o => o.Run.ToolErrors):F1} tool errors per run");
+        }
+
+        int tasksSolved = scored.GroupBy(o => o.Task.Id).Count(g => g.Any(o => o.Run.Outcome == AgentOutcome.Passed));
+        Console.WriteLine($"  tasks solved at least once: {tasksSolved}/{scored.Select(o => o.Task.Id).Distinct().Count()}; runs written to {output}{(trainOut is null ? "" : $", passing runs to {trainOut}")}");
+        return passed == scored.Count ? 0 : 2;
     }
 
     case "info":

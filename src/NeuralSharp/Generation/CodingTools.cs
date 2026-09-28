@@ -5,6 +5,18 @@ using System.Text.RegularExpressions;
 
 namespace NeuralSharp.Generation;
 
+/// <summary>The outcome of <see cref="CodingTools.ExecuteAsync"/>.</summary>
+/// <param name="ExitCode">The exit code, or null when the command timed out or was refused.</param>
+/// <param name="TimedOut">Stopped at the time limit.</param>
+/// <param name="Output">Standard output and error, interleaved and trimmed (for a refused command: why).</param>
+/// <param name="Duration">How long it ran.</param>
+/// <param name="Refused">Not started (not allowed, not installed, outside the workspace).</param>
+public sealed record CommandResult(int? ExitCode, bool TimedOut, string Output, TimeSpan Duration, bool Refused)
+{
+    /// <summary>Ran and exited with 0.</summary>
+    public bool Succeeded => ExitCode == 0;
+}
+
 /// <summary>Limits and permissions of <see cref="CodingTools"/>.</summary>
 public sealed record CodingToolOptions
 {
@@ -317,44 +329,61 @@ public sealed class CodingTools
         return $"{(existed ? "Replaced" : "Created")} {Relative(full)} ({SplitLines(content).Count} lines).";
     }
 
-    /// <summary><c>run_command</c>.</summary>
+    /// <summary><c>run_command</c>: the command's outcome as the model sees it.</summary>
     public async Task<string> RunCommandAsync(string command, string directory = ".", int? timeoutSeconds = null, CancellationToken cancellationToken = default)
     {
+        var result = await ExecuteAsync(command, directory, timeoutSeconds is { } s ? TimeSpan.FromSeconds(Math.Max(1, s)) : null, cancellationToken).ConfigureAwait(false);
+        if (result.Refused)
+        {
+            return result.Output;
+        }
+
+        string status = result.TimedOut ? $"timed out after {result.Duration.TotalSeconds:0} s (stopped)" : $"exit code {result.ExitCode}";
+        return $"$ {command}\n{status}, {result.Duration.TotalSeconds:0.0} s\n{(result.Output.Length == 0 ? "(no output)" : result.Output)}";
+    }
+
+    /// <summary>
+    /// Runs <paramref name="command"/> under the same rules as <c>run_command</c> (allowlist, no shell, the workspace);
+    /// the timeout is capped at <see cref="CodingToolOptions.CommandTimeout"/>.
+    /// </summary>
+    public async Task<CommandResult> ExecuteAsync(string command, string directory = ".", TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    {
+        static CommandResult Refuse(string why) => new(null, false, why, TimeSpan.Zero, true);
         if (Resolve(directory, out string folder) is { } error)
         {
-            return error;
+            return Refuse(error);
         }
 
         if (!Directory.Exists(folder))
         {
-            return $"Error: folder '{directory}' does not exist.";
+            return Refuse($"Error: folder '{directory}' does not exist.");
         }
 
         if (command.IndexOfAny(['|', '&', ';', '>', '<', '`', '$', '\n']) >= 0)
         {
-            return "Error: the command is not run by a shell, so pipes, redirection, &&, ; and variables are not available. Run one program per call.";
+            return Refuse("Error: the command is not run by a shell, so pipes, redirection, &&, ; and variables are not available. Run one program per call.");
         }
 
         var words = SplitCommandLine(command);
         if (words.Count == 0)
         {
-            return "Error: empty command.";
+            return Refuse("Error: empty command.");
         }
 
         string program = Path.GetFileNameWithoutExtension(words[0]);
         if (!_options.Commands.Contains(program, StringComparer.OrdinalIgnoreCase) || words[0].Contains('/') || words[0].Contains('\\'))
         {
-            return $"Error: '{words[0]}' is not an allowed program. Allowed: {string.Join(", ", _options.Commands)}.";
+            return Refuse($"Error: '{words[0]}' is not an allowed program. Allowed: {string.Join(", ", _options.Commands)}.");
         }
 
         if (program.Equals("git", StringComparison.OrdinalIgnoreCase) && (words.Count < 2 || !_options.GitSubcommands.Contains(words[1])))
         {
-            return $"Error: only git {string.Join(", ", _options.GitSubcommands)} are allowed.";
+            return Refuse($"Error: only git {string.Join(", ", _options.GitSubcommands)} are allowed.");
         }
 
         if (FindProgram(program) is not { } executable)
         {
-            return $"Error: '{program}' is not installed (not found on the PATH).";
+            return Refuse($"Error: '{program}' is not installed (not found on the PATH).");
         }
 
         var start = new ProcessStartInfo(executable)
@@ -384,7 +413,7 @@ public sealed class CodingTools
         start.Environment["npm_config_audit"] = "false";
 
         var output = new StringBuilder();
-        var timeout = TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds ?? (int)_options.CommandTimeout.TotalSeconds, 1, (int)_options.CommandTimeout.TotalSeconds));
+        var limitTime = timeout is { } t && t < _options.CommandTimeout ? t : _options.CommandTimeout;
         var watch = Stopwatch.StartNew();
         using var process = new Process { StartInfo = start };
         process.OutputDataReceived += (_, e) => { if (e.Data is not null) { lock (output) { output.Append(e.Data).Append('\n'); } } };
@@ -395,14 +424,14 @@ public sealed class CodingTools
         }
         catch (System.ComponentModel.Win32Exception ex)
         {
-            return $"Error: could not start '{program}': {ex.Message}";
+            return Refuse($"Error: could not start '{program}': {ex.Message}");
         }
 
         process.StandardInput.Close();
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
         using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        limit.CancelAfter(timeout);
+        limit.CancelAfter(limitTime);
         bool timedOut = false;
         try
         {
@@ -432,8 +461,7 @@ public sealed class CodingTools
             text = Trim(output.ToString().TrimEnd());
         }
 
-        string status = timedOut ? $"timed out after {timeout.TotalSeconds:0} s (stopped)" : $"exit code {process.ExitCode}";
-        return $"$ {command}\n{status}, {watch.Elapsed.TotalSeconds:0.0} s\n{(text.Length == 0 ? "(no output)" : text)}";
+        return new CommandResult(timedOut ? null : process.ExitCode, timedOut, text, watch.Elapsed, false);
     }
 
     // Null when `path` stays inside the workspace (then `full` is its absolute path), else the error for the model.
