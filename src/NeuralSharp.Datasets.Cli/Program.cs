@@ -98,8 +98,22 @@ try
         case "cache":
         {
             string folder = downloads.CacheFolder;
-            long bytes = Directory.Exists(folder) ? new DirectoryInfo(folder).EnumerateFiles("*", SearchOption.AllDirectories).Sum(f => f.Length) : 0;
-            Console.WriteLine($"{folder}: {Downloader.Size(bytes)}");
+            var files = Directory.Exists(folder) ? new DirectoryInfo(folder).EnumerateFiles("*", SearchOption.AllDirectories).ToList() : [];
+            Console.WriteLine($"{folder}: {Downloader.Size(files.Sum(f => f.Length))} in {files.Count} files");
+
+            // Per source: huggingface/<kind>/<owner>/<name>, github/<owner>/<repo>, kaggle/<owner>/<dataset>, zenodo/<record>, urls/<host>.
+            static string SourceOf(string relative)
+            {
+                var parts = relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                int depth = parts[0] switch { "huggingface" => 4, "github" or "kaggle" => 3, "zenodo" or "urls" => 2, _ => 1 };
+                return string.Join('/', parts.Take(Math.Min(depth, parts.Length - 1)));
+            }
+
+            foreach (var group in files.GroupBy(f => SourceOf(Path.GetRelativePath(folder, f.FullName))).OrderBy(g => g.Key, StringComparer.Ordinal))
+            {
+                Console.WriteLine($"  {Downloader.Size(group.Sum(f => f.Length)),10}  {group.Key}  ({group.Count()} file{(group.Count() == 1 ? "" : "s")})");
+            }
+
             if (clear && Directory.Exists(folder))
             {
                 Directory.Delete(folder, true);

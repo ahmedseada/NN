@@ -103,9 +103,8 @@ public sealed class Dataset : IEnumerable<JsonObject>
     /// <summary>A file downloaded from <paramref name="url"/> (once: it is cached, see <see cref="Downloader"/>).</summary>
     public static Dataset FromUrl(string url, ReadOptions? options = null, Downloader? downloader = null, IReadOnlyDictionary<string, string>? headers = null)
     {
-        var uri = new Uri(url);
-        string name = Path.GetFileName(uri.LocalPath);
-        string Fetch() => (downloader ?? Downloader.Shared).Download(url, headers, name.Length > 0 ? name : null);
+        _ = new Uri(url);                                           // a bad URL fails here, not on first use
+        string Fetch() => (downloader ?? Downloader.Shared).Download(url, headers);
         return new Dataset(() => DataFiles.Read(Fetch(), options ?? ReadOptions.Default), url) { Files = () => [Fetch()] };
     }
 

@@ -100,26 +100,36 @@ internal static partial class Tests
 
             // Hugging Face: a repository with split-named Parquet shards, listed over two pages.
             const string hf = "https://huggingface.co";
-            web.Json($"{hf}/api/datasets/org/chat/tree/main?recursive=true",
+            const string commit = "0123456789abcdef0123456789abcdef01234567";
+            foreach (var name in new[] { "chat", "scripted", "sft" })
+            {
+                web.Json($"{hf}/api/datasets/org/{name}/revision/main", $"{{\"sha\":\"{commit}\"}}");
+            }
+
+            web.Json($"{hf}/api/datasets/org/chat/tree/{commit}?recursive=true",
                 "[{\"type\":\"file\",\"path\":\"README.md\",\"size\":10},{\"type\":\"file\",\"path\":\".gitattributes\"},{\"type\":\"directory\",\"path\":\"data\"},"
                 + "{\"type\":\"file\",\"path\":\"data/train-00000-of-00002.parquet\"}]",
-                next: $"{hf}/api/datasets/org/chat/tree/main?recursive=true&cursor=2");
-            web.Json($"{hf}/api/datasets/org/chat/tree/main?recursive=true&cursor=2",
+                next: $"{hf}/api/datasets/org/chat/tree/{commit}?recursive=true&cursor=2");
+            web.Json($"{hf}/api/datasets/org/chat/tree/{commit}?recursive=true&cursor=2",
                 "[{\"type\":\"file\",\"path\":\"data/train-00001-of-00002.parquet\"},{\"type\":\"file\",\"path\":\"data/test-00000-of-00001.parquet\"},"
                 + "{\"type\":\"file\",\"path\":\"data/train.jsonl\"}]");
             foreach (var shard in new[] { "train-00000-of-00002", "train-00001-of-00002", "test-00000-of-00001" })
             {
-                web.Bytes($"{hf}/datasets/org/chat/resolve/main/data/{shard}.parquet", parquet, requireToken: "hf_secret");
+                web.Bytes($"{hf}/datasets/org/chat/resolve/{commit}/data/{shard}.parquet", parquet, requireToken: "hf_secret");
             }
 
             var train = HuggingFace.Dataset("org/chat", token: "hf_secret", downloader: downloader);
             Check(train.Count() == 80 && train.First()["messages"] is JsonArray, $"hf train split: two shards, Parquet preferred over JSON Lines ({train.Count()} rows)");
             Check(HuggingFace.Dataset("org/chat", split: "test", token: "hf_secret", downloader: downloader).Count() == 40, "hf test split");
+            var files = HuggingFace.Dataset("org/chat", token: "hf_secret", downloader: downloader).Download();
+            Check(files.Count == 2 && files.All(File.Exists), "download: the local files of a source");
+            Check(files[0] == Path.Combine(cache, "huggingface", "datasets", "org", "chat", "0123456789ab", "data", "train-00000-of-00002.parquet"), $"cache laid out by source: {files[0]}");
+            Check(Dataset.FromFile(TestData("parquet/delta.parquet")).Download().Single().EndsWith("delta.parquet", StringComparison.Ordinal), "download: a local file is itself");
             Check(HuggingFace.Dataset("org/chat", token: "hf_secret", maxFiles: 1, downloader: downloader).Count() == 40, "hf first files only");
-            web.Json($"{hf}/api/datasets/org/sft/tree/main?recursive=true",
+            web.Json($"{hf}/api/datasets/org/sft/tree/{commit}?recursive=true",
                 "[{\"type\":\"file\",\"path\":\"data/train_sft-00000-of-00001-ab12.parquet\"},{\"type\":\"file\",\"path\":\"data/train_gen-00000-of-00001-cd34.parquet\"},"
                 + "{\"type\":\"file\",\"path\":\"data/test_sft-00000-of-00001-ef56.parquet\"}]");
-            web.Bytes($"{hf}/datasets/org/sft/resolve/main/data/train_sft-00000-of-00001-ab12.parquet", parquet);
+            web.Bytes($"{hf}/datasets/org/sft/resolve/{commit}/data/train_sft-00000-of-00001-ab12.parquet", parquet);
             Check(HuggingFace.Dataset("org/sft", split: "train_sft", downloader: downloader).Count() == 40, "hf split with its own name (train_sft)");
             Check(HuggingFace.Dataset("org/chat", files: "data/test-*", token: "hf_secret", downloader: downloader).Count() == 40, "hf files by pattern");
             try
@@ -133,12 +143,12 @@ internal static partial class Tests
             }
 
             // A dataset without plain data files (a loading script): the Hub's Parquet copy.
-            web.Json($"{hf}/api/datasets/org/scripted/tree/main?recursive=true", "[{\"type\":\"file\",\"path\":\"scripted.py\"}]");
+            web.Json($"{hf}/api/datasets/org/scripted/tree/{commit}?recursive=true", "[{\"type\":\"file\",\"path\":\"scripted.py\"}]");
             web.Json($"{hf}/api/datasets/org/scripted/parquet", $"{{\"en\":{{\"train\":[\"{hf}/api/datasets/org/scripted/parquet/en/train/0.parquet\"]}}}}");
             web.Bytes($"{hf}/api/datasets/org/scripted/parquet/en/train/0.parquet", parquet);
             Check(HuggingFace.Dataset("org/scripted", downloader: downloader).Count() == 40, "hf converted Parquet");
 
-            web.Json($"{hf}/api/datasets/org/gated/tree/main?recursive=true", "[]", status: HttpStatusCode.Unauthorized);
+            web.Json($"{hf}/api/datasets/org/gated/revision/main", "{}", status: HttpStatusCode.Unauthorized);
             try
             {
                 _ = HuggingFace.Dataset("org/gated", downloader: downloader).Count();
@@ -168,16 +178,22 @@ internal static partial class Tests
                 $"github repository: {string.Join(", ", code.Select(r => r["path"]))}");
             Check(GitHub.Repository("owner/app", pattern: "*.cs", token: "gh_secret", downloader: downloader).Single()["language"]!.GetValue<string>() == "csharp", "github pattern");
 
-            web.Json("https://api.github.com/repos/owner/data/git/trees/HEAD?recursive=1",
+            web.Json("https://api.github.com/repos/owner/data/commits/HEAD", "fedcba9876543210fedc");
+            web.Json("https://api.github.com/repos/owner/data/git/trees/fedcba9876543210fedc?recursive=1",
                 "{\"tree\":[{\"type\":\"blob\",\"path\":\"sets/a.jsonl\"},{\"type\":\"blob\",\"path\":\"sets/b.jsonl\"},{\"type\":\"tree\",\"path\":\"sets\"},{\"type\":\"blob\",\"path\":\"README.md\"}]}");
-            web.Bytes("https://api.github.com/repos/owner/data/contents/sets/a.jsonl?ref=HEAD", Encoding.UTF8.GetBytes("{\"q\":1}\n{\"q\":2}\n"));
-            web.Bytes("https://api.github.com/repos/owner/data/contents/sets/b.jsonl?ref=HEAD", Encoding.UTF8.GetBytes("{\"q\":3}\n"));
+            web.Bytes("https://api.github.com/repos/owner/data/contents/sets/a.jsonl?ref=fedcba9876543210fedc", Encoding.UTF8.GetBytes("{\"q\":1}\n{\"q\":2}\n"));
+            web.Bytes("https://api.github.com/repos/owner/data/contents/sets/b.jsonl?ref=fedcba9876543210fedc", Encoding.UTF8.GetBytes("{\"q\":3}\n"));
             Check(GitHub.Files("owner/data", "sets/*.jsonl", downloader: downloader).Count() == 3, "github files");
+            Check(GitHub.Files("owner/data", "sets/*.jsonl", downloader: downloader).Download()[0] == Path.Combine(cache, "github", "owner", "data", "fedcba987654", "sets", "a.jsonl"),
+                "github files cached per commit");
+            Check(GitHub.Repository("owner/app", token: "gh_secret", downloader: downloader).Download().Single() == Path.Combine(cache, "github", "owner", "app", "1a2b3c4d5e6f.tar.gz"),
+                "github snapshot cached per commit");
 
             web.Json("https://api.github.com/repos/owner/data/releases/latest",
-                "{\"assets\":[{\"name\":\"rows.csv\",\"url\":\"https://api.github.com/repos/owner/data/releases/assets/7\"},{\"name\":\"notes.pdf\",\"url\":\"x\"}]}");
+                "{\"tag_name\":\"v2\",\"assets\":[{\"name\":\"rows.csv\",\"url\":\"https://api.github.com/repos/owner/data/releases/assets/7\"},{\"name\":\"notes.pdf\",\"url\":\"x\"}]}");
             web.Bytes("https://api.github.com/repos/owner/data/releases/assets/7", Encoding.UTF8.GetBytes("a,b\n1,2\n3,4\n"));
             Check(GitHub.Release("owner/data", "*.csv", downloader: downloader).Count() == 2, "github release assets");
+            Check(File.Exists(Path.Combine(cache, "github", "owner", "data", "releases", "v2", "rows.csv")), "release assets under their tag");
 
             // Kaggle: a zip, with the account's key.
             Environment.SetEnvironmentVariable("KAGGLE_USERNAME", "me");
@@ -199,11 +215,13 @@ internal static partial class Tests
             web.Bytes("https://www.kaggle.com/api/v1/datasets/download/someone/reviews", zip.ToArray(),
                 requireAuthorization: "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes("me:k123")));
             Check(Kaggle.Dataset("someone/reviews", "*.csv", downloader: downloader).Count() == 2, "kaggle");
+            Check(File.Exists(Path.Combine(cache, "kaggle", "someone", "reviews", "latest", "reviews.zip")), "kaggle cache path");
 
             web.Json("https://zenodo.org/api/records/123",
                 "{\"files\":[{\"key\":\"data.jsonl\",\"links\":{\"self\":\"https://zenodo.org/api/records/123/files/data.jsonl/content\"}},{\"key\":\"paper.pdf\",\"links\":{\"self\":\"y\"}}]}");
             web.Bytes("https://zenodo.org/api/records/123/files/data.jsonl/content", Encoding.UTF8.GetBytes("{\"a\":1}\n"));
             Check(Zenodo.Record("123", downloader: downloader).Count() == 1, "zenodo");
+            Check(File.Exists(Path.Combine(cache, "zenodo", "123", "data.jsonl")), "zenodo cache path");
         }
         finally
         {
@@ -455,6 +473,7 @@ internal static partial class Tests
             var data = Dataset.FromUrl("https://data.example/rows.jsonl", downloader: downloader, headers: new Dictionary<string, string> { ["Authorization"] = "Bearer secret" });
             Check(data.Count() == 100 && data.Count() == 100 && server.Requests == 1, $"cached ({server.Requests} requests)");
             Check(server.LastAuthorization == "Bearer secret", "headers sent");
+            Check(File.Exists(Path.Combine(cache, "urls", "data.example", "rows.jsonl")), "plain URLs under urls/<host>/<path>");
 
             // Resume: a partial file continues with a Range request.
             server.Files["https://data.example/big.jsonl"] = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(0, 1000).Select(i => $"{{\"i\":{i}}}\n")));

@@ -22,7 +22,8 @@ public sealed record DownloadProgress(string Url, long Received, long? Total, st
 /// <summary>
 /// Downloads files once into a cache folder and returns the local path: interrupted downloads resume (HTTP ranges),
 /// failures are retried, a file appears only when complete. The cache is <c>NEURALSHARP_CACHE</c> or
-/// <c>~/.cache/neuralsharp</c>, under <c>downloads/</c>. Credentials in headers are not part of the cache key.
+/// <c>~/.cache/neuralsharp</c>, under <c>downloads/</c>, laid out by source: huggingface/datasets/&lt;owner&gt;/&lt;name&gt;/&lt;commit&gt;/…,
+/// github/&lt;owner&gt;/&lt;repo&gt;/…, kaggle/…, zenodo/…, and urls/&lt;host&gt;/&lt;path&gt; for plain URLs.
 /// </summary>
 public sealed class Downloader
 {
@@ -73,19 +74,19 @@ public sealed class Downloader
     public HttpClient Http => _http;
 
     /// <summary>Downloads (or finds in the cache) <paramref name="url"/>; see <see cref="DownloadAsync"/>.</summary>
-    public string Download(string url, IReadOnlyDictionary<string, string>? headers = null, string? fileName = null) =>
-        DownloadAsync(url, headers, fileName).GetAwaiter().GetResult();
+    public string Download(string url, IReadOnlyDictionary<string, string>? headers = null, string? cachePath = null) =>
+        DownloadAsync(url, headers, cachePath).GetAwaiter().GetResult();
 
     /// <summary>
-    /// The local path of <paramref name="url"/>, downloading it first unless cached. <paramref name="fileName"/> names the
-    /// file (its extension decides how it is read; default: the URL's last segment).
+    /// The local path of <paramref name="url"/>, downloading it first unless cached. <paramref name="cachePath"/> is where
+    /// the file goes in the cache, '/'-separated (e.g. "huggingface/datasets/openai/gsm8k/1a2b3c4d5e6f/main/test.parquet";
+    /// the extension decides how it is read); default: urls/&lt;host&gt;/&lt;path of the URL&gt;.
     /// </summary>
-    public async Task<string> DownloadAsync(string url, IReadOnlyDictionary<string, string>? headers = null, string? fileName = null,
+    public async Task<string> DownloadAsync(string url, IReadOnlyDictionary<string, string>? headers = null, string? cachePath = null,
         CancellationToken cancellationToken = default)
     {
-        fileName = Sanitize(fileName ?? Path.GetFileName(new Uri(url).LocalPath));
-        string folder = Path.Combine(CacheFolder, Key(url));
-        string target = Path.Combine(folder, fileName.Length > 0 ? fileName : "download");
+        string target = Path.Combine([CacheFolder, .. Segments(cachePath ?? UrlPath(url))]);
+        string folder = Path.GetDirectoryName(target)!;
         if (File.Exists(target) && !Refresh)
         {
             Log?.Invoke($"cached {Path.GetFileName(target)} ({Size(new FileInfo(target).Length)})");
@@ -100,8 +101,6 @@ public sealed class Downloader
             {
                 await DownloadOnceAsync(url, headers, partial, cancellationToken).ConfigureAwait(false);
                 File.Move(partial, target, overwrite: true);
-                await File.WriteAllTextAsync(Path.Combine(folder, "source.json"), new JsonObject { ["url"] = url, ["file"] = Path.GetFileName(target) }.ToJsonString(),
-                    cancellationToken).ConfigureAwait(false);
                 return target;
             }
             catch (Exception ex) when (attempt < Attempts && ex is HttpRequestException { StatusCode: null or >= HttpStatusCode.InternalServerError or HttpStatusCode.TooManyRequests }
@@ -257,16 +256,35 @@ public sealed class Downloader
         return new HttpRequestException($"{url}: {(int)status} {status}{hint}. {detail}".TrimEnd(), null, status);
     }
 
-    private static string Key(string url)
+    // urls/<host>/<path>; a query string becomes a short hash in the file name, so different queries do not collide.
+    private static string UrlPath(string url)
     {
-        string hash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(url)))[..16];
         var uri = new Uri(url);
-        return Sanitize($"{uri.Host}-{hash}");
+        string path = Uri.UnescapeDataString(uri.AbsolutePath).Trim('/');
+        if (path.Length == 0)
+        {
+            path = "index";
+        }
+
+        if (uri.Query.Length > 1)
+        {
+            string hash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(uri.Query)))[..8];
+            string extension = Path.GetExtension(path);
+            path = $"{path[..^extension.Length]}-{hash}{extension}";
+        }
+
+        return $"urls/{uri.Host}{(uri.IsDefaultPort ? "" : "_" + uri.Port)}/{path}";
     }
 
-    private static string Sanitize(string name)
+    // The folders and file name of a cache path, each made safe for the file system; ".." and empty parts are dropped.
+    private static string[] Segments(string cachePath)
     {
         var invalid = Path.GetInvalidFileNameChars();
-        return new string([.. name.Select(c => invalid.Contains(c) || c is ':' or '?' or '*' ? '_' : c)]);
+        var parts = cachePath.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Where(p => p is not ("." or ".."))
+            .Select(p => new string([.. p.Select(c => invalid.Contains(c) || c is ':' or '?' or '*' or '"' or '<' or '>' or '|' ? '_' : c)]).TrimEnd('.', ' '))
+            .Where(p => p.Length > 0)
+            .ToArray();
+        return parts.Length > 0 ? parts : ["download"];
     }
 }

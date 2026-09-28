@@ -51,7 +51,21 @@ A recipe mixes sources:
 
 Credentials come from the environment: `HF_TOKEN` (or `huggingface-cli login`), `GITHUB_TOKEN`, `KAGGLE_USERNAME` and
 `KAGGLE_KEY` (or `~/.kaggle/kaggle.json`), `ZENODO_TOKEN`. Downloads are cached under `NEURALSHARP_CACHE` or
-`~/.cache/neuralsharp`; `nsdata cache` shows the folder and `nsdata cache --clear` empties it. `nsdata --help` lists
+`~/.cache/neuralsharp`, in `downloads/` laid out by source:
+
+```
+downloads/huggingface/datasets/<owner>/<name>/<commit>/<path in the repository>
+downloads/huggingface/datasets/<owner>/<name>/parquet/<config>/<split>/00000.parquet   (the Hub's Parquet copy)
+downloads/github/<owner>/<repo>/<commit>.tar.gz                                     (repository snapshots)
+downloads/github/<owner>/<repo>/<commit>/<path>                                     (single files)
+downloads/github/<owner>/<repo>/releases/<tag>/<asset>
+downloads/kaggle/<owner>/<dataset>/<latest | vN>/<dataset>.zip
+downloads/zenodo/<record>/<file>
+downloads/urls/<host>/<path>
+```
+
+Branches and tags are resolved to their commit first, so new commits are downloaded again rather than read stale.
+`nsdata cache` shows the size per source; `nsdata cache --clear` empties it. `nsdata --help` lists
 every option.
 
 The same features are available from code in the `NeuralSharp.Datasets` library (`Dataset`, `HuggingFace`, `GitHub`,

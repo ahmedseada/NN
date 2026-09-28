@@ -156,12 +156,41 @@ public static class HuggingFace
         return RemoteFiles.Over(name, () => ResolveAsync(repo, config, split, files, revision, token, maxFiles, d).GetAwaiter().GetResult(), options, downloader: d);
     }
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> Commits = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The commit a branch or tag of a repository points at (a commit hash is returned as it is). Files are cached per
+    /// commit, so an updated dataset is downloaded again rather than read stale from the cache.
+    /// </summary>
+    public static async Task<string> ResolveRevisionAsync(string repo, string kind = "datasets", string revision = "main", string? token = null,
+        Downloader? downloader = null, CancellationToken cancellationToken = default)
+    {
+        if (revision.Length == 40 && revision.All(char.IsAsciiHexDigitLower))
+        {
+            return revision;
+        }
+
+        string key = $"{Endpoint}|{kind}|{repo}|{revision}";
+        if (Commits.TryGetValue(key, out var known))
+        {
+            return known;
+        }
+
+        var d = downloader ?? Downloader.Shared;
+        var json = JsonNode.Parse(await d.GetStringAsync($"{Endpoint}/api/{kind}/{repo}/revision/{Uri.EscapeDataString(revision)}", RemoteFiles.Bearer(Token(token)),
+            cancellationToken).ConfigureAwait(false));
+        string sha = (string?)json?["sha"] ?? throw new InvalidDataException($"hf:{repo}: no commit for revision '{revision}'.");
+        d.Log?.Invoke($"hf:{repo}: {revision} is at commit {sha[..Math.Min(7, sha.Length)]}");
+        return Commits[key] = sha;
+    }
+
     /// <summary>The files of a repository (<paramref name="kind"/>: "datasets" or "models").</summary>
     public static async Task<IReadOnlyList<RepoFile>> ListFilesAsync(string repo, string kind = "datasets", string revision = "main", string? token = null,
         Downloader? downloader = null, CancellationToken cancellationToken = default)
     {
         var d = downloader ?? Downloader.Shared;
-        string url = $"{Endpoint}/api/{kind}/{repo}/tree/{Uri.EscapeDataString(revision)}?recursive=true";
+        string commit = await ResolveRevisionAsync(repo, kind, revision, token, d, cancellationToken).ConfigureAwait(false);
+        string url = $"{Endpoint}/api/{kind}/{repo}/tree/{commit}?recursive=true";
         var list = new List<RepoFile>();
         foreach (var page in await d.GetPagesAsync(url, RemoteFiles.Bearer(Token(token)), cancellationToken).ConfigureAwait(false))
         {
@@ -177,13 +206,19 @@ public static class HuggingFace
         return list;
     }
 
-    /// <summary>Downloads one file of a repository (or finds it in the cache) and returns its local path.</summary>
-    public static Task<string> DownloadFileAsync(string repo, string path, string kind = "datasets", string revision = "main", string? token = null,
+    /// <summary>
+    /// Downloads one file of a repository (or finds it in the cache) and returns its local path:
+    /// huggingface/&lt;kind&gt;/&lt;owner&gt;/&lt;name&gt;/&lt;commit&gt;/&lt;path&gt; in the cache.
+    /// </summary>
+    public static async Task<string> DownloadFileAsync(string repo, string path, string kind = "datasets", string revision = "main", string? token = null,
         Downloader? downloader = null, CancellationToken cancellationToken = default)
     {
+        var d = downloader ?? Downloader.Shared;
+        string commit = await ResolveRevisionAsync(repo, kind, revision, token, d, cancellationToken).ConfigureAwait(false);
         string prefix = kind == "models" ? "" : kind + "/";
-        string url = $"{Endpoint}/{prefix}{repo}/resolve/{Uri.EscapeDataString(revision)}/{RemoteFiles.EscapePath(path)}";
-        return (downloader ?? Downloader.Shared).DownloadAsync(url, RemoteFiles.Bearer(Token(token)), Path.GetFileName(path), cancellationToken);
+        string url = $"{Endpoint}/{prefix}{repo}/resolve/{commit}/{RemoteFiles.EscapePath(path)}";
+        return await d.DownloadAsync(url, RemoteFiles.Bearer(Token(token)), $"huggingface/{kind}/{repo}/{commit[..Math.Min(12, commit.Length)]}/{path}",
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<IReadOnlyList<string>> ResolveAsync(string repo, string? config, string split, string? pattern, string revision, string? token,
@@ -250,7 +285,7 @@ public static class HuggingFace
         int number = 0;
         foreach (var url in urls.Select(u => (string)u!).Take(maxFiles ?? int.MaxValue))
         {
-            paths.Add(await downloader.DownloadAsync(url, headers, $"{chosenConfig}-{split}-{number++:D5}.parquet").ConfigureAwait(false));
+            paths.Add(await downloader.DownloadAsync(url, headers, $"huggingface/datasets/{repo}/parquet/{chosenConfig}/{split}/{number++:D5}.parquet").ConfigureAwait(false));
         }
 
         return paths;
@@ -290,7 +325,7 @@ public static class GitHub
                     .GetAwaiter().GetResult().Trim();
                 d.Log?.Invoke($"github:{repo}: {reference ?? "default branch"} is at commit {commit[..Math.Min(7, commit.Length)]}");
                 string url = $"{Api}/repos/{repo}/tarball/{commit}";
-                return [d.DownloadAsync(url, Headers(token), $"{repo.Replace('/', '-')}-{commit[..Math.Min(12, commit.Length)]}.tar.gz").GetAwaiter().GetResult()];
+                return [d.DownloadAsync(url, Headers(token), $"github/{repo}/{commit[..Math.Min(12, commit.Length)]}.tar.gz").GetAwaiter().GetResult()];
             },
             options,
             post: row =>
@@ -323,7 +358,9 @@ public static class GitHub
 
     private static async Task<IReadOnlyList<string>> ResolveFilesAsync(string repo, string pattern, string? reference, string? token, Downloader downloader)
     {
-        string tree = reference ?? "HEAD";
+        string tree = (await downloader.GetStringAsync($"{Api}/repos/{repo}/commits/{Uri.EscapeDataString(reference ?? "HEAD")}", Headers(token, "application/vnd.github.sha"))
+            .ConfigureAwait(false)).Trim();
+        downloader.Log?.Invoke($"github:{repo}: {reference ?? "default branch"} is at commit {tree[..Math.Min(7, tree.Length)]}");
         var json = JsonNode.Parse(await downloader.GetStringAsync($"{Api}/repos/{repo}/git/trees/{Uri.EscapeDataString(tree)}?recursive=1", Headers(token)).ConfigureAwait(false));
         var glob = DataFiles.Glob(pattern);
         var paths = (json?["tree"] as JsonArray ?? []).Where(n => (string?)n?["type"] == "blob").Select(n => (string)n!["path"]!)
@@ -337,7 +374,7 @@ public static class GitHub
         foreach (var path in paths)
         {
             string url = $"{Api}/repos/{repo}/contents/{RemoteFiles.EscapePath(path)}?ref={Uri.EscapeDataString(tree)}";
-            local.Add(await downloader.DownloadAsync(url, Headers(token, "application/vnd.github.raw"), Path.GetFileName(path)).ConfigureAwait(false));
+            local.Add(await downloader.DownloadAsync(url, Headers(token, "application/vnd.github.raw"), $"github/{repo}/{tree[..Math.Min(12, tree.Length)]}/{path}").ConfigureAwait(false));
         }
 
         return local;
@@ -357,7 +394,8 @@ public static class GitHub
         var local = new List<string>();
         foreach (var asset in assets)
         {
-            local.Add(await downloader.DownloadAsync((string)asset!["url"]!, Headers(token, "application/octet-stream"), (string)asset["name"]!).ConfigureAwait(false));
+            local.Add(await downloader.DownloadAsync((string)asset!["url"]!, Headers(token, "application/octet-stream"),
+                $"github/{repo}/releases/{(string?)release?["tag_name"] ?? tag ?? "latest"}/{(string)asset["name"]!}").ConfigureAwait(false));
         }
 
         return local;
@@ -376,7 +414,7 @@ public static class Kaggle
         var d = downloader ?? Downloader.Shared;
         string url = $"https://www.kaggle.com/api/v1/datasets/download/{dataset}{(version is null ? "" : $"?datasetVersionNumber={version}")}";
         return RemoteFiles.Over($"kaggle:{dataset}",
-            () => [d.DownloadAsync(url, Credentials(), $"{dataset.Replace('/', '-')}{(version is null ? "" : $"-v{version}")}.zip").GetAwaiter().GetResult()],
+            () => [d.DownloadAsync(url, Credentials(), $"kaggle/{dataset}/{(version is null ? "latest" : $"v{version}")}/{dataset.Split('/')[^1]}.zip").GetAwaiter().GetResult()],
             (options ?? ReadOptions.Default) with { Pattern = pattern ?? options?.Pattern }, downloader: d);
     }
 
@@ -429,7 +467,7 @@ public static class Zenodo
         var local = new List<string>();
         foreach (var (name, url) in files)
         {
-            local.Add(await downloader.DownloadAsync(url, headers, name).ConfigureAwait(false));
+            local.Add(await downloader.DownloadAsync(url, headers, $"zenodo/{record}/{name}").ConfigureAwait(false));
         }
 
         return local;
