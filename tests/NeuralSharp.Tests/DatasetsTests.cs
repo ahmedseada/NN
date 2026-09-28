@@ -116,6 +116,11 @@ internal static partial class Tests
             Check(train.Count() == 80 && train.First()["messages"] is JsonArray, $"hf train split: two shards, Parquet preferred over JSON Lines ({train.Count()} rows)");
             Check(HuggingFace.Dataset("org/chat", split: "test", token: "hf_secret", downloader: downloader).Count() == 40, "hf test split");
             Check(HuggingFace.Dataset("org/chat", token: "hf_secret", maxFiles: 1, downloader: downloader).Count() == 40, "hf first files only");
+            web.Json($"{hf}/api/datasets/org/sft/tree/main?recursive=true",
+                "[{\"type\":\"file\",\"path\":\"data/train_sft-00000-of-00001-ab12.parquet\"},{\"type\":\"file\",\"path\":\"data/train_gen-00000-of-00001-cd34.parquet\"},"
+                + "{\"type\":\"file\",\"path\":\"data/test_sft-00000-of-00001-ef56.parquet\"}]");
+            web.Bytes($"{hf}/datasets/org/sft/resolve/main/data/train_sft-00000-of-00001-ab12.parquet", parquet);
+            Check(HuggingFace.Dataset("org/sft", split: "train_sft", downloader: downloader).Count() == 40, "hf split with its own name (train_sft)");
             Check(HuggingFace.Dataset("org/chat", files: "data/test-*", token: "hf_secret", downloader: downloader).Count() == 40, "hf files by pattern");
             try
             {

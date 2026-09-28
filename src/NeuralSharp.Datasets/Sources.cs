@@ -69,6 +69,13 @@ internal static class RemoteFiles
             return split.Equals("train", StringComparison.OrdinalIgnoreCase) ? paths : [];
         }
 
+        if (!SplitWords.ContainsKey(split))
+        {
+            // A split with its own name ("train_sft", "test_gen"): the name between separators in the path.
+            var named = new Regex($"(^|[^a-z0-9]){Regex.Escape(split.ToLowerInvariant())}([^a-z0-9]|$)");
+            return [.. paths.Where(p => named.IsMatch(p.ToLowerInvariant()))];
+        }
+
         var wanted = Keywords(split);
         return [.. paths.Where(p => Words(p).Any(wanted.Contains))];
     }
