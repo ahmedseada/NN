@@ -9,6 +9,9 @@ Measured on an RTX 5070 Ti (70 SMs, 16 GB). Resume from here when returning to o
    - int8 weights, bfloat16 KV cache (`--int8 --kv16`): top-1 the same everywhere, greedy identical on 3 of 4 prompts
      (one C# continuation diverges after 12 characters into another plausible one); max |Δlogit| 0.5 to 1.4, as int8
      weights give. Decoding 486–575 tok/s in the check.
+   - int8 weights, bfloat16 KV cache, bfloat16 tensor-core prompts (`--int8 --kv16 --matmul bf16`, the path with split-k
+     int8 tensor-core products): the same differences as with float32 products (0.53 / 0.53 / 1.42 / 1.05 against
+     0.52 / 0.52 / 1.43 / 1.01), same top-1 and greedy output; the 291-token forward pass 147 ms instead of 211.
 2. **FP8 against bfloat16 loss curves**, quick version (100.9M-parameter char model: d_model 768, 12 layers, batch 32,
    block 384; 600 steps, same seed and schedule; `--loss-log` and `compare`):
 
@@ -60,6 +63,19 @@ What changed:
   per-kernel GPU-time tables of the Pretrained `profile` command and CharGpt `--profile` (CUDA events; small kernels
   read about 5 µs high, so compare ratios).
 
+## Against PyTorch (transformers, bfloat16), Qwen3-0.6B
+
+| | PyTorch | NeuralSharp bf16 | NeuralSharp int8 | bf16 speedup | int8 speedup |
+|---|---|---|---|---|---|
+| Prompt pass, 180 tokens | 21.0 ms (passes 2 and 3) | 9.2 ms | 9.2 ms | 2.3× | 2.3× |
+| Greedy decoding, 32 tokens | 48.6 tok/s | 372.8 tok/s | 478.2 tok/s | 7.7× | 9.8× |
+| Chat sampling, 128 tokens | 49.1 tok/s | 221.6 tok/s | 254.0 tok/s | 4.5× | 5.2× |
+| Interactive chat | ~49 tok/s (estimated) | 151–169 tok/s | 161–181 tok/s | ~3.1–3.4× | ~3.3–3.7× |
+| First prompt pass (one-time setup) | 304.7 ms | 79.1 ms | 76.6 ms | 3.9× | 4.0× |
+
+The prompt-pass lead is the smallest because PyTorch's prompt products are cuBLAS already; NeuralSharp's 180-row
+products run at about 30 TFLOPS against the 78 its GEMM reaches on large shapes (next steps 4 and 5).
+
 ## Next steps, in order of expected gain
 
 1. **Delayed FP8 scaling: identify operands by call order, not address.** In training it saved only 12 ms of the
@@ -77,10 +93,14 @@ What changed:
    ~31% of the memory-bandwidth ceiling (~1.5k tok/s for this model).
 4. **INT8 prefill on int8 tensor cores:** prompt products currently expand int8 weights to bfloat16 tiles; the int8
    tensor-core path needs a second, k-major copy of the weights (memory cost: the int8 weights once more).
-5. **Training step outside the products** (1.25B, FP8): `adam8` 34 ms, flash-attention backward 32 ms, `sumsq` for
+5. **Prompt products (180 rows): 17–35 TFLOPS** (`gemm_tc_nn_int8w`, largest 180×3072×1024 at 2.2 ms per pass) against
+   78 on large shapes. Only 2 row tiles of 128: a 64-row tile variant or wider split-k, and fusing the q/k/v and gate/up
+   products into one launch each (as decoding does), are the candidates. This is where the 2.3× prompt lead over
+   PyTorch can grow.
+6. **Training step outside the products** (1.25B, FP8): `adam8` 34 ms, flash-attention backward 32 ms, `sumsq` for
    gradient clipping 9 ms, `fill` (zeroing gradients) 8 ms, dropout 10 ms. Candidates: the first gradient write with
    beta 0 instead of zeroing, clipping's norm fused into the backward pass.
-6. **Decoding attention at short contexts:** the ≈5 blocks per SM rule is ~1 µs slower than 16 splits at 200 positions;
+7. **Decoding attention at short contexts:** the ≈5 blocks per SM rule is ~1 µs slower than 16 splits at 200 positions;
    a length-aware split would need the graph-replay constraint handled (splits must not depend on the cache length).
 
 ## Measured facts worth keeping
