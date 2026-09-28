@@ -23,8 +23,7 @@ const string Usage = """
       github:owner/repo?release=latest&asset=*.csv     release assets
       kaggle:owner/dataset, zenodo:123456              (KAGGLE_USERNAME + KAGGLE_KEY or ~/.kaggle/kaggle.json)
       https://host/file.jsonl.gz, a local file or folder
-    Options for any source: where (row filter: lang:csharp|c#, path~\.cs$, lang!:python; comma = and), take, skip,
-    weight, columns=a,b, text=lines|paragraphs|document, documents=true,
+    Options for any source: take, skip, weight, columns=a,b, text=lines|paragraphs|document, documents=true,
     and conversations from columns: user=…&assistant=…&system=… (e.g. user={question}&assistant={answer}).
 
     Options:

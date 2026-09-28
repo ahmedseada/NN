@@ -48,10 +48,6 @@ internal static partial class Tests
 
         var spec = DatasetSpec.Parse("hf:openai/gsm8k?config=main&split=test&user={question}&assistant={answer}&weight=0.5&take=10");
         Check(spec.Source == "hf:openai/gsm8k" && spec.Options["split"] == "test" && spec.Weight == 0.5 && spec.Mapping is { User: "{question}", Assistant: "{answer}" }, "spec options");
-        var rows = Dataset.FromRows([new() { ["lang"] = "CSharp", ["path"] = "src/A.cs" }, new() { ["lang"] = "python", ["path"] = "a.py" },
-            new() { ["lang"] = "c#", ["path"] = "B.cs", ["stars"] = 5 }, new() { ["path"] = "none.cs" }]);
-        Check(rows.Where(DatasetSpec.Condition("lang:csharp|c#")).Count() == 2 && rows.Where(DatasetSpec.Condition("path~\\.cs$,lang!:c#")).Count() == 2
-              && rows.Where(DatasetSpec.Condition("stars:5")).Count() == 1 && rows.Where(DatasetSpec.Condition("lang!:python")).Count() == 3, "where filters");
         Check(DatasetSpec.Parse("https://host/data.jsonl?sig=abc").Source == "https://host/data.jsonl?sig=abc" && DatasetSpec.Parse("https://host/d.jsonl?take=5").Source == "https://host/d.jsonl",
             "URLs keep their own query");
 
