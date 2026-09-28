@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>NeuralSharp.Datasets.Cli</RootNamespace>
+    <AssemblyName>nsdata</AssemblyName>
+    <IsAotCompatible>true</IsAotCompatible>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>nsdata</ToolCommandName>
+    <PackageId>NeuralSharp.Datasets.Cli</PackageId>
+    <Version>0.1.0</Version>
+    <Description>nsdata: inspect, count, download and assemble training datasets from Hugging Face, GitHub, Kaggle, Zenodo, URLs and local files (JSON Lines, JSON, CSV, text, code, Parquet) into JSON Lines any tool can read.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NeuralSharp.Datasets\NeuralSharp.Datasets.csproj" />
+  </ItemGroup>
+
+</Project>

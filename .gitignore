@@ -9,3 +9,4 @@ models/
 output/
 *.weights
 __pycache__/
+artifacts/
