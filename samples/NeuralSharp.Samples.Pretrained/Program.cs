@@ -22,7 +22,9 @@ using NeuralSharp.Pretrained;
 //                                   every token; writes a PEFT adapter to <dir>
 //                                   (--eval F|spec, --eval-fraction 0.02, --system S, --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048,
 //                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
-//                                   --eval-every N, --no-checkpointing; with --int4 / --int8 / --bf16 the base stays quantized)
+//                                   --eval-every N, --no-checkpointing; with --int4 / --int8 / --bf16 the base stays quantized;
+//                                   --profile: measure a few steps instead of training: wall time, GPU time per kernel and
+//                                   per kind of work, host overhead)
 //   (<folder> may also be a Hugging Face model id, for example Qwen/Qwen3-0.6B: taken from the Hugging Face cache or
 //   NeuralSharp's, else downloaded once; HF_TOKEN or huggingface-cli login for gated models; a .gguf file; or an Ollama
 //   model such as ollama:qwen3:8b, read from Ollama's own store)
@@ -58,6 +60,7 @@ int samples = 100, maxNew = 512;
 var metric = AnswerMetric.Auto;
 long maxRows = 0;
 int seed = 0, minChars = 0, maxChars = 0;
+bool profileTraining = false;
 bool shuffleRows = true, dedupRows = true, mixByWeight = false;
 var rowKind = NeuralSharp.Datasets.RowKind.Auto;
 int attempts = 1, maxRounds = 40;
@@ -115,6 +118,7 @@ for (int i = 0; i < args.Length; i++)
         case "--min-chars": minChars = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--max-chars": maxChars = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--no-shuffle": shuffleRows = false; break;
+        case "--profile": profileTraining = true; break;
         case "--no-dedup": dedupRows = false; break;
         case "--mix": mixByWeight = true; break;
         case "--kind": rowKind = Enum.Parse<NeuralSharp.Datasets.RowKind>(args[++i], ignoreCase: true); break;
@@ -375,6 +379,30 @@ switch (positional[0])
         var recipe = Recipe(positional.Skip(2).ToList(), forTraining: true);
         var (trainRows, heldOut) = recipe.Build(downloads);
         var train = Read(trainRows, "training");
+        if (profileTraining)
+        {
+            Console.WriteLine("profiling: 3 warm-up steps, 3 timed steps, 3 steps with every GPU kernel timed…");
+            var measured = FineTuner.Profile(model, train, tuning);
+            Console.Write(GpuProfiler.Format(measured.Kernels, rows: 40));
+            double gpu = measured.GpuMillisecondsPerStep, wall = measured.SecondsPerStep * 1000;
+            if (device.Type != DeviceType.Cuda)
+            {
+                Console.WriteLine($"per step: {measured.TokensPerStep:N0} tokens, {wall:F0} ms ({measured.TokensPerSecond:N0} tok/s); kernel times need a CUDA device (--cuda)");
+                return 0;
+            }
+
+            Console.WriteLine($"\nper step: {measured.TokensPerStep:N0} tokens, {wall:F0} ms wall ({measured.TokensPerSecond:N0} tok/s), "
+                              + $"{gpu:F0} ms of GPU kernels, {Math.Max(0, wall - gpu):F0} ms of host overhead and waiting ({Math.Max(0, wall - gpu) / Math.Max(wall, 1e-9):P0})");
+            Console.WriteLine($"{"kind of work",-32} {"ms/step",9} {"share",7} {"launches",9}");
+            foreach (var (group, ms, calls) in measured.Groups)
+            {
+                Console.WriteLine($"{group,-32} {ms,9:F1} {ms / Math.Max(gpu, 1e-9),7:P1} {calls,9}");
+            }
+
+            Console.WriteLine($"GPU memory {ComputeResources.GetMemoryUsage(device)}");
+            return 0;
+        }
+
         var evaluationRows = evalFile is not null ? Recipe([evalFile], forTraining: true) with { EvaluationFraction = 0 } is var e ? e.Build(downloads).Train : null : heldOut;
         var evaluation = evaluationRows is null ? null : Read(evaluationRows, "evaluation");
         var readable = new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };

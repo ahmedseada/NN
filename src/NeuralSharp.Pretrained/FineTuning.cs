@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using NeuralSharp.Diagnostics;
 using NeuralSharp.Generation;
 using NeuralSharp.Layers;
 using NeuralSharp.Optimizers;
@@ -365,6 +366,48 @@ public sealed record FineTuningOptions
     public int Seed { get; init; }
 }
 
+/// <summary>What <see cref="FineTuner.Profile"/> measured.</summary>
+/// <param name="Kernels">GPU time per kernel over the profiled steps, most first (empty on the CPU).</param>
+/// <param name="ProfiledSteps">Steps profiled.</param>
+/// <param name="ProfiledTokens">Tokens in the profiled steps.</param>
+/// <param name="SecondsPerStep">Wall time per step, measured without the profiler.</param>
+/// <param name="TokensPerStep">Tokens per step in the timed steps.</param>
+public sealed record FineTuningProfile(IReadOnlyList<GpuProfileEntry> Kernels, int ProfiledSteps, long ProfiledTokens, double SecondsPerStep, double TokensPerStep)
+{
+    /// <summary>Tokens per second without the profiler.</summary>
+    public double TokensPerSecond => SecondsPerStep > 0 ? TokensPerStep / SecondsPerStep : 0;
+
+    /// <summary>GPU time per profiled step, in milliseconds.</summary>
+    public double GpuMillisecondsPerStep => Kernels.Sum(k => k.Milliseconds) / ProfiledSteps;
+
+    /// <summary>
+    /// Kernel time grouped into what it does (matrix products, attention, normalization, activations, loss, optimizer,
+    /// copies and conversions, other), per step, most first.
+    /// </summary>
+    public IReadOnlyList<(string Group, double Milliseconds, long Calls)> Groups => [.. Kernels
+        .GroupBy(k => GroupOf(k.Name))
+        .Select(g => (g.Key, g.Sum(k => k.Milliseconds) / ProfiledSteps, g.Sum(k => k.Calls) / ProfiledSteps))
+        .OrderByDescending(g => g.Item2)];
+
+    private static string GroupOf(string kernel)
+    {
+        string k = kernel.ToLowerInvariant();
+        return k switch
+        {
+            _ when k.Contains("gemm") || k.Contains("matmul") || k.Contains("gemv") => "matrix products",
+            _ when k.Contains("attention") || k.Contains("flash") || k.Contains("softmax_rows") && !k.Contains("cross") => "attention",
+            _ when k.Contains("cross_entropy") || k.Contains("crossentropy") => "loss (output layer softmax)",
+            _ when k.Contains("norm") => "normalization",
+            _ when k.Contains("rope") || k.Contains("rotary") => "rotary embedding",
+            _ when k.Contains("silu") || k.Contains("gelu") || k.Contains("gated") || k.Contains("act") => "activations",
+            _ when k.Contains("adam") || k.Contains("sumsq") || k.Contains("clip") => "optimizer and clipping",
+            _ when k.Contains("transpose") || k.Contains("copy") || k.Contains("convert") || k.Contains("bf16") || k.Contains("fill") || k.Contains("quant") => "copies, conversions, zeroing",
+            _ when k.Contains("add") || k.Contains("mul") || k.Contains("axpy") || k.Contains("scale") || k.Contains("sum") => "element-wise and reductions",
+            _ => "other",
+        };
+    }
+}
+
 /// <summary>Where a fine-tuning run is.</summary>
 /// <param name="Step">Optimizer steps done.</param>
 /// <param name="TotalSteps">Optimizer steps planned.</param>
@@ -430,37 +473,10 @@ public static class FineTuner
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var group = batches.Skip(first).Take(accumulation).ToList();
-                float normalizer = Math.Max(1, group.Sum(b => b.Sum(i => train[i].TrainedTokens)));
                 var watch = Stopwatch.StartNew();
-                float loss = 0f;
-                long tokens = 0;
-                network.Train();
-                optimizer.ZeroGrad();
-                for (int b = 0; b < group.Count; b++)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var batch = group[b];
-                    var batchWatch = Stopwatch.StartNew();
-                    using var scope = new TensorScope();
-                    trace?.Invoke($"step {step + 1}/{totalSteps}, batch {first + b + 1}/{batches.Count} of epoch {epoch + 1}: {batch.Length} sequences × "
-                        + $"{batch.Max(i => train[i].Tokens.Length) - 1} tokens…");
-                    var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing);
-                    float batchLoss = lossTensor.Item();                             // waits for the forward pass
-                    double forward = batchWatch.Elapsed.TotalSeconds;
-                    lossTensor.Backward();
-                    model.Device.Synchronize();
-                    loss += batchLoss;
-                    tokens += count;
-                    trace?.Invoke($"  forward {forward:F2} s, backward {batchWatch.Elapsed.TotalSeconds - forward:F2} s, loss {batchLoss * normalizer / Math.Max(1, batch.Sum(i => train[i].TrainedTokens)):F4}");
-                }
-
-                if (options.MaxGradientNorm > 0f)
-                {
-                    optimizer.ClipGradientNorm(options.MaxGradientNorm);
-                }
-
-                float rate = optimizer.LearningRate;
-                optimizer.Step();
+                var (loss, tokens) = RunStep(model, train, group, optimizer, options, cancellationToken, trace,
+                    b => $"step {step + 1}/{totalSteps}, batch {first + b + 1}/{batches.Count} of epoch {epoch + 1}");
+                float rate = optimizer.LearningRate;                     // the rate RunStep's update used
                 schedule.Step();
                 step++;
                 float? evaluationLoss = null;
@@ -487,6 +503,98 @@ public static class FineTuner
         }
 
         return evaluations;
+    }
+
+    // One optimizer step over a group of batches (gradient accumulation): forward, backward, clipping, update. Returns
+    // the mean loss per trained token and the tokens covered.
+    private static (float Loss, long Tokens) RunStep(PretrainedModel model, IReadOnlyList<TrainingSequence> train, IReadOnlyList<int[]> group, AdamW optimizer,
+        FineTuningOptions options, CancellationToken cancellationToken, Action<string>? trace, Func<int, string> label)
+    {
+        var network = model.Network;
+        float normalizer = Math.Max(1, group.Sum(b => b.Sum(i => train[i].TrainedTokens)));
+        float loss = 0f;
+        long tokens = 0;
+        network.Train();
+        optimizer.ZeroGrad();
+        for (int b = 0; b < group.Count; b++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var batch = group[b];
+            var batchWatch = Stopwatch.StartNew();
+            using var scope = new TensorScope();
+            trace?.Invoke($"{label(b)}: {batch.Length} sequences × {batch.Max(i => train[i].Tokens.Length) - 1} tokens…");
+            var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing);
+            float batchLoss = lossTensor.Item();                             // waits for the forward pass
+            double forward = batchWatch.Elapsed.TotalSeconds;
+            lossTensor.Backward();
+            model.Device.Synchronize();
+            loss += batchLoss;
+            tokens += count;
+            trace?.Invoke($"  forward {forward:F2} s, backward {batchWatch.Elapsed.TotalSeconds - forward:F2} s, loss {batchLoss * normalizer / Math.Max(1, batch.Sum(i => train[i].TrainedTokens)):F4}");
+        }
+
+        if (options.MaxGradientNorm > 0f)
+        {
+            optimizer.ClipGradientNorm(options.MaxGradientNorm);
+        }
+
+        optimizer.Step();
+        model.Device.Synchronize();
+        return (loss, tokens);
+    }
+
+    /// <summary>
+    /// Measures training steps without a full run: <paramref name="warmup"/> steps first (the first pays one-time
+    /// setup), then <paramref name="timed"/> steps timed by the clock, then <paramref name="profiled"/> steps with every
+    /// GPU kernel timed (<see cref="GpuProfiler"/>; each kernel is waited for, so these steps run slower). The adapters
+    /// train during the measurement; discard the model's adapters afterwards (or reload the model).
+    /// </summary>
+    public static FineTuningProfile Profile(PretrainedModel model, IReadOnlyList<TrainingSequence> train, FineTuningOptions options, int warmup = 3,
+        int timed = 3, int profiled = 3, Action<string>? trace = null)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        if (!model.Network.Descendants().OfType<Linear>().Any(l => l.Adapter is not null))
+        {
+            model.AddAdapters(options.Rank, options.Alpha, options.Targets, options.Seed);
+        }
+
+        using var optimizer = new AdamW(model.Network.TrainableParameters().ToList(), options.LearningRate, weightDecay: options.WeightDecay);
+        var batches = Batches(train, options.BatchTokens, new Random(options.Seed));
+        int accumulation = Math.Max(1, options.GradientAccumulation);
+        int next = 0;
+        (float Loss, long Tokens, double Seconds) Step(string phase)
+        {
+            var group = Enumerable.Range(0, accumulation).Select(i => batches[(next + i) % batches.Count]).ToList();
+            next += accumulation;
+            var watch = Stopwatch.StartNew();
+            var (loss, tokens) = RunStep(model, train, group, optimizer, options, CancellationToken.None, trace, b => $"{phase} step, batch {b + 1}");
+            return (loss, tokens, watch.Elapsed.TotalSeconds);
+        }
+
+        for (int i = 0; i < warmup; i++)
+        {
+            Step("warm-up");
+        }
+
+        long timedTokens = 0;
+        double timedSeconds = 0;
+        for (int i = 0; i < timed; i++)
+        {
+            var (_, tokens, seconds) = Step("timed");
+            timedTokens += tokens;
+            timedSeconds += seconds;
+        }
+
+        GpuProfiler.Start(model.Device);
+        long profiledTokens = 0;
+        for (int i = 0; i < profiled; i++)
+        {
+            profiledTokens += Step("profiled").Tokens;
+        }
+
+        var kernels = GpuProfiler.Stop(model.Device);
+        model.Network.Eval();
+        return new FineTuningProfile(kernels, Math.Max(1, profiled), profiledTokens, timedSeconds / Math.Max(1, timed), timedTokens / (double)Math.Max(1, timed));
     }
 
     /// <summary>Mean loss per trained token of <paramref name="sequences"/> (no gradients).</summary>
