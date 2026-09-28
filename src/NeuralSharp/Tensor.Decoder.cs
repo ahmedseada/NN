@@ -282,12 +282,31 @@ public sealed partial class Tensor
             outputs[j] = Empty([m, layers[j].OutFeatures], input.Device);
         }
 
-        bool done = kind == 3
-            ? backend.MatMulLowRank(flat.Storage, layers[0].Weight.Storage, outputs[0].Storage, m, layers[0].OutFeatures, k, false, 0f,
-                us[0].Storage, layers[0].Adapter!.B.Storage, rank)
-            : backend.PackedMatMulLowRank(kind == 2 ? 2 : 1, flat.Storage, m, k,
+        // FP8 copies of the frozen weights (Linear.AttachFloat8): y = u·B first, then x·W on FP8 tensor cores added to it.
+        bool done = false;
+        if (layers.All(l => l.Float8 is not null))
+        {
+            done = true;
+            for (int j = 0; j < layers.Count && done; j++)
+            {
+                var f8 = layers[j].Float8!;
+                backend.BatchedMatMul(us[j].Storage, layers[j].Adapter!.B.Storage, outputs[j].Storage, 1, m, layers[j].OutFeatures, rank, false, false, 0f);
+                done = backend.Float8MatMul(flat.Storage, m, k, f8.Values.Storage, f8.Scales.Storage, f8.Columns, outputs[j].Storage, 1f);
+            }
+        }
+
+        if (!done && kind == 3)
+        {
+            done = backend.MatMulLowRank(flat.Storage, layers[0].Weight.Storage, outputs[0].Storage, m, layers[0].OutFeatures, k, false, 0f,
+                us[0].Storage, layers[0].Adapter!.B.Storage, rank);
+        }
+        else if (!done)
+        {
+            done = backend.PackedMatMulLowRank(kind == 2 ? 2 : 1, flat.Storage, m, k,
                 [.. layers.Select((l, j) => (kind == 2 ? l.BFloat16!.Packed.Storage : l.Int4!.Packed.Storage, kind == 2 ? null : l.Int4!.Scales.Storage,
                     outputs[j].Storage, l.OutFeatures, us[j].Storage, l.Adapter!.B.Storage))], rank);
+        }
+
         if (!done)
         {
             foreach (var unused in us.Concat(outputs))

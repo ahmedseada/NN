@@ -359,6 +359,17 @@ public sealed record FineTuningOptions
     /// </summary>
     public bool CudaGraphs { get; init; } = true;
 
+    /// <summary>
+    /// Forward products of the frozen base weights on FP8 (e4m3) tensor cores (compute capability 8.9 and newer): each
+    /// weight is quantized once per output column, activations per row as they are read; the backward pass stays in
+    /// bfloat16. Checked first: the loss of a sample of the training data with FP8 must be within
+    /// <see cref="Float8Tolerance"/> of the bfloat16 loss, otherwise training continues in bfloat16.
+    /// </summary>
+    public bool Float8 { get; init; }
+
+    /// <summary>Largest relative difference between the FP8 and the bfloat16 loss that <see cref="Float8"/> accepts.</summary>
+    public float Float8Tolerance { get; init; } = 0.02f;
+
     /// <summary>Batches whose gradients are added before each optimizer step.</summary>
     public int GradientAccumulation { get; init; } = 1;
 
@@ -475,6 +486,7 @@ public static class FineTuner
         }
 
         var parameters = network.TrainableParameters().ToList();
+        using var float8 = PrepareFloat8(model, train, options, trace);
         using var optimizer = new AdamW(parameters, options.LearningRate, weightDecay: options.WeightDecay);
         var random = new Random(options.Seed);
         var epochBatches = Enumerable.Range(0, options.Epochs).Select(_ => MakeBatches(model, train, options, random)).ToList();
@@ -566,6 +578,45 @@ public static class FineTuner
         public void Dispose() => _graph?.Dispose();
     }
 
+    // FP8 copies of the frozen weights of the layers with adapters (options.Float8), kept only when a sample's loss with
+    // them is within the tolerance of its bfloat16 loss. Disposing the result removes them again.
+    private static IDisposable? PrepareFloat8(PretrainedModel model, IReadOnlyList<TrainingSequence> train, FineTuningOptions options, Action<string>? trace)
+    {
+        if (!options.Float8)
+        {
+            return null;
+        }
+
+        var layers = model.Network.Descendants().OfType<Linear>().Where(l => l.Adapter is not null).ToList();
+        var removal = new Float8Removal(layers);
+        int count = Math.Min(16, train.Count);
+        var sample = Enumerable.Range(0, count).Select(i => train[(int)((long)i * train.Count / count)]).ToList();
+        float reference = Evaluate(model, sample, options.BatchTokens, options.LossChunkRows);
+        int attached = layers.Count(l => l.AttachFloat8());
+        if (attached == 0)
+        {
+            trace?.Invoke("FP8 products are not available here (CUDA, compute capability 8.9 or newer); training stays in bfloat16");
+            return removal;
+        }
+
+        float quantized = Evaluate(model, sample, options.BatchTokens, options.LossChunkRows);
+        double difference = Math.Abs(quantized - reference) / Math.Max(1e-6, Math.Abs(reference));
+        trace?.Invoke($"FP8 check on {count} training sequences: loss {quantized:F4} with FP8 products of the frozen weights, {reference:F4} in bfloat16 "
+                      + $"({difference:P2} apart, {options.Float8Tolerance:P0} allowed); {attached} of {layers.Count} layers");
+        if (!(difference <= options.Float8Tolerance))
+        {
+            removal.Dispose();
+            trace?.Invoke("FP8 loss too far from bfloat16's: training stays in bfloat16");
+        }
+
+        return removal;
+    }
+
+    private sealed class Float8Removal(List<Linear> layers) : IDisposable
+    {
+        public void Dispose() => layers.ForEach(l => l.DetachFloat8());
+    }
+
     private static int MostTrained(IEnumerable<Batch> batches, IReadOnlyList<TrainingSequence> train) =>
         batches.Select(b => b.Sequences.Sum(i => train[i].TrainedTokens)).DefaultIfEmpty(0).Max();
 
@@ -630,6 +681,7 @@ public static class FineTuner
             model.AddAdapters(options.Rank, options.Alpha, options.Targets, options.Seed);
         }
 
+        using var float8 = PrepareFloat8(model, train, options, trace);
         using var optimizer = new AdamW(model.Network.TrainableParameters().ToList(), options.LearningRate, weightDecay: options.WeightDecay);
         var batches = MakeBatches(model, train, options, new Random(options.Seed));
         int accumulation = Math.Max(1, options.GradientAccumulation);

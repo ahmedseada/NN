@@ -195,6 +195,24 @@ internal abstract class Backend
     public virtual bool MatMulLowRank(Storage a, Storage b, Storage c, int m, int n, int k, bool transB, float beta, Storage u, Storage v, int rank) => false;
 
     /// <summary>
+    /// k rounded up for <see cref="Float8QuantizeWeight"/>'s values (0 when the device has no FP8 products): the values
+    /// take n · paddedK bytes, n · paddedK / 4 floats of storage.
+    /// </summary>
+    public virtual int Float8PaddedK(int k) => 0;
+
+    /// <summary>
+    /// Quantizes a frozen weight w [k, n] (float32) once for <see cref="Float8MatMul"/>: FP8 (e4m3) values, k-major per
+    /// column ([n, paddedK] bytes), and one scale per column [n]. Returns false when unsupported.
+    /// </summary>
+    public virtual bool Float8QuantizeWeight(Storage w, int k, int n, Storage values, Storage scales) => false;
+
+    /// <summary>
+    /// y = beta·y + x · w on FP8 tensor cores for x [m, k] (quantized per row as it is read, one scale each) and a weight
+    /// quantized by <see cref="Float8QuantizeWeight"/>. Returns false when unsupported.
+    /// </summary>
+    public virtual bool Float8MatMul(Storage x, int m, int k, Storage values, Storage scales, int n, Storage y, float beta) => false;
+
+    /// <summary>
     /// Products of one input x [m, k] through 1-3 packed layers (<paramref name="kind"/> as in <see cref="PackedMatMulMany"/>),
     /// each with a low-rank term: y_j = x · w_j + u_j · v_j for u_j [m, rank] and v_j [rank, n_j], rank ≤ 32, in one pass.
     /// Returns false when the device has no such pass.

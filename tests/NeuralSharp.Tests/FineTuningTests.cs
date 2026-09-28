@@ -449,11 +449,11 @@ internal static partial class Tests
             return Math.Sqrt(difference / Math.Max(norm, 1e-30));
         }
 
-        void Close(float[] expected, float[] actual, string what)
+        void Close(float[] expected, float[] actual, string what, double tolerance = 2e-2)
         {
             Check(expected.Length == actual.Length, $"{what}: length {actual.Length}, expected {expected.Length}");
             double error = RelativeError(expected, actual);
-            Check(error < 2e-2, $"{what}: relative error {error:G3}");
+            Check(error < tolerance, $"{what}: relative error {error:G3}");
         }
 
         using var precision = MixedPrecision.BFloat16();
@@ -480,9 +480,16 @@ internal static partial class Tests
             }
         }
 
-        foreach (string format in new[] { "float32", "bfloat16", "int4" })
+        bool fp8Available = device.Backend.Float8PaddedK(In) > 0;
+        foreach (string format in new[] { "float32", "bfloat16", "int4", "bfloat16 + fp8", "float32 + fp8" })
         {
-            foreach (int count in format == "float32" ? new[] { 1 } : new[] { 1, 2, 3 })
+            bool fp8 = format.EndsWith("fp8", StringComparison.Ordinal);
+            if (fp8 && !fp8Available)
+            {
+                continue;
+            }
+
+            foreach (int count in format.StartsWith("float32", StringComparison.Ordinal) ? new[] { 1 } : new[] { 1, 2, 3 })
             {
                 var weights = Enumerable.Range(0, count).Select(_ => Values(In * Out)).ToArray();
                 var aValues = Enumerable.Range(0, count).Select(_ => Values(In * Rank)).ToArray();
@@ -496,7 +503,7 @@ internal static partial class Tests
                     for (int j = 0; j < count; j++)
                     {
                         layers[j] = Linear.FromWeights(Tensor.From(weights[j], [In, Out], device));
-                        if (format == "bfloat16")
+                        if (format.StartsWith("bfloat16", StringComparison.Ordinal))
                         {
                             layers[j].ToBFloat16();
                         }
@@ -513,7 +520,16 @@ internal static partial class Tests
                     Tensor[] ys;
                     if (fused)
                     {
+                        if (fp8)
+                        {
+                            Check(layers.All(l => l.AttachFloat8()), $"{format}: FP8 copies of the weights");
+                        }
+
                         ys = Tensor.LoraProducts(x, layers) ?? throw new Exception($"{format} × {count}: no fused LoRA products on {device}");
+                        foreach (var layer in layers)
+                        {
+                            layer.DetachFloat8();
+                        }
                     }
                     else
                     {
@@ -535,7 +551,7 @@ internal static partial class Tests
                 for (int i = 0; i < expected.Length; i++)
                 {
                     string part = i < count ? $"output {i}" : i == count ? "input gradient" : i <= 2 * count ? $"A gradient {i - count - 1}" : $"B gradient {i - 2 * count - 1}";
-                    Close(expected[i], actual[i], $"{format} × {count}: {part}");
+                    Close(expected[i], actual[i], $"{format} × {count}: {part}", fp8 && i < count ? 1e-1 : 2e-2);
                 }
             }
         }

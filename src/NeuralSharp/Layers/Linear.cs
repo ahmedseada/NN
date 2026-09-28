@@ -202,11 +202,44 @@ public sealed class Linear : Module
 
     private Tensor? _tiedTransposed;
 
+    /// <summary>An FP8 copy of the frozen weight used for forward products (see <see cref="AttachFloat8"/>), else null.</summary>
+    internal Float8Weight? Float8 { get; private set; }
+
+    /// <summary>
+    /// Gives the layer an FP8 (e4m3) copy of its frozen weight, used for its forward products with an adapter (the
+    /// backward pass keeps the layer's own weights). False when the weight trains, the layer is tied or int8, or the
+    /// device has no FP8 products.
+    /// </summary>
+    internal bool AttachFloat8()
+    {
+        if (Float8 is not null)
+        {
+            return true;
+        }
+
+        if (_tiedTo is not null || Int8 is not null || _weight is { RequiresGrad: true })
+        {
+            return false;
+        }
+
+        using var dense = _weight is null ? Int4?.Dequantize() ?? BFloat16!.Dequantize() : null;
+        Float8 = Float8Weight.Create(dense ?? _weight!);
+        return Float8 is not null;
+    }
+
+    /// <summary>Removes the FP8 copy (<see cref="AttachFloat8"/>).</summary>
+    internal void DetachFloat8()
+    {
+        Float8?.Dispose();
+        Float8 = null;
+    }
+
     /// <inheritdoc />
     public override void Dispose()
     {
         _tiedTransposed?.Dispose();
         _tiedTransposed = null;
+        DetachFloat8();
         base.Dispose();
     }
 

@@ -1038,6 +1038,65 @@ internal sealed unsafe partial class CudaBackend : Backend
         }
     }
 
+    public override int Float8PaddedK(int k) => EightBitReady(fp8: true) ? PtxKernels.EightBitPaddedK(k) : 0;
+
+    public override bool Float8QuantizeWeight(Storage w, int k, int n, Storage values, Storage scales)
+    {
+        if (!EightBitReady(fp8: true))
+        {
+            return false;
+        }
+
+        // The columns of w [k][n] become rows of k bytes: exact maxima (not the delayed ones), once.
+        var amax = Allocate(n, zeroed: true);
+        try
+        {
+            Launch(TensorKernel("absmax_cols_e4m3")!.Value, (uint)((n + 255) / 256), (uint)((k + 63) / 64), 1, 256, 1, P(w), P(amax), U(n), U(k), U(n), U(64));
+            QuantizeColumnsWithMaxima(true, P(w), n, values, scales, n, k, PtxKernels.EightBitPaddedK(k), amax, null);
+        }
+        finally
+        {
+            amax.Release();
+        }
+
+        return true;
+    }
+
+    public override bool Float8MatMul(Storage x, int m, int k, Storage values, Storage scales, int n, Storage y, float beta)
+    {
+        if (m == 0 || n == 0 || !EightBitReady(fp8: true))
+        {
+            return false;
+        }
+
+        int kp = PtxKernels.EightBitPaddedK(k);
+        var (x8, sx, owned) = Quantized(true, P(x), k, byRows: true, m, k, kp);
+        try
+        {
+            if (_profile is not null)
+            {
+                _profileLabel = $"gemm8_e4m3_nn_fp8w {m}x{n}x{k}";
+                _profileFlops = 2.0 * m * n * k;
+            }
+
+            t_sharedBytes = PtxKernels.EightBitShared;
+            Launch(TensorKernel(PtxKernels.EightBitKernel(true, GemmEpilogue.None))!.Value, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
+                (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), 1, PtxKernels.TensorThreads, 1,
+                P(x8), P(values), P(y), U(m), U(n), U(kp), F(beta), P(sx), P(scales), 0UL, U(kp), U(kp), U(n), 0UL);
+            Interlocked.Increment(ref TensorCoreLaunches);
+        }
+        finally
+        {
+            if (owned)
+            {
+                x8.Release();
+                sx.Release();
+            }
+        }
+
+        return true;
+    }
+
     // Quantized operands kept while a ReuseQuantizedOperands scope is open (on the thread that opened it).
     [ThreadStatic]
     private static Dictionary<(ulong Address, int Ld, bool ByRows, int Rows, int K, bool Fp8), (Storage Values, Storage Scales)>? t_reuse;
