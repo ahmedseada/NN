@@ -8,9 +8,17 @@ or CPU from a CSV of labeled messages and serves predictions from one model file
 |---|---|
 | `Qasd.Core` | the model: training, evaluation, prediction, one-file save / load |
 | `Qasd` | the command line (`qasd`): train, evaluate, predict, info |
-| `Qasd.Api` | the HTTP service (ASP.NET Core) serving a trained model, API reference with Scalar |
+| `Qasd.Tuned` | the command line (`qasd-tuned`) that tunes a pretrained chat model (LoRA) on the same data: train, evaluate, predict (streamed), benchmark |
+| `Qasd.Api` | the HTTP service (ASP.NET Core) serving both models, as one JSON response or streamed; test page and Scalar reference |
 
-`apps/Qasd.slnx` opens all three.
+`apps/Qasd.slnx` opens all four.
+
+| | classifier (`qasd`) | tuned model (`qasd-tuned`) |
+|---|---|---|
+| what it is | hashed n-grams and a small network | a pretrained chat model (default Qwen/Qwen2.5-0.5B-Instruct) taught to answer with the intent |
+| trains in | seconds on a CPU | minutes on a GPU (hours on a CPU) |
+| predicts in | about 0.1 ms per message on a CPU | tens of milliseconds per message |
+| result | intent, confidence, every intent's probability | the same (each intent scored as the model's answer), plus its answer streamed token by token |
 
 How it works: each message becomes a hashed bag of words, word pairs and character 2-4-grams (TF-IDF weighted; Arabic
 normalized: diacritics, alef / yaa / taa marbuta forms, Arabic-Indic digits), and a small network built with NeuralSharp
@@ -33,6 +41,26 @@ everything with `--test-fraction 0`. Other options: `--epochs`, `--batch-size`, 
 dotnet run -c Release --project apps/Qasd -- predict models/intents.nsm "Book me with Dr. Heba on Tuesday" "هلا"
 dotnet run -c Release --project apps/Qasd -- predict models/intents.nsm --json --min-confidence 0.6 < messages.txt
 dotnet run -c Release --project apps/Qasd -- evaluate models/intents.nsm new-labeled.csv
+```
+
+## Tune a language model (Qasd.Tuned)
+
+```
+dotnet run -c Release --project apps/Qasd.Tuned -- train apps/Qasd/data/plan-queries.csv --out models/qasd-tuned --cuda
+dotnet run -c Release --project apps/Qasd.Tuned -- predict models/qasd-tuned "Book me with Dr. Heba on Tuesday" --stream --cuda
+```
+
+It downloads the base model once (`--model` picks another: a Hugging Face id, a folder, a .gguf file or `ollama:name`),
+tunes LoRA adapters so each message is answered with its intent, and holds out the same messages as `qasd train`, so the
+two scores compare directly. The output folder holds the adapter and `qasd-tuned.json` (base model, intents,
+instruction). Predictions score every intent as the model's answer, so the label is always one of the trained intents.
+
+Compare both models on a device:
+
+```
+dotnet run -c Release --project apps/Qasd.Tuned -- benchmark apps/Qasd/data/plan-queries.csv                 (CPU)
+dotnet run -c Release --project apps/Qasd.Tuned -- benchmark apps/Qasd/data/plan-queries.csv --devices cpu,cuda
+dotnet run -c Release --project apps/Qasd.Tuned -- benchmark apps/Qasd/data/plan-queries.csv --sample 400      (quick CPU run)
 ```
 
 ## Serve (Qasd.Api)
@@ -60,15 +88,34 @@ settings come from `appsettings.json` (section `IntentModel`), or environment va
 | `MaxBatch` | 256 | most messages per batch request |
 | `MaxTextLength` | 4000 | longest message in characters |
 | `AdminKey` | empty | the `X-Admin-Key` for `POST /v1/model/reload`; empty disables reloading |
+| `TunedPath` | empty | the folder from `qasd-tuned train`; empty: only the classifier is served |
+| `TunedDevice` | `cpu` | where the tuned model runs (`cuda` recommended) |
+| `MaxTunedBatch` | 32 | most messages per batch request to the tuned model |
+| `DefaultModel` | `classifier` | the model requests use when they name none |
 
 | Endpoint | |
 |---|---|
-| `POST /v1/classify` | `{"text": "..."}` → label, confidence, accepted, every intent's probability |
-| `POST /v1/classify/batch` | `{"texts": ["...", "..."]}` → the results in order (one pass through the model) |
+| `POST /v1/classify` | `{"text": "...", "model": "classifier" \| "tuned", "stream": false}` → label, confidence, accepted, every intent's probability |
+| `POST /v1/classify/batch` | `{"texts": ["...", "..."], "model": ..., "stream": false}` → the results in order |
+| `GET /v1/models` | both models: available, default, intents, device |
 | `GET /v1/model` | the model file, its intents, device and load time |
 | `POST /v1/model/reload` | after retraining: loads the file again without dropping requests in flight |
 | `GET /health` | healthy while a model is loaded |
 | `GET /openapi/v1.json` | the OpenAPI document |
+
+With `"stream": true` both classify endpoints answer with Server-Sent Events (`text/event-stream`) instead of one
+JSON response:
+
+```
+event: token      data: {"index":0,"token":"function"}                    (tuned model: its answer as it is generated)
+event: result     data: {"index":0,"result":{"label":"function_call","confidence":0.97,...}}   (one per message)
+event: done       data: {"count":1,"elapsedMilliseconds":41.2,"firstTokenMilliseconds":18.5,"model":"tuned"}
+```
+
+The test page switches between the two models; with the tuned model selected, the Stream switch shows its answer as it
+is generated, with the time to the first token.
+
+![The tuned model on the test page](docs/qasd-tuned.png)
 
 The model is loaded at startup (a missing or broken file stops the service with a clear message, not the first
 request). Invalid input gets a 400 with ProblemDetails.

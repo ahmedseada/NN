@@ -64,19 +64,22 @@ public sealed class ModelHost : IDisposable
             throw new FileNotFoundException($"No intent model at {Path.GetFullPath(path)}: train one with 'qasd train … --out {path}' or set IntentModel:Path.", path);
         }
 
-        var device = _options.Device.ToLowerInvariant() switch
-        {
-            "auto" => NeuralSharp.Device.IsCudaAvailable ? NeuralSharp.Device.Cuda() : NeuralSharp.Device.Cpu,
-            "cpu" => NeuralSharp.Device.Cpu,
-            "cuda" or "gpu" => NeuralSharp.Device.Cuda(),
-            ['c', 'u', 'd', 'a', ':', .. var index] => NeuralSharp.Device.Cuda(int.Parse(index, System.Globalization.CultureInfo.InvariantCulture)),
-            _ => throw new InvalidOperationException($"IntentModel:Device '{_options.Device}' is not auto, cpu, cuda or cuda:N."),
-        };
+        var device = ParseDevice(_options.Device);
         var classifier = TextClassifier.Load(path, device);
         classifier.Predict(["warm up", "تسخين"]);                                 // compile and allocate now, not on the first request
         _logger.LogInformation("Loaded intent model {Path} on {Device}: {Labels}", Path.GetFullPath(path), device.Name, string.Join(", ", classifier.Labels));
         return new Handle(classifier, Path.GetFullPath(path), DateTimeOffset.UtcNow);
     }
+
+    /// <summary>auto (the GPU when there is one), cpu, cuda or cuda:N.</summary>
+    public static Device ParseDevice(string name) => name.ToLowerInvariant() switch
+    {
+        "auto" => NeuralSharp.Device.IsCudaAvailable ? NeuralSharp.Device.Cuda() : NeuralSharp.Device.Cpu,
+        "cpu" => NeuralSharp.Device.Cpu,
+        "cuda" or "gpu" => NeuralSharp.Device.Cuda(),
+        ['c', 'u', 'd', 'a', ':', .. var index] => NeuralSharp.Device.Cuda(int.Parse(index, System.Globalization.CultureInfo.InvariantCulture)),
+        _ => throw new InvalidOperationException($"Device '{name}' is not auto, cpu, cuda or cuda:N."),
+    };
 
     /// <summary>A loaded model with a count of the requests using it.</summary>
     public sealed class Handle(TextClassifier classifier, string path, DateTimeOffset loadedAt)

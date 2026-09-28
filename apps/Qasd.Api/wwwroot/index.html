@@ -77,6 +77,23 @@
   .model dt { color: var(--muted); }
   .model dd { margin: 0; overflow-wrap: anywhere; }
   .error { color: var(--danger); font-size: 14px; }
+  .controls { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .segmented { display: inline-flex; padding: 3px; border-radius: 10px; background: var(--panel-2); border: 1px solid var(--border); }
+  .segmented button { border: 0; background: transparent; padding: 6px 14px; border-radius: 8px; font-weight: 600; font-size: 13px; color: var(--muted); }
+  .segmented button.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+  .segmented button:disabled { opacity: .45; }
+  .switch { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--muted); cursor: pointer; user-select: none; }
+  .switch input { appearance: none; width: 36px; height: 20px; border-radius: 999px; background: var(--border); position: relative; cursor: pointer; transition: background .15s; margin: 0; }
+  .switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+  .switch input:checked { background: var(--accent); }
+  .switch input:checked::after { transform: translateX(16px); }
+  .switch[hidden] { display: none; }
+  .model-note { font-size: 12px; color: var(--muted); }
+  .answer { margin-top: 8px; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--muted); white-space: pre-wrap; unicode-bidi: plaintext; }
+  .answer b { color: var(--text); font-weight: 600; }
+  .caret { display: inline-block; width: 7px; height: 14px; background: var(--accent); vertical-align: -2px; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .pending { opacity: .75; }
 </style>
 </head>
 <body>
@@ -93,6 +110,14 @@
   <section class="left">
     <div class="card">
       <h2>Messages <span class="hint" id="count">0 messages</span></h2>
+      <div class="controls">
+        <div class="segmented" role="tablist" aria-label="Model">
+          <button id="m-classifier" class="on" data-model="classifier">Classifier</button>
+          <button id="m-tuned" data-model="tuned" disabled title="The tuned model is not configured">Tuned LLM</button>
+        </div>
+        <label class="switch" id="stream-switch" hidden><input type="checkbox" id="stream" checked> Stream</label>
+        <span class="model-note" id="model-note"></span>
+      </div>
       <textarea id="input" dir="auto" spellcheck="false" placeholder="One message per line — English, Arabic or mixed…"></textarea>
       <div class="row" style="margin-top: 12px">
         <button id="run" class="primary">Classify</button>
@@ -110,7 +135,7 @@
   <section class="right">
     <div class="stats">
       <div class="stat"><div class="v" id="m-count">–</div><div class="k">messages</div></div>
-      <div class="stat"><div class="v" id="m-round">–</div><div class="k">round trip</div></div>
+      <div class="stat"><div class="v" id="m-round">–</div><div class="k" id="m-round-k">round trip</div></div>
       <div class="stat"><div class="v" id="m-server">–</div><div class="k">model time</div></div>
       <div class="stat"><div class="v" id="m-accepted">–</div><div class="k">confident</div></div>
     </div>
@@ -153,23 +178,41 @@ function updateCount() {
   $("count").textContent = `${n} message${n === 1 ? "" : "s"}`;
 }
 
+let models = [], selected = "classifier";
+
+function current() { return models.find(m => m.name === selected); }
+
+function selectModel(name) {
+  selected = name;
+  for (const b of document.querySelectorAll(".segmented button")) b.classList.toggle("on", b.dataset.model === name);
+  $("stream-switch").hidden = name !== "tuned";
+  const m = current();
+  labels = m?.labels ?? labels;
+  $("model-note").textContent = name === "tuned" ? "language model: slower, streams its answer" : "about 0.1 ms per message";
+  $("device").textContent = m?.device ?? "";
+  $("device").hidden = !m?.device;
+  $("model").innerHTML = m ? `
+      <dt>model</dt><dd>${esc(m.name)} — ${esc(m.description)}</dd>
+      <dt>intents</dt><dd>${m.labels.map(l => `<span class="pill" style="--c:${color(l)}">${esc(l)}</span>`).join(" ")}</dd>
+      <dt>device</dt><dd>${esc(m.device ?? "")}</dd>
+      <dt>confident at</dt><dd>${pct(minConfidence)} or more (below: send to the fallback)</dd>
+      <dt>source</dt><dd>${esc(m.source ?? "")}</dd>` : "";
+}
+
 async function loadModel() {
   try {
-    const r = await fetch("/v1/model");
+    const r = await fetch("/v1/models");
     if (!r.ok) throw new Error(r.statusText);
-    const m = await r.json();
-    labels = m.labels;
-    minConfidence = m.minConfidence;
-    $("status").textContent = "model loaded";
+    const body = await r.json();
+    models = body.models;
+    minConfidence = body.minConfidence;
+    labels = models.find(m => m.name === "classifier").labels;
+    const tuned = models.find(m => m.name === "tuned");
+    $("m-tuned").disabled = !tuned.available;
+    $("m-tuned").title = tuned.available ? tuned.description : `Not available: ${tuned.source}`;
+    $("status").textContent = tuned.available ? "2 models loaded" : "classifier loaded";
     $("status").className = "badge ok";
-    $("device").textContent = m.device;
-    $("device").hidden = false;
-    $("model").innerHTML = `
-      <dt>intents</dt><dd>${m.labels.map(l => `<span class="pill" style="--c:${color(l)}">${esc(l)}</span>`).join(" ")}</dd>
-      <dt>device</dt><dd>${esc(m.device)}</dd>
-      <dt>confident at</dt><dd>${pct(m.minConfidence)} or more (below: send to the fallback)</dd>
-      <dt>loaded</dt><dd>${new Date(m.loadedAt).toLocaleString()}</dd>
-      <dt>file</dt><dd>${esc(m.path)}</dd>`;
+    selectModel(models.find(m => m.default && m.available)?.name ?? "classifier");
   } catch (e) {
     $("status").textContent = "model unavailable";
     $("status").className = "badge bad";
@@ -181,20 +224,26 @@ async function classify() {
   const texts = lines();
   $("error").hidden = true;
   if (texts.length === 0) { $("input").focus(); return; }
+  const stream = selected === "tuned" && $("stream").checked;
   $("run").disabled = true;
   $("run").textContent = "Classifying…";
   const start = performance.now();
   try {
     const r = await fetch("/v1/classify/batch", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ texts }),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ texts, model: selected, stream }),
     });
-    const body = await r.json();
-    const roundTrip = performance.now() - start;
     if (!r.ok) {
+      const body = await r.json();
       const details = body.errors ? Object.values(body.errors).flat().join(" ") : (body.detail || body.title);
       throw new Error(details || r.statusText);
     }
-    render(body, roundTrip);
+
+    if (stream) {
+      await readStream(r, texts, start);
+    } else {
+      const body = await r.json();
+      render(body.results, performance.now() - start, body.elapsedMilliseconds, null);
+    }
   } catch (e) {
     $("error").textContent = String(e.message || e);
     $("error").hidden = false;
@@ -204,22 +253,52 @@ async function classify() {
   }
 }
 
-function render(body, roundTrip) {
-  const results = body.results;
-  const accepted = results.filter(r => r.accepted).length;
-  $("m-count").textContent = results.length;
-  $("m-round").innerHTML = `${roundTrip.toFixed(1)}<small>ms</small>`;
-  $("m-server").innerHTML = `${body.elapsedMilliseconds.toFixed(2)}<small>ms</small>`;
-  $("m-accepted").innerHTML = `${accepted}<small>/ ${results.length}</small>`;
-  $("per").textContent = `${(body.elapsedMilliseconds / results.length).toFixed(3)} ms per message in the model`;
+// Server-Sent Events from the response body: "token" pieces go into each message's answer line as they arrive,
+// "result" fills its card, "done" completes the metrics.
+async function readStream(response, texts, start) {
+  const results = texts.map(text => ({ text, pending: true, answer: "" }));
+  render(results, null, null, null);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "", firstToken = null;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let end;
+    while ((end = buffer.indexOf("\n\n")) >= 0) {
+      const block = buffer.slice(0, end);
+      buffer = buffer.slice(end + 2);
+      const name = /^event: (.*)$/m.exec(block)?.[1];
+      const data = JSON.parse(/^data: (.*)$/m.exec(block)?.[1] ?? "null");
+      if (name === "token") {
+        firstToken ??= performance.now() - start;
+        results[data.index].answer += data.token;
+        updateCard(data.index, results[data.index]);
+      } else if (name === "result") {
+        firstToken ??= performance.now() - start;
+        results[data.index] = { ...data.result, answer: results[data.index].answer };
+        updateCard(data.index, results[data.index]);
+        summarize(results.filter(x => !x.pending), performance.now() - start, null, firstToken);
+      } else if (name === "done") {
+        summarize(results, performance.now() - start, data.elapsedMilliseconds, firstToken);
+      } else if (name === "error") {
+        throw new Error(data.message);
+      }
+    }
+  }
+}
 
-  const counts = Object.fromEntries(labels.map(l => [l, 0]));
-  results.forEach(r => counts[r.label] = (counts[r.label] || 0) + 1);
-  $("dist").innerHTML = labels.filter(l => counts[l] > 0)
-    .map(l => `<div style="width:${counts[l] / results.length * 100}%;background:${color(l)}" title="${esc(l)}: ${counts[l]}"></div>`).join("");
-  $("legend").innerHTML = labels.map(l => `<span style="--c:${color(l)}">${esc(l)} · ${counts[l] || 0}</span>`).join("");
+function card(r) {
+  if (r.pending) {
+    return `
+      <div class="result pending">
+        <div class="top"><div class="text" dir="auto" title="${esc(r.text)}">${esc(r.text)}</div><span class="conf">…</span></div>
+        <div class="answer">answer: <b>${esc(r.answer ?? "")}</b><span class="caret"></span></div>
+      </div>`;
+  }
 
-  $("results").innerHTML = results.map(r => `
+  return `
     <div class="result">
       <div class="top">
         <div class="text" dir="auto" title="${esc(r.text)}">${esc(r.text)}</div>
@@ -227,6 +306,7 @@ function render(body, roundTrip) {
         <span class="pill" style="--c:${color(r.label)}">${esc(r.label)}</span>
         <span class="conf">${pct(r.confidence)}</span>
       </div>
+      ${r.answer !== undefined ? `<div class="answer">answer: <b>${esc(r.answer.trim())}</b></div>` : ""}
       <div class="bars">
         ${r.probabilities.map(p => `
           <div class="bar" style="--c:${color(p.label)}">
@@ -235,9 +315,37 @@ function render(body, roundTrip) {
             <span class="n">${pct(p.probability)}</span>
           </div>`).join("")}
       </div>
-    </div>`).join("");
+    </div>`;
 }
 
+function updateCard(index, r) {
+  const node = $("results").children[index];
+  if (node) node.outerHTML = card(r);
+}
+
+function summarize(results, roundTrip, serverMs, firstToken) {
+  const done = results.filter(r => !r.pending);
+  const accepted = done.filter(r => r.accepted).length;
+  $("m-count").textContent = done.length;
+  if (roundTrip !== null) $("m-round").innerHTML = `${roundTrip.toFixed(1)}<small>ms</small>`;
+  $("m-server").innerHTML = serverMs === null ? "…" : `${serverMs.toFixed(2)}<small>ms</small>`;
+  $("m-accepted").innerHTML = `${accepted}<small>/ ${done.length}</small>`;
+  $("per").textContent = (firstToken !== null ? `first token ${firstToken.toFixed(0)} ms · ` : "")
+    + (serverMs !== null && done.length ? `${(serverMs / done.length).toFixed(3)} ms per message in the model` : "");
+
+  const counts = Object.fromEntries(labels.map(l => [l, 0]));
+  done.forEach(r => counts[r.label] = (counts[r.label] || 0) + 1);
+  $("dist").innerHTML = labels.filter(l => counts[l] > 0)
+    .map(l => `<div style="width:${counts[l] / Math.max(1, done.length) * 100}%;background:${color(l)}" title="${esc(l)}: ${counts[l]}"></div>`).join("");
+  $("legend").innerHTML = labels.map(l => `<span style="--c:${color(l)}">${esc(l)} · ${counts[l] || 0}</span>`).join("");
+}
+
+function render(results, roundTrip, serverMs, firstToken) {
+  $("results").innerHTML = results.map(card).join("");
+  if (results.some(r => !r.pending)) summarize(results, roundTrip, serverMs, firstToken);
+}
+
+for (const b of document.querySelectorAll(".segmented button")) b.addEventListener("click", () => selectModel(b.dataset.model));
 $("examples").innerHTML = examples.map(e => `<button class="chip" dir="auto">${esc(e)}</button>`).join("");
 $("examples").addEventListener("click", e => {
   if (!e.target.classList.contains("chip")) return;

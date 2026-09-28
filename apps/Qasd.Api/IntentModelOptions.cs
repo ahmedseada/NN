@@ -18,6 +18,18 @@ public sealed class IntentModelOptions
     /// <summary>Longest message in characters (longer ones are refused).</summary>
     public int MaxTextLength { get; set; } = 4000;
 
+    /// <summary>The folder written by 'qasd-tuned train' (adapter + qasd-tuned.json); empty: the tuned model is not served.</summary>
+    public string? TunedPath { get; set; }
+
+    /// <summary>Where the tuned model runs: cpu (default), cuda, cuda:N or auto (a language model is much faster on the GPU).</summary>
+    public string TunedDevice { get; set; } = "cpu";
+
+    /// <summary>Most messages per batch request to the tuned model (it is slower than the classifier).</summary>
+    public int MaxTunedBatch { get; set; } = 32;
+
+    /// <summary>The model requests use when they name none: classifier or tuned.</summary>
+    public string DefaultModel { get; set; } = "classifier";
+
     /// <summary>When set, POST /v1/model/reload needs this value in the X-Admin-Key header; when empty, reloading is disabled.</summary>
     public string? AdminKey { get; set; }
 }

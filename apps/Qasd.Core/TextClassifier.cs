@@ -78,6 +78,34 @@ public sealed record TextClassifierReport(IReadOnlyList<string> Labels, int[,] C
     /// <summary>Share classified right.</summary>
     public double Accuracy => Count == 0 ? 0 : Enumerable.Range(0, Labels.Count).Sum(i => Confusion[i, i]) / (double)Count;
 
+    /// <summary>
+    /// The report for <paramref name="predictions"/> of <paramref name="examples"/> (in the same order) over
+    /// <paramref name="labels"/>; examples whose label is not one of them are left out.
+    /// </summary>
+    public static TextClassifierReport Create(IReadOnlyList<string> labels, IReadOnlyList<LabeledText> examples, IReadOnlyList<TextPrediction> predictions)
+    {
+        var index = labels.Select((l, i) => (l, i)).ToDictionary(p => p.l, p => p.i, StringComparer.Ordinal);
+        int k = labels.Count;
+        var confusion = new int[k, k];
+        for (int i = 0; i < examples.Count; i++)
+        {
+            if (index.TryGetValue(examples[i].Label.Trim(), out int actual) && index.TryGetValue(predictions[i].Label, out int predicted))
+            {
+                confusion[actual, predicted]++;
+            }
+        }
+
+        var scores = new List<LabelScores>();
+        for (int c = 0; c < k; c++)
+        {
+            int predicted = Enumerable.Range(0, k).Sum(a => confusion[a, c]), actual = Enumerable.Range(0, k).Sum(p => confusion[c, p]);
+            double precision = predicted == 0 ? 0 : confusion[c, c] / (double)predicted, recall = actual == 0 ? 0 : confusion[c, c] / (double)actual;
+            scores.Add(new LabelScores(labels[c], precision, recall, precision + recall == 0 ? 0 : 2 * precision * recall / (precision + recall), actual));
+        }
+
+        return new TextClassifierReport(labels, confusion, scores);
+    }
+
     /// <summary>Mean F1 over the labels (each label counts the same, however rare).</summary>
     public double MacroF1 => Scores.Count == 0 ? 0 : Scores.Average(s => s.F1);
 
@@ -409,32 +437,7 @@ public sealed class TextClassifier : IDisposable
     public TextClassifierReport Evaluate(IEnumerable<LabeledText> examples)
     {
         var list = examples.ToList();
-        var predictions = Predict([.. list.Select(e => e.Text)]);
-        var index = Labels.Select((l, i) => (l, i)).ToDictionary(p => p.l, p => p.i, StringComparer.Ordinal);
-        int k = Labels.Count;
-        var confusion = new int[k, k];
-        int unknown = 0;
-        for (int i = 0; i < list.Count; i++)
-        {
-            if (index.TryGetValue(list[i].Label.Trim(), out int actual))
-            {
-                confusion[actual, index[predictions[i].Label]]++;
-            }
-            else
-            {
-                unknown++;
-            }
-        }
-
-        var scores = new List<LabelScores>();
-        for (int c = 0; c < k; c++)
-        {
-            int predicted = Enumerable.Range(0, k).Sum(a => confusion[a, c]), actual = Enumerable.Range(0, k).Sum(p => confusion[c, p]);
-            double precision = predicted == 0 ? 0 : confusion[c, c] / (double)predicted, recall = actual == 0 ? 0 : confusion[c, c] / (double)actual;
-            scores.Add(new LabelScores(Labels[c], precision, recall, precision + recall == 0 ? 0 : 2 * precision * recall / (precision + recall), actual));
-        }
-
-        return new TextClassifierReport(Labels, confusion, scores);
+        return TextClassifierReport.Create(Labels, list, Predict([.. list.Select(e => e.Text)]));
     }
 
     /// <summary>Writes the model (weights, labels, feature settings) to one file.</summary>

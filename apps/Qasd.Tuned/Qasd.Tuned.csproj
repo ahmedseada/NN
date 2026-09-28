@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Tunes a pretrained chat model (LoRA) on the intent data: the language-model counterpart of the qasd classifier,
+       served by Qasd.Api next to it. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Qasd.Tuned</RootNamespace>
+    <AssemblyName>qasd-tuned</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Qasd.Core\Qasd.Core.csproj" />
+  </ItemGroup>
+
+</Project>
