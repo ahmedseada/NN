@@ -53,6 +53,15 @@ public static class Losses
         Tensor.TokenCrossEntropy(hidden, head, targets, weights, normalizer, chunkRows);
 
     /// <summary>
+    /// <see cref="TokenCrossEntropy"/> computed only on the rows listed in <paramref name="rows"/> (for example the trained
+    /// positions of a batch): the head runs on those rows alone. <paramref name="targets"/> and <paramref name="weights"/>
+    /// hold one value per listed row; other rows count as weight 0. Same loss and gradients as the full version.
+    /// </summary>
+    public static Tensor TokenCrossEntropyRows(Tensor hidden, Func<Tensor, Tensor> head, int[] rows, float[] targets, float[] weights, float normalizer,
+        int chunkRows = 1024) =>
+        Tensor.TokenCrossEntropyRows(hidden, head, rows, targets, weights, normalizer, chunkRows);
+
+    /// <summary>
     /// Binary cross-entropy for probabilities in (0, 1), e.g. after a <see cref="Layers.Sigmoid"/> layer:
     /// -mean(y·log p + (1 - y)·log(1 - p)). Prefer <see cref="BinaryCrossEntropyWithLogits"/> for stability.
     /// </summary>

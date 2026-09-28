@@ -728,8 +728,19 @@ public static class FineTuner
             }
         }
 
-        var loss = Losses.TokenCrossEntropy(hidden.Reshape(rows * length, hidden.Shape[^1]), h => head.Forward(h),
-            Tensor.From(targets, [rows * length], device), Tensor.From(weights, [rows * length], device), normalizer, chunkRows);
+        // The output layer and softmax run only on the positions that are trained (the assistant's tokens): prompts and
+        // padding have weight 0 and would only cost a vocabulary-wide product each.
+        var trained = new List<int>();
+        for (int i = 0; i < weights.Length; i++)
+        {
+            if (weights[i] != 0f)
+            {
+                trained.Add(i);
+            }
+        }
+
+        var loss = Losses.TokenCrossEntropyRows(hidden.Reshape(rows * length, hidden.Shape[^1]), h => head.Forward(h), [.. trained],
+            [.. trained.Select(i => targets[i])], [.. trained.Select(i => weights[i])], normalizer, chunkRows);
         return (loss, tokens);
     }
 }

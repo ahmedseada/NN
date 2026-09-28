@@ -8,7 +8,7 @@ internal static partial class Tests
 {
     private static readonly (string Name, Action<Device> Run)[] FineTuning =
     [
-        ("fine-tuning: chunked token cross-entropy matches the dense loss, its input gradient and a head adapter's gradient", TokenLoss),
+        ("fine-tuning: chunked token cross-entropy (all rows or trained rows only) and the frozen-transpose product match dense results and gradients", TokenLoss),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
@@ -327,7 +327,7 @@ internal static partial class Tests
         float normalizer = weights.Sum();
         var adapterB = Random(2 * Vocabulary);
 
-        float[] Run(bool chunked, out float[] hiddenGrad, out float[] adapterGrad)
+        float[] Run(int mode, out float[] hiddenGrad, out float[] adapterGrad)
         {
             using var head = new Linear(Dim, Vocabulary, bias: true, device, new Random(82));
             head.AddLora(rank: 2, alpha: 2, targets: _ => true, freezeBase: true, random: new Random(83));
@@ -335,7 +335,14 @@ internal static partial class Tests
             using var scope = new TensorScope();
             var hidden = Tensor.From(hiddenValues, [Rows, Dim], device, requiresGrad: true);
             Tensor loss;
-            if (chunked)
+            if (mode == 2)
+            {
+                // Only the rows with a weight: the head never sees the others.
+                int[] rows = [.. Enumerable.Range(0, Rows).Where(i => weights[i] != 0f)];
+                loss = Losses.TokenCrossEntropyRows(hidden, h => head.Forward(h), rows, [.. rows.Select(i => ids[i])], [.. rows.Select(i => weights[i])],
+                    normalizer, chunkRows: 3);
+            }
+            else if (mode == 1)
             {
                 using var targets = Tensor.From(ids, [Rows], device);
                 using var w = Tensor.From(weights, [Rows], device);
@@ -359,10 +366,31 @@ internal static partial class Tests
             return loss.ToArray();
         }
 
-        var expected = Run(false, out var expectedHidden, out var expectedAdapter);
-        var actual = Run(true, out var actualHidden, out var actualAdapter);
+        var expected = Run(0, out var expectedHidden, out var expectedAdapter);
+        var actual = Run(1, out var actualHidden, out var actualAdapter);
         AssertClose(expected, actual, 1e-4f, "loss");
         AssertClose(expectedHidden, actualHidden, 1e-4f, "hidden gradient");
         AssertClose(expectedAdapter, actualAdapter, 1e-4f, "adapter gradient");
+        var rowsOnly = Run(2, out var rowsHidden, out var rowsAdapter);
+        AssertClose(expected, rowsOnly, 1e-4f, "loss on trained rows only");
+        AssertClose(expectedHidden, rowsHidden, 1e-4f, "hidden gradient, trained rows only");
+        AssertClose(expectedAdapter, rowsAdapter, 1e-4f, "adapter gradient, trained rows only");
+
+        // A frozen matrix used through a transposed copy: same product and input gradient as x · Wᵀ.
+        var tableValues = Random(Vocabulary * Dim);
+        float[] Tied(bool cached, out float[] inputGrad)
+        {
+            using var scope = new TensorScope();
+            var table = Tensor.From(tableValues, [Vocabulary, Dim], device);
+            var x = Tensor.From(hiddenValues, [Rows, Dim], device, requiresGrad: true);
+            using var transposed = Tensor.TransposedCopy(table);
+            var y = cached ? Tensor.MatMulFrozenTransposed(x, table, transposed) : x.MatMul(table, transposeB: true);
+            (y * y).Sum().Backward();
+            inputGrad = x.Grad!.ToArray();
+            return y.ToArray();
+        }
+
+        AssertClose(Tied(false, out var plainGrad), Tied(true, out var cachedGrad), 1e-4f, "frozen transposed product");
+        AssertClose(plainGrad, cachedGrad, 1e-4f, "frozen transposed product: input gradient");
     }
 }

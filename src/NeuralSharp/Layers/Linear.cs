@@ -160,8 +160,34 @@ public sealed class Linear : Module
     internal Tensor ProjectWithoutBias(Tensor input)
     {
         var product = Int8 is { } q ? input.MatMulInt8(q) : Int4 is { } q4 ? input.MatMulInt4(q4) : BFloat16 is { } h ? input.MatMulBFloat16(h)
-            : _tiedTo is { } e ? input.MatMul(e.Weight, transposeB: true) : input.MatMul(Weight);
+            : _tiedTo is { } e ? TiedProduct(input, e.Weight) : input.MatMul(Weight);
         return Adapter is { } a ? product + input.MatMul(a.A).MatMul(a.B) * a.Scale : product;
+    }
+
+    // The tied head (x · Eᵀ). While the table is frozen, large products read a transposed copy made once (the tensor-core
+    // kernels would otherwise copy the whole table transposed on every call, 0.9 GB for a 152k × 1536 float table).
+    private Tensor TiedProduct(Tensor input, Tensor table)
+    {
+        int rows = input.Size / Math.Max(1, InFeatures);
+        if (table.RequiresGrad || rows < 64 || table.Device.Type != DeviceType.Cuda || !MixedPrecision.UsesTensorCores)
+        {
+            _tiedTransposed?.Dispose();
+            _tiedTransposed = null;
+            return input.MatMul(table, transposeB: true);
+        }
+
+        _tiedTransposed ??= Tensor.TransposedCopy(table);
+        return Tensor.MatMulFrozenTransposed(input, table, _tiedTransposed);
+    }
+
+    private Tensor? _tiedTransposed;
+
+    /// <inheritdoc />
+    public override void Dispose()
+    {
+        _tiedTransposed?.Dispose();
+        _tiedTransposed = null;
+        base.Dispose();
     }
 
     /// <inheritdoc />
@@ -210,6 +236,8 @@ public sealed class Linear : Module
         {
             _weight = Tensor.Persistent(TiedValues(), [InFeatures, OutFeatures], e.Device, requiresGrad: false);
             _tiedTo = null;
+            _tiedTransposed?.Dispose();
+            _tiedTransposed = null;
         }
     }
 

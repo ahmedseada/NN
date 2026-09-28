@@ -175,6 +175,112 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// x · Wᵀ for a frozen <paramref name="weight"/> W [outputs, inputs] also kept as <paramref name="transposed"/> Wᵀ
+    /// [inputs, outputs]: the product reads Wᵀ as stored and the input's gradient (g · W) reads W as stored, so neither
+    /// direction makes a transposed copy of W (the tensor-core kernels copy transposed operands into place first).
+    /// W receives no gradient.
+    /// </summary>
+    internal static Tensor MatMulFrozenTransposed(Tensor input, Tensor weight, Tensor transposed)
+    {
+        Tensor output;
+        using (Autograd.NoGrad())
+        {
+            output = input.MatMul(transposed);
+        }
+
+        if (WillRecord(input))
+        {
+            output.Record("matmul_frozen", g =>
+            {
+                using (Autograd.NoGrad())
+                {
+                    using var gradient = g.MatMul(weight);
+                    input.Backend.Axpy(gradient.Storage, input.GradStorage(), input.Size, 1f);
+                }
+            }, input);
+        }
+
+        return output;
+    }
+
+    /// <summary>A transposed copy of a 2-D tensor that no <see cref="TensorScope"/> releases; the caller owns it.</summary>
+    internal static Tensor TransposedCopy(Tensor weight)
+    {
+        var scope = new TensorScope();
+        Tensor copy;
+        using (Autograd.NoGrad())
+        {
+            copy = weight.Transpose();
+        }
+
+        foreach (var other in scope.Detach().Where(t => !ReferenceEquals(t, copy)))
+        {
+            other.Dispose();
+        }
+
+        return copy;
+    }
+
+    /// <summary>
+    /// <see cref="TokenCrossEntropy"/> over only the rows listed in <paramref name="rows"/> (the positions with a non-zero
+    /// weight): the head and the softmax run on those rows alone, gathered from <paramref name="hidden"/> chunk by chunk,
+    /// and their gradients are scattered back. <paramref name="targets"/> and <paramref name="weights"/> hold one value
+    /// per listed row. Rows left out have zero loss and zero gradient, as they would with weight 0.
+    /// </summary>
+    internal static Tensor TokenCrossEntropyRows(Tensor hidden, Func<Tensor, Tensor> head, int[] rows, float[] targets, float[] weights, float normalizer, int chunkRows)
+    {
+        hidden.ThrowIfDisposed();
+        if (hidden.Rank != 2 || targets.Length != rows.Length || weights.Length != rows.Length)
+        {
+            throw new ArgumentException("TokenCrossEntropyRows needs hidden [rows, dim] and one target and weight per listed row.");
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int total = hidden._shape[0], dim = hidden._shape[1], count = rows.Length;
+        chunkRows = Math.Max(1, chunkRows);
+        var device = hidden.Device;
+        var backend = hidden.Backend;
+        bool record = WillRecord(hidden);
+        var gradient = record ? Empty([total, dim], device, zeroed: true) : null;
+        var losses = Empty([Math.Max(1, count)], device, zeroed: true);
+        for (int r0 = 0; r0 < count; r0 += chunkRows)
+        {
+            int n = Math.Min(chunkRows, count - r0);
+            using var scope = new TensorScope();
+            var index = From([.. rows.AsSpan(r0, n).ToArray().Select(r => (float)r)], [n], device);
+            var chunk = Empty([n, dim], device);
+            backend.Gather(hidden.Storage, index.Storage, chunk.Storage, n, dim, total);
+            chunk.RequiresGrad = record;
+            var logits = head(chunk);
+            int vocabulary = logits._shape[^1];
+            if (logits.Size != n * vocabulary)
+            {
+                throw new ArgumentException($"The head must map [{n}, {dim}] to [{n}, vocabulary], got {FormatShape(logits._shape)}.");
+            }
+
+            var chunkTargets = From(targets.AsSpan(r0, n).ToArray(), [n], device);
+            var chunkWeights = From(weights.AsSpan(r0, n).ToArray(), [n], device);
+            var chunkLosses = Empty([n], device);
+            backend.SoftmaxCrossEntropyRows(logits.Storage, chunkTargets.Storage, chunkWeights.Storage, chunkLosses.Storage, n, vocabulary, 1f / normalizer);
+            backend.Copy2D(chunkLosses.Storage, 0, n, losses.Storage, r0, n, 1, n, accumulate: false);
+            if (record && logits.RequiresGrad)
+            {
+                logits.Backward(logits);                                         // the logits now hold their gradient
+                backend.ScatterAdd(chunk.GradStorage(), index.Storage, gradient!.Storage, n, dim, total);
+            }
+        }
+
+        var loss = Empty([1], device);
+        backend.Sum(losses.Storage, loss.Storage, Math.Max(1, count), 1f / normalizer);
+        if (record)
+        {
+            loss.Record("token_cross_entropy", g => backend.Axpy(gradient!.Storage, hidden.GradStorage(), total * dim, g.Item()), hidden);
+        }
+
+        return Traced("token_cross_entropy", loss, start);
+    }
+
+    /// <summary>
     /// (act(gate) · up) · W for a packed layer W with few rows, the activation applied as the input is read (not recorded;
     /// no bias), or null when the layer is not packed or the device has no fused version.
     /// </summary>
