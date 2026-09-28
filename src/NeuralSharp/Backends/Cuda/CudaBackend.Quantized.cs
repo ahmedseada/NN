@@ -262,6 +262,76 @@ internal sealed unsafe partial class CudaBackend
         return true;
     }
 
+    public override bool PackedMatMulLowRank(int kind, Storage x, int m, int k,
+        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage Output, int Columns, Storage U, Storage V)> products, int rank)
+    {
+        if (products.Length is < 1 or > 3 || kind is not (1 or 2) || m < 64 || k < 32 || rank is < 1 or > 32 || !MixedPrecision.UsesTensorCores
+            || MixedPrecision.Current == MatMulPrecision.Float8)
+        {
+            return false;
+        }
+
+        bool multi = products.Length > 1;
+        int columnTiles = 0;
+        foreach (var product in products)
+        {
+            if (product.Columns == 0 || multi && product.Columns % PtxKernels.TensorTile != 0)
+            {
+                return false;
+            }
+
+            columnTiles += (product.Columns + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
+        }
+
+        string format = kind == 1 ? "int4w" : "bf16w";
+        if (TensorKernel($"gemm_tc_nn_{format}{(multi ? "_multi" : "")}_lr_f32") is not { } tensor)
+        {
+            return false;
+        }
+
+        int perWord = kind == 1 ? 8 : 2;
+        int rowTiles = (m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
+        int splits = PackedSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 32)) : PromptSplits(rowTiles * columnTiles, k);
+        if (_profile is not null)
+        {
+            _profileLabel = $"gemm_tc_nn_{format}{(multi ? "_multi" : "")}_lr {m}x{string.Join('+', products.ToArray().Select(p => p.Columns))}x{k}+{rank}";
+            _profileFlops = 0;
+            foreach (var product in products)
+            {
+                _profileFlops += 2.0 * m * product.Columns * (k + rank);
+            }
+        }
+
+        if (splits > 1)
+        {
+            foreach (var product in products)
+            {
+                Check(cuMemsetD32Async(P(product.Output), 0, (nuint)((long)m * product.Columns), _stream), nameof(cuMemsetD32Async));
+            }
+        }
+
+        static ulong Scales(Storage? scales) => scales is null ? 0UL : P(scales);
+        var p0 = products[0];
+        if (!multi)
+        {
+            Launch(tensor, (uint)columnTiles, (uint)rowTiles, (uint)splits, PtxKernels.TensorThreads, 1,
+                P(x), P(p0.Packed), P(p0.Output), U(m), U(p0.Columns), U(k), F(0f), 0UL, 0UL, 0UL, 0UL,
+                U(k), U((p0.Columns + perWord - 1) / perWord), U(p0.Columns), Scales(p0.Scales), P(p0.U), P(p0.V), U(rank));
+            return true;
+        }
+
+        var p1 = products[1];
+        var p2 = products.Length == 3 ? products[2] : products[1];
+        int n2 = products.Length == 3 ? products[2].Columns : 0;
+        Launch(tensor, (uint)columnTiles, (uint)rowTiles, (uint)splits, PtxKernels.TensorThreads, 1,
+            P(x), P(p0.Packed), P(p0.Output), U(m), U(p0.Columns), U(k), F(0f), 0UL, 0UL, 0UL, 0UL,
+            U(k), U(p0.Columns / perWord), U(p0.Columns), Scales(p0.Scales),
+            P(p1.Packed), P(p1.Output), Scales(p1.Scales), U(p1.Columns),
+            P(p2.Packed), P(p2.Output), Scales(p2.Scales), U(n2),
+            P(p0.U), P(p0.V), U(rank), P(p1.U), P(p1.V), P(p2.U), P(p2.V));
+        return true;
+    }
+
     public override bool PackedMatMulGated(int kind, int activation, Storage gate, Storage up, Storage packed, Storage? scales, Storage y,
         int m, int n, int k)
     {

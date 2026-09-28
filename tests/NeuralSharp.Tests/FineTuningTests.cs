@@ -9,6 +9,7 @@ internal static partial class Tests
     private static readonly (string Name, Action<Device> Run)[] FineTuning =
     [
         ("fine-tuning: chunked token cross-entropy (all rows or trained rows only) and the frozen-transpose product and the fused LoRA term match dense results and gradients", TokenLoss),
+        ("fine-tuning: LoRA terms inside the tensor-core products (float32, bfloat16 and 4-bit bases, one layer or merged) and rank-16 products match the separate computation, with gradients", LoraInsideProducts),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
@@ -416,6 +417,125 @@ internal static partial class Tests
         for (int i = 0; i < parts.Length; i++)
         {
             AssertClose(plainLora[i], fusedLora[i], 1e-3f, $"fused LoRA: {parts[i]}");
+        }
+    }
+
+    private static void LoraInsideProducts(Device device)
+    {
+        const int Batch = 2, Steps = 100, In = 96, Out = 384, Rank = 16;
+        var random = new Random(71);
+        float[] Values(int n) => RandomArray(random, n);
+        if (device.Type != DeviceType.Cuda || MixedPrecision.TensorCoresUnavailable(device) is not null)
+        {
+            // Devices without the fused kernels decline, and callers compute the term separately.
+            using var scope = new TensorScope();
+            var layer = new Linear(In, Out, bias: false, device: device, random: random);
+            layer.Adapter = new LoraAdapter(Tensor.From(Values(In * Rank), [In, Rank], device), Tensor.From(Values(Rank * Out), [Rank, Out], device), Rank, 2f);
+            Check(Tensor.LoraProducts(Tensor.From(Values(Steps * In), [Steps, In], device), [layer]) is null, "no fused LoRA products on this device");
+            return;
+        }
+
+        static double RelativeError(float[] expected, float[] actual)
+        {
+            double difference = 0, norm = 0;
+            for (int i = 0; i < expected.Length; i++)
+            {
+                difference += (double)(expected[i] - actual[i]) * (expected[i] - actual[i]);
+                norm += (double)expected[i] * expected[i];
+            }
+
+            return Math.Sqrt(difference / Math.Max(norm, 1e-30));
+        }
+
+        void Close(float[] expected, float[] actual, string what)
+        {
+            Check(expected.Length == actual.Length, $"{what}: length {actual.Length}, expected {expected.Length}");
+            double error = RelativeError(expected, actual);
+            Check(error < 2e-2, $"{what}: relative error {error:G3}");
+        }
+
+        using var precision = MixedPrecision.BFloat16();
+
+        // Skinny products (one side 16) on tensor cores: as the CPU computes them, in every layout.
+        foreach (var (m, n, k, ta, tb) in new[] { (300, 16, 2000, false, false), (2000, 16, 300, true, false), (300, 16, 2000, false, true),
+                     (16, 2000, 300, true, false), (300, 2000, 16, false, false), (300, 2000, 16, false, true) })
+        {
+            var av = Values(m * k);
+            var bv = Values(k * n);
+            var cv = Values(m * n);
+            float[] Product(Device on, float beta)
+            {
+                using var a = Tensor.From(av, ta ? [k, m] : [m, k], on);
+                using var b = Tensor.From(bv, tb ? [n, k] : [k, n], on);
+                using var c = Tensor.From(cv, [m, n], on);
+                on.Backend.BatchedMatMul(a.Storage, b.Storage, c.Storage, 1, m, n, k, ta, tb, beta);
+                return c.ToArray();
+            }
+
+            foreach (float beta in new[] { 0f, 1f })
+            {
+                Close(Product(Device.Cpu, beta), Product(device, beta), $"{m}x{n}x{k} {(ta ? 't' : 'n')}{(tb ? 't' : 'n')} beta {beta}");
+            }
+        }
+
+        foreach (string format in new[] { "float32", "bfloat16", "int4" })
+        {
+            foreach (int count in format == "float32" ? new[] { 1 } : new[] { 1, 2, 3 })
+            {
+                var weights = Enumerable.Range(0, count).Select(_ => Values(In * Out)).ToArray();
+                var aValues = Enumerable.Range(0, count).Select(_ => Values(In * Rank)).ToArray();
+                var bValues = Enumerable.Range(0, count).Select(_ => Values(Rank * Out)).ToArray();
+                var coefficients = Enumerable.Range(0, count).Select(_ => Values(Batch * Steps * Out)).ToArray();
+                var xValues = Values(Batch * Steps * In);
+                float[][] Run(bool fused)
+                {
+                    using var scope = new TensorScope();
+                    var layers = new Linear[count];
+                    for (int j = 0; j < count; j++)
+                    {
+                        layers[j] = Linear.FromWeights(Tensor.From(weights[j], [In, Out], device));
+                        if (format == "bfloat16")
+                        {
+                            layers[j].ToBFloat16();
+                        }
+                        else if (format == "int4")
+                        {
+                            layers[j].QuantizeInt4();
+                        }
+
+                        layers[j].Adapter = new LoraAdapter(Tensor.From(aValues[j], [In, Rank], device, requiresGrad: true),
+                            Tensor.From(bValues[j], [Rank, Out], device, requiresGrad: true), Rank, 1.5f);
+                    }
+
+                    var x = Tensor.From(xValues, [Batch, Steps, In], device, requiresGrad: true);
+                    Tensor[] ys;
+                    if (fused)
+                    {
+                        ys = Tensor.LoraProducts(x, layers) ?? throw new Exception($"{format} × {count}: no fused LoRA products on {device}");
+                    }
+                    else
+                    {
+                        ys = [.. layers.Select(l =>
+                        {
+                            var product = l.BFloat16 is { } h ? x.MatMulBFloat16(h) : l.Int4 is { } q ? x.MatMulInt4(q) : x.MatMul(l.Weight);
+                            return product + x.MatMul(l.Adapter!.A).MatMul(l.Adapter.B) * l.Adapter.Scale;
+                        })];
+                    }
+
+                    var loss = ys.Select((y, j) => (y * Tensor.From(coefficients[j], [Batch, Steps, Out], device)).Sum()).Aggregate((p, q) => p + q);
+                    loss.Backward();
+                    return [.. ys.Select(y => y.ToArray()), x.Grad!.ToArray(), .. layers.Select(l => l.Adapter!.A.Grad!.ToArray()),
+                        .. layers.Select(l => l.Adapter!.B.Grad!.ToArray())];
+                }
+
+                var expected = Run(false);
+                var actual = Run(true);
+                for (int i = 0; i < expected.Length; i++)
+                {
+                    string part = i < count ? $"output {i}" : i == count ? "input gradient" : i <= 2 * count ? $"A gradient {i - count - 1}" : $"B gradient {i - 2 * count - 1}";
+                    Close(expected[i], actual[i], $"{format} × {count}: {part}");
+                }
+            }
         }
     }
 }

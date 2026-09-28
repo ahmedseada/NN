@@ -55,6 +55,15 @@ internal static partial class PtxKernels
                 TensorCoreGemm(sb, false, false, 0, packed: packed, tileM: 64);
                 TensorCoreGemm(sb, false, false, 0, packed: packed, multi: true, tileM: 64);
             }
+
+            // LoRA: the adapter's low-rank term as one more k step of the product (…_lr_f32).
+            TensorCoreGemm(sb, false, false, 0, lowRank: true);
+            TensorCoreGemm(sb, false, true, 0, lowRank: true);
+            foreach (int packed in new[] { 2, 3 })
+            {
+                TensorCoreGemm(sb, false, false, 0, packed: packed, lowRank: true);
+                TensorCoreGemm(sb, false, false, 0, packed: packed, multi: true, lowRank: true);
+            }
         }),
         Module("attention d64", sb => { FlashForward(sb, 64); FlashBackwardQ(sb, 64); FlashBackwardKv(sb, 64); }),
         Module("attention d128", sb => { FlashForward(sb, 128); FlashBackwardQ(sb, 128); FlashBackwardKv(sb, 128); }),
@@ -133,10 +142,21 @@ internal static partial class PtxKernels
     //
     // tileM 64 (packed, …_m64_f32): 64-row tiles for prompts whose last 128-row tile would be mostly empty (180 rows: 192
     // computed instead of 256); the 8 warps take 32 × 32 each instead of 64 × 32.
-    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode, int packed = 0, bool multi = false, int tileM = TensorTile)
+    //
+    // lowRank (A as stored, mode 0, 128-row tiles, not int8, …_lr_f32): c = beta·c + a·b + u·v, a LoRA adapter's term
+    // added as one more k step of at most 32: u [m, r] (p_u, rows of r floats), v [r, n] (b as stored; rows of n floats)
+    // or [n, r] (b transposed), r = p_r ≤ 32; multi takes p_u1 / p_v1 and p_u2 / p_v2 for its other products. p_u = 0
+    // skips the term. With split k only block z = 0 adds it.
+    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode, int packed = 0, bool multi = false, int tileM = TensorTile,
+        bool lowRank = false)
     {
+        if (lowRank && (ta || mode != 0 || packed == 1 || tileM != TensorTile))
+        {
+            throw new ArgumentException("The low-rank stage needs A as stored, no epilogue, no int8 column scales and 128-row tiles.");
+        }
+
         string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}{mode switch { 1 => "_gelu", 2 => "_gelugrad", _ => "" }}"
-                      + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}{(multi ? "_multi" : "")}{(tileM == 64 ? "_m64" : "")}_f32";
+                      + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}{(multi ? "_multi" : "")}{(tileM == 64 ? "_m64" : "")}{(lowRank ? "_lr" : "")}_f32";
         int mts = tileM / 32, warpRowShift = (int)Math.Log2(tileM / 2);          // m16 slices per warp; the warp's first row
         int cpw = packed switch { 1 => 4, 2 => 8, _ => 2 }, tileWords = TensorTile / cpw, wordRows = TensorThreads / tileWords;
         int wordsPerThread = TensorK * tileWords / TensorThreads;
@@ -154,6 +174,12 @@ internal static partial class PtxKernels
                 ,
                                 .param .u64 p_b1, .param .u64 p_c1, .param .u64 p_aux1, .param .u32 p_n1,
                                 .param .u64 p_b2, .param .u64 p_c2, .param .u64 p_aux2, .param .u32 p_n2
+                """ : "")}}{{(lowRank ? """
+                ,
+                                .param .u64 p_u, .param .u64 p_v, .param .u32 p_r
+                """ : "")}}{{(lowRank && multi ? """
+                ,
+                                .param .u64 p_u1, .param .u64 p_v1, .param .u64 p_u2, .param .u64 p_v2
                 """ : "")}}
             )
             {
@@ -179,6 +205,9 @@ internal static partial class PtxKernels
                 .reg .f32 %beta;
                 .reg .b32 %r<64>;
                 .reg .b64 %rd<32>;
+                .reg .b32 %lr<8>;
+                .reg .b64 %lrd<8>;
+                .reg .pred %plr;
                 .shared .align 16 .b8 {{name}}_as[{{2 * StageBytes}}];
                 .shared .align 16 .b8 {{name}}_bs[{{2 * StageBytes}}];
                 ld.param.u64 %rd1, [p_a];
@@ -236,6 +265,14 @@ internal static partial class PtxKernels
                 ld.param.u32 %r60, [p_ldc];
                 ld.param.u64 %rdaux, [p_aux];
             """);
+        if (lowRank)
+        {
+            s.AppendLine("""
+                    ld.param.u64 %lrd2, [p_u];
+                    ld.param.u64 %lrd3, [p_v];
+                """);
+        }
+
         if (multi)
         {
             // This block's product: its column tile %r10 past the widths of the products before it.
@@ -247,6 +284,8 @@ internal static partial class PtxKernels
                     ld.param.u64 %rd3, [p_c1];
                     ld.param.u64 %rdaux, [p_aux1];
                     ld.param.u32 %r2, [p_n1];
+                    {(lowRank ? "ld.param.u64 %lrd2, [p_u1];" : "")}
+                    {(lowRank ? "ld.param.u64 %lrd3, [p_v1];" : "")}
                     setp.ge.u32 %pm0, %r10, %r2;
                     @!%pm0 bra PRODUCT_POINTERS;
                     sub.u32 %r10, %r10, %r2;
@@ -254,6 +293,8 @@ internal static partial class PtxKernels
                     ld.param.u64 %rd3, [p_c2];
                     ld.param.u64 %rdaux, [p_aux2];
                     ld.param.u32 %r2, [p_n2];
+                    {(lowRank ? "ld.param.u64 %lrd2, [p_u2];" : "")}
+                    {(lowRank ? "ld.param.u64 %lrd3, [p_v2];" : "")}
                 PRODUCT_POINTERS:
                     cvta.to.global.u64 %rd2, %rd2;
                     cvta.to.global.u64 %rd3, %rd3;
@@ -594,32 +635,37 @@ internal static partial class PtxKernels
                 add.u32 %r41, %r21, %r34;
             """);
 
-        // Two k16 steps over the current stage.
-        for (int kk = 0; kk < 2; kk++)
+        // Two k16 steps over the current stage (%r39 / %r41: its A / B lane addresses).
+        void Mma()
         {
-            for (int mt = 0; mt < mts; mt++)
+            for (int kk = 0; kk < 2; kk++)
             {
-                int offset = ta ? kk * 16 * WideStride + mt * 16 * 2 : mt * 16 * NarrowStride + kk * 32;
-                s.AppendLine($"    ldmatrix.sync.aligned.m8n8.x4{(ta ? ".trans" : "")}.shared.b16 {{%fa{4 * mt}, %fa{4 * mt + 1}, %fa{4 * mt + 2}, %fa{4 * mt + 3}}}, [%r39+{offset}];");
-            }
-
-            for (int np = 0; np < 2; np++)
-            {
-                int offset = tb ? np * 16 * NarrowStride + kk * 32 : kk * 16 * WideStride + np * 16 * 2;
-                s.AppendLine($"    ldmatrix.sync.aligned.m8n8.x4{(tb ? "" : ".trans")}.shared.b16 {{%fb{4 * np}, %fb{4 * np + 1}, %fb{4 * np + 2}, %fb{4 * np + 3}}}, [%r41+{offset}];");
-            }
-
-            for (int mt = 0; mt < mts; mt++)
-            {
-                for (int nt = 0; nt < 4; nt++)
+                for (int mt = 0; mt < mts; mt++)
                 {
-                    int c = (mt * 4 + nt) * 4, fb = (nt / 2) * 4 + (nt % 2) * 2;
-                    s.AppendLine($"    mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{%c{c}, %c{c + 1}, %c{c + 2}, %c{c + 3}}}, "
-                                 + $"{{%fa{4 * mt}, %fa{4 * mt + 1}, %fa{4 * mt + 2}, %fa{4 * mt + 3}}}, {{%fb{fb}, %fb{fb + 1}}}, "
-                                 + $"{{%c{c}, %c{c + 1}, %c{c + 2}, %c{c + 3}}};");
+                    int offset = ta ? kk * 16 * WideStride + mt * 16 * 2 : mt * 16 * NarrowStride + kk * 32;
+                    s.AppendLine($"    ldmatrix.sync.aligned.m8n8.x4{(ta ? ".trans" : "")}.shared.b16 {{%fa{4 * mt}, %fa{4 * mt + 1}, %fa{4 * mt + 2}, %fa{4 * mt + 3}}}, [%r39+{offset}];");
+                }
+
+                for (int np = 0; np < 2; np++)
+                {
+                    int offset = tb ? np * 16 * NarrowStride + kk * 32 : kk * 16 * WideStride + np * 16 * 2;
+                    s.AppendLine($"    ldmatrix.sync.aligned.m8n8.x4{(tb ? "" : ".trans")}.shared.b16 {{%fb{4 * np}, %fb{4 * np + 1}, %fb{4 * np + 2}, %fb{4 * np + 3}}}, [%r41+{offset}];");
+                }
+
+                for (int mt = 0; mt < mts; mt++)
+                {
+                    for (int nt = 0; nt < 4; nt++)
+                    {
+                        int c = (mt * 4 + nt) * 4, fb = (nt / 2) * 4 + (nt % 2) * 2;
+                        s.AppendLine($"    mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{%c{c}, %c{c + 1}, %c{c + 2}, %c{c + 3}}}, "
+                                     + $"{{%fa{4 * mt}, %fa{4 * mt + 1}, %fa{4 * mt + 2}, %fa{4 * mt + 3}}}, {{%fb{fb}, %fb{fb + 1}}}, "
+                                     + $"{{%c{c}, %c{c + 1}, %c{c + 2}, %c{c + 3}}};");
+                    }
                 }
             }
         }
+
+        Mma();
 
         s.AppendLine($"""
                 @!%p11 bra NOSTORE;
@@ -633,6 +679,40 @@ internal static partial class PtxKernels
                 bra KLOOP;
             KEND:
             """);
+        if (lowRank)
+        {
+            // One more k step: u's tile as A (rows of r), v's as B (r × n as stored, or n × r transposed), zero past r.
+            var u = a with { Name = "u", InnerLimit = "%lr7" };
+            var v = tb ? new TileLoad("v", KIsOuter: false, Width: TensorK, OuterLimit: "%r2", InnerLimit: "%lr7", Tile: "%r10")
+                       : new TileLoad("v", KIsOuter: true, Width: TensorTile, OuterLimit: "%lr7", InnerLimit: "%r2", Tile: "%r10");
+            s.AppendLine("""
+                    setp.eq.u64 %plr, %lrd2, 0;
+                    mov.u32 %lr0, %ctaid.z;
+                    mov.u32 %lr4, %nctaid.z;
+                    setp.gt.u32 %p10, %lr4, 1;
+                    setp.ne.and.u32 %p10, %lr0, 0, %p10;
+                    or.pred %plr, %plr, %p10;
+                    @%plr bra LR_DONE;
+                    cvta.to.global.u64 %lrd2, %lrd2;
+                    cvta.to.global.u64 %lrd3, %lrd3;
+                    ld.param.u32 %lr7, [p_r];
+                    mul.wide.u32 %lrd1, %lr7, 4;
+                    mov.u32 %r30, 0;
+                    mov.u32 %r34, 0;
+                """);
+            Coordinates(v, "%lr1", "%lr2", "%lr3", "%r12", "%lrd4", tb ? "%lr7" : "%r2");
+            Load(u, "%lrd2", "%lrd1", "%r13", "%r14", "%ga");
+            Load(v, "%lrd3", "%lrd4", "%lr1", "%lr2", "%gb");
+            Store(u, "%r15", "%ga");
+            Store(v, "%lr3", "%gb");
+            s.AppendLine("""
+                    bar.sync 0;
+                    mov.u32 %r39, %r20;
+                    mov.u32 %r41, %r21;
+                """);
+            Mma();
+            s.AppendLine("LR_DONE:");
+        }
 
         EmitTensorEpilogue(s, mode, packed == 1 ? t => ColumnScales(t, mts) : null, splitK: mode == 0, mts: mts);
         s.AppendLine("""

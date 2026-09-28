@@ -153,6 +153,12 @@ public sealed class Linear : Module
             return outputs;
         }
 
+        // Adapters on every layer (LoRA / QLoRA, training or evaluation): one pass with each low-rank term inside its product.
+        if (layers.All(l => l.Adapter is not null && l.Bias is null) && Tensor.LoraProducts(input, layers) is { } lora)
+        {
+            return lora;
+        }
+
         // Training over frozen packed layers (LoRA / QLoRA): the base products still run as one pass, recorded, and each
         // layer's adapter adds its low-rank term into its output.
         bool training = kind >= 0 && Autograd.IsEnabled && layers.Length is > 1 and <= 3 && input.Device.Type == DeviceType.Cuda
@@ -168,6 +174,11 @@ public sealed class Linear : Module
     /// <summary>x·W, plus the adapter's low-rank term when an adapter is attached.</summary>
     internal Tensor ProjectWithoutBias(Tensor input)
     {
+        if (Adapter is not null && Tensor.LoraProducts(input, [this]) is [var fused])
+        {
+            return fused;
+        }
+
         var product = Int8 is { } q ? input.MatMulInt8(q) : Int4 is { } q4 ? input.MatMulInt4(q4) : BFloat16 is { } h ? input.MatMulBFloat16(h)
             : _tiedTo is { } e ? TiedProduct(input, e.Weight) : input.MatMul(Weight);
         return Adapter is { } a ? Tensor.AddLowRank(product, input, a.A, a.B, a.Scale) : product;

@@ -780,9 +780,13 @@ internal sealed unsafe partial class CudaBackend : Backend
             long tiles128 = (long)((m + 127) / 128) * ((n + 127) / 128) * batch;
             gemmTile = tiles128 >= Math.Max(1, _multiprocessors) ? 128 : 64;
         }
-        // bfloat16 tensor cores (MixedPrecision): products large enough to fill 128 × 128 tiles.
-        var tensorCore = !few && m >= 64 && n >= 64 && k >= 32 && MixedPrecision.UsesTensorCores ? TensorCoreKernels() : null;
-        if (tensorCore is not null && MixedPrecision.Current == MatMulPrecision.Float8 && EightBitReady(fp8: true) && batch <= 64)
+        // bfloat16 tensor cores (MixedPrecision): products large enough to fill 128 × 128 tiles, and skinny ones with a
+        // side of 8-63 (a LoRA adapter's rank-16 products: x·A, g·Bᵀ, xᵀ·dt, u·B), which the float kernels ran at 1-3
+        // TFLOPS; with k split across blocks they read their wide operand about as fast as memory allows.
+        bool large = m >= 64 && n >= 64 && k >= 32;
+        bool skinny = batch == 1 && Math.Min(m, n) >= 8 && Math.Max(m, n) >= 256 && k >= 16 && (long)m * n * k >= 1 << 24;
+        var tensorCore = !few && (large || skinny) && MixedPrecision.UsesTensorCores ? TensorCoreKernels() : null;
+        if (tensorCore is not null && large && MixedPrecision.Current == MatMulPrecision.Float8 && EightBitReady(fp8: true) && batch <= 64)
         {
             for (int i = 0; i < batch; i++)
             {
@@ -894,6 +898,28 @@ internal sealed unsafe partial class CudaBackend : Backend
 
         Launch(tensorCore["gemm_tc_nn_f32"], (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
             1, PtxKernels.TensorThreads, 1, P(a), P(b), P(c), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, P(bias), U(k), U(n), U(n), 0UL);
+        Interlocked.Increment(ref TensorCoreLaunches);
+        return true;
+    }
+
+    public override bool MatMulLowRank(Storage a, Storage b, Storage c, int m, int n, int k, bool transB, float beta, Storage u, Storage v, int rank)
+    {
+        if (m == 0 || n == 0 || k < 16 || rank is < 1 or > 32 || !MixedPrecision.UsesTensorCores || MixedPrecision.Current == MatMulPrecision.Float8
+            || TensorCoreKernels() is not { } tensorCore || !tensorCore.TryGetValue(transB ? "gemm_tc_nt_lr_f32" : "gemm_tc_nn_lr_f32", out var function))
+        {
+            return false;
+        }
+
+        if (_profile is not null)
+        {
+            _profileLabel = $"gemm_tc_{(transB ? "nt" : "nn")}_lr {m}x{n}x{k}+{rank}";
+            _profileFlops = 2.0 * m * n * (k + rank);
+        }
+
+        int splits = TensorSplits(m, n, k, beta, P(c), n);
+        Launch(function, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
+            (uint)splits, PtxKernels.TensorThreads, 1, P(a), P(b), P(c), U(m), U(n), U(k), F(beta), 0UL, 0UL, 0UL, 0UL,
+            U(k), U(transB ? k : n), U(n), 0UL, P(u), P(v), U(rank));
         Interlocked.Increment(ref TensorCoreLaunches);
         return true;
     }

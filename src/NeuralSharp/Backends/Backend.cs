@@ -188,6 +188,21 @@ internal abstract class Backend
     public virtual bool MatMulBias(Storage a, Storage b, Storage bias, Storage c, int m, int n, int k) => false;
 
     /// <summary>
+    /// c = beta·c + a·op(b) + u·op(v) in one product (a LoRA adapter's term as one more k step): a [m, k], b [k, n]
+    /// (transposed: [n, k]), u [m, rank], v [rank, n] (with <paramref name="transB"/>: [n, rank]), rank ≤ 32, all rows
+    /// contiguous. Returns false when the device has no such pass (callers then compute the two products separately).
+    /// </summary>
+    public virtual bool MatMulLowRank(Storage a, Storage b, Storage c, int m, int n, int k, bool transB, float beta, Storage u, Storage v, int rank) => false;
+
+    /// <summary>
+    /// Products of one input x [m, k] through 1-3 packed layers (<paramref name="kind"/> as in <see cref="PackedMatMulMany"/>),
+    /// each with a low-rank term: y_j = x · w_j + u_j · v_j for u_j [m, rank] and v_j [rank, n_j], rank ≤ 32, in one pass.
+    /// Returns false when the device has no such pass.
+    /// </summary>
+    public virtual bool PackedMatMulLowRank(int kind, Storage x, int m, int k,
+        ReadOnlySpan<(Storage Packed, Storage? Scales, Storage Output, int Columns, Storage U, Storage V)> products, int rank) => false;
+
+    /// <summary>
     /// c = beta·c + op(a)·op(b) on bfloat16 tensor cores, with row strides: a [m, k] stored with <paramref name="lda"/>
     /// floats per row (transposed: [k, m] rows), b [k, n] with <paramref name="ldb"/> (transposed: [n, k] rows), c [m, n]
     /// with <paramref name="ldc"/>; offsets in elements. <paramref name="bias"/> [n] is added to every row (modes None and

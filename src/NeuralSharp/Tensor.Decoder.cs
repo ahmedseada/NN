@@ -238,6 +238,138 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// x · W_j + scale_j · (x·A_j)·B_j for 1-3 layers with frozen weights (float32, bfloat16 or 4-bit) and LoRA adapters of
+    /// one rank ≤ 32, with each low-rank term computed inside its base product (one more k step of the tensor-core kernel)
+    /// instead of in separate passes over the full-width output. The backward pass does the same for the input's
+    /// gradient: dx = g·Wᵀ + (scale · g·Bᵀ)·Aᵀ in one product. Null (nothing computed) when the device has no fused
+    /// version; callers then run the base products and <see cref="AddLowRank"/>. No bias: callers add it.
+    /// </summary>
+    internal static Tensor[]? LoraProducts(Tensor input, IReadOnlyList<Layers.Linear> layers)
+    {
+        input.ThrowIfDisposed();
+        int k = input._shape[^1], m = input.Size / Math.Max(1, k);
+        if (input.Device.Type != DeviceType.Cuda || layers.Count is < 1 or > 3 || m < 64 || k < 32 || !MixedPrecision.UsesTensorCores
+            || layers[0].Adapter is not { } first || first.Rank > 32)
+        {
+            return null;
+        }
+
+        // One kind for all: 3 = float32 (one layer), 2 = bfloat16, 1 = 4-bit.
+        int kind = layers[0].BFloat16 is not null ? 2 : layers[0].Int4 is not null ? 1 : layers[0].Int8 is null && layers[0].TiedTo is null ? 3 : -1;
+        foreach (var layer in layers)
+        {
+            int own = layer.BFloat16 is not null ? 2 : layer.Int4 is not null ? 1 : layer.Int8 is null && layer.TiedTo is null ? 3 : -1;
+            if (own != kind || kind < 0 || layer.InFeatures != k || layer.Adapter is not { } adapter || adapter.Rank != first.Rank
+                || adapter.A.Device != input.Device || kind == 3 && (layers.Count > 1 || layer.Weight.RequiresGrad))
+            {
+                return null;
+            }
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var backend = input.Backend;
+        int rank = first.Rank;
+        var flat = input.Rank == 2 ? input : input.Reshape(-1, k);
+        var us = new Tensor[layers.Count];
+        var outputs = new Tensor[layers.Count];
+        for (int j = 0; j < layers.Count; j++)
+        {
+            var adapter = layers[j].Adapter!;
+            us[j] = Empty([m, rank], input.Device, zeroed: true);                        // scale · x·A (kept for dB)
+            using var t = Empty([m, rank], input.Device, track: false);
+            backend.BatchedMatMul(flat.Storage, adapter.A.Storage, t.Storage, 1, m, rank, k, false, false, 0f);
+            backend.Axpy(t.Storage, us[j].Storage, m * rank, adapter.Scale);
+            outputs[j] = Empty([m, layers[j].OutFeatures], input.Device);
+        }
+
+        bool done = kind == 3
+            ? backend.MatMulLowRank(flat.Storage, layers[0].Weight.Storage, outputs[0].Storage, m, layers[0].OutFeatures, k, false, 0f,
+                us[0].Storage, layers[0].Adapter!.B.Storage, rank)
+            : backend.PackedMatMulLowRank(kind == 2 ? 2 : 1, flat.Storage, m, k,
+                [.. layers.Select((l, j) => (kind == 2 ? l.BFloat16!.Packed.Storage : l.Int4!.Packed.Storage, kind == 2 ? null : l.Int4!.Scales.Storage,
+                    outputs[j].Storage, l.OutFeatures, us[j].Storage, l.Adapter!.B.Storage))], rank);
+        if (!done)
+        {
+            foreach (var unused in us.Concat(outputs))
+            {
+                unused.Dispose();
+            }
+
+            if (!ReferenceEquals(flat, input))
+            {
+                flat.Dispose();
+            }
+
+            return null;
+        }
+
+        var results = new Tensor[layers.Count];
+        for (int j = 0; j < layers.Count; j++)
+        {
+            var layer = layers[j];
+            var (a, b, scale) = (layer.Adapter!.A, layer.Adapter.B, layer.Adapter.Scale);
+            var u = us[j];
+            int n = layer.OutFeatures;
+            if (Autograd.IsEnabled && (flat.RequiresGrad || a.RequiresGrad || b.RequiresGrad))
+            {
+                outputs[j].Record("lora_fused", g =>
+                {
+                    if (b.RequiresGrad)
+                    {
+                        backend.BatchedMatMul(u.Storage, g.Storage, b.GradStorage(), 1, rank, n, m, true, false, 1f);         // dB += uᵀ·g
+                    }
+
+                    using var du = Empty([m, rank], flat.Device, track: false);
+                    using var dt = Empty([m, rank], flat.Device, zeroed: true, track: false);
+                    backend.BatchedMatMul(g.Storage, b.Storage, du.Storage, 1, m, rank, n, false, true, 0f);                 // du = g·Bᵀ
+                    backend.Axpy(du.Storage, dt.Storage, m * rank, scale);                                                  // dt = scale · du
+                    if (a.RequiresGrad)
+                    {
+                        backend.BatchedMatMul(flat.Storage, dt.Storage, a.GradStorage(), 1, k, rank, m, true, false, 1f);   // dA += xᵀ·dt
+                    }
+
+                    if (flat.RequiresGrad)
+                    {
+                        // dx += g·Wᵀ + dt·Aᵀ (W [k, n] as float32; packed weights expanded first).
+                        Tensor? expanded = null;
+                        if (kind != 3)
+                        {
+                            expanded = Empty([k, n], flat.Device, track: false);
+                            if (kind == 2)
+                            {
+                                backend.BFloat16Dequantize(layer.BFloat16!.Packed.Storage, expanded.Storage, k, n);
+                            }
+                            else
+                            {
+                                backend.Int4Dequantize(layer.Int4!.Packed.Storage, layer.Int4.Scales.Storage, expanded.Storage, k, n);
+                            }
+                        }
+
+                        using (expanded)
+                        {
+                            var w = (expanded ?? layer.Weight).Storage;
+                            if (!backend.MatMulLowRank(g.Storage, w, flat.GradStorage(), m, k, n, true, 1f, dt.Storage, a.Storage, rank))
+                            {
+                                backend.BatchedMatMul(g.Storage, w, flat.GradStorage(), 1, m, k, n, false, true, 1f);
+                                backend.BatchedMatMul(dt.Storage, a.Storage, flat.GradStorage(), 1, m, k, rank, false, true, 1f);
+                            }
+                        }
+                    }
+                }, flat, a, b);
+            }
+            else
+            {
+                u.Dispose();
+            }
+
+            results[j] = input.Rank == 2 ? outputs[j] : outputs[j].Reshape([.. input._shape[..^1], n]);
+            Traced("lora_fused", results[j], start);
+        }
+
+        return results;
+    }
+
+    /// <summary>
     /// The frozen packed layers' products of one input in one device pass (<see cref="MatMulPackedMany"/>), recorded for
     /// training: each output's gradient flows to the input (dx += g · Wᵀ with the weight expanded to float32). Null when
     /// the device has no such pass.
