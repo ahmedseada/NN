@@ -120,6 +120,42 @@ public sealed class Downloader
         }
     }
 
+    /// <summary>GETs <paramref name="url"/> and every following page named by a <c>Link: &lt;…&gt;; rel="next"</c> header.</summary>
+    public async Task<List<string>> GetPagesAsync(string url, IReadOnlyDictionary<string, string>? headers = null, CancellationToken cancellationToken = default)
+    {
+        var pages = new List<string>();
+        string? next = url;
+        while (next is not null && pages.Count < 10_000)
+        {
+            using var request = Request(next, headers);
+            using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            string body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                throw Failure(next, response.StatusCode, body);
+            }
+
+            pages.Add(body);
+            next = response.Headers.TryGetValues("Link", out var links) ? NextLink(string.Join(",", links)) : null;
+        }
+
+        return pages;
+    }
+
+    private static string? NextLink(string header)
+    {
+        foreach (var part in header.Split(','))
+        {
+            int open = part.IndexOf('<'), close = part.IndexOf('>');
+            if (open >= 0 && close > open && part.Contains("rel=\"next\"", StringComparison.Ordinal))
+            {
+                return part[(open + 1)..close].Trim();
+            }
+        }
+
+        return null;
+    }
+
     private async Task DownloadOnceAsync(string url, IReadOnlyDictionary<string, string>? headers, string partial, CancellationToken cancellationToken)
     {
         long existing = File.Exists(partial) ? new FileInfo(partial).Length : 0;

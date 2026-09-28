@@ -15,7 +15,167 @@ internal static partial class Tests
         ("datasets: JSON Lines, JSON, CSV/TSV, text and code files, also in .gz, .zip and .tar.gz", DatasetFormats),
         ("datasets: select, filter, shuffle, deduplicate, split and mix are lazy, streamed and reproducible", DatasetOperations),
         ("datasets: downloads are cached, resumed, retried, and explain missing access", DatasetDownloads),
+        ("datasets: Hugging Face (splits, pages, tokens, Parquet fallback), GitHub (repositories, files, releases), Kaggle and Zenodo against a fake server", DatasetSources),
     ];
+
+    private static void DatasetSources(Device device)
+    {
+        _ = device;
+        string cache = Path.Combine(Path.GetTempPath(), "ns-cache-" + Guid.NewGuid().ToString("N"));
+        string? kaggleUser = Environment.GetEnvironmentVariable("KAGGLE_USERNAME"), kaggleKey = Environment.GetEnvironmentVariable("KAGGLE_KEY");
+        try
+        {
+            var parquet = File.ReadAllBytes(TestData("parquet/snappy-v1.parquet"));
+            var web = new FakeRouter();
+            var downloader = new Downloader(new HttpClient(web), cache) { Attempts = 1 };
+
+            // Hugging Face: a repository with split-named Parquet shards, listed over two pages.
+            const string hf = "https://huggingface.co";
+            web.Json($"{hf}/api/datasets/org/chat/tree/main?recursive=true",
+                "[{\"type\":\"file\",\"path\":\"README.md\",\"size\":10},{\"type\":\"file\",\"path\":\".gitattributes\"},{\"type\":\"directory\",\"path\":\"data\"},"
+                + "{\"type\":\"file\",\"path\":\"data/train-00000-of-00002.parquet\"}]",
+                next: $"{hf}/api/datasets/org/chat/tree/main?recursive=true&cursor=2");
+            web.Json($"{hf}/api/datasets/org/chat/tree/main?recursive=true&cursor=2",
+                "[{\"type\":\"file\",\"path\":\"data/train-00001-of-00002.parquet\"},{\"type\":\"file\",\"path\":\"data/test-00000-of-00001.parquet\"},"
+                + "{\"type\":\"file\",\"path\":\"data/train.jsonl\"}]");
+            foreach (var shard in new[] { "train-00000-of-00002", "train-00001-of-00002", "test-00000-of-00001" })
+            {
+                web.Bytes($"{hf}/datasets/org/chat/resolve/main/data/{shard}.parquet", parquet, requireToken: "hf_secret");
+            }
+
+            var train = HuggingFace.Dataset("org/chat", token: "hf_secret", downloader: downloader);
+            Check(train.Count() == 80 && train.First()["messages"] is JsonArray, $"hf train split: two shards, Parquet preferred over JSON Lines ({train.Count()} rows)");
+            Check(HuggingFace.Dataset("org/chat", split: "test", token: "hf_secret", downloader: downloader).Count() == 40, "hf test split");
+            Check(HuggingFace.Dataset("org/chat", token: "hf_secret", maxFiles: 1, downloader: downloader).Count() == 40, "hf first files only");
+            Check(HuggingFace.Dataset("org/chat", files: "data/test-*", token: "hf_secret", downloader: downloader).Count() == 40, "hf files by pattern");
+            try
+            {
+                _ = HuggingFace.Dataset("org/chat", split: "validation", token: "hf_secret", downloader: downloader).Count();
+                Check(false, "a missing split should fail");
+            }
+            catch (HttpRequestException ex)
+            {
+                Check(ex.Message.Contains("/parquet", StringComparison.Ordinal), $"missing split falls back to the Parquet index: {ex.Message}");
+            }
+
+            // A dataset without plain data files (a loading script): the Hub's Parquet copy.
+            web.Json($"{hf}/api/datasets/org/scripted/tree/main?recursive=true", "[{\"type\":\"file\",\"path\":\"scripted.py\"}]");
+            web.Json($"{hf}/api/datasets/org/scripted/parquet", $"{{\"en\":{{\"train\":[\"{hf}/api/datasets/org/scripted/parquet/en/train/0.parquet\"]}}}}");
+            web.Bytes($"{hf}/api/datasets/org/scripted/parquet/en/train/0.parquet", parquet);
+            Check(HuggingFace.Dataset("org/scripted", downloader: downloader).Count() == 40, "hf converted Parquet");
+
+            web.Json($"{hf}/api/datasets/org/gated/tree/main?recursive=true", "[]", status: HttpStatusCode.Unauthorized);
+            try
+            {
+                _ = HuggingFace.Dataset("org/gated", downloader: downloader).Count();
+                Check(false, "gated without a token should fail");
+            }
+            catch (HttpRequestException ex)
+            {
+                Check(ex.Message.Contains("sign-in needed", StringComparison.Ordinal), ex.Message);
+            }
+
+            // GitHub: a repository snapshot as a code dataset.
+            var tarball = new MemoryStream();
+            using (var gzip = new GZipStream(tarball, CompressionLevel.Fastest, leaveOpen: true))
+            using (var tar = new TarWriter(gzip))
+            {
+                foreach (var (name, text) in new[] { ("owner-app-1a2b3c/src/Program.cs", "Console.WriteLine();"), ("owner-app-1a2b3c/web/main.ts", "bootstrap();"),
+                             ("owner-app-1a2b3c/bin/Debug/app.cs", "generated"), ("owner-app-1a2b3c/data/rows.jsonl", "{\"x\":1}") })
+                {
+                    tar.WriteEntry(new PaxTarEntry(TarEntryType.RegularFile, name) { DataStream = new MemoryStream(Encoding.UTF8.GetBytes(text)) });
+                }
+            }
+
+            web.Bytes("https://api.github.com/repos/owner/app/tarball", tarball.ToArray(), requireToken: "gh_secret");
+            var code = GitHub.Repository("owner/app", token: "gh_secret", downloader: downloader).ToList();
+            Check(code.Select(r => (string)r["path"]!).Order().SequenceEqual(["data/rows.jsonl", "src/Program.cs", "web/main.ts"]) && code.All(r => (string?)r["repo"] == "owner/app"),
+                $"github repository: {string.Join(", ", code.Select(r => r["path"]))}");
+            Check(GitHub.Repository("owner/app", pattern: "*.cs", token: "gh_secret", downloader: downloader).Single()["language"]!.GetValue<string>() == "csharp", "github pattern");
+
+            web.Json("https://api.github.com/repos/owner/data/git/trees/HEAD?recursive=1",
+                "{\"tree\":[{\"type\":\"blob\",\"path\":\"sets/a.jsonl\"},{\"type\":\"blob\",\"path\":\"sets/b.jsonl\"},{\"type\":\"tree\",\"path\":\"sets\"},{\"type\":\"blob\",\"path\":\"README.md\"}]}");
+            web.Bytes("https://api.github.com/repos/owner/data/contents/sets/a.jsonl?ref=HEAD", Encoding.UTF8.GetBytes("{\"q\":1}\n{\"q\":2}\n"));
+            web.Bytes("https://api.github.com/repos/owner/data/contents/sets/b.jsonl?ref=HEAD", Encoding.UTF8.GetBytes("{\"q\":3}\n"));
+            Check(GitHub.Files("owner/data", "sets/*.jsonl", downloader: downloader).Count() == 3, "github files");
+
+            web.Json("https://api.github.com/repos/owner/data/releases/latest",
+                "{\"assets\":[{\"name\":\"rows.csv\",\"url\":\"https://api.github.com/repos/owner/data/releases/assets/7\"},{\"name\":\"notes.pdf\",\"url\":\"x\"}]}");
+            web.Bytes("https://api.github.com/repos/owner/data/releases/assets/7", Encoding.UTF8.GetBytes("a,b\n1,2\n3,4\n"));
+            Check(GitHub.Release("owner/data", "*.csv", downloader: downloader).Count() == 2, "github release assets");
+
+            // Kaggle: a zip, with the account's key.
+            Environment.SetEnvironmentVariable("KAGGLE_USERNAME", "me");
+            Environment.SetEnvironmentVariable("KAGGLE_KEY", "k123");
+            var zip = new MemoryStream();
+            using (var archive = new ZipArchive(zip, ZipArchiveMode.Create, leaveOpen: true))
+            {
+                using (var writer = new StreamWriter(archive.CreateEntry("reviews.csv").Open()))
+                {
+                    writer.Write("text,stars\ngood,5\nbad,1\n");
+                }
+
+                using (var writer = new StreamWriter(archive.CreateEntry("other.json").Open()))
+                {
+                    writer.Write("[{\"x\":1}]");
+                }
+            }
+
+            web.Bytes("https://www.kaggle.com/api/v1/datasets/download/someone/reviews", zip.ToArray(),
+                requireAuthorization: "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes("me:k123")));
+            Check(Kaggle.Dataset("someone/reviews", "*.csv", downloader: downloader).Count() == 2, "kaggle");
+
+            web.Json("https://zenodo.org/api/records/123",
+                "{\"files\":[{\"key\":\"data.jsonl\",\"links\":{\"self\":\"https://zenodo.org/api/records/123/files/data.jsonl/content\"}},{\"key\":\"paper.pdf\",\"links\":{\"self\":\"y\"}}]}");
+            web.Bytes("https://zenodo.org/api/records/123/files/data.jsonl/content", Encoding.UTF8.GetBytes("{\"a\":1}\n"));
+            Check(Zenodo.Record("123", downloader: downloader).Count() == 1, "zenodo");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("KAGGLE_USERNAME", kaggleUser);
+            Environment.SetEnvironmentVariable("KAGGLE_KEY", kaggleKey);
+            if (Directory.Exists(cache))
+            {
+                Directory.Delete(cache, true);
+            }
+        }
+    }
+
+    // Answers fixed URLs, as the real services would.
+    private sealed class FakeRouter : HttpMessageHandler
+    {
+        private readonly Dictionary<string, Func<HttpRequestMessage, HttpResponseMessage>> _routes = [];
+
+        public void Json(string url, string json, string? next = null, HttpStatusCode status = HttpStatusCode.OK) => _routes[url] = _ =>
+        {
+            var response = new HttpResponseMessage(status) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
+            if (next is not null)
+            {
+                response.Headers.TryAddWithoutValidation("Link", $"<{next}>; rel=\"next\"");
+            }
+
+            return response;
+        };
+
+        public void Bytes(string url, byte[] body, string? requireToken = null, string? requireAuthorization = null) => _routes[url] = request =>
+        {
+            string? given = request.Headers.Authorization?.ToString();
+            string? wanted = requireAuthorization ?? (requireToken is null ? null : $"Bearer {requireToken}");
+            if (wanted is not null && given != wanted)
+            {
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = new StringContent("unauthorized") };
+            }
+
+            var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(body) };
+            response.Content.Headers.ContentLength = body.Length;
+            return response;
+        };
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(_routes.TryGetValue(request.RequestUri!.ToString(), out var route)
+                ? route(request)
+                : new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StringContent($"no route for {request.RequestUri}") });
+    }
 
     // tests/NeuralSharp.Tests/data, found from the build output folder.
     private static string TestData(string relative)

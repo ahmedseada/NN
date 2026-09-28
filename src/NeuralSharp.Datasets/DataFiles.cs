@@ -73,6 +73,12 @@ public sealed record ReadOptions
     /// <summary>Also read source code files (as <see cref="DataFormat.Code"/>) in folders and archives.</summary>
     public bool IncludeCode { get; init; }
 
+    /// <summary>
+    /// Every text file (data files such as .json and .csv included) is one row {"text", "path", "language"}: a repository
+    /// or folder read as documents rather than as data. Implies <see cref="IncludeCode"/>.
+    /// </summary>
+    public bool Documents { get; init; }
+
     /// <summary>Largest source or text file read as one document, in bytes (larger ones, often generated, are skipped).</summary>
     public long MaxDocumentBytes { get; init; } = 1 << 20;
 
@@ -130,7 +136,7 @@ public static class DataFiles
             return ReadArchive(path, options);
         }
 
-        var format = options.Format ?? FormatOf(path, includeCode: true)
+        var format = options.Format ?? DocumentFormat(FormatOf(path, includeCode: true), options)
                      ?? throw new NotSupportedException($"'{path}': unknown data format (set ReadOptions.Format).");
         return ReadStream(() => Open(path), shown, format, options);
     }
@@ -151,6 +157,9 @@ public static class DataFiles
         };
         return options.IncludeFile ? rows.Select(r => { r["_file"] = path; return r; }) : rows;
     }
+
+    private static DataFormat? DocumentFormat(DataFormat? format, ReadOptions options) =>
+        options.Documents && format is not null and not DataFormat.Parquet ? DataFormat.Code : format;
 
     internal static IEnumerable<string> InFolder(string root, string? pattern, ReadOptions options)
     {
@@ -173,7 +182,7 @@ public static class DataFiles
             foreach (var file in Directory.EnumerateFiles(folder))
             {
                 string relative = Path.GetRelativePath(root, file).Replace('\\', '/');
-                bool known = options.Format is not null || IsArchive(file) || FormatOf(file, options.IncludeCode) is not null;
+                bool known = options.Format is not null || IsArchive(file) || FormatOf(file, options.IncludeCode || options.Documents) is not null;
                 if (known && (match is null || match.IsMatch(relative) || match.IsMatch(Path.GetFileName(file))))
                 {
                     files.Add(file);
@@ -220,16 +229,23 @@ public static class DataFiles
     private static IEnumerable<JsonObject> ReadArchive(string path, ReadOptions options)
     {
         var match = options.Pattern is null ? null : Glob(options.Pattern);
-        bool Wanted(string name) => (match is null || match.IsMatch(name) || match.IsMatch(Path.GetFileName(name)))
-                                    && !name.Split('/').Any(SkippedFolders.Contains)
-                                    && FormatOf(name, options.IncludeCode) is not null;
+        bool Wanted(string name)
+        {
+            if (match is not null && !match.IsMatch(name) && !match.IsMatch(Path.GetFileName(name)) || name.Split('/').Any(SkippedFolders.Contains))
+            {
+                return false;
+            }
+
+            var format = DocumentFormat(FormatOf(name, options.IncludeCode || options.Documents), options);
+            return format is not null && !(options.Documents && format == DataFormat.Parquet);
+        }
 
         if (path.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
         {
             using var zip = ZipFile.OpenRead(path);
             foreach (var entry in zip.Entries.Where(e => e.Length > 0 && Wanted(e.FullName)).OrderBy(e => e.FullName, StringComparer.Ordinal))
             {
-                foreach (var row in ReadStream(() => Buffered(entry.Open(), entry.Length, entry.FullName), entry.FullName, FormatOf(entry.FullName)!.Value, options))
+                foreach (var row in ReadStream(() => Buffered(entry.Open(), entry.Length, entry.FullName), entry.FullName, DocumentFormat(FormatOf(entry.FullName), options)!.Value, options))
                 {
                     yield return row;
                 }
@@ -253,7 +269,7 @@ public static class DataFiles
             var bytes = new MemoryStream();
             entry.DataStream.CopyTo(bytes);
             var data = bytes.ToArray();
-            foreach (var row in ReadStream(() => Decompressed(new MemoryStream(data), name), name, FormatOf(name)!.Value, options))
+            foreach (var row in ReadStream(() => Decompressed(new MemoryStream(data), name), name, DocumentFormat(FormatOf(name), options)!.Value, options))
             {
                 yield return row;
             }
