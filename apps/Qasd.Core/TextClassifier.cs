@@ -8,7 +8,7 @@ using NeuralSharp.Layers;
 using NeuralSharp.Optimizers;
 using NeuralSharp.Training;
 
-namespace IntentClassifier;
+namespace Qasd;
 
 /// <summary>Settings of <see cref="TextClassifier.Train"/>.</summary>
 public sealed record TextClassifierOptions

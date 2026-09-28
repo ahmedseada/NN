@@ -1,18 +1,18 @@
 using System.Text.Encodings.Web;
-using IntentClassifier;
-using IntentClassifier.Api;
+using Qasd;
+using Qasd.Api;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using Scalar.AspNetCore;
 
-// The intent service: serves a model trained with 'intent-classifier train'. API reference (Scalar) at /scalar.
+// The intent service: serves a model trained with 'qasd train'. API reference (Scalar) at /scalar.
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<IntentModelOptions>(builder.Configuration.GetSection("IntentModel"));
 builder.Services.AddSingleton<ModelHost>();
 builder.Services.AddOpenApi(options => options.AddDocumentTransformer((document, _, _) =>
 {
-    document.Info.Title = "Intent classifier";
+    document.Info.Title = "Qasd: intent classifier";
     document.Info.Description = "Classifies a user's message into an intent (retrieve, function_call, direct_reply, identity, … as trained).";
     return Task.CompletedTask;
 }));
@@ -24,7 +24,7 @@ var app = builder.Build();
 app.UseExceptionHandler();
 app.Services.GetRequiredService<ModelHost>();                                   // load the model now: fail at startup, not on the first request
 app.MapOpenApi();
-app.MapScalarApiReference(options => options.WithTitle("Intent classifier"));
+app.MapScalarApiReference(options => options.WithTitle("Qasd: intent classifier"));
 app.MapGet("/", () => Results.Redirect("/scalar")).ExcludeFromDescription();
 app.MapHealthChecks("/health");
 

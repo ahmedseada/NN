@@ -2,8 +2,8 @@
 
   <!-- The HTTP service: serves a trained intent model (OpenAPI document, Scalar UI at /scalar). -->
   <PropertyGroup>
-    <RootNamespace>IntentClassifier.Api</RootNamespace>
-    <AssemblyName>IntentClassifier.Api</AssemblyName>
+    <RootNamespace>Qasd.Api</RootNamespace>
+    <AssemblyName>Qasd.Api</AssemblyName>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
@@ -13,7 +13,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\IntentClassifier.Core\IntentClassifier.Core.csproj" />
+    <ProjectReference Include="..\Qasd.Core\Qasd.Core.csproj" />
   </ItemGroup>
 
 </Project>

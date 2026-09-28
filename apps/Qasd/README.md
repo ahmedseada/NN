@@ -1,4 +1,4 @@
-# Intent classifier
+# Qasd (قصد): intent classifier
 
 An application built on NeuralSharp (it is not part of the library): it classifies a user's message into an intent
 (`retrieve`, `function_call`, `direct_reply`, `identity`, or whatever labels the training data has). It trains on a GPU
@@ -6,11 +6,11 @@ or CPU from a CSV of labeled messages and serves predictions from one model file
 
 | Project | What it is |
 |---|---|
-| `IntentClassifier.Core` | the model: training, evaluation, prediction, one-file save / load |
-| `IntentClassifier` | the command line (`intent-classifier`): train, evaluate, predict, info |
-| `IntentClassifier.Api` | the HTTP service (ASP.NET Core) serving a trained model, API reference with Scalar |
+| `Qasd.Core` | the model: training, evaluation, prediction, one-file save / load |
+| `Qasd` | the command line (`qasd`): train, evaluate, predict, info |
+| `Qasd.Api` | the HTTP service (ASP.NET Core) serving a trained model, API reference with Scalar |
 
-`apps/IntentClassifier.slnx` opens all three.
+`apps/Qasd.slnx` opens all three.
 
 How it works: each message becomes a hashed bag of words, word pairs and character 2-4-grams (TF-IDF weighted; Arabic
 normalized: diacritics, alef / yaa / taa marbuta forms, Arabic-Indic digits), and a small network built with NeuralSharp
@@ -19,7 +19,7 @@ maps it to the intents.
 ## Train
 
 ```
-dotnet run -c Release --project apps/IntentClassifier -- train plan-queries.csv --out models/intents.nsm --cuda
+dotnet run -c Release --project apps/Qasd -- train plan-queries.csv --out models/intents.nsm --cuda
 ```
 
 The columns default to `raw_question` (text) and `intent` (label); `--text` / `--label` pick others. 20% of the distinct
@@ -30,15 +30,15 @@ everything with `--test-fraction 0`. Other options: `--epochs`, `--batch-size`, 
 ## Use
 
 ```
-dotnet run -c Release --project apps/IntentClassifier -- predict models/intents.nsm "Book me with Dr. Heba on Tuesday" "هلا"
-dotnet run -c Release --project apps/IntentClassifier -- predict models/intents.nsm --json --min-confidence 0.6 < messages.txt
-dotnet run -c Release --project apps/IntentClassifier -- evaluate models/intents.nsm new-labeled.csv
+dotnet run -c Release --project apps/Qasd -- predict models/intents.nsm "Book me with Dr. Heba on Tuesday" "هلا"
+dotnet run -c Release --project apps/Qasd -- predict models/intents.nsm --json --min-confidence 0.6 < messages.txt
+dotnet run -c Release --project apps/Qasd -- evaluate models/intents.nsm new-labeled.csv
 ```
 
-## Serve (IntentClassifier.Api)
+## Serve (Qasd.Api)
 
 ```
-dotnet run -c Release --project apps/IntentClassifier.Api
+dotnet run -c Release --project apps/Qasd.Api
 ```
 
 Then open http://localhost:5080 (the Scalar API reference, where every endpoint can be tried). The model file and
@@ -47,7 +47,7 @@ settings come from `appsettings.json` (section `IntentModel`), or environment va
 
 | Setting | Default | |
 |---|---|---|
-| `Path` | `models/intents.nsm` | the model file from `intent-classifier train` |
+| `Path` | `models/intents.nsm` | the model file from `qasd train` |
 | `Device` | `cpu` | `auto`, `cpu`, `cuda` or `cuda:N` (the CPU is fast enough for single messages) |
 | `MinConfidence` | 0.6 | below it a result has `accepted: false`: send the message to your fallback (the LLM planner) |
 | `MaxBatch` | 256 | most messages per batch request |
@@ -66,19 +66,19 @@ settings come from `appsettings.json` (section `IntentModel`), or environment va
 The model is loaded at startup (a missing or broken file stops the service with a clear message, not the first
 request). Invalid input gets a 400 with ProblemDetails.
 
-From your own .NET code, reference `IntentClassifier.Core` and load the model once:
+From your own .NET code, reference `Qasd.Core` and load the model once:
 
 ```csharp
-using var classifier = IntentClassifier.TextClassifier.Load("models/intents.nsm", NeuralSharp.Device.Cpu);
+using var classifier = Qasd.TextClassifier.Load("models/intents.nsm", NeuralSharp.Device.Cpu);
 var p = classifier.Predict(message);          // p.Label, p.Confidence, p.Probabilities; thread-safe
 ```
 
 ## Publish
 
 ```
-dotnet publish apps/IntentClassifier.Api -c Release -o artifacts/intent-api        (then copy the model next to it)
-dotnet publish apps/IntentClassifier -c Release -r win-x64 -o artifacts/intent-classifier
+dotnet publish apps/Qasd.Api -c Release -o artifacts/intent-api        (then copy the model next to it)
+dotnet publish apps/Qasd -c Release -r win-x64 -o artifacts/qasd
 ```
 
-`IntentClassifier.Core` references the NeuralSharp projects in this repository; when the library is published as
+`Qasd.Core` references the NeuralSharp projects in this repository; when the library is published as
 packages, replace its two `ProjectReference`s with `PackageReference`s and the application can live in its own repository.

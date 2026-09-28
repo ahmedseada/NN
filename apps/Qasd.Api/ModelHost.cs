@@ -1,7 +1,7 @@
 using Microsoft.Extensions.Options;
 using NeuralSharp;
 
-namespace IntentClassifier.Api;
+namespace Qasd.Api;
 
 /// <summary>
 /// Holds the loaded model and swaps in a new one on reload without disturbing requests in flight: each request leases
@@ -61,7 +61,7 @@ public sealed class ModelHost : IDisposable
     {
         if (!File.Exists(path))
         {
-            throw new FileNotFoundException($"No intent model at {Path.GetFullPath(path)}: train one with 'intent-classifier train … --out {path}' or set IntentModel:Path.", path);
+            throw new FileNotFoundException($"No intent model at {Path.GetFullPath(path)}: train one with 'qasd train … --out {path}' or set IntentModel:Path.", path);
         }
 
         var device = _options.Device.ToLowerInvariant() switch

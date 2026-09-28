@@ -5,14 +5,14 @@
        packages, swap them for PackageReferences. -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <RootNamespace>IntentClassifier</RootNamespace>
-    <AssemblyName>intent-classifier</AssemblyName>
+    <RootNamespace>Qasd</RootNamespace>
+    <AssemblyName>qasd</AssemblyName>
     <InvariantGlobalization>true</InvariantGlobalization>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\IntentClassifier.Core\IntentClassifier.Core.csproj" />
+    <ProjectReference Include="..\Qasd.Core\Qasd.Core.csproj" />
   </ItemGroup>
 
 </Project>

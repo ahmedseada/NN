@@ -1,4 +1,4 @@
-namespace IntentClassifier.Api;
+namespace Qasd.Api;
 
 /// <summary>One message to classify.</summary>
 /// <param name="Text">The user's message.</param>

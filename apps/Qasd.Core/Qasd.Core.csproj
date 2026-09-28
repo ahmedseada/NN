@@ -2,8 +2,8 @@
 
   <!-- The intent model (training, evaluation, prediction, one-file save/load), shared by the command line and the API. -->
   <PropertyGroup>
-    <RootNamespace>IntentClassifier</RootNamespace>
-    <AssemblyName>IntentClassifier.Core</AssemblyName>
+    <RootNamespace>Qasd</RootNamespace>
+    <AssemblyName>Qasd.Core</AssemblyName>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 

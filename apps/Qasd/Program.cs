@@ -3,17 +3,17 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
 using NeuralSharp;
-using IntentClassifier;
+using Qasd;
 using NeuralSharp.Datasets;
 
-// intent-classifier: trains and serves the intent model (an application built on NeuralSharp).
+// qasd: trains and serves the intent model (an application built on NeuralSharp).
 const string Usage = """
-    intent-classifier: train, evaluate and run text classifiers (intents, topics, routing; any language)
+    qasd: train, evaluate and run text classifiers (intents, topics, routing; any language)
 
-      intent-classifier train <data…> --out model.nsm   train on labeled texts, report the score on held-out texts, save the model
-      intent-classifier evaluate <model> <data…>        score a model on labeled texts (accuracy, per-label F1, confusion matrix)
-      intent-classifier predict <model> [text…]         classify texts (arguments, else one per line from standard input)
-      intent-classifier info <model>                    labels and settings of a model
+      qasd train <data…> --out model.nsm   train on labeled texts, report the score on held-out texts, save the model
+      qasd evaluate <model> <data…>        score a model on labeled texts (accuracy, per-label F1, confusion matrix)
+      qasd predict <model> [text…]         classify texts (arguments, else one per line from standard input)
+      qasd info <model>                    labels and settings of a model
 
     Data: a CSV, JSON Lines, JSON or Parquet file or folder, a URL, or a dataset spec as nsdata reads it
     (hf:owner/name?split=train, github:…); several sources are combined.

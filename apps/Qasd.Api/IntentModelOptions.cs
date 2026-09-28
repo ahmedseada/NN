@@ -1,9 +1,9 @@
-namespace IntentClassifier.Api;
+namespace Qasd.Api;
 
 /// <summary>The "IntentModel" configuration section.</summary>
 public sealed class IntentModelOptions
 {
-    /// <summary>The model file written by <c>intent-classifier train</c>.</summary>
+    /// <summary>The model file written by <c>qasd train</c>.</summary>
     public string Path { get; set; } = "models/intents.nsm";
 
     /// <summary>auto (the GPU when there is one), cpu, cuda or cuda:N.</summary>
