@@ -39,10 +39,10 @@ Measured on an RTX 5070 Ti (70 SMs, 16 GB). Resume from here when returning to o
 
 | | Start | Now |
 |---|---|---|
-| Qwen3-0.6B int8, bf16 KV cache: greedy decoding | 391 tok/s | 474 tok/s |
-| Chat sampling (temperature 0.6, top-k 20, top-p 0.95) | 227 tok/s | 249 tok/s |
+| Qwen3-0.6B int8, bf16 KV cache: greedy decoding | 391 tok/s | 474–493 tok/s |
+| Chat sampling (temperature 0.6, top-k 20, top-p 0.95) | 227 tok/s | 249–255 tok/s |
 | Kernel launches per decoded token | 345 | 177 |
-| 180-token prompt pass | 13.6 ms | 8.4 ms (products 5.5 ms at 39 TFLOPS) |
+| 180-token prompt pass | 13.6 ms | 7.7 ms (GPU 7.3 ms; products 5.0 ms at 42.8 TFLOPS) |
 | Decoding attention, 4000 cached positions | 76 µs | 38 µs |
 | 1.25B char model training step, FP8 | 592 ms | 560 ms (548 with delayed scaling) |
 | 1.25B char model training step, bfloat16 | 736 ms | 712 ms |
@@ -56,7 +56,9 @@ What changed:
   (power of two); decoding attention ≈ 5 blocks per SM over the cache.
 - Prompts: packed tensor-core products split k up to ≈ 4 blocks per SM (none when the tiles fill one wave); layers
   sharing an input (q/k/v, gate/up) in one launch (`gemm_tc_nn_*w_multi_f32`): q/k/v 1.84 → 1.20 ms and gate/up
-  2.24 → 1.66 ms per 180-token pass, 367 → 283 launches.
+  2.24 → 1.66 ms per 180-token pass, 367 → 283 launches; 64-row tiles when the last 128-row tile would be at most
+  half full (`*_m64_f32`; 180 rows: 192 computed instead of 256): products 5.6 → 5.0 ms, the vocabulary head 0.99 →
+  0.79 ms (70.6 TFLOPS).
 - Training: plain tensor-core products with fewer than 4 output tiles per SM split k (≈ 16 blocks per SM, ≤ 8 splits,
   ≥ 1024 k each). Delayed FP8 column scaling (kept per-column maxima with 2× headroom, recorded in the same pass,
   correction pass for columns that more than doubled) behind `NEURALSHARP_FP8_DELAYED=1`.
@@ -69,9 +71,9 @@ What changed:
 
 | | PyTorch | NeuralSharp bf16 | NeuralSharp int8 | bf16 speedup | int8 speedup |
 |---|---|---|---|---|---|
-| Prompt pass, 180 tokens | 21.0 ms (passes 2 and 3) | 9.2 ms | 9.2 ms | 2.3× | 2.3× |
-| Greedy decoding, 32 tokens | 48.6 tok/s | 372.8 tok/s | 478.2 tok/s | 7.7× | 9.8× |
-| Chat sampling, 128 tokens | 49.1 tok/s | 221.6 tok/s | 254.0 tok/s | 4.5× | 5.2× |
+| Prompt pass, 180 tokens | 21.0 ms (passes 2 and 3) | 9.2 ms (before the prompt work) | 7.7 ms (now) | 2.3× | 2.7× |
+| Greedy decoding, 32 tokens | 48.6 tok/s | 372.8 tok/s | 492.6 tok/s (now) | 7.7× | 10.1× |
+| Chat sampling, 128 tokens | 49.1 tok/s | 221.6 tok/s | 254.8 tok/s | 4.5× | 5.2× |
 | Interactive chat | ~49 tok/s (estimated) | 151–169 tok/s | 161–181 tok/s | ~3.1–3.4× | ~3.3–3.7× |
 | First prompt pass (one-time setup) | 304.7 ms | 79.1 ms | 76.6 ms | 3.9× | 4.0× |
 
@@ -95,10 +97,11 @@ products run at about 30 TFLOPS against the 78 its GEMM reaches on large shapes 
    ~31% of the memory-bandwidth ceiling (~1.5k tok/s for this model).
 4. **INT8 prefill on int8 tensor cores:** prompt products currently expand int8 weights to bfloat16 tiles; the int8
    tensor-core path needs a second, k-major copy of the weights (memory cost: the int8 weights once more).
-5. **Prompt products (180 rows):** q/k/v and gate/up now run in one launch each (35–38 TFLOPS); the o and down products
-   (180×1024×2048, 180×1024×3072) stay at 29–35 TFLOPS against 78 on large shapes. 180 rows fill only 1.4 of the two
-   128-row tiles: a 64-row tile variant is the next candidate, then the gated activation and the residual + norm in
-   the prompt products' epilogues. This is where the prompt lead over PyTorch (2.3× at 9.2 ms; now 8.4 ms) can grow.
+5. **Prompt pass (180 rows, now 7.7 ms, 2.7× PyTorch):** products run at 37–41 TFLOPS with 64-row tiles and one launch
+   per shared input; the o product (180×1024×2048) is still at 30. The rest: norm/rope 0.69 ms, residual + norm
+   0.53 ms, attention 0.48 ms, head permute 0.29 ms, gated activation 0.24 ms; candidates are the gated activation and
+   the residual + norm in the products' epilogues, and the attention output written in the o product's layout. The
+   split rule is 1–1.3 µs off the best for a few 64-row shapes (--bench-gemv), about 0.1 ms per pass.
 6. **Training step outside the products** (1.25B, FP8): `adam8` 34 ms, flash-attention backward 32 ms, `sumsq` for
    gradient clipping 9 ms, `fill` (zeroing gradients) 8 ms, dropout 10 ms. Candidates: the first gradient write with
    beta 0 instead of zeroing, clipping's norm fused into the backward pass.
