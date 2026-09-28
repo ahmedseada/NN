@@ -236,6 +236,12 @@ switch (positional[0])
     case "finetune":
     {
         using var model = Load(positional[1]);
+        if (tuning.MaxLength >= model.MaxPositions)
+        {
+            Console.WriteLine($"--max-length {tuning.MaxLength} is beyond the model's context of {model.MaxPositions} positions; using {model.MaxPositions - 1}");
+            tuning = tuning with { MaxLength = model.MaxPositions - 1 };
+        }
+
         var encoder = new ChatTranscriptEncoder(model.ChatTemplate ?? throw new InvalidOperationException("The model has no chat template."),
             model.Tokenizer ?? throw new InvalidOperationException("The model has no tokenizer."));
         List<TrainingSequence> Read(NeuralSharp.Datasets.Dataset rows, string what)
