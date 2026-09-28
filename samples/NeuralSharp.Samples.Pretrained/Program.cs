@@ -26,6 +26,10 @@ using NeuralSharp.Pretrained;
 //   (<folder> may also be a Hugging Face model id, for example Qwen/Qwen3-0.6B: taken from the Hugging Face cache or
 //   NeuralSharp's, else downloaded once; HF_TOKEN or huggingface-cli login for gated models; a .gguf file; or an Ollama
 //   model such as ollama:qwen3:8b, read from Ollama's own store)
+//   evaluate <folder> <data…>       scores the model's answers to held-out conversations against their reference answers
+//                                   (greedy decoding): with --adapter DIR the base model and the adapter side by side;
+//                                   the same data and --eval-fraction as finetune evaluate on the rows it held out
+//                                   (--samples 100, --metric auto|number|exact|contains|f1, --max-new 512, --out F.jsonl)
 //   download <model id>             download a model (config, tokenizer, chat template, safetensors) and print its folder
 //
 //   (<data…> specs, recipes and the dataset tool: see src/NeuralSharp.Datasets.Cli, command nsdata)
@@ -50,6 +54,8 @@ int context = 4096;
 string? folderOverride = null, output = null, evalFile = null, adapterFolder = null;
 string? workspace = null, workRoot = null, filter = null, systemPrompt = null;
 double evalFraction = 0;
+int samples = 100, maxNew = 512;
+var metric = AnswerMetric.Auto;
 long maxRows = 0;
 int seed = 0, minChars = 0, maxChars = 0;
 bool shuffleRows = true, dedupRows = true, mixByWeight = false;
@@ -99,6 +105,9 @@ for (int i = 0; i < args.Length; i++)
         case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
         case "--workspace": workspace = args[++i]; break;
+        case "--samples": samples = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--max-new": maxNew = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--metric": metric = Enum.Parse<AnswerMetric>(args[++i], ignoreCase: true); break;
         case "--eval-fraction": evalFraction = double.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--system": systemPrompt = args[++i]; break;
         case "--max-rows": maxRows = long.Parse(args[++i], CultureInfo.InvariantCulture); break;
@@ -121,11 +130,12 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run" or "agent-check" or "download")
+if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run" or "agent-check" or "download" or "evaluate")
     || positional[0] is "agent" && (positional.Count < 3 || workspace is null) || positional[0] is "agent-run" && (positional.Count < 3 || output is null)
     || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
 {
     Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir> | download <model id>");
+    Console.WriteLine("       evaluate <folder> <data…> [--adapter DIR] [--eval-fraction F] [--samples N] [--metric auto|number|exact|contains|f1] [--out F.jsonl]");
     Console.WriteLine("       agent <folder> <task…> --workspace <dir> | agent-run <folder> <suite> --out <runs.jsonl> [--attempts N] | agent-check <suite>");
     Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] [--matmul fp32|bf16|fp8] (fine-tuning options: see the top of Program.cs)");
     return 1;
@@ -218,6 +228,87 @@ var downloads = status.CreateDownloader();
 
 switch (positional[0])
 {
+    case "evaluate":
+    {
+        if (positional.Count < 3)
+        {
+            Console.Error.WriteLine("evaluate needs a model and data: evaluate <folder> <data…>");
+            return 1;
+        }
+
+        // The rows: the held-out part when --eval-fraction splits the data as finetune did, else the data itself.
+        var recipe = Recipe(positional.Skip(2).ToList(), forTraining: true) with { Kind = NeuralSharp.Datasets.RowKind.Chat };
+        var (allRows, heldOut) = recipe.Build(downloads);
+        var rows = status.Track(heldOut ?? allRows, "reading").Take(samples).ToList();
+        Console.WriteLine($"{rows.Count} conversations from {(heldOut is null ? "the data" : $"the {recipe.EvaluationFraction:P1} held out of the data")}");
+        string? adapter = adapterFolder;
+        var runs = adapter is null ? new[] { (string?)null } : [null, adapter];
+        var reports = new List<(string Name, EvaluationReport Report)>();
+        foreach (var run in runs)
+        {
+            adapterFolder = run;
+            string name = run is null ? "base model" : $"adapter {Path.GetFileName(Path.TrimEndingDirectorySeparator(run))}";
+            Console.WriteLine($"\n{name}:");
+            using var model = Load(positional[1]);
+            var encoder = new ChatTranscriptEncoder(model.ChatTemplate ?? throw new InvalidOperationException("The model has no chat template."), model.Tokenizer!);
+            var sequences = rows.SelectMany(r => encoder.EncodeRow((JsonObject)r.DeepClone(), Math.Min(tuning.MaxLength, model.MaxPositions - 1))).ToList();
+            double loss = sequences.Count > 0 ? FineTuner.Evaluate(model, sequences, tuning.BatchTokens) : double.NaN;
+            var chat = model.CreateChat(cacheFormat, context);
+            int done = 0;
+            double sum = 0;
+            var clock = Stopwatch.StartNew();
+            var report = ChatEvaluation.Run(chat, rows.Select(r => (JsonObject)r.DeepClone()), metric, maxNew, noThink ? false : null,
+                new ConsoleProgress<EvaluatedAnswer>(a =>
+                {
+                    done++;
+                    sum += a.Score;
+                    status.Bar("answering", done, rows.Count, clock.Elapsed, $"{done}/{rows.Count}  score {sum / done:P1}");
+                }), context);
+            status.Clear();
+            report = report with { Loss = loss };
+            reports.Add((name, report));
+            Console.WriteLine($"  loss {report.Loss:F4}, {report.Metric.ToString().ToLowerInvariant()} score {report.Score:P1} on {report.Answers.Count} answers, "
+                              + $"{report.MeanTokens:F0} tokens per answer, {report.TokensPerSecond:F0} tok/s ({report.Duration.TotalSeconds:F0} s)");
+        }
+
+        if (reports.Count == 2)
+        {
+            var (b, a) = (reports[0].Report, reports[1].Report);
+            int fixedCount = b.Answers.Zip(a.Answers).Count(p => p.First.Score < 0.5 && p.Second.Score >= 0.5);
+            int broken = b.Answers.Zip(a.Answers).Count(p => p.First.Score >= 0.5 && p.Second.Score < 0.5);
+            Console.WriteLine($"\n{"",-22}{"loss",10}{"score",10}{"tokens",9}");
+            foreach (var (name, r) in reports)
+            {
+                Console.WriteLine($"{name,-22}{r.Loss,10:F4}{r.Score,10:P1}{r.MeanTokens,9:F0}");
+            }
+
+            Console.WriteLine($"the adapter answers {fixedCount} questions right that the base model got wrong, and {broken} the other way round");
+        }
+
+        if (output is not null)
+        {
+            using var writer = new StreamWriter(output);
+            for (int i = 0; i < reports[0].Report.Answers.Count; i++)
+            {
+                var line = new JsonObject
+                {
+                    ["prompt"] = reports[0].Report.Answers[i].Prompt[^1].Content,
+                    ["reference"] = reports[0].Report.Answers[i].Reference,
+                };
+                foreach (var (name, r) in reports)
+                {
+                    line[name] = new JsonObject { ["answer"] = r.Answers[i].Answer, ["score"] = r.Answers[i].Score };
+                }
+
+                writer.WriteLine(line.ToJsonString(new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
+            }
+
+            Console.WriteLine($"answers written to {output}");
+        }
+
+        return 0;
+    }
+
     case "download":
     {
         foreach (var id in positional.Skip(1))
