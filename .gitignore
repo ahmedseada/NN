@@ -10,3 +10,5 @@ output/
 *.weights
 __pycache__/
 artifacts/
+apps/Qasd/models/
+apps/Qasd.Tuned/models/

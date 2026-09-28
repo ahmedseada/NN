@@ -27,7 +27,7 @@ maps it to the intents.
 ## Train
 
 ```
-dotnet run -c Release --project apps/Qasd -- train apps/Qasd/data/plan-queries.csv --out models/intents.nsm
+dotnet run -c Release --project apps/Qasd -- train apps/Qasd/data/plan-queries.csv
 ```
 
 The columns default to `raw_question` (text) and `intent` (label); `--text` / `--label` pick others. 20% of the distinct
@@ -38,10 +38,18 @@ everything with `--test-fraction 0`. Other options: `--epochs`, `--batch-size`, 
 ## Use
 
 ```
-dotnet run -c Release --project apps/Qasd -- predict models/intents.nsm "Book me with Dr. Heba on Tuesday" "هلا"
-dotnet run -c Release --project apps/Qasd -- predict models/intents.nsm --json --min-confidence 0.6 < messages.txt
-dotnet run -c Release --project apps/Qasd -- evaluate models/intents.nsm new-labeled.csv
+dotnet run -c Release --project apps/Qasd -- predict "Book me with Dr. Heba on Tuesday" "هلا"
+dotnet run -c Release --project apps/Qasd -- predict --json --min-confidence 0.6 < messages.txt
+dotnet run -c Release --project apps/Qasd -- evaluate new-labeled.csv
 ```
+
+## Where the models go
+
+Each project keeps its own trained model: `qasd train` saves to `apps/Qasd/models/intents.nsm` and `qasd-tuned train`
+to `apps/Qasd.Tuned/models/qasd-tuned` (`--out` for elsewhere). `predict` and `evaluate` read them from there unless
+given another model, and the service loads both from there with no settings (IntentModel:Path and IntentModel:TunedPath
+override; `"TunedPath": "none"` serves the classifier only). The service starts without the tuned model when it has
+not been trained yet. Both folders are git-ignored.
 
 ## Devices
 
@@ -54,8 +62,8 @@ measure both devices when there is a GPU (`--devices cpu` or `--devices cuda` fo
 ## Tune a language model (Qasd.Tuned)
 
 ```
-dotnet run -c Release --project apps/Qasd.Tuned -- train apps/Qasd/data/plan-queries.csv --out models/qasd-tuned
-dotnet run -c Release --project apps/Qasd.Tuned -- predict models/qasd-tuned "Book me with Dr. Heba on Tuesday" --stream
+dotnet run -c Release --project apps/Qasd.Tuned -- train apps/Qasd/data/plan-queries.csv
+dotnet run -c Release --project apps/Qasd.Tuned -- predict "Book me with Dr. Heba on Tuesday" --stream
 ```
 
 It downloads the base model once (`--model` picks another: a Hugging Face id, a folder, a .gguf file or `ollama:name`),
@@ -90,7 +98,7 @@ settings come from `appsettings.json` (section `IntentModel`), or environment va
 
 | Setting | Default | |
 |---|---|---|
-| `Path` | `models/intents.nsm` | the model file from `qasd train` |
+| `Path` | `apps/Qasd/models/intents.nsm` | the model file from `qasd train` |
 | `Device` | `cpu` | `auto`, `cpu`, `cuda` or `cuda:N` (the CPU is fast enough for single messages) |
 | `MinConfidence` | 0.6 | below it a result has `accepted: false`: send the message to your fallback (the LLM planner) |
 | `MaxBatch` | 256 | most messages per batch request |
@@ -131,7 +139,7 @@ request). Invalid input gets a 400 with ProblemDetails.
 From your own .NET code, reference `Qasd.Core` and load the model once:
 
 ```csharp
-using var classifier = Qasd.TextClassifier.Load("models/intents.nsm", NeuralSharp.Device.Cpu);
+using var classifier = Qasd.TextClassifier.Load("apps/Qasd/models/intents.nsm", NeuralSharp.Device.Cpu);
 var p = classifier.Predict(message);          // p.Label, p.Confidence, p.Probabilities; thread-safe
 ```
 

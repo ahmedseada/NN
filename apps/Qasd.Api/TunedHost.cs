@@ -7,10 +7,17 @@ public sealed class TunedHost : IDisposable
 {
     public TunedHost(IOptions<IntentModelOptions> options, ILogger<TunedHost> logger)
     {
-        string? path = options.Value.TunedPath;
-        if (string.IsNullOrWhiteSpace(path))
+        string? path = options.Value.TunedFolder;
+        if (path is null)
         {
-            Status = "not configured (set IntentModel:TunedPath to a folder from 'qasd-tuned train')";
+            Status = "turned off (IntentModel:TunedPath is \"none\")";
+            return;
+        }
+
+        if (!TunedClassifier.IsTunedFolder(path))
+        {
+            Status = $"not trained yet: no tuned model in {System.IO.Path.GetFullPath(path)} (run 'qasd-tuned train apps/Qasd/data/plan-queries.csv', or set IntentModel:TunedPath)";
+            logger.LogWarning("Serving the classifier only: {Status}", Status);
             return;
         }
 

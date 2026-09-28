@@ -10,10 +10,12 @@ using NeuralSharp.Datasets;
 const string Usage = """
     qasd: train, evaluate and run text classifiers (intents, topics, routing; any language)
 
-      qasd train <data…> --out model.nsm   train on labeled texts, report the score on held-out texts, save the model
-      qasd evaluate <model> <data…>        score a model on labeled texts (accuracy, per-label F1, confusion matrix)
-      qasd predict <model> [text…]         classify texts (arguments, else one per line from standard input)
-      qasd info <model>                    labels and settings of a model
+      qasd train <data…> [--out F]         train on labeled texts, report the score on held-out texts, save the model
+                                          (default apps/Qasd/models/intents.nsm)
+      qasd evaluate [model] <data…>        score a model on labeled texts (accuracy, per-label F1, confusion matrix)
+      qasd predict [model] [text…]         classify texts (arguments, else one per line from standard input)
+      qasd info [model]                    labels and settings of a model
+    (model: a .nsm file; default apps/Qasd/models/intents.nsm)
       qasd benchmark <data…>               train and measure on each device (CPU, and CUDA when present): training time,
                                           held-out accuracy and F1, single-message latency and batch throughput
                                           (--devices cpu,cuda to choose)
@@ -77,10 +79,10 @@ catch (Exception ex) when (ex is ArgumentException or FormatException)
 string command = positional.Count > 0 ? positional[0] : "";
 bool valid = command switch
 {
-    "train" => positional.Count >= 2 && output is not null,
+    "train" => positional.Count >= 2,
     "benchmark" => positional.Count >= 2,
-    "evaluate" => positional.Count >= 3,
-    "predict" or "info" => positional.Count >= 2,
+    "evaluate" => positional.Count >= 2,
+    "predict" or "info" => positional.Count >= 1,
     _ => false,
 };
 if (!valid)
@@ -90,6 +92,12 @@ if (!valid)
 }
 
 Console.OutputEncoding = Encoding.UTF8;
+output ??= QasdPaths.Classifier;
+
+// evaluate / predict / info: the model file first when given (a .nsm file), else the default one.
+bool modelGiven = positional.Count > 1 && positional[1].EndsWith(".nsm", StringComparison.OrdinalIgnoreCase);
+string modelPath = modelGiven ? positional[1] : QasdPaths.Classifier;
+var rest = positional.Skip(modelGiven ? 2 : 1).ToList();
 // JSON with Arabic and other text as written, not \u escapes (for people and pipelines, not HTML).
 var jsonOutput = new System.Text.Json.JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 try
@@ -128,8 +136,8 @@ try
 
         case "evaluate":
         {
-            using var classifier = TextClassifier.Load(positional[1], device);
-            var examples = ReadAll(positional.Skip(2));
+            using var classifier = TextClassifier.Load(modelPath, device);
+            var examples = ReadAll(rest);
             Console.WriteLine(classifier.Evaluate(examples));
             return 0;
         }
@@ -207,15 +215,15 @@ try
 
         case "info":
         {
-            using var classifier = TextClassifier.Load(positional[1], Device.Cpu);
-            Console.WriteLine($"{positional[1]}: {classifier.Labels.Count} labels: {string.Join(", ", classifier.Labels)}");
+            using var classifier = TextClassifier.Load(modelPath, Device.Cpu);
+            Console.WriteLine($"{modelPath}: {classifier.Labels.Count} labels: {string.Join(", ", classifier.Labels)}");
             return 0;
         }
 
         default:
         {
-            using var classifier = TextClassifier.Load(positional[1], device);
-            var texts = positional.Count > 2 ? positional.Skip(2).ToList() : ReadLines().ToList();
+            using var classifier = TextClassifier.Load(modelPath, device);
+            var texts = rest.Count > 0 ? rest : ReadLines().ToList();
             foreach (var (text, prediction) in texts.Zip(classifier.Predict(texts)))
             {
                 string label = prediction.Confidence < minConfidence ? "unknown" : prediction.Label;

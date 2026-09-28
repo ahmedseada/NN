@@ -443,6 +443,7 @@ public sealed class TextClassifier : IDisposable
     /// <summary>Writes the model (weights, labels, feature settings) to one file.</summary>
     public void Save(string path)
     {
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         var settings = new JsonObject
         {
             ["format"] = Format,

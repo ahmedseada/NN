@@ -9,9 +9,10 @@ using Qasd;
 const string Usage = """
     qasd-tuned: tune a pretrained chat model to classify intents (the language-model counterpart of qasd)
 
-      qasd-tuned train <data…> --out <folder>   tune on labeled messages, report the score on held-out messages, save
-      qasd-tuned evaluate <folder> <data…>      score a tuned model on labeled messages
-      qasd-tuned predict <folder> [text…]       classify messages (arguments, else one per line from standard input);
+      qasd-tuned train <data…> [--out F]        tune on labeled messages, report the score on held-out messages, save
+                                                (default apps/Qasd.Tuned/models/qasd-tuned)
+      qasd-tuned evaluate [folder] <data…>      score a tuned model on labeled messages
+      qasd-tuned predict [folder] [text…]       classify messages (arguments, else one per line from standard input);
                                                 --stream prints the model's answer as it is generated
       qasd-tuned benchmark <data…>              tune and measure on each device (--devices cpu,cuda; default: both when there is a GPU): tuning time,
                                                 held-out accuracy and F1, latency, time to the first streamed token and
@@ -78,9 +79,9 @@ catch (Exception ex) when (ex is ArgumentException or FormatException)
 string command = positional.Count > 0 ? positional[0] : "";
 bool valid = command switch
 {
-    "train" => positional.Count >= 2 && output is not null,
-    "evaluate" => positional.Count >= 3,
-    "predict" => positional.Count >= 2,
+    "train" => positional.Count >= 2,
+    "evaluate" => positional.Count >= 2,
+    "predict" => positional.Count >= 1,
     "benchmark" => positional.Count >= 2,
     _ => false,
 };
@@ -91,6 +92,13 @@ if (!valid)
 }
 
 Console.OutputEncoding = Encoding.UTF8;
+
+output ??= QasdPaths.Tuned;
+
+// evaluate / predict: the tuned model's folder first when given, else the default one.
+bool folderGiven = positional.Count > 1 && TunedClassifier.IsTunedFolder(positional[1]);
+string folder = folderGiven ? positional[1] : QasdPaths.Tuned;
+var rest = positional.Skip(folderGiven ? 2 : 1).ToList();
 
 // Tuning on the GPU when there is one; evaluation and prediction on the CPU unless asked (--cuda).
 if (device is null)
@@ -116,7 +124,8 @@ try
             if (test.Count > 0)
             {
                 clock.Restart();
-                var report = tuned.Evaluate(test);
+                Console.WriteLine($"scoring the {test.Count:N0} held-out messages…");
+                var report = tuned.Evaluate(test, Progress(clock));
                 Console.WriteLine($"\n{report}");
                 Console.WriteLine($"{test.Count / clock.Elapsed.TotalSeconds:F1} messages/s while scoring on {device.Name}");
             }
@@ -148,17 +157,17 @@ try
                 double classifierTrain = clock.Elapsed.TotalSeconds;
                 rows.Add(Measure("classifier", target, classifierTrain, classifier.Evaluate(probe), t => classifier.Predict(t), null, probe));
 
-                string folder = Path.Combine(Path.GetTempPath(), $"qasd-tuned-bench-{Guid.NewGuid():N}");
+                string benchFolder = Path.Combine(Path.GetTempPath(), $"qasd-tuned-bench-{Guid.NewGuid():N}");
                 try
                 {
                     clock.Restart();
-                    using var tuned = TunedClassifier.Train(train, folder, options with { Device = target }, line => Console.WriteLine($"  {line}"));
+                    using var tuned = TunedClassifier.Train(train, benchFolder, options with { Device = target }, line => Console.WriteLine($"  {line}"));
                     double tunedTrain = clock.Elapsed.TotalSeconds;
                     rows.Add(Measure("tuned", target, tunedTrain, tuned.Evaluate(probe), t => tuned.Predict(t), tuned, probe));
                 }
                 finally
                 {
-                    Directory.Delete(folder, true);
+                    Directory.Delete(benchFolder, true);
                 }
             }
 
@@ -177,16 +186,17 @@ try
 
         case "evaluate":
         {
-            using var tuned = TunedClassifier.Load(positional[1], device);
-            var examples = ReadAll(positional.Skip(2));
-            Console.WriteLine(tuned.Evaluate(examples));
+            using var tuned = TunedClassifier.Load(folder, device);
+            var examples = ReadAll(rest);
+            Console.WriteLine($"scoring {examples.Count:N0} messages on {device.Name}…");
+            Console.WriteLine(tuned.Evaluate(examples, Progress(Stopwatch.StartNew())));
             return 0;
         }
 
         default:
         {
-            using var tuned = TunedClassifier.Load(positional[1], device);
-            var texts = positional.Count > 2 ? positional.Skip(2).ToList() : ReadLines().ToList();
+            using var tuned = TunedClassifier.Load(folder, device);
+            var texts = rest.Count > 0 ? rest : ReadLines().ToList();
             foreach (string text in texts)
             {
                 if (stream)
@@ -273,6 +283,21 @@ static string[] Measure(string name, Device device, double trainSeconds, TextCla
     Console.WriteLine($"  {name}: trained in {trainSeconds:F1} s; accuracy {report.Accuracy:P1}, macro F1 {report.MacroF1:F3}; latency p50 {latencies[singles / 2]:F2} ms");
     return [name, device.Name.Length > 30 ? device.Name[..30] : device.Name, trainSeconds >= 120 ? $"{trainSeconds / 60:F1} min" : $"{trainSeconds:F1} s",
         $"{report.Accuracy:P1}", $"{report.MacroF1:F3}", $"{latencies[singles / 2]:F2} ms", $"{latencies[(int)(singles * 0.95)]:F2} ms", firstToken, $"{throughput:N1}/s"];
+}
+
+// Progress while scoring: a line every 10% (and the rate).
+static Action<int, int> Progress(Stopwatch clock)
+{
+    int lastTenth = 0;
+    return (done, total) =>
+    {
+        int tenth = done * 10 / Math.Max(1, total);
+        if (tenth > lastTenth || done == total)
+        {
+            lastTenth = tenth;
+            Console.WriteLine($"  scored {done:N0}/{total:N0} ({done / Math.Max(1e-9, clock.Elapsed.TotalSeconds):F1} messages/s)");
+        }
+    };
 }
 
 List<LabeledText> ReadAll(IEnumerable<string> sources)

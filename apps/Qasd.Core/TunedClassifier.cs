@@ -105,6 +105,7 @@ public sealed class TunedClassifier : IDisposable
         string folder = ModelSource.Resolve(options.BaseModel);
         log?.Invoke($"base model {options.BaseModel} ({folder}) on {device.Name}");
         var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, BFloat16 = device.Type == DeviceType.Cuda });
+        Directory.CreateDirectory(outputFolder);
         var classifier = new TunedClassifier(model, labels, system, options.MaxLength, options.BaseModel, Path.GetFullPath(outputFolder));
         try
         {
@@ -172,7 +173,7 @@ public sealed class TunedClassifier : IDisposable
         _gate.Wait();
         try
         {
-            return [.. texts.Select(Score)];
+            return Score(texts);
         }
         finally
         {
@@ -181,10 +182,19 @@ public sealed class TunedClassifier : IDisposable
     }
 
     /// <summary>Accuracy, per-intent scores and the confusion matrix on labeled messages.</summary>
-    public TextClassifierReport Evaluate(IEnumerable<LabeledText> examples)
+    public TextClassifierReport Evaluate(IEnumerable<LabeledText> examples, Action<int, int>? progress = null)
     {
         var list = examples.ToList();
-        return TextClassifierReport.Create(Labels, list, Predict([.. list.Select(e => e.Text)]));
+        _gate.Wait();
+        try
+        {
+            var predictions = Score([.. list.Select(e => e.Text)], done => progress?.Invoke(done, list.Count));
+            return TextClassifierReport.Create(Labels, list, predictions);
+        }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
     /// <summary>
@@ -253,83 +263,111 @@ public sealed class TunedClassifier : IDisposable
         return (text, null);
     }
 
-    // log p(label's answer tokens | instruction, message) for each intent, softmaxed over the intents. One batch: a row per
-    // intent, right-padded; the network runs up to its final normalization and the output layer only on the answer rows.
-    private TextPrediction Score(string text)
+    private TextPrediction Score(string text) => Score([text])[0];
+
+    // log p(label's answer tokens | instruction, message) for each intent, softmaxed over the intents. A batch holds a row
+    // per (message, intent), right-padded; the network runs up to its final normalization and the output layer only on the
+    // answer rows. Messages go 16 at a time (64 rows with four intents).
+    private List<TextPrediction> Score(IReadOnlyList<string> texts, Action<int>? progress = null)
     {
-        // One shortened message for every intent: fitted to the longest answer, so each intent is scored on the same text.
+        const int MessagesPerPass = 16;
         string longest = Labels.MaxBy(l => _model.Tokenizer!.Encode(l).Count)!;
-        string fitted = Fit(text, longest).Text;
-        var sequences = Labels.Select(l => Fit(fitted, l).Sequence).ToList();
-        if (sequences.Any(s => s is null))
-        {
-            // Not even an empty message fits: MaxLength is too small for the instruction; no intent can be preferred.
-            float even = 1f / Labels.Count;
-            return new TextPrediction(Labels[0], even, [.. Labels.Select(l => (l, even))]);
-        }
-
-        int rows = sequences.Count, length = sequences.Max(s => s!.Tokens.Length) - 1;
-        var input = new float[rows * length];
-        var targets = new List<(int Row, int Position, int Token)>();
-        for (int r = 0; r < rows; r++)
-        {
-            var s = sequences[r]!;
-            for (int t = 0; t + 1 < s.Tokens.Length; t++)
-            {
-                input[r * length + t] = s.Tokens[t];
-                if (s.Trained[t + 1])
-                {
-                    targets.Add((r, t, s.Tokens[t + 1]));
-                }
-            }
-        }
-
+        var predictions = new List<TextPrediction>(texts.Count);
         var modules = _model.Network.ToList();
         var head = (Linear)modules[^1];
-        var scores = new double[rows];
-        using (Autograd.NoGrad())
-        using (var scope = new TensorScope())
+        for (int first = 0; first < texts.Count; first += MessagesPerPass)
         {
-            var hidden = Tensor.From(input, [rows, length], Device);
-            for (int i = 0; i < modules.Count - 1; i++)
+            var chunk = texts.Skip(first).Take(MessagesPerPass).ToList();
+
+            // One shortened message for every intent: fitted to the longest answer, so each intent is scored on the same text.
+            var sequences = new List<TrainingSequence?>();
+            foreach (string text in chunk)
             {
-                hidden = modules[i].Forward(hidden);
+                string fitted = Fit(text, longest).Text;
+                sequences.AddRange(Labels.Select(l => Fit(fitted, l).Sequence));
             }
 
-            int dim = hidden.Shape[^1];
-            var all = hidden.ToArray();
-            var picked = new float[targets.Count * dim];
-            for (int i = 0; i < targets.Count; i++)
+            int rows = sequences.Count, length = sequences.Max(s => s?.Tokens.Length ?? 2) - 1;
+            var input = new float[rows * length];
+            var targets = new List<(int Row, int Position, int Token)>();
+            for (int r = 0; r < rows; r++)
             {
-                Array.Copy(all, (targets[i].Row * length + targets[i].Position) * dim, picked, i * dim, dim);
-            }
-
-            var logits = head.Forward(Tensor.From(picked, [targets.Count, dim], Device)).ToArray();
-            int vocabulary = logits.Length / targets.Count;
-            for (int i = 0; i < targets.Count; i++)
-            {
-                var row = logits.AsSpan(i * vocabulary, vocabulary);
-                float max = float.NegativeInfinity;
-                foreach (float v in row)
+                if (sequences[r] is not { } s)
                 {
-                    max = MathF.Max(max, v);
+                    continue;
                 }
 
-                double sum = 0;
-                foreach (float v in row)
+                for (int t = 0; t + 1 < s.Tokens.Length; t++)
                 {
-                    sum += Math.Exp(v - max);
+                    input[r * length + t] = s.Tokens[t];
+                    if (s.Trained[t + 1])
+                    {
+                        targets.Add((r, t, s.Tokens[t + 1]));
+                    }
+                }
+            }
+
+            var scores = new double[rows];
+            using (Autograd.NoGrad())
+            using (var scope = new TensorScope())
+            {
+                var hidden = Tensor.From(input, [rows, length], Device);
+                for (int i = 0; i < modules.Count - 1; i++)
+                {
+                    hidden = modules[i].Forward(hidden);
                 }
 
-                scores[targets[i].Row] += row[targets[i].Token] - max - Math.Log(sum);    // log p(token)
+                int dim = hidden.Shape[^1];
+                var all = hidden.ToArray();
+                var picked = new float[targets.Count * dim];
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    Array.Copy(all, (targets[i].Row * length + targets[i].Position) * dim, picked, i * dim, dim);
+                }
+
+                var logits = head.Forward(Tensor.From(picked, [targets.Count, dim], Device)).ToArray();
+                int vocabulary = logits.Length / targets.Count;
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    var row = logits.AsSpan(i * vocabulary, vocabulary);
+                    float max = float.NegativeInfinity;
+                    foreach (float v in row)
+                    {
+                        max = MathF.Max(max, v);
+                    }
+
+                    double sum = 0;
+                    foreach (float v in row)
+                    {
+                        sum += Math.Exp(v - max);
+                    }
+
+                    scores[targets[i].Row] += row[targets[i].Token] - max - Math.Log(sum);    // log p(token)
+                }
             }
+
+            for (int m = 0; m < chunk.Count; m++)
+            {
+                var own = scores.AsSpan(m * Labels.Count, Labels.Count).ToArray();
+                if (sequences.Skip(m * Labels.Count).Take(Labels.Count).Any(s => s is null))
+                {
+                    // Not even an empty message fits: MaxLength is too small for the instruction; no intent can be preferred.
+                    float even = 1f / Labels.Count;
+                    predictions.Add(new TextPrediction(Labels[0], even, [.. Labels.Select(l => (l, even))]));
+                    continue;
+                }
+
+                double best = own.Max();
+                var weights = own.Select(x => Math.Exp(x - best)).ToArray();
+                double total = weights.Sum();
+                var probabilities = Labels.Select((l, i) => (Label: l, Probability: (float)(weights[i] / total))).OrderByDescending(p => p.Probability).ToList();
+                predictions.Add(new TextPrediction(probabilities[0].Label, probabilities[0].Probability, probabilities));
+            }
+
+            progress?.Invoke(predictions.Count);
         }
 
-        double best = scores.Max();
-        var weights = scores.Select(s => Math.Exp(s - best)).ToArray();
-        double total = weights.Sum();
-        var probabilities = Labels.Select((l, i) => (Label: l, Probability: (float)(weights[i] / total))).OrderByDescending(p => p.Probability).ToList();
-        return new TextPrediction(probabilities[0].Label, probabilities[0].Probability, probabilities);
+        return predictions;
     }
 
     private sealed class SynchronousProgress(Action<FineTuningProgress> report) : IProgress<FineTuningProgress>

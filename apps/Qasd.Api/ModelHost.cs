@@ -18,7 +18,7 @@ public sealed class ModelHost : IDisposable
     {
         _options = options.Value;
         _logger = logger;
-        _current = Open(_options.Path);
+        _current = Open(_options.ClassifierPath);
     }
 
     /// <summary>The model's description.</summary>
@@ -43,7 +43,7 @@ public sealed class ModelHost : IDisposable
     /// <summary>Loads the model file again (after retraining) and serves it from now on.</summary>
     public ModelInfo Reload()
     {
-        var next = Open(_options.Path);
+        var next = Open(_options.ClassifierPath);
         Handle previous;
         lock (_gate)
         {
@@ -61,7 +61,7 @@ public sealed class ModelHost : IDisposable
     {
         if (!File.Exists(path))
         {
-            throw new FileNotFoundException($"No intent model at {Path.GetFullPath(path)}: train one with 'qasd train … --out {path}' or set IntentModel:Path.", path);
+            throw new FileNotFoundException($"No intent model at {Path.GetFullPath(path)}: train one with 'qasd train apps/Qasd/data/plan-queries.csv' (it saves there) or set IntentModel:Path.", path);
         }
 
         var device = ParseDevice(_options.Device);
