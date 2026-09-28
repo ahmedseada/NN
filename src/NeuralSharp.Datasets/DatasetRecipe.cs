@@ -12,7 +12,8 @@ namespace NeuralSharp.Datasets;
 /// <item><c>kaggle:owner/dataset</c> (files), <c>zenodo:123456</c> (files)</item>
 /// <item><c>https://host/data.jsonl.gz</c>, or a local file or folder (files)</item>
 /// </list>
-/// Options for any source: take, skip, weight, text (lines | paragraphs | document), documents (every file one row),
+/// Options for any source: where (a row filter: lang:csharp|c#, path~\.cs$, lang!:python), take, skip, weight,
+/// text (lines | paragraphs | document), documents (every file one row),
 /// columns (a,b,…), format, json_property, and the chat
 /// mapping system, user, assistant (templates over columns such as <c>user={question}</c>).
 /// </summary>
@@ -73,12 +74,18 @@ public sealed class DatasetSpec
     }
 
     private static readonly HashSet<string> Known = new(["config", "split", "files", "max_files", "revision", "ref", "release", "asset", "take", "skip", "weight",
-        "text", "columns", "system", "user", "assistant", "format", "json_property", "documents"], StringComparer.OrdinalIgnoreCase);
+        "text", "columns", "system", "user", "assistant", "format", "json_property", "documents", "where"], StringComparer.OrdinalIgnoreCase);
 
     /// <summary>The rows of this source, with take / skip / columns applied (not yet normalized to chat or text).</summary>
     public Dataset Open(Downloader? downloader = null)
     {
         var data = OpenSource(downloader);
+        if (String("where") is { } where)
+        {
+            var keep = Condition(where, Source);
+            data = data.Where(keep);
+        }
+
         if (Long("skip") is { } skip)
         {
             data = data.Skip(skip);
@@ -96,6 +103,47 @@ public sealed class DatasetSpec
 
         return data;
     }
+
+    /// <summary>
+    /// A row filter from <c>where=</c>: conditions separated by commas, all of which must hold. <c>column:a|b</c> keeps rows
+    /// whose column equals one of the values (ignoring case); <c>column~pattern</c> keeps rows whose column matches the
+    /// regular expression (ignoring case); <c>column!:a|b</c> keeps rows whose column is none of the values.
+    /// </summary>
+    public static Func<JsonObject, bool> Condition(string where, string source = "")
+    {
+        var tests = new List<Func<JsonObject, bool>>();
+        foreach (var part in where.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            int tilde = part.IndexOf('~'), colon = part.IndexOf(':');
+            if (tilde > 0 && (colon < 0 || tilde < colon))
+            {
+                string column = part[..tilde];
+                var regex = new System.Text.RegularExpressions.Regex(part[(tilde + 1)..],
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+                tests.Add(row => Text(row, column) is { } v && regex.IsMatch(v));
+            }
+            else if (colon > 0)
+            {
+                bool negate = part[colon - 1] == '!';
+                string column = part[..(negate ? colon - 1 : colon)];
+                var values = part[(colon + 1)..].Split('|').Select(v => v.Trim()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                tests.Add(row => (Text(row, column) is { } v && values.Contains(v.Trim())) != negate);
+            }
+            else
+            {
+                throw new ArgumentException($"{source}: where={part}: use column:value|value, column!:value or column~pattern.");
+            }
+        }
+
+        return row => tests.All(t => t(row));
+    }
+
+    private static string? Text(JsonObject row, string column) => row[column] switch
+    {
+        null => null,
+        JsonValue v when v.TryGetValue<string>(out var s) => s,
+        var node => node.ToJsonString(),
+    };
 
     /// <summary>Downloads the source's files into the cache (without reading rows) and returns their local paths.</summary>
     public IReadOnlyList<string> Download(Downloader? downloader = null) => OpenSource(downloader).Download();
