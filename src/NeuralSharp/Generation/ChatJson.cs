@@ -3,8 +3,8 @@ using System.Text.Json.Nodes;
 namespace NeuralSharp.Generation;
 
 /// <summary>
-/// Conversations in the OpenAI / Hugging Face chat JSON: the request body of OpenAI-compatible servers and the
-/// transcript lines fine-tuning reads (<c>{"messages": [...], "tools": [...]}</c>). Tool calls get ids (call_1, call_2, …)
+/// Conversations in the OpenAI / Hugging Face chat JSON, the layout fine-tuning reads
+/// (<c>{"messages": [...], "tools": [...]}</c>). Tool calls get ids (call_1, call_2, …)
 /// and each tool message the id of the call it answers, matched in order by name.
 /// </summary>
 public static class ChatJson
@@ -26,11 +26,8 @@ public static class ChatJson
         return json;
     }
 
-    /// <summary>
-    /// The messages. <paramref name="argumentsAsText"/>: call arguments as a JSON string (what OpenAI servers expect) instead
-    /// of an object; <paramref name="includeThinking"/>: assistant reasoning as "reasoning_content".
-    /// </summary>
-    public static JsonArray Messages(IReadOnlyList<ChatMessage> messages, bool argumentsAsText = false, bool includeThinking = true)
+    /// <summary>The messages; assistant reasoning goes in "reasoning_content", call arguments are JSON objects.</summary>
+    public static JsonArray Messages(IReadOnlyList<ChatMessage> messages)
     {
         var array = new JsonArray();
         var pending = new List<(string Id, string Name)>();
@@ -38,7 +35,7 @@ public static class ChatJson
         foreach (var message in messages)
         {
             var json = new JsonObject { ["role"] = message.Role, ["content"] = message.Content };
-            if (includeThinking && !string.IsNullOrEmpty(message.Thinking))
+            if (!string.IsNullOrEmpty(message.Thinking))
             {
                 json["reasoning_content"] = message.Thinking;
             }
@@ -57,7 +54,7 @@ public static class ChatJson
                         ["function"] = new JsonObject
                         {
                             ["name"] = call.Name,
-                            ["arguments"] = argumentsAsText ? call.Arguments.ToJsonString() : call.Arguments.DeepClone(),
+                            ["arguments"] = call.Arguments.DeepClone(),
                         },
                     });
                 }

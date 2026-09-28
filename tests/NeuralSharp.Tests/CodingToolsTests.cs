@@ -11,7 +11,6 @@ internal static partial class Tests
         ("coding tools: list, read, search, edit and write stay inside the workspace and explain mistakes", CodingToolsFiles),
         ("coding tools: run_command starts allowlisted programs without a shell and trims long output", CodingToolsCommands),
         ("coding agent: transcripts written as OpenAI chat JSON read back for fine-tuning", AgentTranscriptJson),
-        ("coding agent: an OpenAI-compatible server's streamed content, reasoning and tool-call fragments", OpenAIStreaming),
         ("coding agent: a task is copied, run, verified by its commands and recorded", AgentRunsTask),
     ];
 
@@ -33,58 +32,6 @@ internal static partial class Tests
         Check(back.Messages[2].ToolCalls![0].Arguments["pattern"]!.GetValue<string>() == "Main", "arguments");
         Check(back.Messages[4].ToolName == "read_file" && (string?)json["messages"]![4]!["tool_call_id"] == "call_2", "tool results matched to calls");
         Check(back.Tools[0].Parameters!["required"]!.AsArray().Count == 0 && back.Tools[1].Parameters!["required"]![0]!.GetValue<string>() == "path", "tool schemas");
-        var wire = ChatJson.Messages(messages, argumentsAsText: true, includeThinking: false);
-        Check(wire[2]!["tool_calls"]![0]!["function"]!["arguments"]!.GetValue<string>() == "{\"pattern\":\"Main\"}" && wire[2]!["reasoning_content"] is null, "request form");
-    }
-
-    private static void OpenAIStreaming(Device device)
-    {
-        _ = device;
-        string sse = string.Join("\n\n", [
-            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Need the \"}}]}",
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"file.\"}}]}",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Reading.\"}}]}",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"pa\"}}]}}]}",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\": \\\"a.ts\\\"}\"}}]}}]}",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"c2\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"pattern\\\":\\\"x\\\"}\"}}]}}]}",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":17}}",
-            "data: [DONE]", ""]);
-        var handler = new RecordingHttp(sse);
-        using var http = new HttpClient(handler);
-        using var model = new OpenAIChatModel("http://localhost:8080/v1", "teacher", http: http);
-        var request = new ChatRequest([new ChatMessage("user", "Read a.ts")], [new ToolDefinition("read_file")], Think: true,
-            Options: new GenerationOptions { Temperature = 0.2f, NumPredict = 256, Seed = 7 });
-        var chunks = new List<ChatChunk>();
-        var stream = model.StreamAsync(request).GetAsyncEnumerator();
-        while (stream.MoveNextAsync().AsTask().GetAwaiter().GetResult())
-        {
-            chunks.Add(stream.Current);
-        }
-
-        var final = chunks[^1];
-        Check(final.Done && final.Message is { Content: "Reading.", Thinking: "Need the file." }, "content and reasoning");
-        Check(final.Message!.ToolCalls is [{ Name: "read_file" }, { Name: "search" }] && final.Message.ToolCalls[0].Arguments["path"]!.GetValue<string>() == "a.ts", "tool calls from fragments");
-        Check(final.Stats is { PromptTokens: 120, GeneratedTokens: 17 }, "usage");
-        Check(string.Concat(chunks.Select(c => c.Delta.Thinking)) == "Need the file." && chunks.Count(c => c.Delta.ToolCalls.Count > 0) == 1, "streamed pieces");
-        var body = JsonNode.Parse(handler.Body!)!;
-        Check(handler.Url == "http://localhost:8080/v1/chat/completions" && (string?)body["model"] == "teacher" && (bool?)body["stream"] == true, "endpoint");
-        Check((int?)body["max_tokens"] == 256 && (int?)body["seed"] == 7 && Math.Abs((float)body["temperature"]! - 0.2f) < 1e-6 && (bool?)body["chat_template_kwargs"]!["enable_thinking"] == true, "options");
-        Check((string?)body["tools"]![0]!["function"]!["name"] == "read_file", "tools sent");
-    }
-
-    private sealed class RecordingHttp(string sse) : HttpMessageHandler
-    {
-        public string? Body { get; private set; }
-
-        public string? Url { get; private set; }
-
-        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
-        {
-            Url = request.RequestUri!.ToString();
-            Body = await request.Content!.ReadAsStringAsync(cancellationToken);
-            return new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new StringContent(sse, System.Text.Encoding.UTF8, "text/event-stream") };
-        }
     }
 
     private static void AgentRunsTask(Device device)

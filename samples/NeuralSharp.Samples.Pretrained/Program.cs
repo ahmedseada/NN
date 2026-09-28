@@ -23,17 +23,14 @@ using NeuralSharp.Pretrained;
 //                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
 //                                   --eval-every N, --no-checkpointing; with --int4 / --int8 / --bf16 the base stays quantized)
 //   (<folder> may also be a Hugging Face model id already downloaded, for example Qwen/Qwen3-0.6B)
-//   agent <model> <task…> --workspace <dir>
-//                                   a coding agent (read, search, edit, write, run dotnet / npm / ng …) working in <dir>
-//   agent-run <model> <suite> --out <runs.jsonl>
-//                                   runs every task of a suite (folders with task.json, workspace/, verify/) in a fresh
-//                                   copy, verifies it with the task's commands and writes one transcript per run; with
-//                                   a teacher this makes training data (--train F: passing runs only), with the model
-//                                   under test it is the evaluation (--attempts N, --filter S, --work DIR, --rounds N)
+//   agent <folder> <task…> --workspace <dir>
+//                                   a coding agent (read, search, edit, write, run dotnet / npm …) working in <dir>
+//   agent-run <folder> <suite> --out <runs.jsonl>
+//                                   evaluates a model on a task suite (folders with task.json, workspace/, verify/): each
+//                                   task runs in a fresh copy and is verified by its own commands; one record per run
+//                                   (--attempts N, --filter S, --work DIR, --rounds N, --temperature T)
 //   agent-check <suite>             checks every task without a model: verification fails on the starting files and
 //                                   passes with the task's solution/ folder (--filter S, --work DIR)
-//   (<model> may be a model folder or an OpenAI-compatible server: http://localhost:11434/v1 with --model-name N for
-//   Ollama, http://localhost:8080/v1 for llama-server; --api-key K, --temperature T)
 //   export <folder> <adapter> --out <dir>
 //                                   merges a PEFT adapter into the float weights and writes a Hugging Face checkpoint
 //
@@ -45,7 +42,7 @@ var positional = new List<string>();
 bool int8 = false, bf16 = false, int4 = false, kv8 = false, kv16 = false, noThink = false;
 int context = 4096;
 string? folderOverride = null, output = null, evalFile = null, adapterFolder = null;
-string? workspace = null, modelName = null, apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY"), trainOut = null, workRoot = null, filter = null;
+string? workspace = null, workRoot = null, filter = null;
 int attempts = 1, maxRounds = 40;
 float? temperature = null;
 MatMulPrecision? matmul = null;
@@ -91,9 +88,6 @@ for (int i = 0; i < args.Length; i++)
         case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
         case "--workspace": workspace = args[++i]; break;
-        case "--model-name": modelName = args[++i]; break;
-        case "--api-key": apiKey = args[++i]; break;
-        case "--train": trainOut = args[++i]; break;
         case "--work": workRoot = args[++i]; break;
         case "--filter": filter = args[++i]; break;
         case "--attempts": attempts = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
@@ -111,7 +105,7 @@ if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or
     || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
 {
     Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir>");
-    Console.WriteLine("       agent <model> <task…> --workspace <dir> | agent-run <model> <suite> --out <runs.jsonl> [--train F] [--attempts N]  (<model>: folder or http://server/v1 [--model-name N])");
+    Console.WriteLine("       agent <folder> <task…> --workspace <dir> | agent-run <folder> <suite> --out <runs.jsonl> [--attempts N] | agent-check <suite>");
     Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] [--matmul fp32|bf16|fp8] (fine-tuning options: see the top of Program.cs)");
     return 1;
 }
@@ -328,12 +322,10 @@ switch (positional[0])
 
     case "agent" or "agent-run":
     {
-        // The model: a local one (any family, in its own chat template), or an OpenAI-compatible server (a teacher).
-        bool remote = positional[1].StartsWith("http://", StringComparison.OrdinalIgnoreCase) || positional[1].StartsWith("https://", StringComparison.OrdinalIgnoreCase);
-        using var local = remote ? null : Load(positional[1]);
-        using var server = remote ? new OpenAIChatModel(positional[1], modelName ?? "default", apiKey) { SendSampling = temperature is not null } : null;
-        IChatModel chatModel = remote ? server! : local!.CreateChat(cacheFormat, context);
-        var sampling = remote ? new GenerationOptions { Temperature = temperature ?? 0.6f } : ChatSampling() with { Temperature = temperature ?? 0.6f };
+        // Any supported model family, in its own chat template.
+        using var model = Load(positional[1]);
+        IChatModel chatModel = model.CreateChat(cacheFormat, context);
+        var sampling = ChatSampling() with { Temperature = temperature ?? 0.6f };
         var agentOptions = new AgentOptions { Think = noThink ? false : null, Sampling = sampling, MaxRounds = maxRounds };
         bool live = positional[0] == "agent";
         bool inThinking = false;
@@ -429,12 +421,7 @@ switch (positional[0])
                     Console.WriteLine("    " + run.VerifyOutput.Trim().Replace("\n", "\n    ", StringComparison.Ordinal));
                 }
 
-                string line = run.ToJson().ToJsonString() + "\n";
-                File.AppendAllText(output!, line);
-                if (trainOut is not null && run.Outcome == AgentOutcome.Passed)
-                {
-                    File.AppendAllText(trainOut, line);
-                }
+                File.AppendAllText(output!, run.ToJson().ToJsonString() + "\n");
             }
         }
 
@@ -450,7 +437,7 @@ switch (positional[0])
         }
 
         int tasksSolved = scored.GroupBy(o => o.Task.Id).Count(g => g.Any(o => o.Run.Outcome == AgentOutcome.Passed));
-        Console.WriteLine($"  tasks solved at least once: {tasksSolved}/{scored.Select(o => o.Task.Id).Distinct().Count()}; runs written to {output}{(trainOut is null ? "" : $", passing runs to {trainOut}")}");
+        Console.WriteLine($"  tasks solved at least once: {tasksSolved}/{scored.Select(o => o.Task.Id).Distinct().Count()}; runs written to {output}");
         return passed == scored.Count ? 0 : 2;
     }
 

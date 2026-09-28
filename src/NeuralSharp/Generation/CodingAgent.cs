@@ -99,7 +99,7 @@ public enum AgentOutcome
     Error,
 }
 
-/// <summary>One agent run: the conversation (the transcript to train on or to inspect) and its outcome.</summary>
+/// <summary>One agent run: the conversation and its outcome.</summary>
 /// <param name="Task">The task.</param>
 /// <param name="Messages">System, user, assistant and tool messages.</param>
 /// <param name="Tools">The tools the model was offered.</param>
@@ -116,7 +116,7 @@ public enum AgentOutcome
 public sealed record AgentRun(AgentTask Task, IReadOnlyList<ChatMessage> Messages, IReadOnlyList<ToolDefinition> Tools, bool? Think, AgentOutcome Outcome,
     string VerifyOutput, int Rounds, int ToolCalls, int ToolErrors, int GeneratedTokens, TimeSpan ModelTime, TimeSpan ToolTime, string Workspace)
 {
-    /// <summary>The transcript line (the fine-tuning format) with the run's outcome and figures as extra fields.</summary>
+    /// <summary>The run as one JSON line: the conversation in the chat format with the outcome and figures as extra fields.</summary>
     public JsonObject ToJson()
     {
         var json = ChatJson.Transcript(Messages, Tools, Think);
@@ -140,7 +140,7 @@ public sealed record AgentRun(AgentTask Task, IReadOnlyList<ChatMessage> Message
 /// <summary>
 /// A coding agent: a chat model with <see cref="CodingTools"/> in a workspace, looping until it answers without a tool
 /// call. <see cref="RunAsync(AgentTask, string, CancellationToken)"/> prepares a copy of a task's project, runs the agent and
-/// verifies the result; the run is a training transcript (with a teacher model) or an evaluation (with the model under test).
+/// verifies the result: an evaluation of the model on the task.
 /// </summary>
 public sealed class CodingAgent(IChatModel model, AgentOptions? options = null)
 {
