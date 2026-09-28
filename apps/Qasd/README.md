@@ -19,7 +19,7 @@ maps it to the intents.
 ## Train
 
 ```
-dotnet run -c Release --project apps/Qasd -- train plan-queries.csv --out models/intents.nsm          (CPU; add --cuda for the GPU)
+dotnet run -c Release --project apps/Qasd -- train apps/Qasd/data/plan-queries.csv --out models/intents.nsm          (CPU; add --cuda for the GPU)
 ```
 
 The columns default to `raw_question` (text) and `intent` (label); `--text` / `--label` pick others. 20% of the distinct
@@ -78,6 +78,23 @@ From your own .NET code, reference `Qasd.Core` and load the model once:
 ```csharp
 using var classifier = Qasd.TextClassifier.Load("models/intents.nsm", NeuralSharp.Device.Cpu);
 var p = classifier.Predict(message);          // p.Label, p.Confidence, p.Probabilities; thread-safe
+```
+
+## Training data
+
+`apps/Qasd/data/plan-queries.csv`: 5,177 labeled messages (1,872 distinct; Arabic, English and mixed) with the columns
+`raw_question` (the text), `semantic_query`, `intent` (the label: `retrieve` 2,983, `function_call` 1,096,
+`direct_reply` 973, `identity` 125) and `confidence`. Retrain after adding rows; later rows of the same message count
+as more examples of it.
+
+## Postman
+
+`apps/Qasd.Api/Qasd.postman_collection.json`: every endpoint with English and Arabic examples, the validation errors and
+the admin reload, each with tests (status, labels, probabilities summing to 1, `accepted` against MinConfidence).
+Import it in Postman (variables `baseUrl`, default http://localhost:5080, and `adminKey`), or run it from the command line:
+
+```
+npx newman run apps/Qasd.Api/Qasd.postman_collection.json --env-var adminKey=<the service's IntentModel:AdminKey>
 ```
 
 ## Publish
