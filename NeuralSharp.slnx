@@ -2,6 +2,7 @@
   <Folder Name="/samples/">
     <Project Path="samples/NeuralSharp.Samples.CharGpt/NeuralSharp.Samples.CharGpt.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Classification/NeuralSharp.Samples.Classification.csproj" />
+    <Project Path="samples/NeuralSharp.Samples.TextClassifier/NeuralSharp.Samples.TextClassifier.csproj" />
     <Project Path="samples/NeuralSharp.Samples.GptApi/NeuralSharp.Samples.GptApi.csproj" />
     <Project Path="samples/NeuralSharp.Samples.HouseApi/NeuralSharp.Samples.HouseApi.csproj" />
     <Project Path="samples/NeuralSharp.Samples.HousePrices/NeuralSharp.Samples.HousePrices.csproj" />
