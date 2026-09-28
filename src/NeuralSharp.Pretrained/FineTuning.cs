@@ -338,8 +338,18 @@ public sealed record FineTuningOptions
     /// <summary>Longest sequence in tokens (longer transcripts are cut).</summary>
     public int MaxLength { get; init; } = 2048;
 
-    /// <summary>Token budget of one batch (sequences of similar length are batched and padded to the longest).</summary>
+    /// <summary>
+    /// Token budget of one batch: with <see cref="Packing"/>, the positions of each batch (rows of this many positions,
+    /// or of the longest sequence when it is longer); otherwise sequences of similar length padded to the longest.
+    /// </summary>
     public int BatchTokens { get; init; } = 4096;
+
+    /// <summary>
+    /// Packs several sequences into each row of <see cref="BatchTokens"/> positions (each position attends only within
+    /// its own sequence), so batches carry no padding between sequences and every step has the same shape. Used when the
+    /// model and device support it (<see cref="PackedSequences.Supports"/>); otherwise batches are padded.
+    /// </summary>
+    public bool Packing { get; init; } = true;
 
     /// <summary>Batches whose gradients are added before each optimizer step.</summary>
     public int GradientAccumulation { get; init; } = 1;
@@ -459,7 +469,7 @@ public static class FineTuner
         var parameters = network.TrainableParameters().ToList();
         using var optimizer = new AdamW(parameters, options.LearningRate, weightDecay: options.WeightDecay);
         var random = new Random(options.Seed);
-        var epochBatches = Enumerable.Range(0, options.Epochs).Select(_ => Batches(train, options.BatchTokens, random)).ToList();
+        var epochBatches = Enumerable.Range(0, options.Epochs).Select(_ => MakeBatches(model, train, options, random)).ToList();
         int accumulation = Math.Max(1, options.GradientAccumulation);
         int totalSteps = epochBatches.Sum(b => (b.Count + accumulation - 1) / accumulation);
         var schedule = new CosineAnnealing(optimizer, Math.Max(1, totalSteps), options.MinLearningRate,
@@ -507,11 +517,11 @@ public static class FineTuner
 
     // One optimizer step over a group of batches (gradient accumulation): forward, backward, clipping, update. Returns
     // the mean loss per trained token and the tokens covered.
-    private static (float Loss, long Tokens) RunStep(PretrainedModel model, IReadOnlyList<TrainingSequence> train, IReadOnlyList<int[]> group, AdamW optimizer,
+    private static (float Loss, long Tokens) RunStep(PretrainedModel model, IReadOnlyList<TrainingSequence> train, IReadOnlyList<Batch> group, AdamW optimizer,
         FineTuningOptions options, CancellationToken cancellationToken, Action<string>? trace, Func<int, string> label)
     {
         var network = model.Network;
-        float normalizer = Math.Max(1, group.Sum(b => b.Sum(i => train[i].TrainedTokens)));
+        float normalizer = Math.Max(1, group.Sum(b => b.Sequences.Sum(i => train[i].TrainedTokens)));
         float loss = 0f;
         long tokens = 0;
         network.Train();
@@ -522,7 +532,9 @@ public static class FineTuner
             var batch = group[b];
             var batchWatch = Stopwatch.StartNew();
             using var scope = new TensorScope();
-            trace?.Invoke($"{label(b)}: {batch.Length} sequences × {batch.Max(i => train[i].Tokens.Length) - 1} tokens…");
+            trace?.Invoke($"{label(b)}: {batch.Describe(train)}…");
+            using var packing = batch.Packed ? PackedSequences.Create([.. batch.Rows.Select(r => r.Select(i => train[i].Tokens.Length - 1).ToArray())], batch.Length, model.Device) : null;
+            using var packed = packing?.Use();                                // forward and backward (checkpointed blocks run again)
             var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing);
             float batchLoss = lossTensor.Item();                             // waits for the forward pass
             double forward = batchWatch.Elapsed.TotalSeconds;
@@ -530,7 +542,7 @@ public static class FineTuner
             model.Device.Synchronize();
             loss += batchLoss;
             tokens += count;
-            trace?.Invoke($"  forward {forward:F2} s, backward {batchWatch.Elapsed.TotalSeconds - forward:F2} s, loss {batchLoss * normalizer / Math.Max(1, batch.Sum(i => train[i].TrainedTokens)):F4}");
+            trace?.Invoke($"  forward {forward:F2} s, backward {batchWatch.Elapsed.TotalSeconds - forward:F2} s, loss {batchLoss * normalizer / Math.Max(1, batch.Sequences.Sum(i => train[i].TrainedTokens)):F4}");
         }
 
         if (options.MaxGradientNorm > 0f)
@@ -559,7 +571,7 @@ public static class FineTuner
         }
 
         using var optimizer = new AdamW(model.Network.TrainableParameters().ToList(), options.LearningRate, weightDecay: options.WeightDecay);
-        var batches = Batches(train, options.BatchTokens, new Random(options.Seed));
+        var batches = MakeBatches(model, train, options, new Random(options.Seed));
         int accumulation = Math.Max(1, options.GradientAccumulation);
         int next = 0;
         (float Loss, long Tokens, double Seconds) Step(string phase)
@@ -613,7 +625,7 @@ public static class FineTuner
                 var watch = Stopwatch.StartNew();
                 using var scope = new TensorScope();
                 int count = batch.Sum(i => sequences[i].TrainedTokens);
-                var (loss, _) = BatchLoss(model, sequences, batch, 1f, chunkRows);
+                var (loss, _) = BatchLoss(model, sequences, Batch.Padded(batch, sequences), 1f, chunkRows);
                 total += loss.Item();
                 trained += count;
                 trace?.Invoke($"evaluation batch {b + 1}/{batches.Count}: {batch.Length} sequences × {batch.Max(i => sequences[i].Tokens.Length) - 1} tokens, {watch.Elapsed.TotalSeconds:F2} s");
@@ -621,6 +633,99 @@ public static class FineTuner
         }
 
         return (float)(total / Math.Max(1, trained));
+    }
+
+    // A batch: rows of sequences (one per row when padded, several when packed), each row Length positions.
+    private sealed record Batch(int[][] Rows, int Length, bool Packed)
+    {
+        public IEnumerable<int> Sequences => Rows.SelectMany(r => r);
+
+        public static Batch Padded(int[] sequences, IReadOnlyList<TrainingSequence> all) =>
+            new([.. sequences.Select(i => new[] { i })], sequences.Max(i => all[i].Tokens.Length) - 1, false);
+
+        public string Describe(IReadOnlyList<TrainingSequence> all) => Packed
+            ? $"{Rows.Sum(r => r.Length)} sequences packed in {Rows.Length} × {Length} positions ({Rows.Sum(r => r.Sum(i => all[i].Tokens.Length - 1)) * 100.0 / (Rows.Length * Length):F0}% filled)"
+            : $"{Rows.Length} sequences × {Length} tokens";
+    }
+
+    // The training batches: packed when asked and supported, else padded.
+    private static List<Batch> MakeBatches(PretrainedModel model, IReadOnlyList<TrainingSequence> train, FineTuningOptions options, Random random)
+    {
+        if (options.Packing && PackedSequences.Supports(model.Network))
+        {
+            int longest = train.Max(s => s.Tokens.Length - 1);
+            int context = model.Network.Descendants().OfType<CausalSelfAttention>().Min(a => a.MaxPositions);
+            int length = Math.Max(longest, Math.Min(options.BatchTokens, context));
+            int rows = Math.Max(1, options.BatchTokens / length);
+            return [.. PackedBatches(train, length, rows, random).Select(b => new Batch(b, length, true))];
+        }
+
+        return [.. Batches(train, options.BatchTokens, random).Select(b => Batch.Padded(b, train))];
+    }
+
+    /// <summary>
+    /// Packs sequences into batches of <paramref name="rows"/> rows of <paramref name="length"/> positions each (first fit,
+    /// longest first; a row holds sequences whose token counts minus one, the positions they fill, add up to at most
+    /// <paramref name="length"/>). Returns each batch's rows of sequence indices; the batch order is shuffled when
+    /// <paramref name="random"/> is given. Sequences longer than a row are left out.
+    /// </summary>
+    public static List<int[][]> PackedBatches(IReadOnlyList<TrainingSequence> sequences, int length, int rows, Random? random)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(length);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(rows);
+        var order = Enumerable.Range(0, sequences.Count).Where(i => sequences[i].Tokens.Length - 1 is >= 1 and var n && n <= length)
+            .OrderByDescending(i => sequences[i].Tokens.Length).ThenBy(i => i).ToList();
+        var bins = new List<List<int>>();
+        var free = new List<int>();
+        // First fit: the first row with room (rows are kept in creation order; `fullest` skips rows too full for
+        // anything, which grow with the list, so the search stays short).
+        int fullest = 0;
+        int shortest = order.Count == 0 ? 1 : sequences[order[^1]].Tokens.Length - 1;
+        foreach (int index in order)
+        {
+            int n = sequences[index].Tokens.Length - 1;
+            while (fullest < bins.Count && free[fullest] < shortest)
+            {
+                fullest++;
+            }
+
+            int bin = -1;
+            for (int b = fullest; b < bins.Count; b++)
+            {
+                if (free[b] >= n)
+                {
+                    bin = b;
+                    break;
+                }
+            }
+
+            if (bin < 0)
+            {
+                bins.Add([]);
+                free.Add(length);
+                bin = bins.Count - 1;
+            }
+
+            bins[bin].Add(index);
+            free[bin] -= n;
+        }
+
+        if (random is not null)
+        {
+            for (int i = bins.Count - 1; i > 0; i--)
+            {
+                int j = random.Next(i + 1);
+                (bins[i], bins[j]) = (bins[j], bins[i]);
+            }
+        }
+
+        var batches = new List<int[][]>();
+        for (int first = 0; first < bins.Count; first += rows)
+        {
+            batches.Add([.. bins.Skip(first).Take(rows).Select(b => b.ToArray())]);
+        }
+
+        return batches;
     }
 
     /// <summary>
@@ -671,24 +776,31 @@ public static class FineTuner
 
     // The summed weighted loss of one batch divided by normalizer (padding and untrained positions weigh 0), and the
     // number of tokens it covers. The network runs up to its final normalization; the head runs inside the loss.
-    private static (Tensor Loss, long Tokens) BatchLoss(PretrainedModel model, IReadOnlyList<TrainingSequence> sequences, int[] batch, float normalizer,
+    // Packed batches run under their PackedSequences (the caller's), padded ones as they are.
+    private static (Tensor Loss, long Tokens) BatchLoss(PretrainedModel model, IReadOnlyList<TrainingSequence> sequences, Batch batch, float normalizer,
         int chunkRows, bool checkpointing = false)
     {
-        int length = batch.Max(i => sequences[i].Tokens.Length) - 1;
-        int rows = batch.Length;
+        int length = batch.Length;
+        int rows = batch.Rows.Length;
         var inputs = new float[rows * length];
         var targets = new float[rows * length];
         var weights = new float[rows * length];
         long tokens = 0;
         for (int b = 0; b < rows; b++)
         {
-            var sequence = sequences[batch[b]];
-            for (int t = 0; t + 1 < sequence.Tokens.Length; t++)
+            int offset = b * length;
+            foreach (int index in batch.Rows[b])
             {
-                inputs[b * length + t] = sequence.Tokens[t];
-                targets[b * length + t] = sequence.Tokens[t + 1];
-                weights[b * length + t] = sequence.Trained[t + 1] ? 1f : 0f;
-                tokens++;
+                var sequence = sequences[index];
+                for (int t = 0; t + 1 < sequence.Tokens.Length; t++)
+                {
+                    inputs[offset + t] = sequence.Tokens[t];
+                    targets[offset + t] = sequence.Tokens[t + 1];
+                    weights[offset + t] = sequence.Trained[t + 1] ? 1f : 0f;
+                    tokens++;
+                }
+
+                offset += sequence.Tokens.Length - 1;
             }
         }
 

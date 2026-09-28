@@ -295,7 +295,8 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         }
 
         float scale = 1f / MathF.Sqrt(HeadDim);
-        if (Rope is null && QueryNorm is null && KeyNorm is null && FusedTraining.Enabled && Backends.Cuda.PtxKernels.FlashTensorDim(HeadDim)
+        var packing = PackedSequences.Current is { } current && current.Matches(n, t) ? current : null;
+        if (packing is null && Rope is null && QueryNorm is null && KeyNorm is null && FusedTraining.Enabled && Backends.Cuda.PtxKernels.FlashTensorDim(HeadDim)
             && input.Device.Type == DeviceType.Cuda && MixedPrecision.UsesTensorCores
             && Linear.PlainFloat(Query) && Linear.PlainFloat(Key) && Linear.PlainFloat(Value)
             && Tensor.ProjectPacked(input, [Query, Key, Value]) is { } packed)
@@ -310,9 +311,16 @@ public sealed class CausalSelfAttention : Module, ICachedModule
             packed.Dispose();
         }
 
-        var positions = Positions(t);
-        var (q, keys, values) = Project(input, positions);
+        var positions = packing?.Positions ?? Positions(t);
+        var (q, keys, values) = Project(input, positions, packed: packing is not null);
         Tensor k = keys!, v = values!;
+        if (packing is not null)
+        {
+            // Several sequences per row: each position attends within its own sequence only.
+            return Merge(Tensor.CausalAttentionSegmented(q, k, v, packing, KvHeads, scale)
+                ?? throw new NotSupportedException($"Packed sequences need attention within each sequence, which {input.Device} does not provide for head size {HeadDim} (on CUDA: bfloat16 tensor cores, head size 64 or 128)."), n, t);
+        }
+
         if (HeadDim <= Backends.Cuda.PtxKernels.FlashMaxDim)
         {
             // Tiled attention, forward and backward: no [t, t] weights stored (positions[0] = 0 is the causal offset).
@@ -397,11 +405,12 @@ public sealed class CausalSelfAttention : Module, ICachedModule
 
     // Projections → q [n·kv, group·t, d] (the query heads sharing a key/value head are stacked), k and v [n·kv, t, d];
     // with a (float32 or bfloat16) cache, inference writes k and v into it in the same pass and returns them null.
-    private (Tensor Q, Tensor? K, Tensor? V) Project(Tensor input, Tensor positions, KeyValueCache? cache = null, Tensor? position = null)
+    // packed: positions hold one entry per token of the [n, t] batch (PackedSequences) instead of one per step.
+    private (Tensor Q, Tensor? K, Tensor? V) Project(Tensor input, Tensor positions, KeyValueCache? cache = null, Tensor? position = null, bool packed = false)
     {
         int n = input.Shape[0], t = input.Shape[1], d = HeadDim;
         var projected = Linear.ForwardMany(input, Query, Key, Value);
-        if (!Autograd.IsEnabled && Tensor.NormRopeHeads(projected[0], projected[1], projected[2], Heads, KvHeads, d, QueryNorm, KeyNorm,
+        if (!Autograd.IsEnabled && !packed && Tensor.NormRopeHeads(projected[0], projected[1], projected[2], Heads, KvHeads, d, QueryNorm, KeyNorm,
                 Rope is null ? null : _cos, Rope is null ? null : _sin, positions, Rope?.Interleaved ?? false,
                 cache is { Format: not KeyValueFormat.Int8 } ? cache : null, cache is { Format: not KeyValueFormat.Int8 } ? position : null) is { } heads)
         {
@@ -411,7 +420,7 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         var q = projected[0].Reshape(n, t, Heads, d);
         var k = projected[1].Reshape(n, t, KvHeads, d);
         var v = projected[2].Reshape(n, t, KvHeads, d);
-        if (Rope is not null && QueryNorm is not null && KeyNorm is not null && !Autograd.IsEnabled)
+        if (Rope is not null && QueryNorm is not null && KeyNorm is not null && !Autograd.IsEnabled && !packed)
         {
             // Inference: each head's normalization and rotation in one pass.
             int half = _cos.Shape[1];
@@ -433,8 +442,17 @@ public sealed class CausalSelfAttention : Module, ICachedModule
             if (Rope is not null)
             {
                 int half = _cos.Shape[1];
-                q = q.Rope(_cos, _sin, positions, half, Rope.Interleaved);
-                k = k.Rope(_cos, _sin, positions, half, Rope.Interleaved);
+                if (packed)
+                {
+                    // One position per token: the batch as a single row of n·t steps.
+                    q = q.Reshape(1, n * t, Heads, d).Rope(_cos, _sin, positions, half, Rope.Interleaved).Reshape(n, t, Heads, d);
+                    k = k.Reshape(1, n * t, KvHeads, d).Rope(_cos, _sin, positions, half, Rope.Interleaved).Reshape(n, t, KvHeads, d);
+                }
+                else
+                {
+                    q = q.Rope(_cos, _sin, positions, half, Rope.Interleaved);
+                    k = k.Rope(_cos, _sin, positions, half, Rope.Interleaved);
+                }
             }
         }
 
@@ -826,6 +844,12 @@ public sealed class PositionEmbedding : Module, ICachedModule
         if (t > MaxPositions)
         {
             throw new ArgumentException($"Sequence length {t} exceeds the {MaxPositions} learned positions.");
+        }
+
+        if (PackedSequences.Current is { } packing && input.Rank == 3 && packing.Matches(input.Shape[0], t))
+        {
+            // Packed sequences: each token's position within its own sequence.
+            return input + Weight.EmbeddingLookup(packing.Positions).Reshape(input.Shape);
         }
 
         return input + (t == MaxPositions ? Weight : Weight.Narrow(0, 0, t));

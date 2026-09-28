@@ -525,6 +525,23 @@ internal abstract class Backend
     /// tiled so query rows share each key and value read; also writes each row's log-sum-exp of the scaled scores to
     /// <paramref name="logSumExp"/> [heads, rowsPerHead] when given.
     /// </summary>
+    /// <summary>
+    /// Causal attention over packed sequences (training): as <see cref="AttentionTiled"/> with offset 0 and keys and values
+    /// [heads, steps, dim], except that several sequences share each row of <paramref name="steps"/> positions, so row i of
+    /// head h sees positions c with starts[b·steps + t] ≤ c ≤ t, where t = i % steps and b = h / <paramref name="headsPerRow"/>
+    /// is the packed row; starts and ends hold, per position of each packed row, where its sequence begins and stops
+    /// (exclusive), as floats. Writes the log-sum-exp when given. Returns false when the device has no such pass.
+    /// </summary>
+    public virtual bool AttentionSegmented(Storage q, Storage keys, Storage values, Storage y, Storage? logSumExp, Storage starts, Storage ends,
+        int heads, int headsPerRow, int rowsPerHead, int steps, int dim, float scale) => false;
+
+    /// <summary>Whether <see cref="AttentionSegmented"/> and its gradient run for this head size (with the current <see cref="MixedPrecision"/>).</summary>
+    public virtual bool SupportsSegmentedAttention(int dim) => false;
+
+    /// <summary>The gradient of <see cref="AttentionSegmented"/> (as <see cref="AttentionTiledBackward"/>); false when unsupported.</summary>
+    public virtual bool AttentionSegmentedBackward(Storage q, Storage keys, Storage values, Storage output, Storage logSumExp, Storage dOutput,
+        Storage dq, Storage dkeys, Storage dvalues, Storage starts, Storage ends, int heads, int headsPerRow, int rowsPerHead, int steps, int dim, float scale) => false;
+
     public virtual void AttentionTiled(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage? logSumExp, int heads,
         int rowsPerHead, int steps, int capacity, int dim, float scale) =>
         AttentionDecode(q, keys, values, position, y, heads, rowsPerHead, steps, capacity, dim, scale);

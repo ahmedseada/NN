@@ -24,7 +24,7 @@ internal static partial class PtxKernels
     public static int FlashTensorBackwardQShared(int dim) => 4 * FlashTensorRows * FlashStride(dim);
 
     /// <inheritdoc cref="FlashTensorBackwardQShared"/>
-    public static int FlashTensorBackwardKvShared(int dim) => 2 * FlashTensorRows * FlashStride(dim) + 2 * FlashTensorBackwardRows * FlashStride(dim) + 2 * FlashTensorBackwardRows * 4;
+    public static int FlashTensorBackwardKvShared(int dim) => 2 * FlashTensorRows * FlashStride(dim) + 2 * FlashTensorBackwardRows * FlashStride(dim) + 3 * FlashTensorBackwardRows * 4;
 
     private static int FlashStride(int dim) => (dim + 8) * 2;
 
@@ -73,9 +73,62 @@ internal static partial class PtxKernels
     // Layout of q-like tensors (q, dq; also the output and dOutput with their own strides): head hh = b · kv + h, row
     // i = g · steps + t sits at base + b·sB + h·sH + g·sG + t·sT (elements); key-like tensors (k, v, dk, dv): position c at
     // base + b·sB + h·sH + c·sT. Parameters common to the three kernels.
+    //
+    // Packed sequences (p_seg ≠ 0): several sequences share a row of `steps` positions, and position t of packed row b
+    // (head hh belongs to row hh / p_segheads) sees only keys from where its sequence starts, p_seg[b·steps + t], up to
+    // itself; p_segend[b·steps + t] is where that sequence stops (exclusive). Both hold positions as floats.
     private const string FlashLayoutParameters =
         ".param .u32 p_kv, .param .u32 p_qsb, .param .u32 p_qsh, .param .u32 p_qsg, .param .u32 p_qst, "
-        + ".param .u32 p_ysb, .param .u32 p_ysh, .param .u32 p_ysg, .param .u32 p_yst, .param .u32 p_ksb, .param .u32 p_ksh, .param .u32 p_kst";
+        + ".param .u32 p_ysb, .param .u32 p_ysh, .param .u32 p_ysg, .param .u32 p_yst, .param .u32 p_ksb, .param .u32 p_ksh, .param .u32 p_kst, "
+        + ".param .u64 p_seg, .param .u64 p_segend, .param .u32 p_segheads";
+
+    // Packed sequences, query side (forward, dQ): %r80 / %r81 = the first key rows `row0` / `row1` see (0 without
+    // p_seg), %r82 = the first key tile to walk (the block's first row's start, rounded down to 64, when all its rows
+    // are the same query group; else 0). Expects %r20 = rows, %r21 = steps, %r24 = head, %r25 = the block's first row.
+    // Uses %r83-%r87, %rd44-%rd45, %f61-%f62, %p14-%p16.
+    private static string SegmentStarts(string row0, string row1) => $$"""
+            mov.u32 %r80, 0;
+            mov.u32 %r81, 0;
+            mov.u32 %r82, 0;
+            ld.param.u64 %rd44, [p_seg];
+            setp.eq.u64 %p14, %rd44, 0;
+            @%p14 bra SEG_DONE;
+            cvta.to.global.u64 %rd44, %rd44;
+            ld.param.u32 %r83, [p_segheads];
+            div.u32 %r84, %r24, %r83;
+            mul.lo.u32 %r84, %r84, %r21;
+            rem.u32 %r85, {{row0}}, %r21;
+            add.u32 %r85, %r85, %r84;
+            mul.wide.u32 %rd45, %r85, 4;
+            add.u64 %rd45, %rd45, %rd44;
+            setp.lt.u32 %p15, {{row0}}, %r20;
+            mov.f32 %f61, 0f00000000;
+            @%p15 ld.global.f32 %f61, [%rd45];
+            cvt.rzi.s32.f32 %r80, %f61;
+            rem.u32 %r85, {{row1}}, %r21;
+            add.u32 %r85, %r85, %r84;
+            mul.wide.u32 %rd45, %r85, 4;
+            add.u64 %rd45, %rd45, %rd44;
+            setp.lt.u32 %p15, {{row1}}, %r20;
+            mov.f32 %f62, 0f00000000;
+            @%p15 ld.global.f32 %f62, [%rd45];
+            cvt.rzi.s32.f32 %r81, %f62;
+            add.u32 %r86, %r25, 63;
+            sub.u32 %r87, %r20, 1;
+            min.u32 %r86, %r86, %r87;
+            div.u32 %r86, %r86, %r21;
+            div.u32 %r87, %r25, %r21;
+            setp.ne.u32 %p16, %r86, %r87;
+            @%p16 bra SEG_DONE;
+            rem.u32 %r85, %r25, %r21;
+            add.u32 %r85, %r85, %r84;
+            mul.wide.u32 %rd45, %r85, 4;
+            add.u64 %rd45, %rd45, %rd44;
+            ld.global.f32 %f61, [%rd45];
+            cvt.rzi.u32.f32 %r82, %f61;
+            and.b32 %r82, %r82, 0xFFFFFFC0;
+        SEG_DONE:
+        """;
 
     // Loads the strides (%r60 = kv, %r61-%r64 q, %r65-%r68 output, %r69-%r71 keys) and splits head %r24 into
     // %r72 = b, %r73 = h.
@@ -358,7 +411,8 @@ internal static partial class PtxKernels
                 add.u32 %r41, %r26, %r7;
                 shl.b32 %r42, %r5, 1;
             {Zeros("%acc", 4 * dTiles)}
-                mov.u32 %r43, 0;
+            {SegmentStarts("%r30", "%r31")}
+                mov.u32 %r43, %r82;
             TILE:
                 setp.ge.u32 %p3, %r43, %r34;
                 @%p3 bra TILE_END;
@@ -393,6 +447,8 @@ internal static partial class PtxKernels
                         add.u32 %r46, %r45, {nt * 8 + j};
                         setp.le.s32 %p4, %r46, %r32;
                         setp.le.s32 %p5, %r46, %r33;
+                        setp.ge.and.s32 %p4, %r46, %r80, %p4;
+                        setp.ge.and.s32 %p5, %r46, %r81, %p5;
                         mul.f32 %s{4 * nt + j}, %s{4 * nt + j}, %f40;
                         mul.f32 %s{4 * nt + j + 2}, %s{4 * nt + j + 2}, %f40;
                         selp.f32 %s{4 * nt + j}, %s{4 * nt + j}, 0fFF800000, %p4;
@@ -648,7 +704,8 @@ internal static partial class PtxKernels
                 add.u32 %r46, %r28, %r6;
                 shl.b32 %r42, %r5, 1;
             {Zeros("%acc", 4 * dTiles)}
-                mov.u32 %r43, 0;
+            {SegmentStarts("%r31", "%r32")}
+                mov.u32 %r43, %r82;
             TILE:
                 setp.ge.u32 %p5, %r43, %r34;
                 @%p5 bra TILE_END;
@@ -684,6 +741,8 @@ internal static partial class PtxKernels
                         add.u32 %r49, %r48, {nt * 8 + j};
                         setp.le.s32 %p6, %r49, %r33;
                         setp.le.s32 %p7, %r49, %r36;
+                        setp.ge.and.s32 %p6, %r49, %r80, %p6;
+                        setp.ge.and.s32 %p7, %r49, %r81, %p7;
                         fma.rn.f32 %s{4 * nt + j}, %s{4 * nt + j}, %f40, %f41;
                         fma.rn.f32 %s{4 * nt + j + 2}, %s{4 * nt + j + 2}, %f40, %f42;
                         ex2.approx.ftz.f32 %s{4 * nt + j}, %s{4 * nt + j};
@@ -748,8 +807,10 @@ internal static partial class PtxKernels
 
     // Block: 64 keys (warp w: keys 16w .. 16w + 15; K and V staged once), walking the query rows that see them in tiles
     // of 32: Sᵀ = K·Qᵀ, dPᵀ = V·dOᵀ, Pᵀ = 2^(Sᵀ·scale·log2 e - lse·log2 e), dSᵀ = Pᵀ ∘ (dPᵀ - D), dV += Pᵀ·dO, dK += dSᵀ·Q;
-    // finally dkeys += scale · dK, dvalues += dV. Dynamic shared memory: K, V (64 rows), Q, dO (32 rows), lse, D.
-    // Grid x = ⌈capacity / 64⌉, y = heads. `skip`: rows before the block's first key see none of its keys (rowsPerHead = steps).
+    // finally dkeys += scale · dK, dvalues += dV. Dynamic shared memory: K, V (64 rows), Q, dO (32 rows), lse, D and each
+    // row's first visible key. Grid x = ⌈capacity / 64⌉, y = heads. Rows are walked per query group g (rows g·steps + t):
+    // only t from the block's first key (rounded down to 32; earlier positions see none of its keys) up to steps, or, for
+    // packed sequences, up to where the sequence of the block's last key stops. (`skip` is no longer needed.)
     private static void FlashBackwardKv(StringBuilder sb, int d)
     {
         const int R = FlashTensorBackwardRows;
@@ -828,15 +889,43 @@ internal static partial class PtxKernels
                 add.u32 %r46, %r28, %r6;
                 add.u32 %r47, %r29, %r6;
                 shl.b32 %r42, %r5, 1;
-                shr.u32 %r43, %r25, 5;
-                shl.b32 %r43, %r43, 5;
-                setp.eq.u32 %p2, %r23, 0;
-                selp.b32 %r43, 0, %r43, %p2;
             {Zeros("%acc", 4 * dTiles)}
             {Zeros("%dv", 4 * dTiles)}
+                // Window of positions per group: %r85 = first (block's first key rounded down to 32), %r86 = end;
+                // %r84 = b * steps for packed sequences (%rd44 / %rd46 = starts / ends, 0 without).
+                shr.u32 %r85, %r25, 5;
+                shl.b32 %r85, %r85, 5;
+                mov.u32 %r86, %r21;
+                mov.u32 %r84, 0;
+                ld.param.u64 %rd44, [p_seg];
+                ld.param.u64 %rd46, [p_segend];
+                setp.eq.u64 %p14, %rd44, 0;
+                @%p14 bra KV_SEG_DONE;
+                cvta.to.global.u64 %rd44, %rd44;
+                cvta.to.global.u64 %rd46, %rd46;
+                ld.param.u32 %r83, [p_segheads];
+                div.u32 %r84, %r24, %r83;
+                mul.lo.u32 %r84, %r84, %r21;
+                add.u32 %r87, %r25, 63;
+                sub.u32 %r88, %r21, 1;
+                min.u32 %r87, %r87, %r88;
+                add.u32 %r87, %r87, %r84;
+                mul.wide.u32 %rd45, %r87, 4;
+                add.u64 %rd45, %rd45, %rd46;
+                ld.global.f32 %f49, [%rd45];
+                cvt.rzi.u32.f32 %r86, %f49;
+                min.u32 %r86, %r86, %r21;
+            KV_SEG_DONE:
+                mov.u32 %r88, 0;
+            GROUPS:
+                setp.ge.u32 %p15, %r88, %r20;
+                @%p15 bra ROWS_END;
+                add.u32 %r43, %r88, %r85;
+                add.u32 %r89, %r88, %r86;
+                min.u32 %r89, %r89, %r20;
             ROWS:
-                setp.ge.u32 %p3, %r43, %r20;
-                @%p3 bra ROWS_END;
+                setp.ge.u32 %p3, %r43, %r89;
+                @%p3 bra ROWS_NEXT;
                 bar.sync 0;
             """);
         s.AppendLine(FlashStage(R, d, "%r28", "%r43", "%r20", (row, dst) => QRow(dst, "%rd10", row, "%r63", "%r64")));
@@ -855,10 +944,18 @@ internal static partial class PtxKernels
                 @%p5 ld.global.f32 %f41, [%rd28];
                 @%p5 ld.global.f32 %f42, [%rd29];
                 @%p5 mul.f32 %f41, %f41, 0f3FB8AA3B;
+                mov.f32 %f50, 0f00000000;
+                setp.ne.and.u64 %p16, %rd44, 0, %p5;
+                rem.u32 %r90, %r49, %r21;
+                add.u32 %r90, %r90, %r84;
+                mul.wide.u32 %rd47, %r90, 4;
+                add.u64 %rd47, %rd47, %rd44;
+                @%p16 ld.global.f32 %f50, [%rd47];
                 shl.b32 %r50, %r1, 2;
                 add.u32 %r50, %r50, %r30;
                 st.shared.f32 [%r50], %f41;
                 st.shared.f32 [%r50+{R * 4}], %f42;
+                st.shared.f32 [%r50+{2 * R * 4}], %f50;
             STATS_DONE:
                 bar.sync 0;
             {Zeros("%s", 16)}
@@ -896,11 +993,17 @@ internal static partial class PtxKernels
                         setp.lt.and.u32 %p6, %r32, %r22, %p6;
                         setp.le.u32 %p7, %r33, %r54;
                         setp.lt.and.u32 %p7, %r33, %r22, %p7;
+                        setp.lt.and.u32 %p6, %r53, %r89, %p6;
+                        setp.lt.and.u32 %p7, %r53, %r89, %p7;
                         add.u32 %r55, %r52, {nt * 8 + j};
                         shl.b32 %r55, %r55, 2;
                         add.u32 %r55, %r55, %r30;
                         ld.shared.f32 %f43, [%r55];
                         ld.shared.f32 %f44, [%r55+{R * 4}];
+                        ld.shared.f32 %f50, [%r55+{2 * R * 4}];
+                        cvt.rzi.u32.f32 %r91, %f50;
+                        setp.ge.and.u32 %p6, %r32, %r91, %p6;
+                        setp.ge.and.u32 %p7, %r33, %r91, %p7;
                         neg.f32 %f43, %f43;
                         fma.rn.f32 %s{4 * nt + j}, %s{4 * nt + j}, %f40, %f43;
                         fma.rn.f32 %s{4 * nt + j + 2}, %s{4 * nt + j + 2}, %f40, %f43;
@@ -939,6 +1042,9 @@ internal static partial class PtxKernels
         s.AppendLine($"""
                 add.u32 %r43, %r43, {R};
                 bra ROWS;
+            ROWS_NEXT:
+                add.u32 %r88, %r88, %r21;
+                bra GROUPS;
             ROWS_END:
                 setp.lt.u32 %p10, %r32, %r22;
                 setp.lt.u32 %p11, %r33, %r22;

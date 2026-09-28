@@ -563,13 +563,15 @@ internal sealed unsafe partial class CudaBackend
 
     // Strides of the tensor-core flash kernels for contiguous [heads, rowsPerHead, dim] queries / outputs and
     // [heads, capacity, dim] keys / values (kv = 1: every head is its own batch).
-    private static ulong[] ContiguousLayout(int rowsPerHead, int steps, int capacity, int dim) =>
-        [U(1), U(rowsPerHead * dim), 0UL, U(steps * dim), U(dim), U(rowsPerHead * dim), 0UL, U(steps * dim), U(dim), U(capacity * dim), 0UL, U(dim)];
+    // Packed sequences add each position's sequence start and end and the heads per packed row (0 without).
+    private static ulong[] ContiguousLayout(int rowsPerHead, int steps, int capacity, int dim, Storage? starts = null, Storage? ends = null, int headsPerRow = 0) =>
+        [U(1), U(rowsPerHead * dim), 0UL, U(steps * dim), U(dim), U(rowsPerHead * dim), 0UL, U(steps * dim), U(dim), U(capacity * dim), 0UL, U(dim),
+            starts is null ? 0UL : P(starts), ends is null ? 0UL : P(ends), U(headsPerRow)];
 
     // Strides for [batch, steps, *] rows (see Backend.AttentionStrided).
     private static ulong[] RowLayout(int kvHeads, int group, int steps, int dim, int qRow, int kRow, int yRow) =>
         [U(kvHeads), U(steps * qRow), U(group * dim), U(dim), U(qRow), U(steps * yRow), U(group * dim), U(dim), U(yRow),
-            U(steps * kRow), U(dim), U(kRow)];
+            U(steps * kRow), U(dim), U(kRow), 0UL, 0UL, 0UL];
 
     private Storage ZeroPosition => _zeroPosition ??= Allocate(1, zeroed: true);
 
@@ -672,6 +674,53 @@ internal sealed unsafe partial class CudaBackend
         {
             delta.Release();
         }
+    }
+
+    public override bool SupportsSegmentedAttention(int dim) => FlashTensorCore(dim) is not null;
+
+    public override bool AttentionSegmented(Storage q, Storage keys, Storage values, Storage y, Storage? logSumExp, Storage starts, Storage ends,
+        int heads, int headsPerRow, int rowsPerHead, int steps, int dim, float scale)
+    {
+        if (FlashTensorCore(dim) is not { } tc)
+        {
+            return false;
+        }
+
+        Launch(tc[$"flash_tc_fwd_d{dim}"], (uint)((rowsPerHead + PtxKernels.FlashTensorRows - 1) / PtxKernels.FlashTensorRows), (uint)heads, 1, 128, 1,
+            [P(q), P(keys), P(values), P(ZeroPosition), P(y), logSumExp is null ? 0UL : P(logSumExp),
+            U(rowsPerHead), U(steps), U(steps), F(scale * Log2E), .. ContiguousLayout(rowsPerHead, steps, steps, dim, starts, ends, headsPerRow)]);
+        return true;
+    }
+
+    public override bool AttentionSegmentedBackward(Storage q, Storage keys, Storage values, Storage output, Storage logSumExp, Storage dOutput,
+        Storage dq, Storage dkeys, Storage dvalues, Storage starts, Storage ends, int heads, int headsPerRow, int rowsPerHead, int steps, int dim, float scale)
+    {
+        if (FlashTensorCore(dim) is not { } tc)
+        {
+            return false;
+        }
+
+        int rows = heads * rowsPerHead;
+        var delta = Allocate(rows, zeroed: false);
+        try
+        {
+            Launch1D(K("attn_bwd_d_f32"), rows, P(output), P(dOutput), P(delta), U(dim), U(rows));
+            var layout = ContiguousLayout(rowsPerHead, steps, steps, dim, starts, ends, headsPerRow);
+            t_sharedBytes = (uint)PtxKernels.FlashTensorBackwardKvShared(dim);
+            Launch(tc[$"flash_tc_bwd_kv_d{dim}"], (uint)((steps + PtxKernels.FlashTensorRows - 1) / PtxKernels.FlashTensorRows), (uint)heads, 1, 128, 1,
+                [P(q), P(keys), P(values), P(dOutput), P(logSumExp), P(delta), P(dkeys), P(dvalues),
+                U(rowsPerHead), U(steps), U(steps), F(scale), F(scale * Log2E), 0UL, .. layout]);
+            t_sharedBytes = (uint)PtxKernels.FlashTensorBackwardQShared(dim);
+            Launch(tc[$"flash_tc_bwd_q_d{dim}"], (uint)((rowsPerHead + PtxKernels.FlashTensorRows - 1) / PtxKernels.FlashTensorRows), (uint)heads, 1, 128, 1,
+                [P(q), P(keys), P(values), P(dOutput), P(logSumExp), P(delta), P(dq),
+                U(rowsPerHead), U(steps), U(steps), F(scale), F(scale * Log2E), .. layout]);
+        }
+        finally
+        {
+            delta.Release();
+        }
+
+        return true;
     }
 
     public override void AttentionInt8(Storage q, Storage keys, Storage values, Storage keyScales, Storage valueScales, Storage position,

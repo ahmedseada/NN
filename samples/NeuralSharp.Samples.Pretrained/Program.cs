@@ -22,7 +22,7 @@ using NeuralSharp.Pretrained;
 //                                   every token; writes a PEFT adapter to <dir>
 //                                   (--eval F|spec, --eval-fraction 0.02, --system S, --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048,
 //                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
-//                                   --eval-every N, --no-checkpointing; with --int4 / --int8 / --bf16 the base stays quantized;
+//                                   --eval-every N, --no-checkpointing, --no-packing (pad instead of packing sequences into rows); with --int4 / --int8 / --bf16 the base stays quantized;
 //                                   --profile: measure a few steps instead of training: wall time, GPU time per kernel and
 //                                   per kind of work, host overhead)
 //   (<folder> may also be a Hugging Face model id, for example Qwen/Qwen3-0.6B: taken from the Hugging Face cache or
@@ -105,6 +105,7 @@ for (int i = 0; i < args.Length; i++)
             break;
         case "--gpu-memory": ComputeResources.GpuMemoryLimit = (long)(double.Parse(args[++i], CultureInfo.InvariantCulture) * (1L << 30)); break;
         case "--no-checkpointing": tuning = tuning with { Checkpointing = false }; break;
+        case "--no-packing": tuning = tuning with { Packing = false }; break;
         case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
         case "--workspace": workspace = args[++i]; break;

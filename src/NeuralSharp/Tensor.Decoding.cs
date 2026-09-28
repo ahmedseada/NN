@@ -160,6 +160,47 @@ public sealed partial class Tensor
         return Traced("attention", y, start);
     }
 
+    /// <summary>
+    /// <see cref="CausalAttention"/> over packed sequences: keys and values [heads, steps, dim], and each position sees
+    /// only its own sequence (<paramref name="packing"/>'s starts; head h belongs to packed row h / <paramref name="headsPerRow"/>).
+    /// Null when the device has no such pass.
+    /// </summary>
+    internal static Tensor? CausalAttentionSegmented(Tensor q, Tensor keys, Tensor values, Layers.PackedSequences packing, int headsPerRow, float scale)
+    {
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int heads = q._shape[0], rowsPerHead = q._shape[1], dim = q._shape[2], steps = keys._shape[1];
+        var y = Empty([heads, rowsPerHead, dim], q.Device);
+        bool record = Autograd.IsEnabled && (q.RequiresGrad || keys.RequiresGrad || values.RequiresGrad);
+        var lse = record ? Empty([heads, rowsPerHead], q.Device, track: false) : null;
+        if (!q.Backend.AttentionSegmented(q.Storage, keys.Storage, values.Storage, y.Storage, lse?.Storage, packing.Starts.Storage, packing.Ends.Storage,
+                heads, headsPerRow, rowsPerHead, steps, dim, scale))
+        {
+            y.Dispose();
+            lse?.Dispose();
+            return null;
+        }
+
+        if (record)
+        {
+            y.Record("attention_packed", g =>
+            {
+                using var dq = q.RequiresGrad ? null : Empty(q._shape, q.Device, zeroed: true, track: false);
+                using var dk = keys.RequiresGrad ? null : Empty(keys._shape, q.Device, zeroed: true, track: false);
+                using var dv = values.RequiresGrad ? null : Empty(values._shape, q.Device, zeroed: true, track: false);
+                if (!q.Backend.AttentionSegmentedBackward(q.Storage, keys.Storage, values.Storage, y.Storage, lse!.Storage, g.Storage,
+                        dq?.Storage ?? q.GradStorage(), dk?.Storage ?? keys.GradStorage(), dv?.Storage ?? values.GradStorage(),
+                        packing.Starts.Storage, packing.Ends.Storage, heads, headsPerRow, rowsPerHead, steps, dim, scale))
+                {
+                    throw new NotSupportedException("Packed attention's backward pass is not available on this device.");
+                }
+
+                lse.Dispose();
+            }, q, keys, values);
+        }
+
+        return Traced("attention_packed", y, start);
+    }
+
     /// <summary>Attention of q [heads, rowsPerHead, dim] over an int8 cache filled up to <paramref name="position"/>.</summary>
     internal static Tensor AttentionInt8(Tensor q, Layers.KeyValueCache cache, Tensor position, int steps, float scale, bool tiled)
     {

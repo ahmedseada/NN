@@ -10,6 +10,7 @@ internal static partial class Tests
     [
         ("fine-tuning: chunked token cross-entropy (all rows or trained rows only) and the frozen-transpose product and the fused LoRA term match dense results and gradients", TokenLoss),
         ("fine-tuning: LoRA terms inside the tensor-core products (float32, bfloat16 and 4-bit bases, one layer or merged) and rank-16 products match the separate computation, with gradients", LoraInsideProducts),
+        ("fine-tuning: packed sequences (several per row, rotary or learned positions) give each sequence the logits and gradients it gets alone; packing fills rows first-fit", PackedSequencesMatch),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
@@ -537,5 +538,138 @@ internal static partial class Tests
                 }
             }
         }
+    }
+
+    private static void PackedSequencesMatch(Device device)
+    {
+        if (device.Type == DeviceType.Cuda && MixedPrecision.TensorCoresUnavailable(device) is not null)
+        {
+            return;                                                              // packed attention runs on tensor cores
+        }
+
+        using var precision = MixedPrecision.Use(device.Type == DeviceType.Cuda ? MatMulPrecision.BFloat16 : MatMulPrecision.Float32);
+        int[][] rows = [[37, 50, 20], [70, 30]];
+        const int Length = 110;
+        var random = new Random(97);
+        var tokens = rows.Select(r => r.Select(n => Enumerable.Range(0, n).Select(_ => (float)random.Next(50)).ToArray()).ToArray()).ToArray();
+        var coefficients = rows.Select(r => r.Select(n => RandomArray(random, n * 50)).ToArray()).ToArray();
+        foreach (bool rotary in new[] { true, false })
+        {
+            var spec = new DecoderSpec
+            {
+                Vocabulary = 50, Dim = 128, Layers = 2, Heads = 4, KvHeads = 2, HeadDim = 64, FfDim = 128, MaxPositions = 256,
+                Rope = rotary ? new RopeSettings(10000f) : null, LearnedPositions = !rotary,
+            };
+            using var model = spec.Build(new RandomWeights(98), new DecoderBuildOptions { Device = device });
+            model.AddLora(rank: 2, alpha: 4, targets: _ => true, freezeBase: true, random: new Random(99));
+            foreach (var adapter in model.Descendants().OfType<Linear>().Select(l => l.Adapter).OfType<LoraAdapter>())
+            {
+                adapter.B.Load([.. Enumerable.Range(0, adapter.B.Size).Select(i => 0.1f * MathF.Sin(i))]);
+            }
+
+            Check(PackedSequences.Supports(model), "the model runs packed batches");
+            model.Train();
+
+            // Packed: both rows in one [2, 110] batch (the ends of the rows are padding).
+            var packedLogits = new List<float[]>();
+            float[] packedGradients;
+            float packedLoss;
+            using (var scope = new TensorScope())
+            {
+                var values = new float[rows.Length * Length];
+                var weights = new float[rows.Length * Length * 50];
+                for (int r = 0; r < rows.Length; r++)
+                {
+                    int offset = 0;
+                    for (int j = 0; j < rows[r].Length; j++)
+                    {
+                        tokens[r][j].CopyTo(values, r * Length + offset);
+                        coefficients[r][j].CopyTo(weights, (r * Length + offset) * 50);
+                        offset += rows[r][j];
+                    }
+                }
+
+                using var packing = PackedSequences.Create(rows, Length, device);
+                using (packing.Use())
+                {
+                    var logits = model.Forward(Tensor.From(values, [rows.Length, Length], device));
+                    var loss = (logits * Tensor.From(weights, [rows.Length, Length, 50], device)).Sum();
+                    loss.Backward();
+                    packedLoss = loss.Item();
+                    var all = logits.ToArray();
+                    for (int r = 0; r < rows.Length; r++)
+                    {
+                        int offset = 0;
+                        foreach (int n in rows[r])
+                        {
+                            packedLogits.Add(all[((r * Length + offset) * 50)..((r * Length + offset + n) * 50)]);
+                            offset += n;
+                        }
+                    }
+                }
+
+                packedGradients = [.. model.TrainableParameters().SelectMany(p => p.Grad!.ToArray())];
+            }
+
+            // Alone: each sequence as its own batch, gradients summed.
+            foreach (var parameter in model.TrainableParameters())
+            {
+                parameter.ZeroGrad();
+            }
+
+            var aloneLogits = new List<float[]>();
+            float aloneLoss = 0f;
+            float[] aloneGradients;
+            using (var scope = new TensorScope())
+            {
+                for (int r = 0; r < rows.Length; r++)
+                {
+                    for (int j = 0; j < rows[r].Length; j++)
+                    {
+                        int n = rows[r][j];
+                        var logits = model.Forward(Tensor.From(tokens[r][j], [1, n], device));
+                        var loss = (logits * Tensor.From(coefficients[r][j], [1, n, 50], device)).Sum();
+                        loss.Backward();
+                        aloneLoss += loss.Item();
+                        aloneLogits.Add(logits.ToArray());
+                    }
+                }
+
+                aloneGradients = [.. model.TrainableParameters().SelectMany(p => p.Grad!.ToArray())];
+            }
+
+            string what = rotary ? "rotary positions" : "learned positions";
+            float tolerance = device.Type == DeviceType.Cuda ? 3e-2f : 1e-3f;
+            for (int i = 0; i < aloneLogits.Count; i++)
+            {
+                CloseByNorm(aloneLogits[i], packedLogits[i], tolerance, $"{what}: logits of sequence {i}");
+            }
+
+            CloseByNorm([aloneLoss], [packedLoss], tolerance, $"{what}: loss");
+            CloseByNorm(aloneGradients, packedGradients, tolerance, $"{what}: adapter gradients");
+        }
+
+        // First fit, longest first: 6+4, 5+5, 3+2 in rows of 10.
+        var sequences = new[] { 5, 3, 6, 4, 5, 2 }.Select(n => new TrainingSequence(new int[n + 1], new bool[n + 1])).ToList();
+        var batches = FineTuner.PackedBatches(sequences, 10, 2, random: null);
+        Check(batches.Count == 2 && batches[0].Length == 2 && batches[1].Length == 1, $"packed batches: {batches.Count}");
+        var filled = batches.SelectMany(b => b).Select(r => r.Sum(i => sequences[i].Tokens.Length - 1)).ToArray();
+        Check(filled.SequenceEqual([10, 10, 5]) && batches.SelectMany(b => b).SelectMany(r => r).Order().SequenceEqual(Enumerable.Range(0, 6)),
+            $"rows filled {string.Join(", ", filled)}");
+    }
+
+    // ‖expected - actual‖ ≤ tolerance · ‖expected‖ (products in bfloat16 differ element by element, not overall).
+    private static void CloseByNorm(float[] expected, float[] actual, float tolerance, string what)
+    {
+        Check(expected.Length == actual.Length, $"{what}: length {actual.Length}, expected {expected.Length}");
+        double difference = 0, norm = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            difference += (double)(expected[i] - actual[i]) * (expected[i] - actual[i]);
+            norm += (double)expected[i] * expected[i];
+        }
+
+        double error = Math.Sqrt(difference / Math.Max(norm, 1e-30));
+        Check(error <= tolerance, $"{what}: relative error {error:G3}");
     }
 }
