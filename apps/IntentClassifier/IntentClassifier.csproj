@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- An application built on NeuralSharp (not part of the library): it references the library projects the way any
+       consumer would; once NeuralSharp is published as packages, swap these for PackageReferences. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>IntentClassifier</RootNamespace>
+    <AssemblyName>intent-classifier</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\NeuralSharp\NeuralSharp.csproj" />
+    <ProjectReference Include="..\..\src\NeuralSharp.Datasets\NeuralSharp.Datasets.csproj" />
+  </ItemGroup>
+
+</Project>

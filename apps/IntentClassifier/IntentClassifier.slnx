@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="IntentClassifier.csproj" />
+  <Folder Name="/NeuralSharp/">
+    <Project Path="../../src/NeuralSharp/NeuralSharp.csproj" />
+    <Project Path="../../src/NeuralSharp.Datasets/NeuralSharp.Datasets.csproj" />
+  </Folder>
+</Solution>
