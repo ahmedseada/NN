@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The intent model (training, evaluation, prediction, one-file save/load), shared by the command line and the API. -->
+  <PropertyGroup>
+    <RootNamespace>IntentClassifier</RootNamespace>
+    <AssemblyName>IntentClassifier.Core</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\NeuralSharp\NeuralSharp.csproj" />
+    <ProjectReference Include="..\..\src\NeuralSharp.Datasets\NeuralSharp.Datasets.csproj" />
+  </ItemGroup>
+
+</Project>
