@@ -1,5 +1,5 @@
 using NeuralSharp;
-using NeuralSharp.Classification;
+using NeuralSharp.Text;
 
 internal static partial class Tests
 {
@@ -59,7 +59,7 @@ internal static partial class Tests
         try
         {
             File.WriteAllText(csv, "﻿raw_question,other,intent\n\"line one\nline, two with \"\"quotes\"\"\",x,retrieve\nهلا,y,direct_reply\n,z,retrieve\n");
-            var rows = TextClassifier.Read(csv, "raw_question", "intent");
+            var rows = TextClassifier.ReadCsv(csv, "raw_question", "intent");
             Check(rows.Count == 2 && rows[0].Text == "line one\nline, two with \"quotes\"" && rows[0].Label == "retrieve" && rows[1].Text == "هلا",
                 $"CSV rows: {string.Join(" | ", rows)}");
         }

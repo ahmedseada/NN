@@ -2,6 +2,7 @@
   <Folder Name="/samples/">
     <Project Path="samples/NeuralSharp.Samples.CharGpt/NeuralSharp.Samples.CharGpt.csproj" />
     <Project Path="samples/NeuralSharp.Samples.Classification/NeuralSharp.Samples.Classification.csproj" />
+    <Project Path="samples/NeuralSharp.Samples.TextClassifier/NeuralSharp.Samples.TextClassifier.csproj" />
     <Project Path="samples/NeuralSharp.Samples.GptApi/NeuralSharp.Samples.GptApi.csproj" />
     <Project Path="samples/NeuralSharp.Samples.HouseApi/NeuralSharp.Samples.HouseApi.csproj" />
     <Project Path="samples/NeuralSharp.Samples.HousePrices/NeuralSharp.Samples.HousePrices.csproj" />
@@ -19,8 +20,6 @@
   </Folder>
   <Folder Name="/src/">
     <Project Path="src/NeuralSharp.AspNetCore/NeuralSharp.AspNetCore.csproj" />
-    <Project Path="src/NeuralSharp.Classification.Cli/NeuralSharp.Classification.Cli.csproj" />
-    <Project Path="src/NeuralSharp.Classification/NeuralSharp.Classification.csproj" />
     <Project Path="src/NeuralSharp.Mcp/NeuralSharp.Mcp.csproj" />
     <Project Path="src/NeuralSharp.Onnx.Runtime/NeuralSharp.Onnx.Runtime.csproj" />
     <Project Path="src/NeuralSharp.Onnx/NeuralSharp.Onnx.csproj" />
