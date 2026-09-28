@@ -61,7 +61,13 @@ public sealed class ModelHost : IDisposable
     {
         if (!File.Exists(path))
         {
-            throw new FileNotFoundException($"No intent model at {Path.GetFullPath(path)}: train one with 'qasd train apps/Qasd/data/plan-queries.csv' (it saves there) or set IntentModel:Path.", path);
+            string advice = string.IsNullOrWhiteSpace(_options.Path)
+                ? "train one with 'qasd train apps/Qasd/data/plan-queries.csv' (it saves there) or set IntentModel:Path."
+                : $"IntentModel:Path (appsettings.json, or the IntentModel__Path environment variable) is set to '{_options.Path}'; "
+                  + (File.Exists(QasdPaths.Classifier)
+                      ? $"remove it to use the trained model at {QasdPaths.Classifier} (PowerShell: Remove-Item Env:IntentModel__Path)."
+                      : "point it at a model from 'qasd train', or remove it to use the default place.");
+            throw new FileNotFoundException($"No intent model at {Path.GetFullPath(path)}: {advice}", path);
         }
 
         var device = ParseDevice(_options.Device);
