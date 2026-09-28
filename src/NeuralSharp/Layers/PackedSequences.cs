@@ -38,6 +38,34 @@ public sealed class PackedSequences : IDisposable
     {
         ArgumentNullException.ThrowIfNull(lengths);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(length);
+        var (positions, starts, ends) = Layout(lengths, length);
+        int rows = lengths.Count;
+        return new PackedSequences(rows, length,
+            Tensor.Persistent(positions, [rows * length], device, requiresGrad: false),
+            Tensor.Persistent(starts, [rows * length], device, requiresGrad: false),
+            Tensor.Persistent(ends, [rows * length], device, requiresGrad: false));
+    }
+
+    /// <summary>
+    /// Lays out other sequences in the same rows, in place: the tensors keep their memory, so work recorded with this
+    /// packing (a CUDA graph) sees the new layout when replayed.
+    /// </summary>
+    public void Update(IReadOnlyList<IReadOnlyList<int>> lengths)
+    {
+        ArgumentNullException.ThrowIfNull(lengths);
+        if (lengths.Count != Rows)
+        {
+            throw new ArgumentException($"The packing has {Rows} rows; {lengths.Count} given.");
+        }
+
+        var (positions, starts, ends) = Layout(lengths, Length);
+        Positions.Load(positions);
+        Starts.Load(starts);
+        Ends.Load(ends);
+    }
+
+    private static (float[] Positions, float[] Starts, float[] Ends) Layout(IReadOnlyList<IReadOnlyList<int>> lengths, int length)
+    {
         int rows = lengths.Count;
         var positions = new float[rows * length];
         var starts = new float[rows * length];
@@ -63,10 +91,7 @@ public sealed class PackedSequences : IDisposable
             }
         }
 
-        return new PackedSequences(rows, length,
-            Tensor.Persistent(positions, [rows * length], device, requiresGrad: false),
-            Tensor.Persistent(starts, [rows * length], device, requiresGrad: false),
-            Tensor.Persistent(ends, [rows * length], device, requiresGrad: false));
+        return (positions, starts, ends);
     }
 
     /// <summary>The packing in effect on this thread, or null.</summary>

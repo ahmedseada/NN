@@ -351,6 +351,14 @@ public sealed record FineTuningOptions
     /// </summary>
     public bool Packing { get; init; } = true;
 
+    /// <summary>
+    /// On CUDA with packed batches and no gradient accumulation: records one training step's forward and backward pass
+    /// as a CUDA graph (after two ordinary steps) and replays it for every later batch of the same shape, with the
+    /// batch's tokens copied into the recorded buffers. The thousands of operations of a step then cost one launch of
+    /// host work instead of one each. Falls back to ordinary steps when recording fails.
+    /// </summary>
+    public bool CudaGraphs { get; init; } = true;
+
     /// <summary>Batches whose gradients are added before each optimizer step.</summary>
     public int GradientAccumulation { get; init; } = 1;
 
@@ -476,6 +484,7 @@ public static class FineTuner
             (int)Math.Round(options.WarmupFraction * totalSteps));
         var evaluations = new List<float>();
         int step = 0;
+        using var runner = new StepRunner(model, train, optimizer, options, MostTrained(epochBatches.SelectMany(b => b), train), trace);
         for (int epoch = 0; epoch < options.Epochs; epoch++)
         {
             var batches = epochBatches[epoch];
@@ -484,7 +493,7 @@ public static class FineTuner
                 cancellationToken.ThrowIfCancellationRequested();
                 var group = batches.Skip(first).Take(accumulation).ToList();
                 var watch = Stopwatch.StartNew();
-                var (loss, tokens) = RunStep(model, train, group, optimizer, options, cancellationToken, trace,
+                var (loss, tokens) = runner.Run(group, cancellationToken,
                     b => $"step {step + 1}/{totalSteps}, batch {first + b + 1}/{batches.Count} of epoch {epoch + 1}");
                 float rate = optimizer.LearningRate;                     // the rate RunStep's update used
                 schedule.Step();
@@ -513,6 +522,63 @@ public static class FineTuner
         }
 
         return evaluations;
+    }
+
+    // Runs optimizer steps: ordinary ones, or replays of a recorded CUDA graph once one is recorded (see
+    // FineTuningOptions.CudaGraphs).
+    // lossRows: the most trained tokens of any batch the runner will see (the recorded loss's capacity).
+    private sealed class StepRunner(PretrainedModel model, IReadOnlyList<TrainingSequence> train, AdamW optimizer, FineTuningOptions options,
+        int lossRows, Action<string>? trace) : IDisposable
+    {
+        private TrainingGraph? _graph;
+        private bool _graphs = options.CudaGraphs && options.GradientAccumulation <= 1 && model.Device.Type == DeviceType.Cuda
+            && model.Device.Backend.SupportsGraphs
+            && !model.Network.Descendants().Any(m => m is Dropout { Probability: > 0f });   // a recorded pass would reuse its masks
+        private int _ordinary;
+
+        public (float Loss, long Tokens) Run(IReadOnlyList<Batch> group, CancellationToken cancellationToken, Func<int, string> label, bool graphs = true)
+        {
+            var batch = group[0];
+            if (graphs && _graphs && group.Count == 1 && batch.Packed)
+            {
+                if (_graph is null && _ordinary >= 2)
+                {
+                    _graph = TrainingGraph.Record(model, train, optimizer, options, batch, (Math.Max(1, lossRows) + 63) / 64 * 64, trace);
+                    _graphs = _graph is not null;
+                }
+
+                if (_graph is not null && _graph.Fits(batch, train))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var watch = Stopwatch.StartNew();
+                    model.Network.Train();
+                    var (loss, tokens) = _graph.Run(train, batch);
+                    trace?.Invoke($"{label(0)}: {batch.Describe(train)}, replayed: loss {loss:F4}, {watch.Elapsed.TotalSeconds:F2} s");
+                    Update(model, optimizer, options);
+                    return (loss, tokens);
+                }
+            }
+
+            _ordinary++;
+            return RunStep(model, train, group, optimizer, options, cancellationToken, trace, label);
+        }
+
+        public void Dispose() => _graph?.Dispose();
+    }
+
+    private static int MostTrained(IEnumerable<Batch> batches, IReadOnlyList<TrainingSequence> train) =>
+        batches.Select(b => b.Sequences.Sum(i => train[i].TrainedTokens)).DefaultIfEmpty(0).Max();
+
+    // Clipping and the optimizer's update, after the gradients of a step.
+    private static void Update(PretrainedModel model, AdamW optimizer, FineTuningOptions options)
+    {
+        if (options.MaxGradientNorm > 0f)
+        {
+            optimizer.ClipGradientNorm(options.MaxGradientNorm);
+        }
+
+        optimizer.Step();
+        model.Device.Synchronize();
     }
 
     // One optimizer step over a group of batches (gradient accumulation): forward, backward, clipping, update. Returns
@@ -545,13 +611,7 @@ public static class FineTuner
             trace?.Invoke($"  forward {forward:F2} s, backward {batchWatch.Elapsed.TotalSeconds - forward:F2} s, loss {batchLoss * normalizer / Math.Max(1, batch.Sequences.Sum(i => train[i].TrainedTokens)):F4}");
         }
 
-        if (options.MaxGradientNorm > 0f)
-        {
-            optimizer.ClipGradientNorm(options.MaxGradientNorm);
-        }
-
-        optimizer.Step();
-        model.Device.Synchronize();
+        Update(model, optimizer, options);
         return (loss, tokens);
     }
 
@@ -574,12 +634,14 @@ public static class FineTuner
         var batches = MakeBatches(model, train, options, new Random(options.Seed));
         int accumulation = Math.Max(1, options.GradientAccumulation);
         int next = 0;
+        using var runner = new StepRunner(model, train, optimizer, options, MostTrained(batches, train), trace);
         (float Loss, long Tokens, double Seconds) Step(string phase)
         {
             var group = Enumerable.Range(0, accumulation).Select(i => batches[(next + i) % batches.Count]).ToList();
             next += accumulation;
             var watch = Stopwatch.StartNew();
-            var (loss, tokens) = RunStep(model, train, group, optimizer, options, CancellationToken.None, trace, b => $"{phase} step, batch {b + 1}");
+            // The profiled steps run ordinary launches (each kernel timed); the others replay a graph when one is used.
+            var (loss, tokens) = runner.Run(group, CancellationToken.None, b => $"{phase} step, batch {b + 1}", graphs: phase != "profiled");
             return (loss, tokens, watch.Elapsed.TotalSeconds);
         }
 
@@ -776,15 +838,16 @@ public static class FineTuner
 
     // The summed weighted loss of one batch divided by normalizer (padding and untrained positions weigh 0), and the
     // number of tokens it covers. The network runs up to its final normalization; the head runs inside the loss.
-    // Packed batches run under their PackedSequences (the caller's), padded ones as they are.
-    private static (Tensor Loss, long Tokens) BatchLoss(PretrainedModel model, IReadOnlyList<TrainingSequence> sequences, Batch batch, float normalizer,
-        int chunkRows, bool checkpointing = false)
+    // The host side of a batch: inputs [rows · length], and the trained positions with their targets and weights.
+    private sealed record BatchData(float[] Inputs, int[] Trained, float[] Targets, float[] Weights, long Tokens);
+
+    private static BatchData Prepare(IReadOnlyList<TrainingSequence> sequences, Batch batch, float weight = 1f)
     {
         int length = batch.Length;
         int rows = batch.Rows.Length;
         var inputs = new float[rows * length];
-        var targets = new float[rows * length];
-        var weights = new float[rows * length];
+        var trained = new List<int>();
+        var targets = new List<float>();
         long tokens = 0;
         for (int b = 0; b < rows; b++)
         {
@@ -795,8 +858,14 @@ public static class FineTuner
                 for (int t = 0; t + 1 < sequence.Tokens.Length; t++)
                 {
                     inputs[offset + t] = sequence.Tokens[t];
-                    targets[offset + t] = sequence.Tokens[t + 1];
-                    weights[offset + t] = sequence.Trained[t + 1] ? 1f : 0f;
+                    if (sequence.Trained[t + 1])
+                    {
+                        // The output layer and softmax run only on the trained positions (the assistant's tokens): prompts
+                        // and padding would only cost a vocabulary-wide product each.
+                        trained.Add(offset + t);
+                        targets.Add(sequence.Tokens[t + 1]);
+                    }
+
                     tokens++;
                 }
 
@@ -804,14 +873,32 @@ public static class FineTuner
             }
         }
 
-        var device = model.Device;
+        return new BatchData(inputs, [.. trained], [.. targets], [.. Enumerable.Repeat(weight, trained.Count)], tokens);
+    }
+
+    // The summed weighted loss of one batch divided by normalizer (untrained positions weigh 0), and the number of tokens
+    // it covers. Packed batches run under their PackedSequences (the caller's), padded ones as they are.
+    private static (Tensor Loss, long Tokens) BatchLoss(PretrainedModel model, IReadOnlyList<TrainingSequence> sequences, Batch batch, float normalizer,
+        int chunkRows, bool checkpointing = false)
+    {
+        var data = Prepare(sequences, batch);
+        var tokens = Tensor.From(data.Inputs, [batch.Rows.Length, batch.Length], model.Device);
+        var loss = NetworkLoss(model, tokens, (hidden, head) => Losses.TokenCrossEntropyRows(hidden, h => head.Forward(h), data.Trained, data.Targets,
+            data.Weights, normalizer, chunkRows), checkpointing);
+        return (loss, data.Tokens);
+    }
+
+    // The network up to its final normalization on tokens [rows, length], then `loss` of the hidden states [rows · length,
+    // dim] with the output head (which the loss runs itself, on the rows it needs).
+    private static Tensor NetworkLoss(PretrainedModel model, Tensor tokens, Func<Tensor, Linear, Tensor> loss, bool checkpointing)
+    {
         var modules = model.Network.ToList();
         if (modules[^1] is not Linear head)
         {
             throw new InvalidOperationException("The network does not end with its output head (a Linear layer).");
         }
 
-        var hidden = Tensor.From(inputs, [rows, length], device);
+        var hidden = tokens;
         for (int i = 0; i < modules.Count - 1; i++)
         {
             if (checkpointing && modules[i] is DecoderBlock && Autograd.IsEnabled)
@@ -827,7 +914,7 @@ public static class FineTuner
                     next = scope.Keep(modules[i].Forward(hidden));
                 }
 
-                if (!ReferenceEquals(next, hidden))
+                if (!ReferenceEquals(next, hidden) && !ReferenceEquals(hidden, tokens))
                 {
                     hidden.Dispose();
                 }
@@ -840,19 +927,134 @@ public static class FineTuner
             }
         }
 
-        // The output layer and softmax run only on the positions that are trained (the assistant's tokens): prompts and
-        // padding have weight 0 and would only cost a vocabulary-wide product each.
-        var trained = new List<int>();
-        for (int i = 0; i < weights.Length; i++)
+        return loss(hidden.Reshape(tokens.Size, hidden.Shape[^1]), head);
+    }
+
+    // One training step's forward and backward pass over a packed batch, recorded as a CUDA graph: its inputs (tokens,
+    // the packing's layout, the trained positions with targets and weights) live in fixed buffers that each step
+    // overwrites before replaying the graph. The loss weights carry 1 / trained tokens, so the recorded pass needs no
+    // per-batch constant. Parameters' gradients are the ones the graph zeroes and fills.
+    private sealed class TrainingGraph : IDisposable
+    {
+        private readonly PretrainedModel _model;
+        private readonly Tensor _tokens, _rows, _targets, _weights, _loss;
+        private readonly PackedSequences _packing;
+        private IntPtr _executable, _graph;
+        private List<NeuralSharp.Backends.Storage> _owned = [];
+
+        private TrainingGraph(PretrainedModel model, Batch batch, IReadOnlyList<TrainingSequence> train, int lossRows)
         {
-            if (weights[i] != 0f)
+            _model = model;
+            var device = model.Device;
+            _tokens = Tensor.Persistent(new float[batch.Rows.Length * batch.Length], [batch.Rows.Length, batch.Length], device, requiresGrad: false);
+            _rows = Tensor.Persistent(new float[lossRows], [lossRows], device, requiresGrad: false);
+            _targets = Tensor.Persistent(new float[lossRows], [lossRows], device, requiresGrad: false);
+            _weights = Tensor.Persistent(new float[lossRows], [lossRows], device, requiresGrad: false);
+            _loss = Tensor.Persistent([0f], [1], device, requiresGrad: false);
+            _packing = PackedSequences.Create(Lengths(batch, train), batch.Length, device);
+            LossRows = lossRows;
+        }
+
+        public int LossRows { get; }
+
+        private static int[][] Lengths(Batch batch, IReadOnlyList<TrainingSequence> train) =>
+            [.. batch.Rows.Select(r => r.Select(i => train[i].Tokens.Length - 1).ToArray())];
+
+        // Records the pass (nothing runs yet); null, with the reason traced, when the device cannot.
+        public static TrainingGraph? Record(PretrainedModel model, IReadOnlyList<TrainingSequence> train, AdamW optimizer, FineTuningOptions options, Batch batch,
+            int lossRows, Action<string>? trace)
+        {
+            var graph = new TrainingGraph(model, batch, train, lossRows);
+            var backend = model.Device.Backend;
+            model.Device.Synchronize();
+            model.Network.Train();
+            try
             {
-                trained.Add(i);
+                backend.BeginCapture();
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                graph.Dispose();
+                trace?.Invoke($"CUDA graph not used ({ex.Message}); ordinary steps continue");
+                return null;
+            }
+
+            try
+            {
+                optimizer.ZeroGrad();
+                using (var scope = new TensorScope())
+                using (graph._packing.Use())
+                {
+                    var loss = NetworkLoss(model, graph._tokens, (hidden, head) => Tensor.TokenCrossEntropyRows(hidden, h => head.Forward(h),
+                        graph._rows, graph._targets, graph._weights, 1f, options.LossChunkRows), options.Checkpointing);
+                    loss.Backward();
+                    backend.Copy(loss.Storage, graph._loss.Storage, 1);
+                }
+
+                (graph._executable, graph._graph, graph._owned) = backend.EndCapture();
+                trace?.Invoke($"recorded one training step as a CUDA graph ({batch.Rows.Length} × {batch.Length} positions, up to {lossRows} trained); later steps replay it");
+                return graph;
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                graph._owned = backend.AbortCapture();
+                graph.Dispose();
+                trace?.Invoke($"CUDA graph not used ({ex.Message}); ordinary steps continue");
+                return null;
             }
         }
 
-        var loss = Losses.TokenCrossEntropyRows(hidden.Reshape(rows * length, hidden.Shape[^1]), h => head.Forward(h), [.. trained],
-            [.. trained.Select(i => targets[i])], [.. trained.Select(i => weights[i])], normalizer, chunkRows);
-        return (loss, tokens);
+        // Same shape, and trained positions within the recorded capacity.
+        public bool Fits(Batch batch, IReadOnlyList<TrainingSequence> train) =>
+            batch.Packed && batch.Rows.Length == _packing.Rows && batch.Length == _packing.Length
+            && batch.Sequences.Sum(i => train[i].TrainedTokens) <= LossRows;
+
+        // Copies the batch in and replays the pass: the parameters' gradients are then set; returns the mean loss per
+        // trained token and the tokens covered.
+        public (float Loss, long Tokens) Run(IReadOnlyList<TrainingSequence> train, Batch batch)
+        {
+            int trained = batch.Sequences.Sum(i => train[i].TrainedTokens);
+            var data = Prepare(train, batch, 1f / Math.Max(1, trained));
+            var rows = new float[LossRows];
+            var targets = new float[LossRows];
+            var weights = new float[LossRows];
+            for (int i = 0; i < data.Trained.Length; i++)
+            {
+                rows[i] = data.Trained[i];
+                targets[i] = data.Targets[i];
+                weights[i] = data.Weights[i];
+            }
+
+            _tokens.Load(data.Inputs);
+            _rows.Load(rows);
+            _targets.Load(targets);
+            _weights.Load(weights);
+            _packing.Update(Lengths(batch, train));
+            _model.Device.Backend.ReplayGraph(_executable);
+            return (_loss.Item(), data.Tokens);
+        }
+
+        public void Dispose()
+        {
+            if (_executable != IntPtr.Zero)
+            {
+                _model.Device.Synchronize();
+                _model.Device.Backend.DestroyGraph(_executable, _graph);
+                _executable = IntPtr.Zero;
+            }
+
+            foreach (var block in _owned)
+            {
+                block.Release();
+            }
+
+            _owned = [];
+            _tokens.Dispose();
+            _rows.Dispose();
+            _targets.Dispose();
+            _weights.Dispose();
+            _loss.Dispose();
+            _packing.Dispose();
+        }
     }
 }

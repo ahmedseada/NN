@@ -11,6 +11,7 @@ internal static partial class Tests
         ("fine-tuning: chunked token cross-entropy (all rows or trained rows only) and the frozen-transpose product and the fused LoRA term match dense results and gradients", TokenLoss),
         ("fine-tuning: LoRA terms inside the tensor-core products (float32, bfloat16 and 4-bit bases, one layer or merged) and rank-16 products match the separate computation, with gradients", LoraInsideProducts),
         ("fine-tuning: packed sequences (several per row, rotary or learned positions) give each sequence the logits and gradients it gets alone; packing fills rows first-fit", PackedSequencesMatch),
+        ("fine-tuning: a training step recorded as a CUDA graph and replayed gives the losses and adapters of ordinary steps", GraphTraining),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
@@ -671,5 +672,58 @@ internal static partial class Tests
 
         double error = Math.Sqrt(difference / Math.Max(norm, 1e-30));
         Check(error <= tolerance, $"{what}: relative error {error:G3}");
+    }
+
+    private static void GraphTraining(Device device)
+    {
+        if (device.Type != DeviceType.Cuda || !device.Backend.SupportsGraphs || MixedPrecision.TensorCoresUnavailable(device) is not null)
+        {
+            return;                                                              // graphs: CUDA; packed attention: tensor cores
+        }
+
+        using var precision = MixedPrecision.BFloat16();
+        var spec = new DecoderSpec
+        {
+            Vocabulary = 260, Dim = 128, Layers = 2, Heads = 2, KvHeads = 1, HeadDim = 64, FfDim = 256, MaxPositions = 512,
+            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, TieEmbeddings = true,
+        };
+        string folder = WriteChatModel(spec);
+        try
+        {
+            var random = new Random(61);
+            var sequences = Enumerable.Range(0, 24).Select(_ =>
+            {
+                int n = random.Next(20, 120);
+                return new TrainingSequence([.. Enumerable.Range(0, n).Select(_ => random.Next(256))], [.. Enumerable.Range(0, n).Select(i => i >= n / 2)]);
+            }).ToList();
+            (List<float> Losses, float[] Adapters, string Trace) Run(bool graphs)
+            {
+                using var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device });
+                var options = new FineTuningOptions { Rank = 4, Alpha = 8, LearningRate = 1e-3f, BatchTokens = 256, Seed = 1, CudaGraphs = graphs };
+                var losses = new List<float>();
+                var trace = new System.Text.StringBuilder();
+                FineTuner.Train(model, sequences, null, options, progress: new SynchronousProgress<FineTuningProgress>(p => losses.Add(p.Loss)),
+                    trace: line => trace.AppendLine(line));
+                return (losses, [.. model.Network.TrainableParameters().SelectMany(p => p.ToArray())], trace.ToString());
+            }
+
+            var ordinary = Run(false);
+            var replayed = Run(true);
+            Check(replayed.Trace.Contains("recorded one training step as a CUDA graph") && replayed.Trace.Contains("replayed"),
+                $"the graph was recorded and replayed:\n{replayed.Trace}");
+            Check(ordinary.Losses.Count >= 5 && ordinary.Losses.Count == replayed.Losses.Count, $"steps: {ordinary.Losses.Count} and {replayed.Losses.Count}");
+            CloseByNorm([.. ordinary.Losses], [.. replayed.Losses], 2e-3f, "losses per step");
+            CloseByNorm(ordinary.Adapters, replayed.Adapters, 2e-3f, "trained adapters");
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
+    }
+
+    // Reports on the calling thread (Progress<T> posts to the thread pool, so its reports can arrive late).
+    private sealed class SynchronousProgress<T>(Action<T> report) : IProgress<T>
+    {
+        public void Report(T value) => report(value);
     }
 }

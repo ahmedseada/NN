@@ -168,7 +168,7 @@ public sealed partial class Tensor
         backend.Sum(losses.Storage, loss.Storage, rows, 1f / normalizer);
         if (record)
         {
-            loss.Record("token_cross_entropy", g => backend.Axpy(gradient!.Storage, hidden.GradStorage(), rows * dim, g.Item()), hidden);
+            loss.Record("token_cross_entropy", g => backend.GroupScaleShift(gradient!.Storage, g.Storage, null, hidden.GradStorage(), rows * dim, 1, rows * dim, true), hidden);
         }
 
         return Traced("token_cross_entropy", loss, start);
@@ -457,25 +457,48 @@ public sealed partial class Tensor
     /// </summary>
     internal static Tensor TokenCrossEntropyRows(Tensor hidden, Func<Tensor, Tensor> head, int[] rows, float[] targets, float[] weights, float normalizer, int chunkRows)
     {
+        if (targets.Length != rows.Length || weights.Length != rows.Length)
+        {
+            throw new ArgumentException("TokenCrossEntropyRows needs one target and weight per listed row.");
+        }
+
+        using var rowTensor = From(rows.Length == 0 ? [0f] : [.. rows.Select(r => (float)r)], [Math.Max(1, rows.Length)], hidden.Device);
+        using var targetTensor = From(targets.Length == 0 ? [0f] : targets, [Math.Max(1, rows.Length)], hidden.Device);
+        using var weightTensor = From(weights.Length == 0 ? [0f] : weights, [Math.Max(1, rows.Length)], hidden.Device);
+        return TokenCrossEntropyRows(hidden, head, rowTensor, targetTensor, weightTensor, normalizer, chunkRows);
+    }
+
+    /// <summary>
+    /// <see cref="TokenCrossEntropyRows(Tensor, Func{Tensor, Tensor}, int[], float[], float[], float, int)"/> with the rows,
+    /// targets and weights already on the device ([count] floats each; a row with weight 0 adds nothing): no host data, so
+    /// the pass can be recorded as a graph and replayed with new values in those tensors.
+    /// </summary>
+    internal static Tensor TokenCrossEntropyRows(Tensor hidden, Func<Tensor, Tensor> head, Tensor rows, Tensor targets, Tensor weights, float normalizer, int chunkRows)
+    {
         hidden.ThrowIfDisposed();
-        if (hidden.Rank != 2 || targets.Length != rows.Length || weights.Length != rows.Length)
+        if (hidden.Rank != 2 || targets.Size != rows.Size || weights.Size != rows.Size)
         {
             throw new ArgumentException("TokenCrossEntropyRows needs hidden [rows, dim] and one target and weight per listed row.");
         }
 
         long start = Telemetry.Start(TelemetryLevel.Operations);
-        int total = hidden._shape[0], dim = hidden._shape[1], count = rows.Length;
+        int total = hidden._shape[0], dim = hidden._shape[1], count = rows.Size;
         chunkRows = Math.Max(1, chunkRows);
         var device = hidden.Device;
         var backend = hidden.Backend;
         bool record = WillRecord(hidden);
         var gradient = record ? Empty([total, dim], device, zeroed: true) : null;
-        var losses = Empty([Math.Max(1, count)], device, zeroed: true);
+        var losses = Empty([count], device, zeroed: true);
         for (int r0 = 0; r0 < count; r0 += chunkRows)
         {
             int n = Math.Min(chunkRows, count - r0);
             using var scope = new TensorScope();
-            var index = From([.. rows.AsSpan(r0, n).ToArray().Select(r => (float)r)], [n], device);
+            var index = Empty([n], device);
+            var chunkTargets = Empty([n], device);
+            var chunkWeights = Empty([n], device);
+            backend.Copy2D(rows.Storage, r0, n, index.Storage, 0, n, 1, n, accumulate: false);
+            backend.Copy2D(targets.Storage, r0, n, chunkTargets.Storage, 0, n, 1, n, accumulate: false);
+            backend.Copy2D(weights.Storage, r0, n, chunkWeights.Storage, 0, n, 1, n, accumulate: false);
             var chunk = Empty([n, dim], device);
             backend.Gather(hidden.Storage, index.Storage, chunk.Storage, n, dim, total);
             chunk.RequiresGrad = record;
@@ -486,8 +509,6 @@ public sealed partial class Tensor
                 throw new ArgumentException($"The head must map [{n}, {dim}] to [{n}, vocabulary], got {FormatShape(logits._shape)}.");
             }
 
-            var chunkTargets = From(targets.AsSpan(r0, n).ToArray(), [n], device);
-            var chunkWeights = From(weights.AsSpan(r0, n).ToArray(), [n], device);
             var chunkLosses = Empty([n], device);
             backend.SoftmaxCrossEntropyRows(logits.Storage, chunkTargets.Storage, chunkWeights.Storage, chunkLosses.Storage, n, vocabulary, 1f / normalizer);
             backend.Copy2D(chunkLosses.Storage, 0, n, losses.Storage, r0, n, 1, n, accumulate: false);
@@ -499,10 +520,11 @@ public sealed partial class Tensor
         }
 
         var loss = Empty([1], device);
-        backend.Sum(losses.Storage, loss.Storage, Math.Max(1, count), 1f / normalizer);
+        backend.Sum(losses.Storage, loss.Storage, count, 1f / normalizer);
         if (record)
         {
-            loss.Record("token_cross_entropy", g => backend.Axpy(gradient!.Storage, hidden.GradStorage(), total * dim, g.Item()), hidden);
+            // dhidden += gradient · g, with g read on the device (no host read: recordable as a graph).
+            loss.Record("token_cross_entropy", g => backend.GroupScaleShift(gradient!.Storage, g.Storage, null, hidden.GradStorage(), total * dim, 1, total * dim, true), hidden);
         }
 
         return Traced("token_cross_entropy", loss, start);
