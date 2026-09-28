@@ -119,9 +119,7 @@ try
                               + string.Join(", ", examples.GroupBy(e => e.Label.Trim()).OrderBy(g => g.Key, StringComparer.Ordinal).Select(g => $"{g.Key} {g.Count():N0}")));
             Console.WriteLine($"training on {train.Count:N0} on {device.Name}{(test.Count > 0 ? $", testing on {test.Count:N0} (texts not in training)" : "")}");
             var clock = Stopwatch.StartNew();
-            using var classifier = TextClassifier.Train(train, options with { Device = device },
-                epoch => Console.WriteLine($"  epoch {epoch.Epoch,3}: loss {epoch.Loss:F4}"
-                                           + (double.IsNaN(epoch.ValidationAccuracy) ? "" : $", validation accuracy {epoch.ValidationAccuracy:P1}") + (epoch.Best ? "  *" : "")));
+            using var classifier = ConsoleTraining.Classifier(train, options with { Device = device });
             Console.WriteLine($"trained in {clock.Elapsed.TotalSeconds:F1} s (the best validation epoch, *, is kept)");
             if (test.Count > 0)
             {
@@ -155,7 +153,8 @@ try
                 Console.WriteLine($"{target.Name}:");
                 var clock = Stopwatch.StartNew();
                 int epochs = 0;
-                using var classifier = TextClassifier.Train(train, options with { Device = target }, epoch => epochs = epoch.Epoch);
+                using var classifier = ConsoleTraining.Classifier(train, options with { Device = target }, epochLines: false, label: "  training",
+                    onEpoch: epoch => epochs = epoch.Epoch);
                 double trainSeconds = clock.Elapsed.TotalSeconds;
                 var report = classifier.Evaluate(test);
 

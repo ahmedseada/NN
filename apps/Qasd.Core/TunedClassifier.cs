@@ -87,10 +87,11 @@ public sealed class TunedClassifier : IDisposable
     /// <summary>
     /// Tunes <see cref="TunedOptions.BaseModel"/> on <paramref name="train"/> (each message answered with its label), writes
     /// the adapter and settings to <paramref name="outputFolder"/> and returns the tuned model, ready to predict.
-    /// <paramref name="log"/> receives progress lines.
+    /// <paramref name="log"/> receives progress lines, and <paramref name="steps"/> each optimizer step (when given, the steps
+    /// are not logged).
     /// </summary>
     public static TunedClassifier Train(IReadOnlyList<LabeledText> train, string outputFolder, TunedOptions? options = null, Action<string>? log = null,
-        CancellationToken cancellationToken = default)
+        Action<FineTuningProgress>? steps = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(train);
         options ??= new TunedOptions();
@@ -120,8 +121,8 @@ public sealed class TunedClassifier : IDisposable
                 BatchTokens = options.BatchTokens,
                 MaxLength = options.MaxLength,
                 Seed = options.Seed,
-            }, outputFolder, new SynchronousProgress(p => log?.Invoke(
-                $"step {p.Step}/{p.TotalSteps}: loss {p.Loss:F4}, {p.TokensPerSecond:N0} tokens/s")), cancellationToken);
+            }, outputFolder, new SynchronousProgress(steps ?? (p => log?.Invoke(
+                $"step {p.Step}/{p.TotalSteps}: loss {p.Loss:F4}, {p.TokensPerSecond:N0} tokens/s"))), cancellationToken);
             File.WriteAllText(Path.Combine(outputFolder, SettingsFile), new JsonObject
             {
                 ["format"] = Format,

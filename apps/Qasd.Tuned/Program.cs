@@ -119,13 +119,13 @@ try
             var (train, test) = testFraction > 0 ? TextClassifier.Split(examples, testFraction, 7) : (examples, []);
             Console.WriteLine($"{examples.Count:N0} messages: tuning on {train.Count:N0}{(test.Count > 0 ? $", testing on {test.Count:N0} held out (the same as qasd train)" : "")}");
             var clock = Stopwatch.StartNew();
-            using var tuned = TunedClassifier.Train(train, output!, options with { Device = device }, line => Console.WriteLine($"  {line}"));
+            using var tuned = ConsoleTraining.Tuned(train, output!, options with { Device = device });
             Console.WriteLine($"tuned in {clock.Elapsed.TotalMinutes:F1} min; saved to {Path.GetFullPath(output!)}");
             if (test.Count > 0)
             {
                 clock.Restart();
                 Console.WriteLine($"scoring the {test.Count:N0} held-out messages…");
-                var report = tuned.Evaluate(test, Progress(clock));
+                var report = tuned.Evaluate(test, ConsoleTraining.Scoring());
                 Console.WriteLine($"\n{report}");
                 Console.WriteLine($"{test.Count / clock.Elapsed.TotalSeconds:F1} messages/s while scoring on {device.Name}");
             }
@@ -153,7 +153,8 @@ try
             {
                 Console.WriteLine($"{target.Name}:");
                 var clock = Stopwatch.StartNew();
-                using var classifier = TextClassifier.Train(train, new TextClassifierOptions { Device = target, Seed = 1 });
+                using var classifier = ConsoleTraining.Classifier(train, new TextClassifierOptions { Device = target, Seed = 1 }, epochLines: false,
+                    label: "  training the classifier");
                 double classifierTrain = clock.Elapsed.TotalSeconds;
                 rows.Add(Measure("classifier", target, classifierTrain, classifier.Evaluate(probe), t => classifier.Predict(t), null, probe));
 
@@ -161,7 +162,7 @@ try
                 try
                 {
                     clock.Restart();
-                    using var tuned = TunedClassifier.Train(train, benchFolder, options with { Device = target }, line => Console.WriteLine($"  {line}"));
+                    using var tuned = ConsoleTraining.Tuned(train, benchFolder, options with { Device = target }, "  tuning");
                     double tunedTrain = clock.Elapsed.TotalSeconds;
                     rows.Add(Measure("tuned", target, tunedTrain, tuned.Evaluate(probe), t => tuned.Predict(t), tuned, probe));
                 }
@@ -189,7 +190,7 @@ try
             using var tuned = TunedClassifier.Load(folder, device);
             var examples = ReadAll(rest);
             Console.WriteLine($"scoring {examples.Count:N0} messages on {device.Name}…");
-            Console.WriteLine(tuned.Evaluate(examples, Progress(Stopwatch.StartNew())));
+            Console.WriteLine(tuned.Evaluate(examples, ConsoleTraining.Scoring()));
             return 0;
         }
 
@@ -283,21 +284,6 @@ static string[] Measure(string name, Device device, double trainSeconds, TextCla
     Console.WriteLine($"  {name}: trained in {trainSeconds:F1} s; accuracy {report.Accuracy:P1}, macro F1 {report.MacroF1:F3}; latency p50 {latencies[singles / 2]:F2} ms");
     return [name, device.Name.Length > 30 ? device.Name[..30] : device.Name, trainSeconds >= 120 ? $"{trainSeconds / 60:F1} min" : $"{trainSeconds:F1} s",
         $"{report.Accuracy:P1}", $"{report.MacroF1:F3}", $"{latencies[singles / 2]:F2} ms", $"{latencies[(int)(singles * 0.95)]:F2} ms", firstToken, $"{throughput:N1}/s"];
-}
-
-// Progress while scoring: a line every 10% (and the rate).
-static Action<int, int> Progress(Stopwatch clock)
-{
-    int lastTenth = 0;
-    return (done, total) =>
-    {
-        int tenth = done * 10 / Math.Max(1, total);
-        if (tenth > lastTenth || done == total)
-        {
-            lastTenth = tenth;
-            Console.WriteLine($"  scored {done:N0}/{total:N0} ({done / Math.Max(1e-9, clock.Elapsed.TotalSeconds):F1} messages/s)");
-        }
-    };
 }
 
 List<LabeledText> ReadAll(IEnumerable<string> sources)

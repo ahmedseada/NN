@@ -66,6 +66,13 @@ public sealed record TextPrediction(string Label, float Confidence, IReadOnlyLis
 /// <param name="Best">Whether this epoch is the best so far (the one kept).</param>
 public sealed record TextClassifierEpoch(int Epoch, double Loss, double ValidationAccuracy, bool Best);
 
+/// <summary>One optimizer step while training a <see cref="TextClassifier"/>.</summary>
+/// <param name="Step">1-based step across all epochs.</param>
+/// <param name="TotalSteps">Steps if every epoch runs (training can stop earlier, see <see cref="TextClassifierOptions.Patience"/>).</param>
+/// <param name="Epoch">1-based epoch.</param>
+/// <param name="Loss">Mean training loss of the epoch so far.</param>
+public sealed record TextClassifierStep(int Step, int TotalSteps, int Epoch, double Loss);
+
 /// <summary>Precision, recall and F1 of one label.</summary>
 public sealed record LabelScores(string Label, double Precision, double Recall, double F1, int Support);
 
@@ -178,11 +185,11 @@ public sealed class TextClassifier : IDisposable
 
     /// <summary>
     /// Trains a classifier on <paramref name="examples"/> (at least two labels). <paramref name="progress"/> receives
-    /// each epoch. With validation (<see cref="TextClassifierOptions.ValidationFraction"/>), the best epoch's weights
+    /// each epoch and <paramref name="steps"/> each optimizer step. With validation (<see cref="TextClassifierOptions.ValidationFraction"/>), the best epoch's weights
     /// are kept.
     /// </summary>
     public static TextClassifier Train(IEnumerable<LabeledText> examples, TextClassifierOptions? options = null, Action<TextClassifierEpoch>? progress = null,
-        CancellationToken cancellationToken = default)
+        Action<TextClassifierStep>? steps = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(examples);
         options ??= new TextClassifierOptions();
@@ -206,7 +213,7 @@ public sealed class TextClassifier : IDisposable
         var classifier = new TextClassifier(model, features, labels, options.Hidden, options.Dropout);
         try
         {
-            classifier.Fit(train, validation, options, progress, cancellationToken);
+            classifier.Fit(train, validation, options, progress, steps, cancellationToken);
             return classifier;
         }
         catch
@@ -217,7 +224,7 @@ public sealed class TextClassifier : IDisposable
     }
 
     private void Fit(List<LabeledText> train, List<LabeledText> validation, TextClassifierOptions options, Action<TextClassifierEpoch>? progress,
-        CancellationToken cancellationToken)
+        Action<TextClassifierStep>? steps, CancellationToken cancellationToken)
     {
         var index = Labels.Select((l, i) => (l, i)).ToDictionary(p => p.l, p => p.i, StringComparer.Ordinal);
         var weights = Labels.Select(l => options.BalanceLabels
@@ -233,7 +240,7 @@ public sealed class TextClassifier : IDisposable
         var y = new float[batchSize * classes];
         double bestScore = double.NegativeInfinity;
         byte[]? best = null;
-        int sinceBest = 0;
+        int sinceBest = 0, step = 0, totalSteps = Math.Max(1, options.Epochs) * stepsPerEpoch;
         for (int epoch = 1; epoch <= Math.Max(1, options.Epochs); epoch++)
         {
             random.Shuffle(order);
@@ -261,6 +268,7 @@ public sealed class TextClassifier : IDisposable
                 optimizer.Step();
                 schedule.Step();
                 lossSum += loss.Item() * n;
+                steps?.Invoke(new TextClassifierStep(++step, totalSteps, epoch, lossSum / (first + n)));
             }
 
             double accuracy = validation.Count > 0 ? Evaluate(validation).Accuracy : double.NaN;
