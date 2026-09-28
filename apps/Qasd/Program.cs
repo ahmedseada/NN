@@ -14,6 +14,9 @@ const string Usage = """
       qasd evaluate <model> <data…>        score a model on labeled texts (accuracy, per-label F1, confusion matrix)
       qasd predict <model> [text…]         classify texts (arguments, else one per line from standard input)
       qasd info <model>                    labels and settings of a model
+      qasd benchmark <data…>               train and measure on each device (CPU, and CUDA when present): training time,
+                                          held-out accuracy and F1, single-message latency and batch throughput
+                                          (--devices cpu,cuda to choose)
 
     Data: a CSV, JSON Lines, JSON or Parquet file or folder, a URL, or a dataset spec as nsdata reads it
     (hf:owner/name?split=train, github:…); several sources are combined.
@@ -29,7 +32,7 @@ const string Usage = """
     """;
 
 var positional = new List<string>();
-string? output = null, textColumn = null, labelColumn = null, deviceName = null;
+string? output = null, textColumn = null, labelColumn = null, deviceName = null, deviceList = null;
 double testFraction = 0.2, minConfidence = 0;
 bool json = false;
 var options = new TextClassifierOptions();
@@ -45,6 +48,7 @@ try
             case "--text": textColumn = Next(); break;
             case "--label": labelColumn = Next(); break;
             case "--device": deviceName = Next(); break;
+            case "--devices": deviceList = Next(); break;
             case "--cpu": deviceName = "cpu"; break;
             case "--cuda" or "--gpu": deviceName = "cuda"; break;
             case "--test-fraction": testFraction = double.Parse(Next(), CultureInfo.InvariantCulture); break;
@@ -73,6 +77,7 @@ string command = positional.Count > 0 ? positional[0] : "";
 bool valid = command switch
 {
     "train" => positional.Count >= 2 && output is not null,
+    "benchmark" => positional.Count >= 2,
     "evaluate" => positional.Count >= 3,
     "predict" or "info" => positional.Count >= 2,
     _ => false,
@@ -88,14 +93,7 @@ Console.OutputEncoding = Encoding.UTF8;
 var jsonOutput = new System.Text.Json.JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 try
 {
-    var device = deviceName switch
-    {
-        null or "auto" => Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu,
-        "cpu" => Device.Cpu,
-        "cuda" or "gpu" => Device.Cuda(),
-        ['c', 'u', 'd', 'a', ':', .. var index] => Device.Cuda(int.Parse(index, CultureInfo.InvariantCulture)),
-        _ => throw new ArgumentException($"Unknown device '{deviceName}' (auto, cpu, cuda or cuda:N)."),
-    };
+    var device = ParseDevice(deviceName ?? "auto");
 
     switch (command)
     {
@@ -127,6 +125,77 @@ try
             using var classifier = TextClassifier.Load(positional[1], device);
             var examples = ReadAll(positional.Skip(2));
             Console.WriteLine(classifier.Evaluate(examples));
+            return 0;
+        }
+
+        case "benchmark":
+        {
+            var examples = ReadAll(positional.Skip(1));
+            var (train, test) = TextClassifier.Split(examples, testFraction > 0 ? testFraction : 0.2, options.Seed + 7);
+            var devices = (deviceList ?? (Device.IsCudaAvailable ? "cpu,cuda" : "cpu")).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(ParseDevice).ToList();
+            Console.WriteLine($"{examples.Count:N0} texts: training on {train.Count:N0}, measuring on {test.Count:N0} held-out texts; same data, settings and seed on every device\n");
+            var rows = new List<string[]>();
+            foreach (var target in devices)
+            {
+                Console.WriteLine($"{target.Name}:");
+                var clock = Stopwatch.StartNew();
+                int epochs = 0;
+                using var classifier = TextClassifier.Train(train, options with { Device = target }, epoch => epochs = epoch.Epoch);
+                double trainSeconds = clock.Elapsed.TotalSeconds;
+                var report = classifier.Evaluate(test);
+
+                // Single messages, one call each (a service answering one request at a time), after a warm-up.
+                var texts = test.Select(e => e.Text).ToList();
+                foreach (string text in texts.Take(20))
+                {
+                    classifier.Predict(text);
+                }
+
+                int singles = Math.Min(500, texts.Count);
+                var latencies = new double[singles];
+                for (int i = 0; i < singles; i++)
+                {
+                    var one = Stopwatch.StartNew();
+                    classifier.Predict(texts[i % texts.Count]);
+                    latencies[i] = one.Elapsed.TotalMilliseconds;
+                }
+
+                Array.Sort(latencies);
+
+                // Batches of 256 (the batch endpoint), over all held-out texts, three times.
+                classifier.Predict(texts.Take(256).ToList());
+                var batch = Stopwatch.StartNew();
+                int classified = 0;
+                for (int round = 0; round < 3; round++)
+                {
+                    for (int first = 0; first < texts.Count; first += 256)
+                    {
+                        var chunk = texts.Skip(first).Take(256).ToList();
+                        classifier.Predict(chunk);
+                        classified += chunk.Count;
+                    }
+                }
+
+                double throughput = classified / batch.Elapsed.TotalSeconds;
+                double p50 = latencies[singles / 2], p95 = latencies[(int)(singles * 0.95)];
+                Console.WriteLine($"  trained {epochs} epochs in {trainSeconds:F1} s; accuracy {report.Accuracy:P1}, macro F1 {report.MacroF1:F3}; "
+                                  + $"one message p50 {p50:F2} ms, p95 {p95:F2} ms; batches {throughput:N0} messages/s");
+                rows.Add([target.Name.Length > 34 ? target.Name[..34] : target.Name, $"{trainSeconds:F1} s", $"{epochs}",
+                    $"{train.Count * (double)epochs / trainSeconds:N0}/s", $"{report.Accuracy:P1}", $"{report.MacroF1:F3}",
+                    $"{p50:F2} ms", $"{p95:F2} ms", $"{throughput:N0}/s"]);
+            }
+
+            string[] header = ["device", "train", "epochs", "train speed", "accuracy", "macro F1", "latency p50", "latency p95", "batch speed"];
+            var widths = header.Select((h, c) => Math.Max(h.Length, rows.Max(r => r[c].Length)) + 2).ToArray();
+            Console.WriteLine();
+            Console.WriteLine(string.Concat(header.Select((h, c) => c == 0 ? h.PadRight(widths[c]) : h.PadLeft(widths[c]))));
+            foreach (var row in rows)
+            {
+                Console.WriteLine(string.Concat(row.Select((v, c) => c == 0 ? v.PadRight(widths[c]) : v.PadLeft(widths[c]))));
+            }
+
+            Console.WriteLine("\ntrain speed: training texts per second (texts × epochs / time); latency: one Predict call; batch speed: Predict on 256 texts at a time.");
             return 0;
         }
 
@@ -189,6 +258,15 @@ List<LabeledText> ReadAll(IEnumerable<string> sources)
 
     return all;
 }
+
+static Device ParseDevice(string name) => name.ToLowerInvariant() switch
+{
+    "auto" => Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu,
+    "cpu" => Device.Cpu,
+    "cuda" or "gpu" => Device.Cuda(),
+    ['c', 'u', 'd', 'a', ':', .. var index] => Device.Cuda(int.Parse(index, CultureInfo.InvariantCulture)),
+    _ => throw new ArgumentException($"Unknown device '{name}' (auto, cpu, cuda or cuda:N)."),
+};
 
 static IEnumerable<string> ReadLines()
 {
