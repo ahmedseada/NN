@@ -49,14 +49,127 @@ public sealed class JinjaChatTemplate : ChatTemplate
     /// <summary>The reasoning tags the model writes (&lt;think&gt;…&lt;/think&gt; unless set).</summary>
     public (string Open, string Close) ReasoningTags { get; init; } = ("<think>", "</think>");
 
-    /// <summary>The tags around a tool call's JSON in the model's output (&lt;tool_call&gt;…&lt;/tool_call&gt; unless set).</summary>
-    public (string Open, string Close) CallTags { get; init; } = ("<tool_call>", "</tool_call>");
+    /// <summary>
+    /// How the model writes tool calls; when not set, read off the template itself by rendering a probe call (see
+    /// <see cref="DetectToolCallFormat"/>), so any family's format is parsed as its template writes it.
+    /// </summary>
+    public ToolCallFormat? CallFormat { get; init; }
+
+    private ToolCallFormat? _detectedCalls;
 
     /// <inheritdoc />
     public override (string Open, string Close) ThinkTags => ReasoningTags;
 
     /// <inheritdoc />
-    public override (string Open, string Close) ToolCallTags => CallTags;
+    public override ToolCallFormat ToolCalls => CallFormat ?? (_detectedCalls ??= DetectToolCallFormat());
+
+    /// <summary>
+    /// The template's tool-call format: a conversation whose answer is one probe call is rendered next to one whose
+    /// answer is plain text; the text they share before and after the answer is the turn's layout, and around the call's
+    /// JSON remain its opening and closing text (Qwen/Hermes &lt;tool_call&gt;…&lt;/tool_call&gt;, Mistral [TOOL_CALLS] [ … ],
+    /// Llama 3 nothing: the answer is the JSON, with "parameters"). <see cref="ToolCallFormat.Tagged"/> when the template
+    /// does not render tool calls.
+    /// </summary>
+    public ToolCallFormat DetectToolCallFormat()
+    {
+        const string Name = "ns_probe_function", Argument = "ns_probe_argument", Answer = "ns-probe-answer";
+        try
+        {
+            var tool = new ToolDefinition(Name, "Probe.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject { [Argument] = new JsonObject { ["type"] = "string" } },
+            });
+            var user = new ChatMessage("user", "ns-probe-question");
+            string plain = Render([user, new ChatMessage("assistant", Answer)], [tool], null, addGenerationPrompt: false);
+            string call = Render([user, new ChatMessage("assistant", "", ToolCalls: [new ToolCall(Name, new JsonObject { [Argument] = "ns-probe-value" })])],
+                [tool], null, addGenerationPrompt: false);
+            int answerAt = plain.IndexOf(Answer, StringComparison.Ordinal);
+            int shared = 0;
+            while (shared < answerAt && shared < call.Length && plain[shared] == call[shared])
+            {
+                shared++;
+            }
+
+            int tail = plain.Length - answerAt - Answer.Length, sharedTail = 0;
+            while (sharedTail < tail && sharedTail < call.Length - shared && plain[^(sharedTail + 1)] == call[^(sharedTail + 1)])
+            {
+                sharedTail++;
+            }
+
+            int nameAt = call.IndexOf(Name, shared, StringComparison.Ordinal);
+            if (answerAt < 0 || nameAt < 0)
+            {
+                return ToolCallFormat.Tagged;
+            }
+
+            // The call's JSON: the innermost object around the name; a list when an array encloses it.
+            for (int start = call.LastIndexOf('{', nameAt); start >= shared; start = start > 0 ? call.LastIndexOf('{', start - 1) : -1)
+            {
+                int end = JsonEnd(call, start);
+                if (end <= nameAt || JsonNode.Parse(call[start..end]) is not JsonObject o || o["name"]?.ToString() != Name)
+                {
+                    continue;
+                }
+
+                string key = o.FirstOrDefault(p => p.Key != "name" && (p.Value?.ToJsonString().Contains(Argument, StringComparison.Ordinal) ?? false)).Key ?? "arguments";
+                bool list = false;
+                int before = start - 1;
+                while (before >= shared && char.IsWhiteSpace(call[before]))
+                {
+                    before--;
+                }
+
+                if (before >= shared && call[before] == '[' && JsonEnd(call, before) is int listEnd && listEnd > end && JsonNode.Parse(call[before..listEnd]) is JsonArray)
+                {
+                    (start, end, list) = (before, listEnd, true);
+                }
+
+                return new ToolCallFormat(call[shared..start].Trim(), call[end..(call.Length - sharedTail)].Trim(), list, key);
+            }
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or ArgumentException or FormatException or KeyNotFoundException)
+        {
+        }
+
+        return ToolCallFormat.Tagged;
+    }
+
+    // The index just past the JSON value that starts at `start` (an object or array), or -1 when it does not close.
+    private static int JsonEnd(string text, int start)
+    {
+        int depth = 0;
+        bool inString = false;
+        for (int i = start; i < text.Length; i++)
+        {
+            char c = text[i];
+            if (inString)
+            {
+                if (c == '\\')
+                {
+                    i++;
+                }
+                else if (c == '"')
+                {
+                    inString = false;
+                }
+            }
+            else if (c == '"')
+            {
+                inString = true;
+            }
+            else if (c is '{' or '[')
+            {
+                depth++;
+            }
+            else if (c is '}' or ']' && --depth == 0)
+            {
+                return i + 1;
+            }
+        }
+
+        return -1;
+    }
 
     /// <summary>Extra template variables (for example a date or a model-specific switch).</summary>
     public IReadOnlyDictionary<string, object?> Variables { get; init; } = new Dictionary<string, object?>();

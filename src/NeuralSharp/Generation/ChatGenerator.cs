@@ -55,7 +55,7 @@ public sealed class ChatGenerator(TextGenerator generator, ChatTemplate? templat
     {
         var options = request.Options ?? new GenerationOptions();
         options = options with { Stop = [.. options.Stop, .. Template.StopSequences] };
-        var parser = new ChatOutputParser(Template, separateThinking: request.Think != false);
+        var parser = new ChatOutputParser(Template, separateThinking: request.Think != false, toolNames: request.Tools?.Select(t => t.Name).ToHashSet());
         var content = new System.Text.StringBuilder();
         var thinking = new System.Text.StringBuilder();
         var calls = new List<ToolCall>();

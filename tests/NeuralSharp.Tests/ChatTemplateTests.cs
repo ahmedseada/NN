@@ -11,7 +11,114 @@ internal static partial class Tests
     [
         ("chat templates: Jinja expressions, filters, tests, loops, macros and whitespace control match jinja2", JinjaMatchesPython),
         ("chat templates: a Qwen3 template read from a model folder renders tools, tool calls and reasoning as transformers does", ModelChatTemplate),
+        ("chat templates: each family's tool-call format is read off its template (tags, bare JSON, lists) and parsed from streamed output", ToolCallFormats),
     ];
+
+    // Llama 3.1's tool-call layout (its published template, cut to the parts that render messages and calls): the
+    // answer is the call's JSON, with "parameters".
+    private const string LlamaStyleTemplate = """
+        {{- bos_token }}
+        {%- if messages[0]['role'] == 'system' %}{%- set system_message = messages[0]['content']|trim %}{%- set messages = messages[1:] %}{%- else %}{%- set system_message = "" %}{%- endif %}
+        {{- "<|start_header_id|>system<|end_header_id|>\n\n" }}
+        {%- if tools is not none %}{{- "Environment: ipython\n" }}{%- endif %}
+        {{- system_message }}
+        {{- "<|eot_id|>" }}
+        {%- for message in messages %}
+            {%- if not (message.role == 'ipython' or message.role == 'tool' or 'tool_calls' in message) %}
+                {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' }}
+            {%- elif 'tool_calls' in message %}
+                {%- set tool_call = message.tool_calls[0].function %}
+                {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' -}}
+                {{- '{"name": "' + tool_call.name + '", ' }}
+                {{- '"parameters": ' }}
+                {{- tool_call.arguments | tojson }}
+                {{- "}" }}
+                {{- "<|eot_id|>" }}
+            {%- else %}
+                {{- "<|start_header_id|>ipython<|end_header_id|>\n\n" }}
+                {{- message.content }}
+                {{- "<|eot_id|>" }}
+            {%- endif %}
+        {%- endfor %}
+        {%- if add_generation_prompt %}{{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{%- endif %}
+        """;
+
+    // Mistral's (v3 tokenizer) layout: [TOOL_CALLS] and a JSON list of calls, the turn ended by the end-of-sequence token.
+    private const string MistralStyleTemplate = """
+        {{- bos_token }}
+        {%- for message in messages %}
+            {%- if message.role == 'user' %}
+                {%- if tools is not none and loop.last %}{{- '[AVAILABLE_TOOLS] ' + tools | tojson + '[/AVAILABLE_TOOLS]' }}{%- endif %}
+                {{- '[INST] ' + message.content + '[/INST]' }}
+            {%- elif message.tool_calls is defined and message.tool_calls is not none %}
+                {{- '[TOOL_CALLS] [' }}
+                {%- for tool_call in message.tool_calls %}
+                    {{- '{"name": "' + tool_call.function.name + '", "arguments": ' + tool_call.function.arguments | tojson + ', "id": "' + tool_call.id + '"}' }}
+                    {%- if not loop.last %}{{- ', ' }}{%- endif %}
+                {%- endfor %}
+                {{- ']' + eos_token }}
+            {%- elif message.role == 'assistant' %}
+                {{- ' ' + message.content + eos_token }}
+            {%- elif message.role == 'tool' %}
+                {{- '[TOOL_RESULTS] {"content": ' + message.content | tojson + ', "call_id": "' + message.tool_call_id + '"}[/TOOL_RESULTS]' }}
+            {%- endif %}
+        {%- endfor %}
+        """;
+
+    private static void ToolCallFormats(Device device)
+    {
+        _ = device;
+        var families = new (string Name, JinjaChatTemplate Template, ToolCallFormat Expected, string Output)[]
+        {
+            ("qwen", new JinjaChatTemplate(Qwen3Template, ["<|im_end|>"]), new ToolCallFormat("<tool_call>", "</tool_call>"),
+                "Let me read it.\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/app.ts\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"search\", \"arguments\": \"{\\\"pattern\\\": \\\"Component\\\"}\"}\n</tool_call>"),
+            ("llama", new JinjaChatTemplate(LlamaStyleTemplate, ["<|eot_id|>"], "<|begin_of_text|>"), new ToolCallFormat("", "", false, "parameters"),
+                "{\"name\": \"read_file\", \"parameters\": {\"path\": \"src/app.ts\"}}"),
+            ("mistral", new JinjaChatTemplate(MistralStyleTemplate, ["</s>"], "<s>", "</s>"), new ToolCallFormat("[TOOL_CALLS]", "", true),
+                "[TOOL_CALLS] [{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/app.ts\"}, \"id\": \"abc123def\"}, {\"name\": \"search\", \"arguments\": {\"pattern\": \"Component\"}}]"),
+        };
+        string[] toolNames = ["read_file", "search"];
+        foreach (var (name, template, expected, output) in families)
+        {
+            var format = template.ToolCalls;
+            Check(format == expected, $"{name}: detected {format}, expected {expected}");
+            foreach (int size in new[] { 1, 3, 1000 })
+            {
+                var parser = new ChatOutputParser(template, toolNames: toolNames);
+                string content = "";
+                var calls = new List<ToolCall>();
+                for (int i = 0; i < output.Length; i += size)
+                {
+                    var d = parser.Feed(output.Substring(i, Math.Min(size, output.Length - i)));
+                    content += d.Content;
+                    calls.AddRange(d.ToolCalls);
+                }
+
+                var f = parser.Finish();
+                content += f.Content;
+                calls.AddRange(f.ToolCalls);
+                Check(calls.Count >= 1 && calls[0].Name == "read_file" && calls[0].Arguments["path"]!.GetValue<string>() == "src/app.ts",
+                    $"{name}, chunks of {size}: first call");
+                Check(name == "llama" || (calls.Count == 2 && calls[1].Name == "search" && calls[1].Arguments["pattern"]!.GetValue<string>() == "Component"),
+                    $"{name}, chunks of {size}: second call");
+                Check(content.Trim() == (name == "qwen" ? "Let me read it." : ""), $"{name}, chunks of {size}: content '{content}'");
+            }
+        }
+
+        // Bare JSON (Llama): an answer that is JSON but no call to a known tool, or plain text, stays text.
+        var llama = families[1].Template;
+        foreach (string answer in new[] { "{\"name\": \"unknown_tool\", \"parameters\": {}}", "{\"result\": 42}", "The answer is {not JSON}." })
+        {
+            var parser = new ChatOutputParser(llama, toolNames: toolNames);
+            var a = parser.Feed(answer);
+            var b = parser.Finish();
+            Check(a.ToolCalls.Count + b.ToolCalls.Count == 0 && a.Content + b.Content == answer, $"llama: '{answer}' stays text");
+        }
+
+        // A template that renders no tool calls falls back to the tags.
+        var plain = new JinjaChatTemplate("{%- for m in messages %}{{ m.role }}: {{ m.content }}\n{%- endfor %}", ["\n"]);
+        Check(plain.ToolCalls == ToolCallFormat.Tagged, $"no tool calls in the template: {plain.ToolCalls}");
+    }
 
     // Qwen3's chat template, as published in its tokenizer_config.json.
     private const string Qwen3Template = """
