@@ -153,6 +153,15 @@ public sealed class Linear : Module
             return outputs;
         }
 
+        // Training over frozen packed layers (LoRA / QLoRA): the base products still run as one pass, recorded, and each
+        // layer's adapter adds its low-rank term into its output.
+        bool training = kind >= 0 && Autograd.IsEnabled && layers.Length is > 1 and <= 3 && input.Device.Type == DeviceType.Cuda
+            && layers.All(l => l.Bias is null && l.InFeatures == k && (kind == 0 ? l.Int8 is not null : kind == 1 ? l.Int4 is not null : l.BFloat16 is not null));
+        if (training && Tensor.MatMulPackedManyRecorded(input, kind, layers) is { } products)
+        {
+            return [.. products.Select((product, j) => layers[j].Adapter is { } a ? Tensor.AddLowRank(product, input, a.A, a.B, a.Scale) : product)];
+        }
+
         return [.. layers.Select(l => l.Forward(input))];
     }
 
@@ -161,7 +170,7 @@ public sealed class Linear : Module
     {
         var product = Int8 is { } q ? input.MatMulInt8(q) : Int4 is { } q4 ? input.MatMulInt4(q4) : BFloat16 is { } h ? input.MatMulBFloat16(h)
             : _tiedTo is { } e ? TiedProduct(input, e.Weight) : input.MatMul(Weight);
-        return Adapter is { } a ? product + input.MatMul(a.A).MatMul(a.B) * a.Scale : product;
+        return Adapter is { } a ? Tensor.AddLowRank(product, input, a.A, a.B, a.Scale) : product;
     }
 
     // The tied head (x · Eᵀ). While the table is frozen, large products read a transposed copy made once (the tensor-core

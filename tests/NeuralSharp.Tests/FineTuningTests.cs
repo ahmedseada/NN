@@ -8,7 +8,7 @@ internal static partial class Tests
 {
     private static readonly (string Name, Action<Device> Run)[] FineTuning =
     [
-        ("fine-tuning: chunked token cross-entropy (all rows or trained rows only) and the frozen-transpose product match dense results and gradients", TokenLoss),
+        ("fine-tuning: chunked token cross-entropy (all rows or trained rows only) and the frozen-transpose product and the fused LoRA term match dense results and gradients", TokenLoss),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
@@ -392,5 +392,30 @@ internal static partial class Tests
 
         AssertClose(Tied(false, out var plainGrad), Tied(true, out var cachedGrad), 1e-4f, "frozen transposed product");
         AssertClose(plainGrad, cachedGrad, 1e-4f, "frozen transposed product: input gradient");
+
+        // The fused LoRA term: same output and gradients (input, A, B, base weight) as product + x·A·B·scale.
+        var w0 = Random(Dim * Vocabulary);
+        var a0 = Random(Dim * 3);
+        var b0 = Random(3 * Vocabulary);
+        float[][] Lora(bool fused)
+        {
+            using var scope = new TensorScope();
+            var x = Tensor.From(hiddenValues, [Rows, Dim], device, requiresGrad: true);
+            var w = Tensor.From(w0, [Dim, Vocabulary], device, requiresGrad: true);
+            var a = Tensor.From(a0, [Dim, 3], device, requiresGrad: true);
+            var b = Tensor.From(b0, [3, Vocabulary], device, requiresGrad: true);
+            var product = x.MatMul(w);
+            var y = fused ? Tensor.AddLowRank(product, x, a, b, 0.75f) : product + x.MatMul(a).MatMul(b) * 0.75f;
+            (y * y).Sum().Backward();
+            return [y.ToArray(), x.Grad!.ToArray(), w.Grad!.ToArray(), a.Grad!.ToArray(), b.Grad!.ToArray()];
+        }
+
+        var plainLora = Lora(false);
+        var fusedLora = Lora(true);
+        string[] parts = ["output", "input gradient", "base weight gradient", "A gradient", "B gradient"];
+        for (int i = 0; i < parts.Length; i++)
+        {
+            AssertClose(plainLora[i], fusedLora[i], 1e-3f, $"fused LoRA: {parts[i]}");
+        }
     }
 }

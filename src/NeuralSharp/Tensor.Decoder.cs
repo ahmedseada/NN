@@ -175,6 +175,102 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// <paramref name="product"/> + scale · (x·A)·B (a LoRA adapter's term), accumulated into <paramref name="product"/>'s
+    /// buffer: only the rank-wide x·A is stored for the backward pass, not the full-width (x·A)·B and its scaled copy, and
+    /// no separate scale or addition pass runs. <paramref name="product"/> must be a fresh result nothing else reads (the
+    /// base projection of the same input). Gradients as for <c>product + x.MatMul(a).MatMul(b) * scale</c>.
+    /// </summary>
+    internal static Tensor AddLowRank(Tensor product, Tensor x, Tensor a, Tensor b, float scale)
+    {
+        int inputs = a._shape[0], rank = a._shape[1], outputs = b._shape[1];
+        int m = x.Size / inputs;
+        if (product.Size != m * outputs || b._shape[0] != rank)
+        {
+            throw new ArgumentException($"AddLowRank: product {FormatShape(product._shape)}, input {FormatShape(x._shape)}, A {FormatShape(a._shape)}, B {FormatShape(b._shape)}.");
+        }
+
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var backend = x.Backend;
+        var u = Empty([m, rank], x.Device, zeroed: true);           // scale · x·A
+        using (var t = Empty([m, rank], x.Device, track: false))
+        {
+            backend.BatchedMatMul(x.Storage, a.Storage, t.Storage, 1, m, rank, inputs, false, false, 0f);
+            backend.Axpy(t.Storage, u.Storage, m * rank, scale);
+        }
+
+        backend.BatchedMatMul(u.Storage, b.Storage, product.Storage, 1, m, outputs, rank, false, false, 1f);   // product += u·B
+        product.Storage.AddRef();
+        var y = new Tensor([.. product._shape], product.Storage, product.Device, track: true);
+        if (Autograd.IsEnabled && (product.RequiresGrad || x.RequiresGrad || a.RequiresGrad || b.RequiresGrad))
+        {
+            y.Record("lora", g =>
+            {
+                if (b.RequiresGrad)
+                {
+                    backend.BatchedMatMul(u.Storage, g.Storage, b.GradStorage(), 1, rank, outputs, m, true, false, 1f);       // dB += uᵀ·g
+                }
+
+                if (a.RequiresGrad || x.RequiresGrad)
+                {
+                    using var du = Empty([m, rank], x.Device, track: false);
+                    using var dt = Empty([m, rank], x.Device, zeroed: true, track: false);
+                    backend.BatchedMatMul(g.Storage, b.Storage, du.Storage, 1, m, rank, outputs, false, true, 0f);        // du = g·Bᵀ
+                    backend.Axpy(du.Storage, dt.Storage, m * rank, scale);                                                // dt = scale · du
+                    if (a.RequiresGrad)
+                    {
+                        backend.BatchedMatMul(x.Storage, dt.Storage, a.GradStorage(), 1, inputs, rank, m, true, false, 1f);  // dA += xᵀ·dt
+                    }
+
+                    if (x.RequiresGrad)
+                    {
+                        backend.BatchedMatMul(dt.Storage, a.Storage, x.GradStorage(), 1, m, inputs, rank, false, true, 1f);  // dx += dt·Aᵀ
+                    }
+                }
+
+                if (product.RequiresGrad)
+                {
+                    product.AddGradient(g, adopt: true);                  // last: the base product's backward may reuse g's buffer
+                }
+            }, product, x, a, b);
+        }
+
+        return Traced("lora", y, start);
+    }
+
+    /// <summary>
+    /// The frozen packed layers' products of one input in one device pass (<see cref="MatMulPackedMany"/>), recorded for
+    /// training: each output's gradient flows to the input (dx += g · Wᵀ with the weight expanded to float32). Null when
+    /// the device has no such pass.
+    /// </summary>
+    internal static Tensor[]? MatMulPackedManyRecorded(Tensor input, int kind, IReadOnlyList<Layers.Linear> layers)
+    {
+        Tensor[]? outputs;
+        using (Autograd.NoGrad())
+        {
+            outputs = MatMulPackedMany(input, kind, layers);
+        }
+
+        if (outputs is null || !WillRecord(input))
+        {
+            return outputs;
+        }
+
+        int k = input._shape[^1], m = input.Size / k;
+        for (int j = 0; j < outputs.Length; j++)
+        {
+            var layer = layers[j];
+            int n = layer.OutFeatures;
+            outputs[j].Record("matmul_packed", g =>
+            {
+                using var w = layer.Int8?.Dequantize() ?? layer.Int4?.Dequantize() ?? layer.BFloat16!.Dequantize();
+                input.Backend.BatchedMatMul(g.Storage, w.Storage, input.GradStorage(), 1, m, k, n, false, true, 1f);   // dx += g · wᵀ
+            }, input);
+        }
+
+        return outputs;
+    }
+
+    /// <summary>
     /// x · Wᵀ for a frozen <paramref name="weight"/> W [outputs, inputs] also kept as <paramref name="transposed"/> Wᵀ
     /// [inputs, outputs]: the product reads Wᵀ as stored and the input's gradient (g · W) reads W as stored, so neither
     /// direction makes a transposed copy of W (the tensor-core kernels copy transposed operands into place first).
