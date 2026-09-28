@@ -138,6 +138,14 @@ internal sealed unsafe partial class CudaBackend
         }
     }
 
+    /// <summary>Benchmarks only: the row tile (64 or 128) of prompt-sized packed products instead of the heuristic's.</summary>
+    internal static int? PromptTileRowsOverride { get; set; }
+
+    // Row tile of a prompt-sized packed product: 64 when the last 128-row tile would be at most half full (180 rows: 3
+    // tiles of 64, 192 rows computed, instead of 2 of 128, 256), else 128.
+    private static int PromptTileRows(int m) =>
+        PromptTileRowsOverride ?? (m < 1024 && m % PtxKernels.TensorTile is > 0 and <= 64 ? 64 : PtxKernels.TensorTile);
+
     // k splits of a prompt-sized packed product: up to four blocks per SM, chunks of 256 k or more; none when the tiles
     // already fill one wave (85-100% of the SMs: splitting then only adds the zeroing and atomic additions; --bench-gemv,
     // 180 rows, q+k+v in one launch = 64 tiles on 70 SMs: 35.3 us unsplit against 41.5 with 4 splits).
@@ -155,19 +163,20 @@ internal sealed unsafe partial class CudaBackend
         }
 
         // Tensor cores (MixedPrecision): the weights unpacked into the bfloat16 tiles as they are loaded.
-        string packedKernel = kind switch { 0 => "gemm_tc_nn_int8w_f32", 1 => "gemm_tc_nn_int4w_f32", _ => "gemm_tc_nn_bf16w_f32" };
+        int tileRows = PromptTileRows(m);
+        string packedKernel = $"gemm_tc_nn_{(kind switch { 0 => "int8w", 1 => "int4w", _ => "bf16w" })}{(tileRows == 64 ? "_m64" : "")}_f32";
         if (MixedPrecision.UsesTensorCores && m >= 32 && k >= 32 && TensorKernel(packedKernel) is { } tensor)
         {
             int perWord = kind switch { 0 => 4, 1 => 8, _ => 2 };
             if (_profile is not null)
             {
-                _profileLabel = $"gemm_tc_nn_{(kind switch { 0 => "int8w", 1 => "int4w", _ => "bf16w" })} {m}x{n}x{k}";
+                _profileLabel = $"gemm_tc_nn_{(kind switch { 0 => "int8w", 1 => "int4w", _ => "bf16w" })}{(tileRows == 64 ? "_m64" : "")} {m}x{n}x{k}";
                 _profileFlops = 2.0 * m * n * k;
             }
 
             // Split k when the output tiles leave SMs idle (prompt-sized m): up to two blocks per SM, chunks of 256 k or
             // more, partial sums added into the zeroed output.
-            int rowTiles = (m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile, columnTiles = (n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
+            int rowTiles = (m + tileRows - 1) / tileRows, columnTiles = (n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
             int splits = PackedSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 32))
                 : PromptSplits(rowTiles * columnTiles, k);
             if (splits > 1)
@@ -212,20 +221,25 @@ internal sealed unsafe partial class CudaBackend
             columnTiles += product.Columns / PtxKernels.TensorTile;
         }
 
+        int tileRows = PromptTileRows(m);
         string format = kind switch { 0 => "int8w", 1 => "int4w", _ => "bf16w" };
-        if (TensorKernel($"gemm_tc_nn_{format}_multi_f32") is not { } tensor)
+        if (TensorKernel($"gemm_tc_nn_{format}_multi{(tileRows == 64 ? "_m64" : "")}_f32") is not { } tensor)
         {
             return false;
         }
 
         int perWord = kind switch { 0 => 4, 1 => 8, _ => 2 };
-        int rowTiles = (m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
+        int rowTiles = (m + tileRows - 1) / tileRows;
         int splits = PackedSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 32))
             : PromptSplits(rowTiles * columnTiles, k);
         if (_profile is not null)
         {
-            _profileLabel = $"gemm_tc_nn_{format}_multi {m}x{string.Join('+', products.ToArray().Select(p => p.Columns))}x{k}";
-            _profileFlops = 2.0 * m * columnTiles * PtxKernels.TensorTile * k;
+            _profileLabel = $"gemm_tc_nn_{format}_multi{(tileRows == 64 ? "_m64" : "")} {m}x{string.Join('+', products.ToArray().Select(p => p.Columns))}x{k}";
+            _profileFlops = 0;
+            foreach (var product in products)
+            {
+                _profileFlops += 2.0 * m * product.Columns * k;
+            }
         }
 
         if (splits > 1)

@@ -50,6 +50,11 @@ internal static partial class PtxKernels
             TensorCoreGemm(sb, false, false, 0, packed: 1, multi: true);
             TensorCoreGemm(sb, false, false, 0, packed: 2, multi: true);
             TensorCoreGemm(sb, false, false, 0, packed: 3, multi: true);
+            foreach (int packed in new[] { 1, 2, 3 })
+            {
+                TensorCoreGemm(sb, false, false, 0, packed: packed, tileM: 64);
+                TensorCoreGemm(sb, false, false, 0, packed: packed, multi: true, tileM: 64);
+            }
         }),
         Module("attention d64", sb => { FlashForward(sb, 64); FlashBackwardQ(sb, 64); FlashBackwardKv(sb, 64); }),
         Module("attention d128", sb => { FlashForward(sb, 128); FlashBackwardQ(sb, 128); FlashBackwardKv(sb, 128); }),
@@ -96,11 +101,11 @@ internal static partial class PtxKernels
     // One operand's tile as it is read from global memory: `outer` rows of `width` contiguous floats (the stored layout),
     // copied to shared memory in the same orientation. A as stored [m, k] is 128 rows of 32 k; transposed ([k, m]) 32
     // rows of 128 m. B as stored [k, n] is 32 rows of 128 n; transposed ([n, k]) 128 rows of 32 k.
-    private sealed record TileLoad(string Name, bool KIsOuter, int Width, string OuterLimit, string InnerLimit, string Tile)
+    private sealed record TileLoad(string Name, bool KIsOuter, int Width, string OuterLimit, string InnerLimit, string Tile, int Rows = TensorTile)
     {
         public int PairsPerRow => Width / 2;
         public int RowStep => 2 * TensorThreads / Width;                  // rows between one thread's successive pairs
-        public int Pairs => TensorTile * TensorK / 2 / TensorThreads;     // 8 pairs per thread
+        public int Pairs => Rows * TensorK / 2 / TensorThreads;           // 8 pairs per thread (4 for a 64-row A tile)
         public int Stride => Width == TensorK ? NarrowStride : WideStride;
     }
 
@@ -125,14 +130,19 @@ internal static partial class PtxKernels
     // multi (packed, …_multi_f32): up to three products of the same input (queries/keys/values, gate/up), each with its
     // own weights, scales and output: p_b/p_c/p_aux/p_n for the first, then p_b1… and p_b2… (p_n2 = 0 for two). Column
     // tiles of product 0 come first, then 1, then 2 (widths multiples of 128); ldb and ldc follow each product's width.
-    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode, int packed = 0, bool multi = false)
+    //
+    // tileM 64 (packed, …_m64_f32): 64-row tiles for prompts whose last 128-row tile would be mostly empty (180 rows: 192
+    // computed instead of 256); the 8 warps take 32 × 32 each instead of 64 × 32.
+    private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode, int packed = 0, bool multi = false, int tileM = TensorTile)
     {
         string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}{mode switch { 1 => "_gelu", 2 => "_gelugrad", _ => "" }}"
-                      + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}{(multi ? "_multi" : "")}_f32";
+                      + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}{(multi ? "_multi" : "")}{(tileM == 64 ? "_m64" : "")}_f32";
+        int mts = tileM / 32, warpRowShift = (int)Math.Log2(tileM / 2);          // m16 slices per warp; the warp's first row
         int cpw = packed switch { 1 => 4, 2 => 8, _ => 2 }, tileWords = TensorTile / cpw, wordRows = TensorThreads / tileWords;
         int wordsPerThread = TensorK * tileWords / TensorThreads;
         // Registers: %rd1..3 = a, b, c; %r1..3 = m, n, k; %r9 / %r10 = the tile's first row / column.
-        var a = new TileLoad("a", KIsOuter: ta, Width: ta ? TensorTile : TensorK, OuterLimit: ta ? "%r3" : "%r1", InnerLimit: ta ? "%r1" : "%r3", Tile: "%r9");
+        var a = new TileLoad("a", KIsOuter: ta, Width: ta ? TensorTile : TensorK, OuterLimit: ta ? "%r3" : "%r1", InnerLimit: ta ? "%r1" : "%r3", Tile: "%r9",
+            Rows: ta ? TensorTile : tileM);
         var b = new TileLoad("b", KIsOuter: !tb, Width: tb ? TensorK : TensorTile, OuterLimit: tb ? "%r2" : "%r3", InnerLimit: tb ? "%r3" : "%r2", Tile: "%r10");
         var s = new StringBuilder();
         s.AppendLine($$"""
@@ -217,7 +227,7 @@ internal static partial class PtxKernels
                 rem.u32 %r9, %r57, %r56;
                 add.u32 %r9, %r9, %r55;
                 div.u32 %r10, %r57, %r56;
-                shl.b32 %r9, %r9, 7;
+                shl.b32 %r9, %r9, {{(int)Math.Log2(tileM)}};
                 shl.b32 %r10, %r10, 7;
                 mov.u32 %r11, {{name}}_as;
                 mov.u32 %r12, {{name}}_bs;
@@ -321,7 +331,7 @@ internal static partial class PtxKernels
             // A stored [m][k]: lanes 0-15 rows 0-15 at k 0, lanes 16-31 rows 0-15 at k 8 (non-transposed ldmatrix).
             s.AppendLine($"""
                     and.b32 %r22, %r5, 15;
-                    shl.b32 %r23, %r7, 6;
+                    shl.b32 %r23, %r7, {warpRowShift};
                     add.u32 %r22, %r22, %r23;
                     mul.lo.u32 %r20, %r22, {NarrowStride};
                     shr.u32 %r23, %r5, 4;
@@ -587,7 +597,7 @@ internal static partial class PtxKernels
         // Two k16 steps over the current stage.
         for (int kk = 0; kk < 2; kk++)
         {
-            for (int mt = 0; mt < 4; mt++)
+            for (int mt = 0; mt < mts; mt++)
             {
                 int offset = ta ? kk * 16 * WideStride + mt * 16 * 2 : mt * 16 * NarrowStride + kk * 32;
                 s.AppendLine($"    ldmatrix.sync.aligned.m8n8.x4{(ta ? ".trans" : "")}.shared.b16 {{%fa{4 * mt}, %fa{4 * mt + 1}, %fa{4 * mt + 2}, %fa{4 * mt + 3}}}, [%r39+{offset}];");
@@ -599,7 +609,7 @@ internal static partial class PtxKernels
                 s.AppendLine($"    ldmatrix.sync.aligned.m8n8.x4{(tb ? "" : ".trans")}.shared.b16 {{%fb{4 * np}, %fb{4 * np + 1}, %fb{4 * np + 2}, %fb{4 * np + 3}}}, [%r41+{offset}];");
             }
 
-            for (int mt = 0; mt < 4; mt++)
+            for (int mt = 0; mt < mts; mt++)
             {
                 for (int nt = 0; nt < 4; nt++)
                 {
@@ -624,7 +634,7 @@ internal static partial class PtxKernels
             KEND:
             """);
 
-        EmitTensorEpilogue(s, mode, packed == 1 ? ColumnScales : null, splitK: mode == 0);
+        EmitTensorEpilogue(s, mode, packed == 1 ? t => ColumnScales(t, mts) : null, splitK: mode == 0, mts: mts);
         s.AppendLine("""
                 ret;
             }
@@ -649,13 +659,14 @@ internal static partial class PtxKernels
     // and the parameters p_bias and p_aux. `scale` may rescale the accumulators once %r42 / %r43 are set. With `splitK`
     // (mode 0), %psplit (set by the caller) marks a split k: each block adds its partial sums into c atomically (beta
     // must be 0, c zeroed first, or 1) and only block z = 0 adds the bias.
-    private static void EmitTensorEpilogue(StringBuilder s, int mode, Action<StringBuilder>? scale, bool splitK = false)
+    // mts: the m16 slices of each warp (4: 64 rows, the 128-row tiles; 2: 32 rows, the 64-row tiles).
+    private static void EmitTensorEpilogue(StringBuilder s, int mode, Action<StringBuilder>? scale, bool splitK = false, int mts = 4)
     {
         // Epilogue: c[row, col] = acc + beta · c (rows (lane >> 2) and +8 of each m16 tile, columns 2 (lane & 3) and +1
         // of each n8 tile). %r42 = first row, %r43 = first column, %rd14 = its address, %rd15 = a row in bytes.
-        s.AppendLine("""
+        s.AppendLine($"""
                 shr.u32 %r42, %r5, 2;
-                shl.b32 %r44, %r7, 6;
+                shl.b32 %r44, %r7, {(int)Math.Log2(mts * 16)};
                 add.u32 %r42, %r42, %r44;
                 add.u32 %r42, %r42, %r9;
                 and.b32 %r43, %r5, 3;
@@ -722,7 +733,7 @@ internal static partial class PtxKernels
         }
 
         scale?.Invoke(s);
-        for (int mt = 0; mt < 4; mt++)
+        for (int mt = 0; mt < mts; mt++)
         {
             for (int half = 0; half < 2; half++)
             {
@@ -876,7 +887,7 @@ internal static partial class PtxKernels
     }
 
     // Int8 weights: acc · scale[column] (the per-column scales in p_aux).
-    private static void ColumnScales(StringBuilder s)
+    private static void ColumnScales(StringBuilder s, int mts)
     {
         s.AppendLine("""
                 ld.param.u64 %rd25, [p_aux];
@@ -894,7 +905,7 @@ internal static partial class PtxKernels
                         add.u64 %rd19, %rd25, %rd20;
                         @%p9 ld.global.f32 %t0, [%rd19];
                     """);
-                for (int mt = 0; mt < 4; mt++)
+                for (int mt = 0; mt < mts; mt++)
                 {
                     int c = (mt * 4 + nt) * 4 + j;
                     s.AppendLine($"mul.f32 %c{c}, %c{c}, %t0;");

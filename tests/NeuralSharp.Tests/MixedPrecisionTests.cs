@@ -346,8 +346,9 @@ internal static partial class Tests
         }
 
         var random = new Random(22);
-        // k = 1056 splits k over several blocks (few output tiles), with an uneven last chunk.
-        foreach (var (M, K, N) in new[] { (150, 256, 200), (150, 1056, 200) })
+        // k = 1056 splits k over several blocks (few output tiles), with an uneven last chunk; 150 rows take the 64-row
+        // tiles (the last 128-row tile would be mostly empty), 200 rows the 128-row ones.
+        foreach (var (M, K, N) in new[] { (150, 256, 200), (150, 1056, 200), (200, 1056, 200) })
         {
             float[] x = [.. Enumerable.Range(0, M * K).Select(_ => random.NextSingle() * 2 - 1)];
             float[] w = [.. Enumerable.Range(0, K * N).Select(_ => (random.NextSingle() * 2 - 1) * 0.1f)];
@@ -717,26 +718,38 @@ internal static partial class Tests
                 $"{Timed(() => Tensor.AttentionBFloat16(query, cache, position, 1, 0.088f, tiled: false), v => CudaBackend.DecodeSplits = v, split),9}")));
         }
 
-        // Prompt-sized products (180 rows) through int8 weights on tensor cores, forced k splits.
-        Console.WriteLine();
-        int?[] promptSplits = [null, 1, 2, 4, 6, 8, 12, 16];
-        Console.WriteLine($"{"180 rows, int8 weights",-32} " + string.Join(" ", promptSplits.Select(s => $"{(s is null ? "auto" : s.ToString()),9}")));
-        using (MixedPrecision.BFloat16())
+        // Prompt-sized products (180 rows) through int8 weights on tensor cores, forced k splits, with 128-row tiles and with
+        // 64-row ones (the heuristic's choice for 180 rows).
+        foreach (int tileRows in new[] { 128, 64 })
         {
-            foreach (var (kIn, nOut, layer) in new[] { (1024, 1024, k), (1024, 2048, q), (1024, 3072, gate), (2048, 1024, o), (3072, 1024, down) })
+            CudaBackend.PromptTileRowsOverride = tileRows;
+            try
             {
-                using var x = Tensor.From([.. Enumerable.Range(0, 180 * kIn).Select(_ => random.NextSingle() - 0.5f)], [180, kIn], device);
-                Console.WriteLine($"{$"{kIn} -> {nOut}",-32} " + string.Join(" ", promptSplits.Select(split =>
-                    $"{Timed(() => x.MatMulInt8(layer.Int8!), v => CudaBackend.PackedSplits = v, split),9}")));
-            }
+                Console.WriteLine();
+                int?[] promptSplits = [null, 1, 2, 4, 6, 8, 12, 16];
+                Console.WriteLine($"{$"180 rows, int8, {tileRows}-row tiles",-32} " + string.Join(" ", promptSplits.Select(s => $"{(s is null ? "auto" : s.ToString()),9}")));
+                using (MixedPrecision.BFloat16())
+                {
+                    foreach (var (kIn, nOut, layer) in new[] { (1024, 1024, k), (1024, 2048, q), (1024, 3072, gate), (2048, 1024, o), (3072, 1024, down) })
+                    {
+                        using var x = Tensor.From([.. Enumerable.Range(0, 180 * kIn).Select(_ => random.NextSingle() - 0.5f)], [180, kIn], device);
+                        Console.WriteLine($"{$"{kIn} -> {nOut}",-32} " + string.Join(" ", promptSplits.Select(split =>
+                            $"{Timed(() => x.MatMulInt8(layer.Int8!), v => CudaBackend.PackedSplits = v, split),9}")));
+                    }
 
-            // The layers sharing an input in one launch, against their separate launches (auto splits).
-            using var prompt = Tensor.From([.. Enumerable.Range(0, 180 * 1024).Select(_ => random.NextSingle() - 0.5f)], [180, 1024], device);
-            foreach (var (name, layers) in new[] { ("q+k+v one launch (1024 -> 4096)", new[] { q, k, v }), ("gate+up one launch (1024 -> 6144)", new[] { gate, up }) })
+                    // The layers sharing an input in one launch, against their separate launches (auto splits).
+                    using var prompt = Tensor.From([.. Enumerable.Range(0, 180 * 1024).Select(_ => random.NextSingle() - 0.5f)], [180, 1024], device);
+                    foreach (var (name, layers) in new[] { ("q+k+v one launch (1024 -> 4096)", new[] { q, k, v }), ("gate+up one launch (1024 -> 6144)", new[] { gate, up }) })
+                    {
+                        Console.WriteLine($"{name,-32} " + string.Join(" ", promptSplits.Select(split =>
+                            $"{Timed(() => Tensor.MatMulPackedMany(prompt, 0, layers), v => CudaBackend.PackedSplits = v, split),9}")));
+                        Console.WriteLine($"{"  same, separate launches",-32} {Timed(() => { foreach (var layer in layers) { prompt.MatMulInt8(layer.Int8!); } }, _ => { }, null),9}");
+                    }
+                }
+            }
+            finally
             {
-                Console.WriteLine($"{name,-32} " + string.Join(" ", promptSplits.Select(split =>
-                    $"{Timed(() => Tensor.MatMulPackedMany(prompt, 0, layers), v => CudaBackend.PackedSplits = v, split),9}")));
-                Console.WriteLine($"{"  same, separate launches",-32} {Timed(() => { foreach (var layer in layers) { prompt.MatMulInt8(layer.Int8!); } }, _ => { }, null),9}");
+                CudaBackend.PromptTileRowsOverride = null;
             }
         }
 
