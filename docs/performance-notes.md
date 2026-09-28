@@ -107,6 +107,30 @@ products run at about 30 TFLOPS against the 78 its GEMM reaches on large shapes 
    beta 0 instead of zeroing, clipping's norm fused into the backward pass.
 7. **Decoding attention at short contexts:** the ≈5 blocks per SM rule is ~1 µs slower than 16 splits at 200 positions;
    a length-aware split would need the graph-replay constraint handled (splits must not depend on the cache length).
+8. **First prompt pass (one-time setup): ~78 ms** against 7.7 ms afterwards (PyTorch 305 ms). Mostly loading the CUDA
+   modules (the driver compiles the PTX on first use) and first allocations; caching the compiled modules
+   (cuModuleLoadData on a saved cubin, keyed by driver version and GPU) would cut the start-up of every run.
+9. **Host overhead of the prompt pass:** 7.7 ms wall against 7.3 ms of GPU time (283 launches); recording the prompt
+   pass as a graph per prompt length, or fewer launches (the fusions in step 5), closes that gap.
+
+Not worth pursuing (measured): one-launch column quantization through L2 (removed), more k splits for decoding GEMVs
+beyond ≈2 blocks per SM, splitting prompt products whose tiles already fill one wave.
+
+## How to resume
+
+```
+git pull
+dotnet run -c Release --project tests/NeuralSharp.Tests                          # 272 tests on CPU and GPU
+dotnet run -c Release --project tests/NeuralSharp.Tests -- --bench-gemm          # large products, long-k split sweep, 8-bit
+dotnet run -c Release --project tests/NeuralSharp.Tests -- --bench-gemv          # decoding products and attention, 180-row products
+dotnet run -c Release --project tests/NeuralSharp.Tests -- --bench-fp8           # FP8 column quantizers, delayed-scaling error
+dotnet run -c Release --project samples/NeuralSharp.Samples.Pretrained -- profile Qwen/Qwen3-0.6B --cuda --int8 --kv16
+dotnet run -c Release --project samples/NeuralSharp.Samples.Pretrained -- check qwen3.json --cuda --int8 --kv16 --matmul bf16
+dotnet run -c Release --project samples/NeuralSharp.Samples.CharGpt -- <1.25B arguments> --profile [--fp8]
+```
+
+Before claiming a speed-up: the tests, the check against transformers, and for training changes the loss comparison
+(`--loss-log` + `compare`, the quick 600-step version above).
 
 ## Measured facts worth keeping
 
