@@ -27,7 +27,7 @@ maps it to the intents.
 ## Train
 
 ```
-dotnet run -c Release --project apps/Qasd -- train apps/Qasd/data/plan-queries.csv --out models/intents.nsm          (CPU; add --cuda for the GPU)
+dotnet run -c Release --project apps/Qasd -- train apps/Qasd/data/plan-queries.csv --out models/intents.nsm
 ```
 
 The columns default to `raw_question` (text) and `intent` (label); `--text` / `--label` pick others. 20% of the distinct
@@ -43,11 +43,19 @@ dotnet run -c Release --project apps/Qasd -- predict models/intents.nsm --json -
 dotnet run -c Release --project apps/Qasd -- evaluate models/intents.nsm new-labeled.csv
 ```
 
+## Devices
+
+Training (`qasd train`, `qasd-tuned train`) runs on the GPU when there is one (else the CPU, with a notice); `--cpu`
+forces the CPU. Inference runs on the CPU unless asked: `predict` and `evaluate` take `--cuda`, and the service takes
+`IntentModel__Device=cuda` (classifier) and `IntentModel__TunedDevice=cuda` (tuned model). The classifier is fastest on
+the CPU (about 0.1 ms per message); the tuned model is a language model and gains most from the GPU. The benchmarks
+measure both devices when there is a GPU (`--devices cpu` or `--devices cuda` for one).
+
 ## Tune a language model (Qasd.Tuned)
 
 ```
-dotnet run -c Release --project apps/Qasd.Tuned -- train apps/Qasd/data/plan-queries.csv --out models/qasd-tuned --cuda
-dotnet run -c Release --project apps/Qasd.Tuned -- predict models/qasd-tuned "Book me with Dr. Heba on Tuesday" --stream --cuda
+dotnet run -c Release --project apps/Qasd.Tuned -- train apps/Qasd/data/plan-queries.csv --out models/qasd-tuned
+dotnet run -c Release --project apps/Qasd.Tuned -- predict models/qasd-tuned "Book me with Dr. Heba on Tuesday" --stream
 ```
 
 It downloads the base model once (`--model` picks another: a Hugging Face id, a folder, a .gguf file or `ollama:name`),

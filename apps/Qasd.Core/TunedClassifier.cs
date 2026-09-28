@@ -13,7 +13,7 @@ public sealed record TunedOptions
     /// <summary>The pretrained chat model to tune: a Hugging Face id, a folder, a .gguf file or ollama:name.</summary>
     public string BaseModel { get; init; } = "Qwen/Qwen2.5-0.5B-Instruct";
 
-    /// <summary>Where the model trains (default: the CPU, slow for a language model; pass a CUDA device to train on the GPU).</summary>
+    /// <summary>Where the model trains (default: the GPU when there is one, else the CPU, which is slow for a language model). <see cref="TunedClassifier.Load"/> runs on the CPU unless told otherwise.</summary>
     public Device? Device { get; init; }
 
     /// <summary>LoRA rank.</summary>
@@ -101,7 +101,7 @@ public sealed class TunedClassifier : IDisposable
         }
 
         string system = options.SystemPrompt ?? DefaultSystem(labels);
-        var device = options.Device ?? Device.Cpu;
+        var device = options.Device ?? (Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu);
         string folder = ModelSource.Resolve(options.BaseModel);
         log?.Invoke($"base model {options.BaseModel} ({folder}) on {device.Name}");
         var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, BFloat16 = device.Type == DeviceType.Cuda });

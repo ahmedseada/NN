@@ -49,7 +49,7 @@ public sealed record TextClassifierOptions
     /// <summary>Seed for the initial weights, the split and the batch order (the same data and seed give the same model).</summary>
     public int Seed { get; init; }
 
-    /// <summary>Where the model trains and runs (default: the CPU; pass a CUDA device to train on the GPU).</summary>
+    /// <summary>Where the model trains (default: the GPU when there is one, else the CPU). <see cref="TextClassifier.Load"/> runs on the CPU unless told otherwise.</summary>
     public Device? Device { get; init; }
 }
 
@@ -194,7 +194,7 @@ public sealed class TextClassifier : IDisposable
             throw new ArgumentException($"Training needs texts of at least two labels; got {labels.Length}.", nameof(examples));
         }
 
-        var device = options.Device ?? Device.Cpu;
+        var device = options.Device ?? (Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu);
         var (train, validation) = options.ValidationFraction > 0 ? Split(all, options.ValidationFraction, options.Seed + 1) : (all, []);
         if (train.Count == 0)
         {

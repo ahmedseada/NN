@@ -13,7 +13,7 @@ const string Usage = """
       qasd-tuned evaluate <folder> <data…>      score a tuned model on labeled messages
       qasd-tuned predict <folder> [text…]       classify messages (arguments, else one per line from standard input);
                                                 --stream prints the model's answer as it is generated
-      qasd-tuned benchmark <data…>              tune and measure on each device (--devices cpu,cuda; default cpu): tuning time,
+      qasd-tuned benchmark <data…>              tune and measure on each device (--devices cpu,cuda; default: both when there is a GPU): tuning time,
                                                 held-out accuracy and F1, latency, time to the first streamed token and
                                                 throughput, next to the qasd classifier trained on the same split
                                                 (--sample N: tune on N messages only, for a quick CPU run)
@@ -23,7 +23,7 @@ const string Usage = """
 
     Options:
       --model M           the pretrained chat model (default Qwen/Qwen2.5-0.5B-Instruct; a Hugging Face id, folder, .gguf or ollama:name)
-      --cpu | --cuda      where to run (default cpu; tuning a language model is much faster on the GPU)
+      --cpu | --cuda      where to run (default: train on the GPU when there is one; evaluate and predict on the CPU, --cuda for the GPU)
       --text C, --label C columns with the message and the intent
       --test-fraction F   distinct messages held out (default 0.2; 0 = tune on everything)
       --epochs N (1), --rank N (16), --lr F (0.0002), --batch-tokens N (4096), --max-length N (256), --seed N
@@ -34,7 +34,7 @@ string? output = null, textColumn = null, labelColumn = null, deviceList = null;
 int sample = 0;
 double testFraction = 0.2;
 bool stream = false;
-var device = Device.Cpu;
+Device? device = null;
 var options = new TunedOptions();
 try
 {
@@ -91,6 +91,16 @@ if (!valid)
 }
 
 Console.OutputEncoding = Encoding.UTF8;
+
+// Tuning on the GPU when there is one; evaluation and prediction on the CPU unless asked (--cuda).
+if (device is null)
+{
+    device = command == "train" && Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu;
+    if (command == "train" && device.Type == DeviceType.Cpu)
+    {
+        Console.WriteLine("no CUDA GPU found: tuning on the CPU (slow for a language model)");
+    }
+}
 try
 {
     switch (command)
@@ -126,7 +136,7 @@ try
 
             int measured = Math.Min(test.Count, 200);
             var probe = test.Take(measured).ToList();
-            var devices = (deviceList ?? "cpu").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            var devices = (deviceList ?? (Device.IsCudaAvailable ? "cpu,cuda" : "cpu")).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Select(d => d == "cpu" ? Device.Cpu : d is "cuda" or "gpu" ? Device.Cuda() : Device.Cuda(int.Parse(d[5..], CultureInfo.InvariantCulture))).ToList();
             Console.WriteLine($"{examples.Count:N0} messages; tuning on {train.Count:N0}, measuring on {probe.Count:N0} held-out messages (the split of qasd train)\n");
             var rows = new List<string[]>();
