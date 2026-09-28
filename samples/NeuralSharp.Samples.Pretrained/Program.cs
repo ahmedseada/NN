@@ -30,6 +30,8 @@ using NeuralSharp.Pretrained;
 //                                   copy, verifies it with the task's commands and writes one transcript per run; with
 //                                   a teacher this makes training data (--train F: passing runs only), with the model
 //                                   under test it is the evaluation (--attempts N, --filter S, --work DIR, --rounds N)
+//   agent-check <suite>             checks every task without a model: verification fails on the starting files and
+//                                   passes with the task's solution/ folder (--filter S, --work DIR)
 //   (<model> may be a model folder or an OpenAI-compatible server: http://localhost:11434/v1 with --model-name N for
 //   Ollama, http://localhost:8080/v1 for llama-server; --api-key K, --temperature T)
 //   export <folder> <adapter> --out <dir>
@@ -104,7 +106,7 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run")
+if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run" or "agent-check")
     || positional[0] is "agent" && (positional.Count < 3 || workspace is null) || positional[0] is "agent-run" && (positional.Count < 3 || output is null)
     || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
 {
@@ -137,6 +139,22 @@ static string ResolveModel(string folder)
         : null;
     return found ?? throw new DirectoryNotFoundException($"'{folder}' is not a folder and is not in the Hugging Face cache ({snapshots}); download it first "
         + "(for example: python tools/pytorch/pretrained_reference.py --model " + folder + ").");
+}
+
+// npm packages of the tasks' shared projects, installed once (each run links them instead of installing).
+static async Task InstallDependencies(IEnumerable<AgentTask> tasks)
+{
+    foreach (var folder in tasks.SelectMany(t => new[] { t.Base, t.Workspace }).OfType<string>().Distinct())
+    {
+        if (File.Exists(Path.Combine(folder, "package.json")) && !Directory.Exists(Path.Combine(folder, "node_modules")))
+        {
+            Console.WriteLine($"installing npm packages in {folder} (once)…");
+            var npm = new CodingTools(folder, new CodingToolOptions { CommandTimeout = TimeSpan.FromMinutes(15) });
+            string command = File.Exists(Path.Combine(folder, "package-lock.json")) ? "npm ci" : "npm install";
+            var result = await npm.ExecuteAsync(command);
+            Console.WriteLine(result.Succeeded ? "  done" : $"  {command} failed:\n{result.Output}");
+        }
+    }
 }
 
 // The sampling chat uses (Qwen3's recommended settings for thinking mode).
@@ -284,6 +302,30 @@ switch (positional[0])
         return 0;
     }
 
+    case "agent-check":
+    {
+        var suite = AgentTask.LoadSuite(positional[1]).Where(t => filter is null || t.Id.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();
+        string work = Path.GetFullPath(workRoot ?? Path.Combine(Path.GetTempPath(), "neuralsharp-agent-check", DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)));
+        var checker = new CodingAgent(FakeChatModel.Script());
+        await InstallDependencies(suite);
+        int good = 0;
+        foreach (var task in suite)
+        {
+            var watch = Stopwatch.StartNew();
+            var (startFails, solutionPasses, report) = await checker.CheckTaskAsync(task, Path.Combine(work, task.Id.Replace('/', Path.DirectorySeparatorChar)));
+            bool ok = startFails && solutionPasses;
+            good += ok ? 1 : 0;
+            Console.WriteLine($"  {(ok ? "ok  " : "BAD ")} {task.Id} ({watch.Elapsed.TotalSeconds:F0} s){(startFails ? "" : "; verification passes without any change")}{(solutionPasses ? "" : "; the solution does not pass")}");
+            if (!ok)
+            {
+                Console.WriteLine("       " + string.Join("\n       ", report.Trim().Split('\n').TakeLast(40)));
+            }
+        }
+
+        Console.WriteLine($"{good}/{suite.Count} tasks check out; work folders under {work}");
+        return good == suite.Count ? 0 : 2;
+    }
+
     case "agent" or "agent-run":
     {
         // The model: a local one (any family, in its own chat template), or an OpenAI-compatible server (a teacher).
@@ -355,6 +397,7 @@ switch (positional[0])
         }
 
         var suite = AgentTask.LoadSuite(positional[2]).Where(t => filter is null || t.Id.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();
+        await InstallDependencies(suite);
         string work = Path.GetFullPath(workRoot ?? Path.Combine(Path.GetTempPath(), "neuralsharp-agent", DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)));
         Console.WriteLine($"{suite.Count} tasks × {attempts} attempts; work folders under {work}");
         var outcomes = new List<(AgentTask Task, AgentRun Run)>();

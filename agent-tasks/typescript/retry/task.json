@@ -1,0 +1,7 @@
+{
+  "prompt": "Add `retry` to src/timing.ts (new file): `retry<T>(operation: (attempt: number) => Promise<T>, options: { retries: number; delayMs: number; signal?: AbortSignal }): Promise<T>`. It calls operation (attempt numbers start at 1) and, when it rejects, waits delayMs * 2^(attempt-1) and tries again, at most `retries` more times; then it rejects with the last error. If the signal is aborted (before or while waiting), it stops at once and rejects with signal.reason. Add tests.",
+  "language": "typescript",
+  "base": "../../_bases/typescript-utils",
+  "setup": [], "verify": ["npx tsc --noEmit", "npm test"],
+  "tags": ["feature", "async", "tests"]
+}

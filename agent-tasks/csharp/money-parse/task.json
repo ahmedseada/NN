@@ -1,0 +1,8 @@
+{
+  "prompt": "Add `Money.Parse(string)` and `Money.TryParse(string?, out Money)` that read what `Money.ToString()` writes, e.g. \"EUR 12.50\" or \"USD -3.00\": a three-letter upper-case currency code, one space, and an amount with a dot as the decimal separator (independent of the machine's culture). Parse throws FormatException for anything else; TryParse returns false. Add unit tests.",
+  "language": "csharp",
+  "base": "../../_bases/csharp-shop",
+  "setup": ["dotnet restore"],
+  "verify": ["dotnet test --no-restore"],
+  "tags": ["feature", "tests", "parsing"]
+}

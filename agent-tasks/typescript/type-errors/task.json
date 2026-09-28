@@ -1,0 +1,7 @@
+{
+  "prompt": "`npx tsc --noEmit` reports errors since the last change to src/cart.ts. Fix them properly: no `any`, no `@ts-ignore`/`@ts-expect-error`, no non-null assertions (!) and no `as` casts. Behaviour must stay the same.",
+  "language": "typescript",
+  "base": "../../_bases/typescript-utils",
+  "setup": [], "verify": ["npx tsc --noEmit", "npm test"],
+  "tags": ["build-fix", "strict"]
+}

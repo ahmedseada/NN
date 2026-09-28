@@ -1,0 +1,7 @@
+{
+  "prompt": "Add a generic LRU cache in src/lru-cache.ts: `export class LruCache<K, V>` with `constructor(capacity: number)` (a positive integer, else RangeError), `get(key): V | undefined` (marks the key as recently used), `set(key, value): this` (evicts the least recently used entry when full), `has(key)` (does not change the order), `delete(key): boolean`, a `size` getter, and `keys()` returning the keys from least to most recently used. Add tests.",
+  "language": "typescript",
+  "base": "../../_bases/typescript-utils",
+  "setup": [], "verify": ["npx tsc --noEmit", "npm test"],
+  "tags": ["feature", "generics", "tests"]
+}

@@ -7,7 +7,9 @@ namespace NeuralSharp.Generation;
 /// A coding task: a prompt, the project it starts from, and the commands that decide whether it was done. On disk a task
 /// is a folder with <c>task.json</c> (<c>{"prompt", "language", "base", "setup": [...], "verify": [...], "tags": [...]}</c>), a
 /// <c>workspace/</c> folder with the starting files (laid over <c>base</c>, a shared project folder relative to the task),
-/// and optionally a <c>verify/</c> folder whose files (hidden tests) are copied in after the agent finishes.
+/// optionally a <c>verify/</c> folder whose files (hidden tests) are copied in after the agent finishes, and a
+/// <c>solution/</c> folder with a reference solution laid over the workspace (<see cref="CodingAgent.CheckTaskAsync"/>
+/// checks that verification fails without it and passes with it).
 /// </summary>
 /// <param name="Id">Name (the folder's path within the suite).</param>
 /// <param name="Prompt">What the user asks for.</param>
@@ -18,8 +20,9 @@ namespace NeuralSharp.Generation;
 /// <param name="Setup">Commands run before the agent starts (for example dotnet restore), not shown to it.</param>
 /// <param name="Verify">Commands that must all exit with 0 for the task to count as done.</param>
 /// <param name="Tags">Free-form labels.</param>
+/// <param name="Solution">A reference solution laid over the workspace, or null.</param>
 public sealed record AgentTask(string Id, string Prompt, string? Language = null, string? Base = null, string? Workspace = null, string? VerifyFiles = null,
-    IReadOnlyList<string>? Setup = null, IReadOnlyList<string>? Verify = null, IReadOnlyList<string>? Tags = null)
+    IReadOnlyList<string>? Setup = null, IReadOnlyList<string>? Verify = null, IReadOnlyList<string>? Tags = null, string? Solution = null)
 {
     /// <summary>Every task under <paramref name="folder"/> (each folder holding a task.json), ordered by id.</summary>
     public static IReadOnlyList<AgentTask> LoadSuite(string folder)
@@ -48,7 +51,7 @@ public sealed record AgentTask(string Id, string Prompt, string? Language = null
         return new AgentTask(id ?? (string?)json["id"] ?? Path.GetFileName(folder),
             (string?)json["prompt"] ?? throw new InvalidDataException($"{folder}/task.json has no prompt."),
             (string?)json["language"], Folder(baseFolder), Folder("workspace"), Folder("verify"),
-            List(json["setup"]), List(json["verify"]), List(json["tags"]));
+            List(json["setup"]), List(json["verify"]), List(json["tags"]), Folder("solution"));
     }
 }
 
@@ -197,13 +200,58 @@ public sealed class CodingAgent(IChatModel model, AgentOptions? options = null)
             return run;
         }
 
+        var (passed, output) = await VerifyAsync(task, checks, cancellationToken).ConfigureAwait(false);
+        var outcome = passed ? AgentOutcome.Passed : run.Outcome == AgentOutcome.OutOfBudget ? AgentOutcome.OutOfBudget : AgentOutcome.Failed;
+        return run with { Outcome = outcome, VerifyOutput = output };
+    }
+
+    /// <summary>
+    /// Checks a task without a model: its verification must fail on the starting files (else the task tests nothing) and
+    /// pass with its <see cref="AgentTask.Solution"/> (else it cannot be solved). Uses two folders under <paramref name="workFolder"/>.
+    /// </summary>
+    public async Task<(bool StartFails, bool SolutionPasses, string Output)> CheckTaskAsync(AgentTask task, string workFolder, CancellationToken cancellationToken = default)
+    {
+        var report = new System.Text.StringBuilder();
+        var results = new bool[2];
+        for (int pass = 0; pass < 2; pass++)
+        {
+            string folder = Path.Combine(workFolder, pass == 0 ? "start" : "solution");
+            PrepareWorkspace(task, folder);
+            if (pass == 1 && task.Solution is { } solution)
+            {
+                CopyTree(solution, folder, overwrite: true);
+            }
+
+            var checks = new CodingTools(folder, _options.Tools with { CommandTimeout = _options.VerifyTimeout });
+            bool setupOk = true;
+            foreach (var command in task.Setup ?? [])
+            {
+                OnStatus?.Invoke($"setup: {command}");
+                var setup = await checks.ExecuteAsync(command, ".", null, cancellationToken).ConfigureAwait(false);
+                if (!setup.Succeeded)
+                {
+                    report.Append($"[{(pass == 0 ? "start" : "solution")}] setup failed: $ {command}\n{setup.Output}\n");
+                    setupOk = false;
+                    break;
+                }
+            }
+
+            var (passed, output) = setupOk ? await VerifyAsync(task, checks, cancellationToken).ConfigureAwait(false) : (false, "");
+            results[pass] = pass == 0 ? setupOk && !passed : passed;
+            report.Append($"[{(pass == 0 ? "start" : "solution")}] {(passed ? "verification passed" : "verification failed")}\n{output}");
+        }
+
+        return (results[0], task.Solution is not null && results[1], report.ToString());
+    }
+
+    private async Task<(bool Passed, string Output)> VerifyAsync(AgentTask task, CodingTools checks, CancellationToken cancellationToken)
+    {
         if (task.VerifyFiles is { } hidden)
         {
-            CopyTree(hidden, workFolder, overwrite: true);
+            CopyTree(hidden, checks.Workspace, overwrite: true);
         }
 
         var output = new System.Text.StringBuilder();
-        bool passed = true;
         foreach (var command in task.Verify ?? [])
         {
             OnStatus?.Invoke($"verify: {command}");
@@ -211,13 +259,11 @@ public sealed class CodingAgent(IChatModel model, AgentOptions? options = null)
             output.Append($"$ {command}\n{(result.TimedOut ? "timed out" : $"exit code {result.ExitCode}")}\n{result.Output}\n");
             if (!result.Succeeded)
             {
-                passed = false;
-                break;
+                return (false, output.ToString());
             }
         }
 
-        var outcome = passed ? AgentOutcome.Passed : run.Outcome == AgentOutcome.OutOfBudget ? AgentOutcome.OutOfBudget : AgentOutcome.Failed;
-        return run with { Outcome = outcome, VerifyOutput = output.ToString() };
+        return (true, output.ToString());
     }
 
     /// <summary>Runs the agent on <paramref name="task"/>'s prompt with <paramref name="tools"/> as they are (no setup or verification).</summary>

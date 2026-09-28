@@ -1,0 +1,8 @@
+{
+  "prompt": "Customers see negative prices when a discount code is applied: PriceCalculator.ApplyDiscount(EUR 20.00, 15) returns EUR -280.00 instead of EUR 17.00. Please fix it.",
+  "language": "csharp",
+  "base": "../../_bases/csharp-shop",
+  "setup": ["dotnet restore"],
+  "verify": ["dotnet test --no-restore"],
+  "tags": ["bug"]
+}

@@ -1,0 +1,7 @@
+{
+  "prompt": "Add `groupBy` and `sumBy` to src/collections.ts:\n- `groupBy<T, K extends PropertyKey>(items: readonly T[], key: (item: T) => K): Partial<Record<K, T[]>>`, groups in first-seen order, items in their original order;\n- `sumBy<T>(items: readonly T[], value: (item: T) => number): number`, 0 for an empty list.\nKeep the types exactly as written so callers get the key type back. Add tests.",
+  "language": "typescript",
+  "base": "../../_bases/typescript-utils",
+  "setup": [], "verify": ["npx tsc --noEmit", "npm test"],
+  "tags": ["feature", "generics", "tests"]
+}

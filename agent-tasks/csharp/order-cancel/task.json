@@ -1,0 +1,8 @@
+{
+  "prompt": "Add order cancellation.\n- Order gets a `Status` property of a new enum `OrderStatus` { Placed, Cancelled }; new orders are Placed.\n- IOrderRepository gets `Task UpdateAsync(Order order, CancellationToken cancellationToken = default)`.\n- `OrderService.CancelAsync(Guid orderId, CancellationToken cancellationToken = default)` returns the cancelled order: it puts the order's stock back into the inventory and saves the order with status Cancelled through UpdateAsync.\n- Cancelling an unknown order throws KeyNotFoundException; cancelling an order that is already cancelled throws InvalidOperationException and changes nothing.\nKeep the existing tests passing and add tests for cancellation.",
+  "language": "csharp",
+  "base": "../../_bases/csharp-shop",
+  "setup": ["dotnet restore"],
+  "verify": ["dotnet test --no-restore"],
+  "tags": ["feature", "async", "multi-file", "tests"]
+}

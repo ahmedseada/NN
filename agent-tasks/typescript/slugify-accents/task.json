@@ -1,0 +1,7 @@
+{
+  "prompt": "slugify drops accented letters: slugify(\"Crème Brûlée\") gives \"cr-me-br-l-e\" but should give \"creme-brulee\". Make it keep letters with diacritics as their plain ASCII letter (é → e, ü → u, ñ → n, å → a) and add tests for it.",
+  "language": "typescript",
+  "base": "../../_bases/typescript-utils",
+  "setup": [], "verify": ["npx tsc --noEmit", "npm test"],
+  "tags": ["bug", "tests"]
+}

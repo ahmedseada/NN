@@ -1,0 +1,8 @@
+{
+  "prompt": "Adding the same product to a cart twice gives two cart lines. It should give one line with the quantities added up. Can you fix Cart?",
+  "language": "csharp",
+  "base": "../../_bases/csharp-shop",
+  "setup": ["dotnet restore"],
+  "verify": ["dotnet test --no-restore"],
+  "tags": ["bug"]
+}

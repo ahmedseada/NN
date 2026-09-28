@@ -1,0 +1,7 @@
+{
+  "prompt": "Add `debounce` to a new src/timing.ts: `debounce<A extends unknown[]>(fn: (...args: A) => void, waitMs: number)` returns a function with the same parameters that calls fn with the latest arguments once no call has come for waitMs milliseconds. The returned function also has `cancel()` (drops a pending call) and `flush()` (runs a pending call now; does nothing if none is pending). Use setTimeout/clearTimeout. Add tests (node:test's mock timers work well for this).",
+  "language": "typescript",
+  "base": "../../_bases/typescript-utils",
+  "setup": [], "verify": ["npx tsc --noEmit", "npm test"],
+  "tags": ["feature", "generics", "timers", "tests"]
+}

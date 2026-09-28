@@ -1,0 +1,8 @@
+{
+  "prompt": "Bug: when an order can't be placed because one product in the cart is out of stock, the stock of the other products has already been taken. OrderService.PlaceOrderAsync should check every line first and, if any line lacks stock, throw an InvalidOperationException without changing the inventory or saving anything.",
+  "language": "csharp",
+  "base": "../../_bases/csharp-shop",
+  "setup": ["dotnet restore"],
+  "verify": ["dotnet test --no-restore"],
+  "tags": ["bug", "async"]
+}

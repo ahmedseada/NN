@@ -1,0 +1,8 @@
+{
+  "prompt": "Add reservations to Inventory so stock can be held for orders that are still being paid:\n- `bool TryReserve(string sku, int quantity)` holds stock; it returns false (and holds nothing) when not enough is available.\n- `void Release(string sku, int quantity)` gives held stock back; releasing more than is held throws InvalidOperationException.\n- `int Available(string sku)` is the stock minus what is held. `Quantity` stays the physical stock.\n- `Remove` must not take stock that is held.\nSKUs are case-insensitive, like the rest of the class. Please add tests for it too.",
+  "language": "csharp",
+  "base": "../../_bases/csharp-shop",
+  "setup": ["dotnet restore"],
+  "verify": ["dotnet test --no-restore"],
+  "tags": ["feature", "tests"]
+}

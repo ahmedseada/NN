@@ -1,0 +1,8 @@
+{
+  "prompt": "dotnet build fails since I added Catalog.cs. Please get the build green again without changing what Catalog does.",
+  "language": "csharp",
+  "base": "../../_bases/csharp-shop",
+  "setup": ["dotnet restore"],
+  "verify": ["dotnet build --no-restore", "dotnet test --no-restore"],
+  "tags": ["build-fix"]
+}
