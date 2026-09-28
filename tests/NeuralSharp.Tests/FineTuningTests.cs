@@ -12,6 +12,7 @@ internal static partial class Tests
         ("fine-tuning: LoRA terms inside the tensor-core products (float32, bfloat16 and 4-bit bases, one layer or merged) and rank-16 products match the separate computation, with gradients", LoraInsideProducts),
         ("fine-tuning: packed sequences (several per row, rotary or learned positions) give each sequence the logits and gradients it gets alone; packing fills rows first-fit", PackedSequencesMatch),
         ("fine-tuning: a training step recorded as a CUDA graph and replayed gives the losses and adapters of ordinary steps", GraphTraining),
+        ("generation: prompts of different lengths decoded together (left-padded, per-row starts) give each row its own logits and greedy replies", RaggedBatchDecoding),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
@@ -741,5 +742,102 @@ internal static partial class Tests
     private sealed class SynchronousProgress<T>(Action<T> report) : IProgress<T>
     {
         public void Report(T value) => report(value);
+    }
+
+    private static void RaggedBatchDecoding(Device device)
+    {
+        if (device.Type == DeviceType.Cuda && MixedPrecision.TensorCoresUnavailable(device) is not null)
+        {
+            return;                                                              // per-row starts: tensor-core attention
+        }
+
+        using var precision = MixedPrecision.Use(device.Type == DeviceType.Cuda ? MatMulPrecision.BFloat16 : MatMulPrecision.Float32);
+        var spec = new DecoderSpec
+        {
+            Vocabulary = 260, Dim = 128, Layers = 2, Heads = 4, KvHeads = 2, HeadDim = 64, FfDim = 128, MaxPositions = 256,
+            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, TieEmbeddings = true,
+        };
+        var random = new Random(41);
+        int[] lengths = [5, 12, 9];
+        var prompts = lengths.Select(n => Enumerable.Range(0, n).Select(_ => (float)random.Next(250)).ToArray()).ToArray();
+        var next = lengths.Select(_ => Enumerable.Range(0, 4).Select(_ => (float)random.Next(250)).ToArray()).ToArray();
+        float tolerance = device.Type == DeviceType.Cuda ? 3e-2f : 1e-4f;
+        using (var model = spec.Build(new RandomWeights(42), new DecoderBuildOptions { Device = device }))
+        using (Autograd.NoGrad())
+        {
+            model.Eval();
+            int longest = lengths.Max();
+            var batched = new List<float[]>[lengths.Length];
+            using (var scope = new TensorScope())
+            using (var context = new DecodingContext(device, lengths.Length, 32))
+            {
+                context.SetRowStarts([.. lengths.Select(n => longest - n)]);
+                context.LastPositionOnly = true;
+                var input = new float[lengths.Length * longest];
+                for (int r = 0; r < lengths.Length; r++)
+                {
+                    prompts[r].CopyTo(input, r * longest + longest - lengths[r]);
+                    batched[r] = [];
+                }
+
+                void Collect(Tensor logits)
+                {
+                    var values = logits.ToArray();
+                    for (int r = 0; r < lengths.Length; r++)
+                    {
+                        batched[r].Add(values[(r * 260)..((r + 1) * 260)]);
+                    }
+                }
+
+                Collect(model.ForwardCached(Tensor.From(input, [lengths.Length, longest], device), context));
+                for (int s = 0; s < 4; s++)
+                {
+                    Collect(model.ForwardCached(Tensor.From([.. next.Select(n => n[s])], [lengths.Length, 1], device), context));
+                }
+            }
+
+            for (int r = 0; r < lengths.Length; r++)
+            {
+                using var scope = new TensorScope();
+                using var context = new DecodingContext(device, 1, 32) { LastPositionOnly = true };
+                var alone = new List<float[]> { model.ForwardCached(Tensor.From(prompts[r], [1, lengths[r]], device), context).ToArray() };
+                for (int s = 0; s < 4; s++)
+                {
+                    alone.Add(model.ForwardCached(Tensor.From([next[r][s]], [1, 1], device), context).ToArray());
+                }
+
+                for (int s = 0; s < alone.Count; s++)
+                {
+                    CloseByNorm(alone[s], batched[r][s], tolerance, $"row {r} (prompt of {lengths[r]}), step {s}: logits");
+                }
+            }
+        }
+
+        if (device.Type != DeviceType.Cpu)
+        {
+            return;                                                              // greedy choices can flip on bfloat16 near-ties
+        }
+
+        // Whole greedy replies through the chat template (a Qwen3-style model): batched as generated one by one.
+        string folder = WriteChatModel(spec with { QkNorm = true });
+        try
+        {
+            using var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device });
+            var chat = model.CreateChat();
+            var options = new GenerationOptions { Temperature = 0f, TopK = 1, TopP = 1f, RepeatPenalty = 1f, NumPredict = 12, NumCtx = 200 };
+            var requests = new[] { "hi", "tell me a longer story about the sea", "2+2?" }
+                .Select(q => new ChatRequest([new ChatMessage("user", q)], null, null, options)).ToList();
+            var together = chat.ChatBatch(requests);
+            for (int i = 0; i < requests.Count; i++)
+            {
+                var alone = chat.Chat(requests[i]);
+                Check(together[i].Message!.Content == alone.Message!.Content && together[i].DoneReason == alone.DoneReason,
+                    $"reply {i}: batched '{together[i].Message!.Content}' ({together[i].DoneReason}), alone '{alone.Message!.Content}' ({alone.DoneReason})");
+            }
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
     }
 }

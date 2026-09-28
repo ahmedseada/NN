@@ -678,6 +678,20 @@ internal sealed unsafe partial class CudaBackend
 
     public override bool SupportsSegmentedAttention(int dim) => FlashTensorCore(dim) is not null;
 
+    public override bool AttentionRows(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage starts, int heads, int headsPerRow,
+        int rowsPerHead, int steps, int capacity, int dim, float scale)
+    {
+        if (FlashTensorCore(dim) is not { } tc)
+        {
+            return false;
+        }
+
+        Launch(tc[$"flash_tc_fwd_d{dim}"], (uint)((rowsPerHead + PtxKernels.FlashTensorRows - 1) / PtxKernels.FlashTensorRows), (uint)heads, 1, 128, 1,
+            [P(q), P(keys), P(values), P(position), P(y), 0UL, U(rowsPerHead), U(steps), U(capacity), F(scale * Log2E),
+            .. ContiguousLayout(rowsPerHead, steps, capacity, dim, starts, starts, headsPerRow)]);
+        return true;
+    }
+
     public override bool AttentionSegmented(Storage q, Storage keys, Storage values, Storage y, Storage? logSumExp, Storage starts, Storage ends,
         int heads, int headsPerRow, int rowsPerHead, int steps, int dim, float scale)
     {

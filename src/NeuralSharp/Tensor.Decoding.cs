@@ -161,6 +161,25 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// <see cref="AttentionTiled"/> for rows of different lengths: head h's row i sees cached positions c with
+    /// starts[(h / headsPerRow)·steps + i % steps] ≤ c ≤ position[0] + i % steps. Null when the device has no such pass.
+    /// </summary>
+    internal static Tensor? AttentionRows(Tensor q, Tensor keys, Tensor values, Tensor position, int steps, float scale, Tensor starts, int headsPerRow)
+    {
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        int heads = q._shape[0], rowsPerHead = q._shape[1], dim = q._shape[2];
+        var y = Empty([heads, rowsPerHead, dim], q.Device);
+        if (!q.Backend.AttentionRows(q.Storage, keys.Storage, values.Storage, position.Storage, y.Storage, starts.Storage, heads, headsPerRow, rowsPerHead,
+                steps, keys._shape[1], dim, scale))
+        {
+            y.Dispose();
+            return null;
+        }
+
+        return Traced("attention_rows", y, start);
+    }
+
+    /// <summary>
     /// <see cref="CausalAttention"/> over packed sequences: keys and values [heads, steps, dim], and each position sees
     /// only its own sequence (<paramref name="packing"/>'s starts; head h belongs to packed row h / <paramref name="headsPerRow"/>).
     /// Null when the device has no such pass.

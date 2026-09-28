@@ -31,7 +31,7 @@ using NeuralSharp.Pretrained;
 //   evaluate <folder> <data…>       scores the model's answers to held-out conversations against their reference answers
 //                                   (greedy decoding): with --adapter DIR the base model and the adapter side by side;
 //                                   the same data and --eval-fraction as finetune evaluate on the rows it held out
-//                                   (--samples 100, --metric auto|number|exact|contains|f1, --max-new 512, --out F.jsonl)
+//                                   (--samples 100, --metric auto|number|exact|contains|f1, --max-new 512, --batch 8: answers generated together, --out F.jsonl)
 //   download <model id>             download a model (config, tokenizer, chat template, safetensors) and print its folder
 //
 //   (<data…> specs, recipes and the dataset tool: see src/NeuralSharp.Datasets.Cli, command nsdata)
@@ -56,7 +56,7 @@ int context = 4096;
 string? folderOverride = null, output = null, evalFile = null, adapterFolder = null;
 string? workspace = null, workRoot = null, filter = null, systemPrompt = null;
 double evalFraction = 0;
-int samples = 100, maxNew = 512;
+int samples = 100, maxNew = 512, evaluationBatch = 8;
 var metric = AnswerMetric.Auto;
 long maxRows = 0;
 int seed = 0, minChars = 0, maxChars = 0;
@@ -112,6 +112,7 @@ for (int i = 0; i < args.Length; i++)
         case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
         case "--workspace": workspace = args[++i]; break;
         case "--samples": samples = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
+        case "--batch": evaluationBatch = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--max-new": maxNew = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--metric": metric = Enum.Parse<AnswerMetric>(args[++i], ignoreCase: true); break;
         case "--eval-fraction": evalFraction = double.Parse(args[++i], CultureInfo.InvariantCulture); break;
@@ -142,7 +143,7 @@ if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or
     || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
 {
     Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir> | download <model id>");
-    Console.WriteLine("       evaluate <folder> <data…> [--adapter DIR] [--eval-fraction F] [--samples N] [--metric auto|number|exact|contains|f1] [--out F.jsonl]");
+    Console.WriteLine("       evaluate <folder> <data…> [--adapter DIR] [--eval-fraction F] [--samples N] [--batch N] [--metric auto|number|exact|contains|f1] [--out F.jsonl]");
     Console.WriteLine("       agent <folder> <task…> --workspace <dir> | agent-run <folder> <suite> --out <runs.jsonl> [--attempts N] | agent-check <suite>");
     Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] [--matmul fp32|bf16|fp8] (fine-tuning options: see the top of Program.cs)");
     return 1;
@@ -270,7 +271,7 @@ switch (positional[0])
                     done++;
                     sum += a.Score;
                     status.Bar("answering", done, rows.Count, clock.Elapsed, $"{done}/{rows.Count}  score {sum / done:P1}");
-                }), context);
+                }), context, batchSize: evaluationBatch);
             status.Clear();
             report = report with { Loss = loss };
             reports.Add((name, report));

@@ -314,6 +314,55 @@ internal sealed partial class CpuBackend
 
     public override bool SupportsSegmentedAttention(int dim) => true;
 
+    public override bool AttentionRows(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage starts, int heads, int headsPerRow,
+        int rowsPerHead, int steps, int capacity, int dim, float scale)
+    {
+        float[] qv = D(q), kv = D(keys), vv = D(values), yv = D(y), sv = D(starts);
+        int position0 = (int)D(position)[0];
+        For(heads * rowsPerHead, (long)heads * rowsPerHead * dim * Math.Max(1, position0), (first, last) =>
+        {
+            var scores = new float[capacity];
+            for (int row = first; row < last; row++)
+            {
+                int h = row / rowsPerHead, t = row % rowsPerHead % steps;
+                int begin = (int)sv[h / headsPerRow * steps + t], end = Math.Min(position0 + t, capacity - 1) + 1, count = end - begin;
+                var output = yv.AsSpan(row * dim, dim);
+                output.Clear();
+                if (count <= 0)
+                {
+                    continue;                                                    // padding: sees nothing
+                }
+
+                var query = qv.AsSpan(row * dim, dim);
+                float max = float.NegativeInfinity;
+                for (int c = 0; c < count; c++)
+                {
+                    float dot = 0f;
+                    var key = kv.AsSpan((int)(((long)h * capacity + begin + c) * dim), dim);
+                    for (int d = 0; d < dim; d++)
+                    {
+                        dot += query[d] * key[d];
+                    }
+
+                    scores[c] = dot * scale;
+                    max = MathF.Max(max, scores[c]);
+                }
+
+                float sum = CpuMath.ExpShifted(scores.AsSpan(0, count), max);
+                for (int c = 0; c < count; c++)
+                {
+                    float weight = scores[c] / sum;
+                    var value = vv.AsSpan((int)(((long)h * capacity + begin + c) * dim), dim);
+                    for (int d = 0; d < dim; d++)
+                    {
+                        output[d] += weight * value[d];
+                    }
+                }
+            }
+        });
+        return true;
+    }
+
     public override bool AttentionSegmented(Storage q, Storage keys, Storage values, Storage y, Storage? logSumExp, Storage starts, Storage ends,
         int heads, int headsPerRow, int rowsPerHead, int steps, int dim, float scale)
     {

@@ -50,6 +50,39 @@ public sealed class ChatGenerator(TextGenerator generator, ChatTemplate? templat
     public Task<ChatChunk> ChatAsync(ChatRequest request, CancellationToken cancellationToken = default) =>
         Task.Run(() => Chat(request, cancellationToken), CancellationToken.None);
 
+    /// <summary>
+    /// The complete replies to several requests, generated together (<see cref="TextGenerator.GenerateBatch"/>): the
+    /// options of the first request apply to all. Each reply is what <see cref="Chat"/> returns for its request.
+    /// </summary>
+    public IReadOnlyList<ChatChunk> ChatBatch(IReadOnlyList<ChatRequest> requests, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0)
+        {
+            return [];
+        }
+
+        var options = requests[0].Options ?? new GenerationOptions();
+        options = options with { Stop = [.. options.Stop, .. Template.StopSequences] };
+        var outputs = Generator.GenerateBatch([.. requests.Select(RenderPrompt)], options, cancellationToken);
+        var replies = new List<ChatChunk>(requests.Count);
+        for (int i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i];
+            var (text, reason, stats) = outputs[i];
+            var parser = new ChatOutputParser(Template, separateThinking: request.Think != false, toolNames: request.Tools?.Select(t => t.Name).ToHashSet());
+            var first = parser.Feed(text);
+            var last = parser.Finish();
+            var calls = first.ToolCalls.Concat(last.ToolCalls).ToList();
+            string thinking = first.Thinking + last.Thinking;
+            var message = new ChatMessage("assistant", (first.Content + last.Content).Trim(), thinking.Length > 0 ? thinking.Trim() : null,
+                calls.Count > 0 ? calls : null);
+            replies.Add(new ChatChunk(last, true, reason, message, stats));
+        }
+
+        return replies;
+    }
+
     /// <summary>Streams the reply.</summary>
     public IEnumerable<ChatChunk> Stream(ChatRequest request, CancellationToken cancellationToken = default)
     {

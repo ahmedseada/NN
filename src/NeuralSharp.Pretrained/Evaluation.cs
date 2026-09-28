@@ -59,12 +59,34 @@ public static partial class ChatEvaluation
     /// <summary>
     /// Evaluates <paramref name="chat"/> on <paramref name="conversations"/> (rows {"messages": [...]} as datasets give them;
     /// rows without a final assistant message are skipped). <paramref name="progress"/> gets each answer as it is scored.
+    /// With <paramref name="batchSize"/> above 1, that many conversations are answered together
+    /// (<see cref="ChatGenerator.ChatBatch"/>: the same greedy answers, generated in one pass per token).
     /// </summary>
     public static EvaluationReport Run(ChatGenerator chat, IEnumerable<JsonObject> conversations, AnswerMetric metric = AnswerMetric.Auto,
-        int maxNewTokens = 512, bool? think = null, IProgress<EvaluatedAnswer>? progress = null, int contextLength = 4096, CancellationToken cancellationToken = default)
+        int maxNewTokens = 512, bool? think = null, IProgress<EvaluatedAnswer>? progress = null, int contextLength = 4096, CancellationToken cancellationToken = default,
+        int batchSize = 1)
     {
         var answers = new List<EvaluatedAnswer>();
         var watch = Stopwatch.StartNew();
+        var options = new GenerationOptions { Temperature = 0f, TopK = 1, TopP = 1f, RepeatPenalty = 1f, NumPredict = maxNewTokens, NumCtx = contextLength };
+        var pending = new List<(ChatRequest Request, List<ChatMessage> Prompt, string Reference)>();
+        void Answer()
+        {
+            var replies = pending.Count == 1 || batchSize <= 1
+                ? [.. pending.Select(p => chat.Chat(p.Request, cancellationToken))]
+                : chat.ChatBatch([.. pending.Select(p => p.Request)], cancellationToken);
+            for (int i = 0; i < pending.Count; i++)
+            {
+                string answer = replies[i].Message?.Content ?? "";
+                var result = new EvaluatedAnswer(pending[i].Prompt, pending[i].Reference, answer, Score(metric, answer, pending[i].Reference),
+                    replies[i].Stats?.GeneratedTokens ?? 0);
+                answers.Add(result);
+                progress?.Report(result);
+            }
+
+            pending.Clear();
+        }
+
         foreach (var row in conversations)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -82,13 +104,16 @@ public static partial class ChatEvaluation
                 metric = FinalMarker().IsMatch(reference) ? AnswerMetric.Number : AnswerMetric.F1;
             }
 
-            var reply = chat.Chat(new ChatRequest(prompt, transcript.Tools.Count > 0 ? transcript.Tools : null, think,
-                new GenerationOptions { Temperature = 0f, TopK = 1, TopP = 1f, RepeatPenalty = 1f, NumPredict = maxNewTokens, NumCtx = contextLength }),
-                cancellationToken);
-            string answer = reply.Message?.Content ?? "";
-            var result = new EvaluatedAnswer(prompt, reference, answer, Score(metric, answer, reference), reply.Stats?.GeneratedTokens ?? 0);
-            answers.Add(result);
-            progress?.Report(result);
+            pending.Add((new ChatRequest(prompt, transcript.Tools.Count > 0 ? transcript.Tools : null, think, options), prompt, reference));
+            if (pending.Count >= Math.Max(1, batchSize))
+            {
+                Answer();
+            }
+        }
+
+        if (pending.Count > 0)
+        {
+            Answer();
         }
 
         return new EvaluationReport(metric == AnswerMetric.Auto ? AnswerMetric.F1 : metric, answers, double.NaN, watch.Elapsed);

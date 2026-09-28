@@ -553,6 +553,14 @@ internal abstract class Backend
     public virtual bool AttentionSegmented(Storage q, Storage keys, Storage values, Storage y, Storage? logSumExp, Storage starts, Storage ends,
         int heads, int headsPerRow, int rowsPerHead, int steps, int dim, float scale) => false;
 
+    /// <summary>
+    /// <see cref="AttentionTiled"/> (no log-sum-exp) for rows of different lengths decoded together: row i of head h
+    /// sees cached positions c with starts[(h / headsPerRow)·steps + i % steps] ≤ c ≤ position[0] + i % steps (a row with
+    /// none, padding, gets zeros). Returns false when the device has no such pass.
+    /// </summary>
+    public virtual bool AttentionRows(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage starts, int heads, int headsPerRow,
+        int rowsPerHead, int steps, int capacity, int dim, float scale) => false;
+
     /// <summary>Whether <see cref="AttentionSegmented"/> and its gradient run for this head size (with the current <see cref="MixedPrecision"/>).</summary>
     public virtual bool SupportsSegmentedAttention(int dim) => false;
 

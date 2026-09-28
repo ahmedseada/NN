@@ -125,6 +125,159 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
     }
 
     /// <summary>
+    /// Whether <see cref="GenerateBatch"/> decodes several prompts together on this model and device (attention from
+    /// per-row starts: on CUDA, bfloat16 tensor cores with head size 64 or 128); otherwise it runs them one by one.
+    /// </summary>
+    public bool SupportsBatches =>
+        Model.Descendants().OfType<CausalSelfAttention>().ToList() is { Count: > 0 } attention
+        && !Model.Descendants().Any(m => m is MultiHeadAttention or PositionalEncoding)
+        && attention.All(a => Device.Backend.SupportsSegmentedAttention(a.HeadDim));
+
+    /// <summary>
+    /// Generates the continuations of several prompts together (one batch through the model per token, so the GPU
+    /// reads each weight once for all of them): the prompts are padded on the left to end at the same position, and each
+    /// row numbers its positions and attends from its own start, so every row gets what it would get alone. The same
+    /// options apply to every prompt; repetition penalties are not supported (use <see cref="Generate"/>). Runs the
+    /// prompts one by one when the model cannot batch them (<see cref="SupportsBatches"/>).
+    /// </summary>
+    public IReadOnlyList<(string Text, string DoneReason, GenerationStats Stats)> GenerateBatch(IReadOnlyList<string> prompts, GenerationOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(prompts);
+        if (prompts.Count == 0)
+        {
+            return [];
+        }
+
+        bool penalties = options.RepeatPenalty != 1f || options.PresencePenalty != 0f || options.FrequencyPenalty != 0f;
+        if (prompts.Count == 1 || penalties || !SupportsBatches)
+        {
+            return [.. prompts.Select(p => Generate(p, options, cancellationToken))];
+        }
+
+        var total = Stopwatch.StartNew();
+        int rows = prompts.Count;
+        int context = Math.Clamp(options.NumCtx, 2, ContextLength);
+        var tokens = prompts.Select(p =>
+        {
+            var ids = Tokenizer.Encode(p).ToList();
+            if (ids.Count == 0)
+            {
+                ids.Add(0);
+            }
+
+            return ids.Count > context - 1 ? ids.GetRange(ids.Count - (context - 1), context - 1) : ids;
+        }).ToList();
+        int promptLength = tokens.Max(t => t.Count);
+        int limit = Math.Min(options.NumPredict > 0 ? Math.Min(options.NumPredict, MaxTokens) : MaxTokens, context - promptLength);
+        limit = Math.Max(1, limit);
+        var stops = options.Stop.Where(x => x.Length > 0).ToArray();
+        var starts = tokens.Select(t => promptLength - t.Count).ToArray();
+        var input = new float[rows * promptLength];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int i = 0; i < tokens[r].Count; i++)
+            {
+                input[r * promptLength + starts[r] + i] = tokens[r][i];
+            }
+        }
+
+        using var sampler = new TokenSampler(Device, rows, Tokenizer.VocabularySize, limit + 1, 1)
+        {
+            Temperature = options.Temperature,
+            TopK = options.TopK,
+            TopP = options.TopP,
+            MinP = options.MinP,
+            Seed = (uint)(options.Seed ?? Random.Shared.Next()),
+        };
+        using var decoding = new DecodingContext(Device, rows, promptLength + limit, KeyValueFormat.Float32) { LastPositionOnly = true };
+        decoding.SetRowStarts(starts);
+        var generated = Enumerable.Range(0, rows).Select(_ => new List<int>()).ToList();
+        var ends = new int?[rows];                                            // text length where a stop sequence begins
+        Model.Eval();
+        TimeSpan promptDuration;
+        using (Autograd.NoGrad())
+        using (var scope = new TensorScope())
+        {
+            sampler.Sample(Model.ForwardCached(Tensor.From(input, [rows, promptLength], Device), decoding));
+        }
+
+        promptDuration = total.Elapsed;
+        int produced = 1, read = 0;
+        bool Finished()
+        {
+            foreach (var step in sampler.Read(read, produced))
+            {
+                for (int r = 0; r < rows; r++)
+                {
+                    if (ends[r] is null)
+                    {
+                        generated[r].Add(step[r].Id);
+                    }
+                }
+            }
+
+            read = produced;
+            for (int r = 0; r < rows; r++)
+            {
+                if (ends[r] is null && stops.Length > 0)
+                {
+                    string text = Tokenizer.Decode(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(generated[r]));
+                    int at = stops.Select(x => text.IndexOf(x, StringComparison.Ordinal)).Where(i => i >= 0).DefaultIfEmpty(-1).Min();
+                    if (at >= 0)
+                    {
+                        ends[r] = at;
+                    }
+                }
+            }
+
+            return ends.All(e => e is not null);
+        }
+
+        while (produced < limit && !cancellationToken.IsCancellationRequested)
+        {
+            if (produced % Math.Max(1, options.ChunkSize) == 0 && Finished())
+            {
+                break;
+            }
+
+            using (Autograd.NoGrad())
+            using (var scope = new TensorScope())
+            {
+                sampler.Sample(Model.ForwardCached(sampler.Ids.Reshape(rows, 1), decoding));
+            }
+
+            produced++;
+        }
+
+        Finished();
+        var elapsed = total.Elapsed;
+        var results = new List<(string, string, GenerationStats)>(rows);
+        for (int r = 0; r < rows; r++)
+        {
+            var ids = generated[r];
+            string text = Tokenizer.Decode(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(ids));
+            int count = ids.Count;
+            if (ends[r] is int end)
+            {
+                // The tokens up to the one that completes the stop sequence.
+                count = 1;
+                while (count < ids.Count && Tokenizer.Decode(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(ids)[..count]).Length < end + 1)
+                {
+                    count++;
+                }
+
+                text = text[..end];
+            }
+
+            results.Add((text, ends[r] is null ? "length" : "stop",
+                new GenerationStats(tokens[r].Count, promptDuration, count, elapsed - promptDuration, elapsed, 0)));
+        }
+
+        return results;
+    }
+
+    /// <summary>
     /// <see cref="Stream"/> on a background thread, as an <c>await foreach</c> stream: the same chunks, and the calling
     /// thread (a UI or request thread) is never blocked by the model.
     /// </summary>

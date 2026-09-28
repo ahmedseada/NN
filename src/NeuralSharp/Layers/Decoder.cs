@@ -350,6 +350,22 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         int n = input.Shape[0], t = input.Shape[1];
         var positions = context.Positions ?? throw new InvalidOperationException("Call DecodingContext.BeginStep first.");
         var cache = context.CacheFor(this, n * KvHeads, HeadDim);
+        if (context.RowStarts is not null)
+        {
+            // Rows of different lengths: positions per token, and each row attends from its own start.
+            if (cache.Format != KeyValueFormat.Float32)
+            {
+                throw new NotSupportedException("Rows of different lengths need a float32 key/value cache.");
+            }
+
+            var (rq, rk, rv) = Project(input, context.TokenPositions!, packed: true);
+            Tensor.WriteKeyValues(rk!, cache.Keys, context.Position);
+            Tensor.WriteKeyValues(rv!, cache.Values, context.Position);
+            var rows = Tensor.AttentionRows(q: rq, cache.Keys, cache.Values, context.Position, t, 1f / MathF.Sqrt(HeadDim), context.TokenStarts!, KvHeads)
+                       ?? throw new NotSupportedException($"Rows of different lengths need attention from per-row starts, which {input.Device} does not provide for head size {HeadDim} (on CUDA: bfloat16 tensor cores, head size 64 or 128).");
+            return MergeHeads(rows, n, t);
+        }
+
         var (q, k, v) = Project(input, positions, cache, context.Position);   // k and v null: already in the cache
         float scale = 1f / MathF.Sqrt(HeadDim);
         Tensor context8;
@@ -856,8 +872,9 @@ public sealed class PositionEmbedding : Module, ICachedModule
     }
 
     /// <inheritdoc />
-    public Tensor ForwardCached(Tensor input, DecodingContext context) =>
-        input + Weight.EmbeddingLookup(context.Positions ?? throw new InvalidOperationException("Call DecodingContext.BeginStep first."));
+    public Tensor ForwardCached(Tensor input, DecodingContext context) => context.TokenPositions is { } positions
+        ? input + Weight.EmbeddingLookup(positions).Reshape(input.Shape)                     // rows of different lengths
+        : input + Weight.EmbeddingLookup(context.Positions ?? throw new InvalidOperationException("Call DecodingContext.BeginStep first."));
 
     /// <inheritdoc />
     public override IEnumerable<Tensor> Parameters() => [Weight];

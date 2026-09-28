@@ -168,6 +168,30 @@ public sealed class DecodingContext : IDisposable
     /// <summary>The current step's position indices, [newSteps] (set by <see cref="BeginStep"/>).</summary>
     public Tensor? Positions { get; private set; }
 
+    /// <summary>
+    /// Rows of different lengths decoded together: row b's sequence starts at position RowStarts[b] (its prompt padded
+    /// on the left so every row's prompt ends at the same position). Its tokens are numbered from there and see no earlier
+    /// position. Null (the default): every row starts at 0. Needs a <see cref="KeyValueFormat.Float32"/> cache.
+    /// </summary>
+    public IReadOnlyList<int>? RowStarts { get; private set; }
+
+    /// <summary>Sets <see cref="RowStarts"/> (one start per row; null: all rows start at 0).</summary>
+    public void SetRowStarts(IReadOnlyList<int>? starts)
+    {
+        if (starts is not null && (starts.Count != Batch || starts.Any(s => s < 0 || s >= Capacity)))
+        {
+            throw new ArgumentException($"Row starts: one per row ({Batch}), each within the capacity ({Capacity}).");
+        }
+
+        RowStarts = starts?.ToArray();
+    }
+
+    /// <summary>With <see cref="RowStarts"/>: the current step's position of each new token within its row's sequence, [batch · newSteps].</summary>
+    internal Tensor? TokenPositions { get; private set; }
+
+    /// <summary>With <see cref="RowStarts"/>: each new token's row start, [batch · newSteps].</summary>
+    internal Tensor? TokenStarts { get; private set; }
+
     /// <summary>Prepares mask and positions for <paramref name="steps"/> new positions (all computed on the device).</summary>
     public void BeginStep(int steps)
     {
@@ -178,6 +202,23 @@ public sealed class DecodingContext : IDisposable
 
         _steps = steps;
         InStep = true;
+        if (RowStarts is { } starts)
+        {
+            var positions = new float[Batch * steps];
+            var first = new float[Batch * steps];
+            for (int b = 0; b < Batch; b++)
+            {
+                for (int t = 0; t < steps; t++)
+                {
+                    positions[b * steps + t] = Math.Max(0, Length + t - starts[b]);      // padding: position 0 (it attends to nothing)
+                    first[b * steps + t] = starts[b];
+                }
+            }
+
+            TokenPositions = Tensor.Persistent(positions, [Batch * steps], Device, requiresGrad: false);
+            TokenStarts = Tensor.Persistent(first, [Batch * steps], Device, requiresGrad: false);
+        }
+
         if (steps == 1)
         {
             Positions = Position;
@@ -211,6 +252,11 @@ public sealed class DecodingContext : IDisposable
     /// </summary>
     public ComputeGraph CaptureStep(Action step)
     {
+        if (RowStarts is not null)
+        {
+            throw new InvalidOperationException("Steps with row starts upload positions from the host and cannot be recorded.");
+        }
+
         int length = Length;
         var graph = ComputeGraph.Capture(Device, step);
         Length = length;   // recording does not execute the step
@@ -222,6 +268,10 @@ public sealed class DecodingContext : IDisposable
     {
         _mask?.Dispose();
         _mask = null;
+        TokenPositions?.Dispose();
+        TokenPositions = null;
+        TokenStarts?.Dispose();
+        TokenStarts = null;
         InStep = false;
         Positions = null;
     }
