@@ -138,6 +138,15 @@ internal sealed unsafe partial class CudaBackend
         }
     }
 
+    // k splits of a prompt-sized packed product: up to four blocks per SM, chunks of 256 k or more; none when the tiles
+    // already fill one wave (85-100% of the SMs: splitting then only adds the zeroing and atomic additions; --bench-gemv,
+    // 180 rows, q+k+v in one launch = 64 tiles on 70 SMs: 35.3 us unsplit against 41.5 with 4 splits).
+    private int PromptSplits(int tiles, int k)
+    {
+        int sms = Math.Max(1, _multiprocessors);
+        return tiles * 100 >= sms * 85 && tiles <= sms ? 1 : Math.Clamp(Math.Min(k / 256, 4 * sms / tiles), 1, 8);
+    }
+
     public override bool PackedMatMulLarge(int kind, Storage x, Storage packed, Storage? scales, Storage y, int m, int n, int k)
     {
         if (m < 64 || n < 64 || k < 8)
@@ -160,7 +169,7 @@ internal sealed unsafe partial class CudaBackend
             // more, partial sums added into the zeroed output.
             int rowTiles = (m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile, columnTiles = (n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
             int splits = PackedSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 32))
-                : Math.Clamp(Math.Min(k / 256, 4 * Math.Max(1, _multiprocessors) / (rowTiles * columnTiles)), 1, 8);
+                : PromptSplits(rowTiles * columnTiles, k);
             if (splits > 1)
             {
                 Check(cuMemsetD32Async(P(y), 0, (nuint)((long)m * n), _stream), nameof(cuMemsetD32Async));
@@ -212,7 +221,7 @@ internal sealed unsafe partial class CudaBackend
         int perWord = kind switch { 0 => 4, 1 => 8, _ => 2 };
         int rowTiles = (m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile;
         int splits = PackedSplits is int forced ? Math.Clamp(forced, 1, Math.Max(1, k / 32))
-            : Math.Clamp(Math.Min(k / 256, 4 * Math.Max(1, _multiprocessors) / (rowTiles * columnTiles)), 1, 8);
+            : PromptSplits(rowTiles * columnTiles, k);
         if (_profile is not null)
         {
             _profileLabel = $"gemm_tc_nn_{format}_multi {m}x{string.Join('+', products.ToArray().Select(p => p.Columns))}x{k}";

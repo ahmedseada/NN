@@ -42,7 +42,7 @@ Measured on an RTX 5070 Ti (70 SMs, 16 GB). Resume from here when returning to o
 | Qwen3-0.6B int8, bf16 KV cache: greedy decoding | 391 tok/s | 474 tok/s |
 | Chat sampling (temperature 0.6, top-k 20, top-p 0.95) | 227 tok/s | 249 tok/s |
 | Kernel launches per decoded token | 345 | 177 |
-| 180-token prompt pass | 13.6 ms | 9.0 ms |
+| 180-token prompt pass | 13.6 ms | 8.4 ms (products 5.5 ms at 39 TFLOPS) |
 | Decoding attention, 4000 cached positions | 76 µs | 38 µs |
 | 1.25B char model training step, FP8 | 592 ms | 560 ms (548 with delayed scaling) |
 | 1.25B char model training step, bfloat16 | 736 ms | 712 ms |
@@ -54,7 +54,9 @@ What changed:
   split decoding attention merged by its last block; packed GEMVs with the residual addition and next RMSNorm
   (`*_gemv_addnorm_f32`) and with the gated activation (`*_gemv_multi_act_f32`); GEMV k splits ≈ 2 blocks per SM
   (power of two); decoding attention ≈ 5 blocks per SM over the cache.
-- Prompts: packed tensor-core products split k up to ≈ 4 blocks per SM.
+- Prompts: packed tensor-core products split k up to ≈ 4 blocks per SM (none when the tiles fill one wave); layers
+  sharing an input (q/k/v, gate/up) in one launch (`gemm_tc_nn_*w_multi_f32`): q/k/v 1.84 → 1.20 ms and gate/up
+  2.24 → 1.66 ms per 180-token pass, 367 → 283 launches.
 - Training: plain tensor-core products with fewer than 4 output tiles per SM split k (≈ 16 blocks per SM, ≤ 8 splits,
   ≥ 1024 k each). Delayed FP8 column scaling (kept per-column maxima with 2× headroom, recorded in the same pass,
   correction pass for columns that more than doubled) behind `NEURALSHARP_FP8_DELAYED=1`.
@@ -93,10 +95,10 @@ products run at about 30 TFLOPS against the 78 its GEMM reaches on large shapes 
    ~31% of the memory-bandwidth ceiling (~1.5k tok/s for this model).
 4. **INT8 prefill on int8 tensor cores:** prompt products currently expand int8 weights to bfloat16 tiles; the int8
    tensor-core path needs a second, k-major copy of the weights (memory cost: the int8 weights once more).
-5. **Prompt products (180 rows): 17–35 TFLOPS** (`gemm_tc_nn_int8w`, largest 180×3072×1024 at 2.2 ms per pass) against
-   78 on large shapes. Only 2 row tiles of 128: a 64-row tile variant or wider split-k, and fusing the q/k/v and gate/up
-   products into one launch each (as decoding does), are the candidates. This is where the 2.3× prompt lead over
-   PyTorch can grow.
+5. **Prompt products (180 rows):** q/k/v and gate/up now run in one launch each (35–38 TFLOPS); the o and down products
+   (180×1024×2048, 180×1024×3072) stay at 29–35 TFLOPS against 78 on large shapes. 180 rows fill only 1.4 of the two
+   128-row tiles: a 64-row tile variant is the next candidate, then the gated activation and the residual + norm in
+   the prompt products' epilogues. This is where the prompt lead over PyTorch (2.3× at 9.2 ms; now 8.4 ms) can grow.
 6. **Training step outside the products** (1.25B, FP8): `adam8` 34 ms, flash-attention backward 32 ms, `sumsq` for
    gradient clipping 9 ms, `fill` (zeroing gradients) 8 ms, dropout 10 ms. Candidates: the first gradient write with
    beta 0 instead of zeroing, clipping's norm fused into the backward pass.
