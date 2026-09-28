@@ -117,6 +117,12 @@ try
                 var rows = status.Track(spec.Open(downloads), "reading").Take((int)Math.Min(take, int.MaxValue)).ToList();
                 Console.WriteLine($"  columns: {string.Join(", ", rows.SelectMany(r => r.Select(p => p.Key)).Distinct())}");
                 Console.WriteLine($"  layout:  {(rows.Count > 0 ? ChatRows.Describe(rows[0]) ?? "not recognized (map columns with user=…&assistant=…)" : "no rows")}");
+                if (rows.Count == 0)
+                {
+                    Console.WriteLine(spec.Source.StartsWith("github:", StringComparison.OrdinalIgnoreCase)
+                        ? "  hint: nothing matched. Check the files= pattern, and the branch: without @branch the default branch is read (github:owner/repo@branch)."
+                        : "  hint: nothing matched. Check the split, config and files= options.");
+                }
                 foreach (var row in rows)
                 {
                     Console.WriteLine($"  row:        {Short(row)}");

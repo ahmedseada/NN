@@ -161,7 +161,8 @@ internal static partial class Tests
                 }
             }
 
-            web.Bytes("https://api.github.com/repos/owner/app/tarball", tarball.ToArray(), requireToken: "gh_secret");
+            web.Json("https://api.github.com/repos/owner/app/commits/HEAD", "1a2b3c4d5e6f7a8b9c0d");
+            web.Bytes("https://api.github.com/repos/owner/app/tarball/1a2b3c4d5e6f7a8b9c0d", tarball.ToArray(), requireToken: "gh_secret");
             var code = GitHub.Repository("owner/app", token: "gh_secret", downloader: downloader).ToList();
             Check(code.Select(r => (string)r["path"]!).Order().SequenceEqual(["data/rows.jsonl", "src/Program.cs", "web/main.ts"]) && code.All(r => (string?)r["repo"] == "owner/app"),
                 $"github repository: {string.Join(", ", code.Select(r => r["path"]))}");

@@ -281,10 +281,17 @@ public static class GitHub
     public static Dataset Repository(string repo, string? reference = null, string? pattern = null, string? token = null, Downloader? downloader = null)
     {
         var d = downloader ?? Downloader.Shared;
-        string url = $"{Api}/repos/{repo}/tarball{(reference is null ? "" : "/" + Uri.EscapeDataString(reference))}";
         var options = new ReadOptions { Documents = true, Text = TextRows.Document, Pattern = pattern is null ? null : pattern.Contains('/') ? "*/" + pattern : pattern };
         return RemoteFiles.Over($"github:{repo}{(reference is null ? "" : "@" + reference)}",
-            () => [d.DownloadAsync(url, Headers(token), $"{repo.Replace('/', '-')}{(reference is null ? "" : "-" + reference)}.tar.gz").GetAwaiter().GetResult()],
+            () =>
+            {
+                // The branch or tag names a commit; snapshots are cached per commit, so a new push is fetched again.
+                string commit = d.GetStringAsync($"{Api}/repos/{repo}/commits/{Uri.EscapeDataString(reference ?? "HEAD")}", Headers(token, "application/vnd.github.sha"))
+                    .GetAwaiter().GetResult().Trim();
+                d.Log?.Invoke($"github:{repo}: {reference ?? "default branch"} is at commit {commit[..Math.Min(7, commit.Length)]}");
+                string url = $"{Api}/repos/{repo}/tarball/{commit}";
+                return [d.DownloadAsync(url, Headers(token), $"{repo.Replace('/', '-')}-{commit[..Math.Min(12, commit.Length)]}.tar.gz").GetAwaiter().GetResult()];
+            },
             options,
             post: row =>
             {
