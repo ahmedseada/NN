@@ -85,7 +85,7 @@ public sealed class Downloader
     public async Task<string> DownloadAsync(string url, IReadOnlyDictionary<string, string>? headers = null, string? cachePath = null,
         CancellationToken cancellationToken = default)
     {
-        string target = Path.Combine([CacheFolder, .. Segments(cachePath ?? UrlPath(url))]);
+        string target = PathFor(cachePath ?? UrlPath(url));
         string folder = Path.GetDirectoryName(target)!;
         if (File.Exists(target) && !Refresh)
         {
@@ -255,6 +255,9 @@ public sealed class Downloader
         string detail = body.Length > 300 ? body[..300] + "…" : body;
         return new HttpRequestException($"{url}: {(int)status} {status}{hint}. {detail}".TrimEnd(), null, status);
     }
+
+    /// <summary>The local path a cache path (as given to <see cref="DownloadAsync"/>) maps to, whether or not it is downloaded yet.</summary>
+    public string PathFor(string cachePath) => Path.Combine([CacheFolder, .. Segments(cachePath)]);
 
     // urls/<host>/<path>; a query string becomes a short hash in the file name, so different queries do not collide.
     private static string UrlPath(string url)

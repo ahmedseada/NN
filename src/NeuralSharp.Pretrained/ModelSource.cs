@@ -68,15 +68,21 @@ public static class ModelSource
         }
 
         var chosen = Choose(repo, files);
-        d.Log?.Invoke($"{repo}: {chosen.Count} of {files.Count} files needed ({Downloader.Size(chosen.Sum(f => f.Size))})");
-        string? folder = null;
-        foreach (var file in chosen)
+        string folder = d.PathFor($"huggingface/models/{repo}/{commit[..Math.Min(12, commit.Length)]}");
+        var missing = chosen.Where(f => !File.Exists(Path.Combine(folder, f.Path)) || d.Refresh).ToList();
+        if (missing.Count == 0)
         {
-            string local = await HuggingFace.DownloadFileAsync(repo, file.Path, "models", commit, token, d, cancellationToken).ConfigureAwait(false);
-            folder ??= Path.GetDirectoryName(local);
+            d.Log?.Invoke($"{repo}: all {chosen.Count} files cached ({Downloader.Size(chosen.Sum(f => new FileInfo(Path.Combine(folder, f.Path)).Length))})");
+            return folder;
         }
 
-        return folder!;
+        d.Log?.Invoke($"{repo}: {chosen.Count} of {files.Count} files needed ({Downloader.Size(chosen.Sum(f => f.Size))}), {missing.Count} to download");
+        foreach (var file in missing)
+        {
+            await HuggingFace.DownloadFileAsync(repo, file.Path, "models", commit, token, d, cancellationToken).ConfigureAwait(false);
+        }
+
+        return folder;
     }
 
     // The files a model needs: its configuration, tokenizer and chat template, and the safetensors weights (the shards the
