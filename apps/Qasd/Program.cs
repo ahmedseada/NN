@@ -24,7 +24,7 @@ const string Usage = """
     Options:
       --text C            column with the text (default raw_question if present, else text)
       --label C           column with the label (default intent if present, else label)
-      --device D          auto | cpu | cuda | cuda:N (default auto: the GPU when there is one)
+      --device D          cpu | cuda | cuda:N | auto (default cpu; --cuda to train on the GPU, auto: the GPU when there is one)
       --test-fraction F   train: distinct texts held out for the test (default 0.2; 0 = train on everything)
       --epochs N, --batch-size N, --buckets N (16384), --hidden N (256), --lr F (0.002), --seed N, --patience N (8)
       --json              predict: one JSON object per text (label, confidence, probabilities)
@@ -93,7 +93,7 @@ Console.OutputEncoding = Encoding.UTF8;
 var jsonOutput = new System.Text.Json.JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 try
 {
-    var device = ParseDevice(deviceName ?? "auto");
+    var device = ParseDevice(deviceName ?? "cpu");
 
     switch (command)
     {

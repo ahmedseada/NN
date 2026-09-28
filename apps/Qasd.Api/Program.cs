@@ -25,7 +25,8 @@ app.UseExceptionHandler();
 app.Services.GetRequiredService<ModelHost>();                                   // load the model now: fail at startup, not on the first request
 app.MapOpenApi();
 app.MapScalarApiReference(options => options.WithTitle("Qasd: intent classifier"));
-app.MapGet("/", () => Results.Redirect("/scalar")).ExcludeFromDescription();
+app.UseDefaultFiles();                                                           // / → wwwroot/index.html, the test page
+app.UseStaticFiles();
 app.MapHealthChecks("/health");
 
 var api = app.MapGroup("/v1").WithTags("Intents");
@@ -52,8 +53,10 @@ api.MapPost("/classify/batch", Results<Ok<ClassifyBatchResponse>, ValidationProb
         }
 
         using var lease = host.Lease();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         var predictions = lease.Classifier.Predict(request.Texts);
-        return TypedResults.Ok(new ClassifyBatchResponse([.. request.Texts.Zip(predictions, (text, p) => Response(text, p, options.Value))]));
+        double elapsed = clock.Elapsed.TotalMilliseconds;
+        return TypedResults.Ok(new ClassifyBatchResponse([.. request.Texts.Zip(predictions, (text, p) => Response(text, p, options.Value))], elapsed));
     })
     .WithName("ClassifyBatch")
     .WithSummary("Classify several messages")

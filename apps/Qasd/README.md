@@ -19,7 +19,7 @@ maps it to the intents.
 ## Train
 
 ```
-dotnet run -c Release --project apps/Qasd -- train plan-queries.csv --out models/intents.nsm --cuda
+dotnet run -c Release --project apps/Qasd -- train plan-queries.csv --out models/intents.nsm          (CPU; add --cuda for the GPU)
 ```
 
 The columns default to `raw_question` (text) and `intent` (label); `--text` / `--label` pick others. 20% of the distinct
@@ -41,7 +41,14 @@ dotnet run -c Release --project apps/Qasd -- evaluate models/intents.nsm new-lab
 dotnet run -c Release --project apps/Qasd.Api
 ```
 
-Then open http://localhost:5080 (the Scalar API reference, where every endpoint can be tried). The model file and
+Then open http://localhost:5080: a test page (messages on the left, one per line; each message's intent, confidence
+and probabilities with the round-trip and model times on the right). The Scalar API reference, where every endpoint
+can be tried, is at http://localhost:5080/scalar.
+
+![The test page](docs/qasd-light.png)
+
+On the CPU, inference skips the dense product: a message sets a few hundred of the 16,384 features, so the first layer
+adds up those rows of its weights (about 0.1 ms per message, 40,000 messages per second in batches on 4 cores). The model file and
 settings come from `appsettings.json` (section `IntentModel`), or environment variables such as
 `IntentModel__Path=D:\models\intents.nsm`:
 

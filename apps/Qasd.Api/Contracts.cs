@@ -23,7 +23,8 @@ public sealed record ClassifyResponse(string Text, string Label, float Confidenc
 
 /// <summary>The classifications of a batch, in the order of the request.</summary>
 /// <param name="Results">One per message.</param>
-public sealed record ClassifyBatchResponse(IReadOnlyList<ClassifyResponse> Results);
+/// <param name="ElapsedMilliseconds">Time the service spent classifying them (without the network).</param>
+public sealed record ClassifyBatchResponse(IReadOnlyList<ClassifyResponse> Results, double ElapsedMilliseconds);
 
 /// <summary>The model being served.</summary>
 /// <param name="Path">The model file.</param>

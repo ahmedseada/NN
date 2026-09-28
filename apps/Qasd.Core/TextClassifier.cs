@@ -49,7 +49,7 @@ public sealed record TextClassifierOptions
     /// <summary>Seed for the initial weights, the split and the batch order (the same data and seed give the same model).</summary>
     public int Seed { get; init; }
 
-    /// <summary>Where the model trains and runs (default <see cref="NeuralSharp.Device.Default"/>).</summary>
+    /// <summary>Where the model trains and runs (default: the CPU; pass a CUDA device to train on the GPU).</summary>
     public Device? Device { get; init; }
 }
 
@@ -166,7 +166,7 @@ public sealed class TextClassifier : IDisposable
             throw new ArgumentException($"Training needs texts of at least two labels; got {labels.Length}.", nameof(examples));
         }
 
-        var device = options.Device ?? Device.Default;
+        var device = options.Device ?? Device.Cpu;
         var (train, validation) = options.ValidationFraction > 0 ? Split(all, options.ValidationFraction, options.Seed + 1) : (all, []);
         if (train.Count == 0)
         {
@@ -269,6 +269,82 @@ public sealed class TextClassifier : IDisposable
         }
 
         _model.Eval();
+        SnapshotWeights();
+    }
+
+    // CPU inference without the dense product: a text sets a few hundred of the buckets, so the first layer is the sum of
+    // those rows of W1 (scaled by the feature values) instead of a mostly-zero [n, buckets] · [buckets, hidden] product.
+    // Snapshot of the trained weights on the host; null while training (the weights still change) or on the GPU.
+    private sealed record HostWeights(float[] W1, float[] B1, float[] W2, float[] B2, int Hidden, int Classes);
+
+    private HostWeights? _host;
+
+    private void SnapshotWeights()
+    {
+        _host = null;
+        if (Device.Type != DeviceType.Cpu)
+        {
+            return;
+        }
+
+        var parameters = _model.Parameters().ToList();                    // W1 [buckets, hidden], b1, W2 [hidden, classes], b2
+        _host = new HostWeights(parameters[0].ToArray(), parameters[1].ToArray(), parameters[2].ToArray(), parameters[3].ToArray(),
+            parameters[0].Shape[1], parameters[2].Shape[1]);
+    }
+
+    private float[] HostProbabilities(HostWeights w, string text)
+    {
+        var hidden = (float[])w.B1.Clone();
+        foreach (var (bucket, value) in _features.Sparse(text))
+        {
+            var row = w.W1.AsSpan(bucket * w.Hidden, w.Hidden);
+            for (int j = 0; j < w.Hidden; j++)
+            {
+                hidden[j] += value * row[j];
+            }
+        }
+
+        var logits = (float[])w.B2.Clone();
+        for (int j = 0; j < w.Hidden; j++)
+        {
+            float h = MathF.Max(0f, hidden[j]);                          // ReLU (dropout is off at inference)
+            if (h == 0f)
+            {
+                continue;
+            }
+
+            var row = w.W2.AsSpan(j * w.Classes, w.Classes);
+            for (int c = 0; c < w.Classes; c++)
+            {
+                logits[c] += h * row[c];
+            }
+        }
+
+        float max = logits.Max(), sum = 0f;
+        for (int c = 0; c < logits.Length; c++)
+        {
+            logits[c] = MathF.Exp(logits[c] - max);
+            sum += logits[c];
+        }
+
+        for (int c = 0; c < logits.Length; c++)
+        {
+            logits[c] /= sum;
+        }
+
+        return logits;
+    }
+
+    private TextPrediction Prediction(ReadOnlySpan<float> p)
+    {
+        var all = new List<(string Label, float Probability)>(p.Length);
+        for (int c = 0; c < p.Length; c++)
+        {
+            all.Add((Labels[c], p[c]));
+        }
+
+        all.Sort((a, b) => b.Probability.CompareTo(a.Probability));
+        return new TextPrediction(all[0].Label, all[0].Probability, all);
     }
 
     /// <summary>The label of <paramref name="text"/>, with probabilities.</summary>
@@ -278,6 +354,25 @@ public sealed class TextClassifier : IDisposable
     public IReadOnlyList<TextPrediction> Predict(IReadOnlyList<string> texts)
     {
         ArgumentNullException.ThrowIfNull(texts);
+        if (_host is { } host)
+        {
+            // The trained weights on the host: no lock needed, texts in parallel for larger batches.
+            var predictions = new TextPrediction[texts.Count];
+            if (texts.Count < 32)
+            {
+                for (int i = 0; i < texts.Count; i++)
+                {
+                    predictions[i] = Prediction(HostProbabilities(host, texts[i] ?? ""));
+                }
+            }
+            else
+            {
+                Parallel.For(0, texts.Count, i => predictions[i] = Prediction(HostProbabilities(host, texts[i] ?? "")));
+            }
+
+            return predictions;
+        }
+
         var results = new List<TextPrediction>(texts.Count);
         int buckets = _features.Buckets, classes = Labels.Count;
         const int Chunk = 256;
@@ -302,8 +397,7 @@ public sealed class TextClassifier : IDisposable
 
                 for (int i = 0; i < n; i++)
                 {
-                    var all = Enumerable.Range(0, classes).Select(c => (Labels[c], p[i * classes + c])).OrderByDescending(t => t.Item2).ToList();
-                    results.Add(new TextPrediction(all[0].Item1, all[0].Item2, all));
+                    results.Add(Prediction(p.AsSpan(i * classes, classes)));
                 }
             }
         }
@@ -361,7 +455,7 @@ public sealed class TextClassifier : IDisposable
         }
     }
 
-    /// <summary>Reads a model written by <see cref="Save"/>, onto <paramref name="device"/> (default <see cref="NeuralSharp.Device.Default"/>).</summary>
+    /// <summary>Reads a model written by <see cref="Save"/>, onto <paramref name="device"/> (default: the CPU).</summary>
     public static TextClassifier Load(string path, Device? device = null)
     {
         using var package = ModelPackage.Open(path);
@@ -375,10 +469,12 @@ public sealed class TextClassifier : IDisposable
         int buckets = (int)settings["buckets"]!, hidden = (int)settings["hidden"]!;
         float dropout = (float)settings["dropout"]!;
         float[] idf = [.. settings["idf"]!.AsArray().Select(v => (float)v!)];
-        var model = Network(buckets, hidden, labels.Length, dropout, 0, device ?? Device.Default);
+        var model = Network(buckets, hidden, labels.Length, dropout, 0, device ?? Device.Cpu);
         package.LoadWeights(model);
         model.Eval();
-        return new TextClassifier(model, new TextFeatures(buckets, idf), labels, hidden, dropout);
+        var classifier = new TextClassifier(model, new TextFeatures(buckets, idf), labels, hidden, dropout);
+        classifier.SnapshotWeights();
+        return classifier;
     }
 
     /// <summary>
@@ -476,6 +572,33 @@ internal sealed class TextFeatures(int buckets, float[] idf)
         }
 
         return new TextFeatures(buckets, [.. documents.Select(d => (float)Math.Log((1.0 + count) / (1.0 + d)) + 1f)]);
+    }
+
+    /// <summary>The non-zero features of <paramref name="text"/> (bucket, value), with the values <see cref="Write"/> gives.</summary>
+    public List<(int Bucket, float Value)> Sparse(string text)
+    {
+        var counts = new Dictionary<int, int>();
+        foreach (int bucket in Hashes(text, Buckets))
+        {
+            counts[bucket] = counts.GetValueOrDefault(bucket) + 1;
+        }
+
+        var features = new List<(int Bucket, float Value)>(counts.Count);
+        double norm = 0;
+        foreach (var (bucket, count) in counts)
+        {
+            float value = (float)(Math.Log(1 + count) * Idf[bucket]);
+            features.Add((bucket, value));
+            norm += value * value;
+        }
+
+        float scale = norm > 0 ? (float)(1 / Math.Sqrt(norm)) : 0f;
+        for (int i = 0; i < features.Count; i++)
+        {
+            features[i] = (features[i].Bucket, features[i].Value * scale);
+        }
+
+        return features;
     }
 
     public void Write(string text, Span<float> output)

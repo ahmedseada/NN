@@ -73,6 +73,7 @@ public sealed class ModelHost : IDisposable
             _ => throw new InvalidOperationException($"IntentModel:Device '{_options.Device}' is not auto, cpu, cuda or cuda:N."),
         };
         var classifier = TextClassifier.Load(path, device);
+        classifier.Predict(["warm up", "تسخين"]);                                 // compile and allocate now, not on the first request
         _logger.LogInformation("Loaded intent model {Path} on {Device}: {Labels}", Path.GetFullPath(path), device.Name, string.Join(", ", classifier.Labels));
         return new Handle(classifier, Path.GetFullPath(path), DateTimeOffset.UtcNow);
     }

@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qasd · Intent classifier</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --panel: #ffffff; --panel-2: #f0f2f5; --text: #15171c; --muted: #646b78; --border: #e1e4ea;
+    --accent: #4f46e5; --accent-2: #6366f1; --accent-text: #ffffff; --warn: #b45309; --warn-bg: #fef3c7; --danger: #b91c1c;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 4px 16px rgba(16, 24, 40, .06); --radius: 14px;
+    --c0: #4f46e5; --c1: #0d9488; --c2: #d97706; --c3: #db2777; --c4: #2563eb; --c5: #65a30d; --c6: #7c3aed; --c7: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1015; --panel: #161920; --panel-2: #1d2129; --text: #e8eaf0; --muted: #9aa1ae; --border: #2a2f39;
+      --accent: #818cf8; --accent-2: #6366f1; --accent-text: #0e1015; --warn: #fbbf24; --warn-bg: #3a2c0b; --danger: #f87171;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
+      --c0: #818cf8; --c1: #2dd4bf; --c2: #fbbf24; --c3: #f472b6; --c4: #60a5fa; --c5: #a3e635; --c6: #a78bfa; --c7: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans Arabic", sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 14px 28px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  .logo { width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; font-weight: 700; font-size: 18px;
+          color: #fff; background: linear-gradient(135deg, #4f46e5, #0d9488); }
+  .brand h1 { margin: 0; font-size: 17px; letter-spacing: -.01em; }
+  .brand p { margin: 0; font-size: 13px; color: var(--muted); }
+  .spacer { flex: 1; }
+  .badge { font-size: 12px; padding: 4px 10px; border-radius: 999px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); white-space: nowrap; }
+  .badge.ok::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #22c55e; margin-right: 6px; vertical-align: 1px; }
+  .badge.bad::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--danger); margin-right: 6px; vertical-align: 1px; }
+  header a { color: var(--accent); text-decoration: none; font-size: 13px; font-weight: 600; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: 20px; padding: 24px 28px; max-width: 1400px; margin: 0 auto; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 16px; } header { padding: 12px 16px; flex-wrap: wrap; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px; }
+  .card h2 { margin: 0 0 12px; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  .card h2 .hint { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: auto; }
+  .left { display: flex; flex-direction: column; gap: 16px; }
+  .right { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  textarea { width: 100%; min-height: 330px; resize: vertical; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--border);
+             background: var(--panel-2); color: var(--text); font: 15px/1.7 inherit; font-family: inherit; outline: none; unicode-bidi: plaintext; }
+  textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent); }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; font-weight: 600; border-radius: 10px; padding: 10px 18px; cursor: pointer; border: 1px solid var(--border); background: var(--panel); color: var(--text); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  button.primary:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .6; cursor: default; }
+  .kbd { font-size: 12px; color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip { font-size: 13px; padding: 6px 12px; border-radius: 999px; border: 1px dashed var(--border); background: transparent; color: var(--muted); font-weight: 500; unicode-bidi: plaintext; }
+  .chip:hover { color: var(--text); border-style: solid; }
+  .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+  @media (max-width: 600px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; box-shadow: var(--shadow); }
+  .stat .v { font-size: 22px; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 13px; font-weight: 500; color: var(--muted); margin-left: 2px; }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .dist { display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: var(--panel-2); }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 3px; background: var(--c); margin-right: 6px; }
+  .results { display: flex; flex-direction: column; gap: 10px; }
+  .result { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; background: var(--panel-2); }
+  .result .top { display: flex; gap: 12px; align-items: center; }
+  .result .text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; unicode-bidi: plaintext; }
+  .pill { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; color: #fff; background: var(--c); white-space: nowrap; }
+  .conf { font-variant-numeric: tabular-nums; font-weight: 600; width: 58px; text-align: right; }
+  .low { font-size: 11px; font-weight: 600; color: var(--warn); background: var(--warn-bg); padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+  .bars { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 20px; margin-top: 10px; }
+  @media (max-width: 600px) { .bars { grid-template-columns: 1fr; } }
+  .bar { display: grid; grid-template-columns: 96px 1fr 42px; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); }
+  .bar .track { height: 6px; border-radius: 999px; background: var(--border); overflow: hidden; }
+  .bar .fill { height: 100%; background: var(--c); border-radius: 999px; }
+  .bar .n { text-align: right; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); text-align: center; padding: 48px 12px; border: 1px dashed var(--border); border-radius: 12px; }
+  .model { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 13px; }
+  .model dt { color: var(--muted); }
+  .model dd { margin: 0; overflow-wrap: anywhere; }
+  .error { color: var(--danger); font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">ق</div>
+  <div class="brand"><h1>Qasd · قصد</h1><p>Intent classifier</p></div>
+  <div class="spacer"></div>
+  <span id="status" class="badge">connecting…</span>
+  <span id="device" class="badge" hidden></span>
+  <a href="/scalar">API reference →</a>
+</header>
+
+<main>
+  <section class="left">
+    <div class="card">
+      <h2>Messages <span class="hint" id="count">0 messages</span></h2>
+      <textarea id="input" dir="auto" spellcheck="false" placeholder="One message per line — English, Arabic or mixed…"></textarea>
+      <div class="row" style="margin-top: 12px">
+        <button id="run" class="primary">Classify</button>
+        <button id="clear">Clear</button>
+        <span class="kbd">Ctrl + Enter</span>
+      </div>
+      <p id="error" class="error" hidden></p>
+    </div>
+    <div class="card">
+      <h2>Examples</h2>
+      <div class="chips" id="examples"></div>
+    </div>
+  </section>
+
+  <section class="right">
+    <div class="stats">
+      <div class="stat"><div class="v" id="m-count">–</div><div class="k">messages</div></div>
+      <div class="stat"><div class="v" id="m-round">–</div><div class="k">round trip</div></div>
+      <div class="stat"><div class="v" id="m-server">–</div><div class="k">model time</div></div>
+      <div class="stat"><div class="v" id="m-accepted">–</div><div class="k">confident</div></div>
+    </div>
+    <div class="card">
+      <h2>Intents <span class="hint" id="per">&nbsp;</span></h2>
+      <div class="dist" id="dist"></div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="card">
+      <h2>Results</h2>
+      <div class="results" id="results"><div class="empty">Write messages on the left and press Classify.</div></div>
+    </div>
+    <div class="card">
+      <h2>Model</h2>
+      <dl class="model" id="model"><dt>status</dt><dd>loading…</dd></dl>
+    </div>
+  </section>
+</main>
+
+<script>
+const examples = [
+  "Book me with Dr. Heba Mansour in neurology on Tuesday at 12:30",
+  "what are the available days?",
+  "هلا",
+  "ايه هي خدماتكم",
+  "عايز احجز مع د. هبة يوم الخميس",
+  "ok",
+  "where are you located?",
+];
+const $ = id => document.getElementById(id);
+let labels = [], minConfidence = 0.6;
+
+const color = label => `var(--c${Math.max(0, labels.indexOf(label)) % 8})`;
+const pct = p => { const v = p * 100; return (Number.isInteger(Math.round(v * 10) / 10) || v >= 99.5 || v < 10 ? Math.round(v) : v.toFixed(1)) + "%"; };
+const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const lines = () => $("input").value.split("\n").map(l => l.trim()).filter(l => l.length > 0);
+
+function updateCount() {
+  const n = lines().length;
+  $("count").textContent = `${n} message${n === 1 ? "" : "s"}`;
+}
+
+async function loadModel() {
+  try {
+    const r = await fetch("/v1/model");
+    if (!r.ok) throw new Error(r.statusText);
+    const m = await r.json();
+    labels = m.labels;
+    minConfidence = m.minConfidence;
+    $("status").textContent = "model loaded";
+    $("status").className = "badge ok";
+    $("device").textContent = m.device;
+    $("device").hidden = false;
+    $("model").innerHTML = `
+      <dt>intents</dt><dd>${m.labels.map(l => `<span class="pill" style="--c:${color(l)}">${esc(l)}</span>`).join(" ")}</dd>
+      <dt>device</dt><dd>${esc(m.device)}</dd>
+      <dt>confident at</dt><dd>${pct(m.minConfidence)} or more (below: send to the fallback)</dd>
+      <dt>loaded</dt><dd>${new Date(m.loadedAt).toLocaleString()}</dd>
+      <dt>file</dt><dd>${esc(m.path)}</dd>`;
+  } catch (e) {
+    $("status").textContent = "model unavailable";
+    $("status").className = "badge bad";
+    $("model").innerHTML = `<dt>status</dt><dd class="error">${esc(String(e.message || e))}</dd>`;
+  }
+}
+
+async function classify() {
+  const texts = lines();
+  $("error").hidden = true;
+  if (texts.length === 0) { $("input").focus(); return; }
+  $("run").disabled = true;
+  $("run").textContent = "Classifying…";
+  const start = performance.now();
+  try {
+    const r = await fetch("/v1/classify/batch", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ texts }),
+    });
+    const body = await r.json();
+    const roundTrip = performance.now() - start;
+    if (!r.ok) {
+      const details = body.errors ? Object.values(body.errors).flat().join(" ") : (body.detail || body.title);
+      throw new Error(details || r.statusText);
+    }
+    render(body, roundTrip);
+  } catch (e) {
+    $("error").textContent = String(e.message || e);
+    $("error").hidden = false;
+  } finally {
+    $("run").disabled = false;
+    $("run").textContent = "Classify";
+  }
+}
+
+function render(body, roundTrip) {
+  const results = body.results;
+  const accepted = results.filter(r => r.accepted).length;
+  $("m-count").textContent = results.length;
+  $("m-round").innerHTML = `${roundTrip.toFixed(1)}<small>ms</small>`;
+  $("m-server").innerHTML = `${body.elapsedMilliseconds.toFixed(2)}<small>ms</small>`;
+  $("m-accepted").innerHTML = `${accepted}<small>/ ${results.length}</small>`;
+  $("per").textContent = `${(body.elapsedMilliseconds / results.length).toFixed(3)} ms per message in the model`;
+
+  const counts = Object.fromEntries(labels.map(l => [l, 0]));
+  results.forEach(r => counts[r.label] = (counts[r.label] || 0) + 1);
+  $("dist").innerHTML = labels.filter(l => counts[l] > 0)
+    .map(l => `<div style="width:${counts[l] / results.length * 100}%;background:${color(l)}" title="${esc(l)}: ${counts[l]}"></div>`).join("");
+  $("legend").innerHTML = labels.map(l => `<span style="--c:${color(l)}">${esc(l)} · ${counts[l] || 0}</span>`).join("");
+
+  $("results").innerHTML = results.map(r => `
+    <div class="result">
+      <div class="top">
+        <div class="text" dir="auto" title="${esc(r.text)}">${esc(r.text)}</div>
+        ${r.accepted ? "" : `<span class="low">below ${pct(minConfidence)}</span>`}
+        <span class="pill" style="--c:${color(r.label)}">${esc(r.label)}</span>
+        <span class="conf">${pct(r.confidence)}</span>
+      </div>
+      <div class="bars">
+        ${r.probabilities.map(p => `
+          <div class="bar" style="--c:${color(p.label)}">
+            <span>${esc(p.label)}</span>
+            <div class="track"><div class="fill" style="width:${p.probability * 100}%"></div></div>
+            <span class="n">${pct(p.probability)}</span>
+          </div>`).join("")}
+      </div>
+    </div>`).join("");
+}
+
+$("examples").innerHTML = examples.map(e => `<button class="chip" dir="auto">${esc(e)}</button>`).join("");
+$("examples").addEventListener("click", e => {
+  if (!e.target.classList.contains("chip")) return;
+  const input = $("input");
+  input.value = (input.value.trim() ? input.value.trimEnd() + "\n" : "") + e.target.textContent;
+  updateCount();
+});
+$("run").addEventListener("click", classify);
+$("clear").addEventListener("click", () => { $("input").value = ""; updateCount(); $("input").focus(); });
+$("input").addEventListener("input", updateCount);
+$("input").addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); classify(); } });
+
+$("input").value = examples.join("\n");
+updateCount();
+loadModel().then(() => { if (labels.length) classify(); });
+</script>
+</body>
+</html>
