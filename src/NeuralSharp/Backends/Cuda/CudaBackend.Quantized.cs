@@ -531,6 +531,67 @@ internal sealed unsafe partial class CudaBackend
     public override void RmsNormAffine(Storage x, Storage gain, Storage y, int rows, int cols, float eps, float offset) =>
         LaunchRows(K("rms_norm_affine_f32"), rows, P(x), P(gain), P(y), U(cols), F(eps), F(offset), U(rows));
 
+    public override bool SkinnyMatMul(Storage x, Storage w, Storage y, int m, int k, int r, bool transW, float alpha, float beta)
+    {
+        if (m == 0 || k == 0 || r is < 1 or > PtxKernels.SkinnyMaxRank || beta is not (0f or 1f))
+        {
+            return false;
+        }
+
+        int blocks = (m + PtxKernels.SkinnyBlock - 1) / PtxKernels.SkinnyBlock;
+        int chunk = SkinnyChunk(blocks, k);
+        Profiled("skinny_nn", $"{m}x{r}x{k}", 2.0 * m * r * k);
+        LaunchSkinny("skinny_nn_f32", blocks, chunk, k, y, m * r, beta, P(x), P(w), P(y), U(m), U(k), U(r), U(transW ? 1 : 0), F(alpha), F(beta), U(chunk));
+        return true;
+    }
+
+    public override bool SkinnyTransposedMatMul(Storage x, Storage d, Storage output, int m, int k, int r, bool transOutput, float alpha, float beta)
+    {
+        if (m == 0 || k == 0 || r is < 1 or > PtxKernels.SkinnyMaxRank || beta is not (0f or 1f))
+        {
+            return false;
+        }
+
+        int blocks = (k + PtxKernels.SkinnyBlock - 1) / PtxKernels.SkinnyBlock;
+        int chunk = SkinnyChunk(blocks, m);
+        Profiled("skinny_tn", $"{k}x{r}x{m}", 2.0 * m * r * k);
+        LaunchSkinny("skinny_tn_f32", blocks, chunk, m, output, k * r, beta,
+            P(x), P(d), P(output), U(m), U(k), U(r), U(transOutput ? 1 : 0), F(alpha), F(beta), U(chunk));
+        return true;
+    }
+
+    // Labels the next launch in a GpuProfiler run (kernel, shape, work).
+    private void Profiled(string kernel, string shape, double flops)
+    {
+        if (_profile is not null)
+        {
+            _profileLabel = $"{kernel} {shape}";
+            _profileFlops = flops;
+        }
+    }
+
+    // The long side's chunk per block: enough blocks for about eight per multiprocessor, chunks of at least 256 (and a
+    // multiple of the 64-long tiles).
+    private int SkinnyChunk(int blocks, int length)
+    {
+        int wanted = (8 * Math.Max(1, _multiprocessors) + blocks - 1) / blocks;
+        int splits = Math.Clamp(wanted, 1, Math.Max(1, length / 256));
+        int chunk = (length + splits - 1) / splits;
+        return (chunk + PtxKernels.SkinnyTile - 1) / PtxKernels.SkinnyTile * PtxKernels.SkinnyTile;
+    }
+
+    // Split chunks add into the output atomically: it is zeroed first when beta is 0.
+    private void LaunchSkinny(string kernel, int blocks, int chunk, int length, Storage output, int size, float beta, params ReadOnlySpan<ulong> args)
+    {
+        int splits = (length + chunk - 1) / chunk;
+        if (splits > 1 && beta == 0f)
+        {
+            Check(cuMemsetD32Async(P(output), 0, (nuint)size, _stream), nameof(cuMemsetD32Async));
+        }
+
+        Launch(K(kernel), (uint)blocks, (uint)splits, 256, 1, args);
+    }
+
     public override void GatedActivation(Storage gate, Storage up, Storage y, int n, int kind) =>
         Launch1D(K("gated_act_f32"), n, P(gate), P(up), P(y), U(kind), U(n));
 

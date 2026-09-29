@@ -660,6 +660,70 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override bool SkinnyMatMul(Storage x, Storage w, Storage y, int m, int k, int r, bool transW, float alpha, float beta)
+    {
+        if (beta is not (0f or 1f))
+        {
+            return false;
+        }
+
+        var product = Allocate(m * r, false);
+        try
+        {
+            MatMul(x, w, product, m, r, k, false, transW, 0f);
+            if (beta == 0f)
+            {
+                Affine(product, y, m * r, alpha, 0f);
+            }
+            else
+            {
+                Axpy(product, y, m * r, alpha);
+            }
+        }
+        finally
+        {
+            product.Release();
+        }
+
+        return true;
+    }
+
+    public override bool SkinnyTransposedMatMul(Storage x, Storage d, Storage output, int m, int k, int r, bool transOutput, float alpha, float beta)
+    {
+        if (beta is not (0f or 1f))
+        {
+            return false;
+        }
+
+        var product = Allocate(k * r, false);
+        try
+        {
+            if (transOutput)
+            {
+                MatMul(d, x, product, r, k, m, true, false, 0f);               // dᵀ·x [r, k]
+            }
+            else
+            {
+                MatMul(x, d, product, k, r, m, true, false, 0f);               // xᵀ·d [k, r]
+            }
+
+            if (beta == 0f)
+            {
+                Affine(product, output, k * r, alpha, 0f);
+            }
+            else
+            {
+                Axpy(product, output, k * r, alpha);
+            }
+        }
+        finally
+        {
+            product.Release();
+        }
+
+        return true;
+    }
+
     public override void GatedActivationPacked(Storage gate, Storage up, Storage packedGate, Storage packedUp, Storage y, Storage packedY, int n, int kind, int flags)
     {
         Storage? g = null, u = null, t = null;
