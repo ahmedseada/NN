@@ -172,7 +172,6 @@ public sealed record TextClassifierReport(IReadOnlyList<string> Labels, int[,] C
 public sealed class TextClassifier : IDisposable
 {
     private const string Format = "qasd-text-classifier/1";
-    private const string LegacyFormat = "neuralsharp-text-classifier/1";     // files trained before the move to Idrak: the same layout
     private readonly Sequential _model;
     private readonly TextFeatures _features;
     private readonly Lock _gate = new();
@@ -483,7 +482,7 @@ public sealed class TextClassifier : IDisposable
     {
         using var package = ModelPackage.Open(path);
         var settings = package.Json("text-classifier").AsObject();
-        if ((string?)settings["format"] is not (Format or LegacyFormat))
+        if ((string?)settings["format"] != Format)
         {
             throw new InvalidDataException($"{path} is not a text classifier ({settings["format"]}).");
         }

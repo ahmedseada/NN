@@ -1,5 +1,4 @@
 using System.Runtime.CompilerServices;
-using System.Text.Json.Nodes;
 using Idrak;
 using Idrak.Generation;
 using Idrak.Layers;
@@ -58,7 +57,6 @@ public sealed class TunedClassifier : IDisposable
     /// </summary>
     public static TunedClassifier Load(string folder, IReadOnlyList<string> labels, Device? device = null)
     {
-        UpgradeLegacy(folder);
         var manifest = TuningManifest.Read(folder)
                        ?? throw new InvalidDataException($"{folder} is not a tuned model folder (no {TuningManifest.FileName}; tune one with idrak-tune train).");
         string[] intents = [.. labels.Select(l => l.Trim()).Where(l => l.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)];
@@ -73,26 +71,7 @@ public sealed class TunedClassifier : IDisposable
 
     /// <summary>Whether <paramref name="folder"/> holds a tuned model.</summary>
     public static bool IsTunedFolder(string folder) =>
-        Directory.Exists(folder) && (TuningManifest.Exists(folder) || File.Exists(Path.Combine(folder, LegacySettings)));
-
-    // Folders from the former qasd-tuned tool keep their settings in qasd-tuned.json: the manifest idrak-tune writes is added
-    // from it once (the base model, instruction and length they were tuned with).
-    private const string LegacySettings = "qasd-tuned.json";
-
-    private static void UpgradeLegacy(string folder)
-    {
-        string legacy = Path.Combine(folder, LegacySettings);
-        if (TuningManifest.Exists(folder) || !File.Exists(legacy))
-        {
-            return;
-        }
-
-        var settings = JsonNode.Parse(File.ReadAllText(legacy))!.AsObject();
-        new TuningManifest
-        {
-            BaseModel = (string)settings["baseModel"]!, System = (string?)settings["system"], MaxLength = (int?)settings["maxLength"] ?? 256,
-        }.Save(folder);
-    }
+        Directory.Exists(folder) && TuningManifest.Exists(folder);
 
     /// <summary>The intent of <paramref name="text"/>, with every intent's probability.</summary>
     public TextPrediction Predict(string text) => Predict([text])[0];

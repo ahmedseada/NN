@@ -96,8 +96,7 @@ dotnet run -c Release --project apps/Qasd -- predict --tuned "Book me with Dr. H
 
 idrak-tune writes the adapter and `idrak-tuning.json` (the base model and the instruction it was tuned with), which is
 all Qasd needs to load it. Predictions score every intent as the model's answer, so the label is always one of the
-intents (taken from the data, the classifier, or `--labels`). A folder from the former `qasd-tuned` tool still loads
-(its settings are converted once).
+intents (taken from the data, the classifier, or `--labels`).
 
 Compare both models on a device (the tuned model's inference; tune it on `split/train.csv` so the measured messages are
 unseen):

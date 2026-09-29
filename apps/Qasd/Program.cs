@@ -119,8 +119,8 @@ output ??= command switch
 };
 tunedFolder ??= QasdPaths.Tuned;
 
-// evaluate / predict / info: the model file first when given (a .qasd file, or .nsm from before), else the default one.
-bool modelGiven = positional.Count > 1 && (positional[1].EndsWith(".qasd", StringComparison.OrdinalIgnoreCase) || positional[1].EndsWith(".nsm", StringComparison.OrdinalIgnoreCase));
+// evaluate / predict / info: the model file first when given (a .qasd file), else the default one.
+bool modelGiven = positional.Count > 1 && positional[1].EndsWith(".qasd", StringComparison.OrdinalIgnoreCase);
 string modelPath = modelGiven ? positional[1] : QasdPaths.Classifier;
 var rest = positional.Skip(modelGiven ? 2 : 1).ToList();
 // JSON with Arabic and other text as written, not \u escapes (for people and pipelines, not HTML).
