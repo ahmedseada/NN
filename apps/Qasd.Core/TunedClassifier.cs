@@ -7,52 +7,15 @@ using NeuralSharp.Pretrained;
 
 namespace Qasd;
 
-/// <summary>Settings of <see cref="TunedClassifier.Train"/>.</summary>
-public sealed record TunedOptions
-{
-    /// <summary>The pretrained chat model to tune: a Hugging Face id, a folder, a .gguf file or ollama:name.</summary>
-    public string BaseModel { get; init; } = "Qwen/Qwen2.5-0.5B-Instruct";
-
-    /// <summary>Where the model trains (default: the GPU when there is one, else the CPU, which is slow for a language model). <see cref="TunedClassifier.Load"/> runs on the CPU unless told otherwise.</summary>
-    public Device? Device { get; init; }
-
-    /// <summary>LoRA rank.</summary>
-    public int Rank { get; init; } = 16;
-
-    /// <summary>LoRA alpha (the adapters' output is scaled by alpha / rank).</summary>
-    public float Alpha { get; init; } = 32f;
-
-    /// <summary>Peak learning rate.</summary>
-    public float LearningRate { get; init; } = 2e-4f;
-
-    /// <summary>Passes over the training messages.</summary>
-    public int Epochs { get; init; } = 1;
-
-    /// <summary>Tokens per training batch.</summary>
-    public int BatchTokens { get; init; } = 4096;
-
-    /// <summary>Longest message in tokens (with the instruction and the answer); longer ones are cut.</summary>
-    public int MaxLength { get; init; } = 256;
-
-    /// <summary>Seed for the adapters and the batch order.</summary>
-    public int Seed { get; init; }
-
-    /// <summary>The instruction before each message (null: one listing the intents).</summary>
-    public string? SystemPrompt { get; init; }
-}
-
 /// <summary>
-/// An intent classifier made by fine-tuning a small pretrained chat model (LoRA) to answer each message with its intent:
-/// the same labeled data and the same kind of result as <see cref="TextClassifier"/> (a label, its confidence and every
-/// label's probability). Predictions score each intent as the model's answer (the probability of its tokens, then a
-/// softmax over the intents), so the label is always one of the trained ones; <see cref="StreamAsync"/> also streams the
-/// model's own answer token by token. A tuned model is a folder: the PEFT adapter plus qasd-tuned.json (base model,
-/// intents, instruction).
+/// The intent classifier over a chat model tuned to answer each message with its intent (tuned with nstune, the
+/// NeuralSharp fine-tuning tool, on the intent data; see the README): the same kind of result as
+/// <see cref="TextClassifier"/> (a label, its confidence and every label's probability). Predictions score each intent as
+/// the model's answer (the probability of its tokens, then a softmax over the intents), so the label is always one of the
+/// intents; <see cref="StreamAsync"/> also streams the model's own answer token by token.
 /// </summary>
 public sealed class TunedClassifier : IDisposable
 {
-    private const string Format = "qasd-tuned/1";
-    private const string SettingsFile = "qasd-tuned.json";
     private readonly PretrainedModel _model;
     private readonly ChatTranscriptEncoder _encoder;
     private readonly string _system;
@@ -85,87 +48,47 @@ public sealed class TunedClassifier : IDisposable
     public Device Device => _model.Device;
 
     /// <summary>
-    /// Tunes <see cref="TunedOptions.BaseModel"/> on <paramref name="train"/> (each message answered with its label), writes
-    /// the adapter and settings to <paramref name="outputFolder"/> and returns the tuned model, ready to predict.
-    /// <paramref name="log"/> receives progress lines, and <paramref name="steps"/> each optimizer step (when given, the steps
-    /// are not logged).
+    /// Loads a tuned adapter folder (written by nstune train: the adapter and neuralsharp-tuning.json, which names the base
+    /// model and the system prompt it was tuned with), the adapter merged into the base weights for speed, to classify into
+    /// <paramref name="labels"/> (the intents it was tuned to answer with).
     /// </summary>
-    public static TunedClassifier Train(IReadOnlyList<LabeledText> train, string outputFolder, TunedOptions? options = null, Action<string>? log = null,
-        Action<FineTuningProgress>? steps = null, CancellationToken cancellationToken = default)
+    public static TunedClassifier Load(string folder, IReadOnlyList<string> labels, Device? device = null)
     {
-        ArgumentNullException.ThrowIfNull(train);
-        options ??= new TunedOptions();
-        string[] labels = [.. train.Select(e => e.Label.Trim()).Where(l => l.Length > 0).Distinct().Order(StringComparer.Ordinal)];
-        if (labels.Length < 2)
+        UpgradeLegacy(folder);
+        var manifest = TuningManifest.Read(folder)
+                       ?? throw new InvalidDataException($"{folder} is not a tuned model folder (no {TuningManifest.FileName}; tune one with nstune train).");
+        string[] intents = [.. labels.Select(l => l.Trim()).Where(l => l.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)];
+        if (intents.Length < 2)
         {
-            throw new ArgumentException($"Tuning needs messages of at least two intents; got {labels.Length}.", nameof(train));
+            throw new ArgumentException("The tuned model needs at least two intents.", nameof(labels));
         }
 
-        string system = options.SystemPrompt ?? DefaultSystem(labels);
-        var device = options.Device ?? (Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu);
-        string folder = ModelSource.Resolve(options.BaseModel);
-        log?.Invoke($"base model {options.BaseModel} ({folder}) on {device.Name}");
-        var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, BFloat16 = device.Type == DeviceType.Cuda });
-        Directory.CreateDirectory(outputFolder);
-        var classifier = new TunedClassifier(model, labels, system, options.MaxLength, options.BaseModel, Path.GetFullPath(outputFolder));
-        try
-        {
-            var sequences = train.Select(e => classifier.Sequence(e.Text, e.Label.Trim())).OfType<TrainingSequence>().ToList();
-            log?.Invoke($"{sequences.Count:N0} training conversations, {sequences.Sum(s => s.Tokens.Length):N0} tokens");
-            FineTuner.Train(model, sequences, null, new FineTuningOptions
-            {
-                Rank = options.Rank,
-                Alpha = options.Alpha,
-                LearningRate = options.LearningRate,
-                Epochs = options.Epochs,
-                BatchTokens = options.BatchTokens,
-                MaxLength = options.MaxLength,
-                Seed = options.Seed,
-            }, outputFolder, new SynchronousProgress(steps ?? (p => log?.Invoke(
-                $"step {p.Step}/{p.TotalSteps}: loss {p.Loss:F4}, {p.TokensPerSecond:N0} tokens/s"))), cancellationToken);
-            File.WriteAllText(Path.Combine(outputFolder, SettingsFile), new JsonObject
-            {
-                ["format"] = Format,
-                ["baseModel"] = options.BaseModel,
-                ["labels"] = new JsonArray([.. labels.Select(l => (JsonNode?)JsonValue.Create(l))]),
-                ["system"] = system,
-                ["maxLength"] = options.MaxLength,
-            }.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
-        }
-        catch
-        {
-            classifier.Dispose();
-            throw;
-        }
-
-        // Scores come from the saved model with the adapter merged, as it is served (and faster than the adapter beside).
-        classifier.Dispose();
-        log?.Invoke("loading the tuned model with the adapter merged");
-        return Load(outputFolder, device);
-    }
-
-    /// <summary>Loads a tuned model folder written by <see cref="Train"/> (the adapter merged into the base weights, for speed).</summary>
-    public static TunedClassifier Load(string folder, Device? device = null)
-    {
-        var settings = JsonNode.Parse(File.ReadAllText(Path.Combine(folder, SettingsFile)))!.AsObject();
-        if ((string?)settings["format"] != Format)
-        {
-            throw new InvalidDataException($"{folder} is not a tuned Qasd model ({settings["format"]}).");
-        }
-
-        string baseModel = (string)settings["baseModel"]!;
-        device ??= Device.Cpu;
-        var model = PretrainedModel.Load(ModelSource.Resolve(baseModel), new PretrainedOptions
-        {
-            Device = device, BFloat16 = device.Type == DeviceType.Cuda, MergeAdapter = folder,
-        });
-        model.Network.Eval();
-        return new TunedClassifier(model, [.. settings["labels"]!.AsArray().Select(l => (string)l!)], (string)settings["system"]!,
-            (int)settings["maxLength"]!, baseModel, Path.GetFullPath(folder));
+        var model = manifest.LoadModel(folder, device ?? Device.Cpu);
+        return new TunedClassifier(model, intents, manifest.System ?? "", manifest.MaxLength, manifest.BaseModel, Path.GetFullPath(folder));
     }
 
     /// <summary>Whether <paramref name="folder"/> holds a tuned model.</summary>
-    public static bool IsTunedFolder(string folder) => File.Exists(Path.Combine(folder, SettingsFile));
+    public static bool IsTunedFolder(string folder) =>
+        Directory.Exists(folder) && (TuningManifest.Exists(folder) || File.Exists(Path.Combine(folder, LegacySettings)));
+
+    // Folders from the former qasd-tuned tool keep their settings in qasd-tuned.json: the manifest nstune writes is added
+    // from it once (the base model, instruction and length they were tuned with).
+    private const string LegacySettings = "qasd-tuned.json";
+
+    private static void UpgradeLegacy(string folder)
+    {
+        string legacy = Path.Combine(folder, LegacySettings);
+        if (TuningManifest.Exists(folder) || !File.Exists(legacy))
+        {
+            return;
+        }
+
+        var settings = JsonNode.Parse(File.ReadAllText(legacy))!.AsObject();
+        new TuningManifest
+        {
+            BaseModel = (string)settings["baseModel"]!, System = (string?)settings["system"], MaxLength = (int?)settings["maxLength"] ?? 256,
+        }.Save(folder);
+    }
 
     /// <summary>The intent of <paramref name="text"/>, with every intent's probability.</summary>
     public TextPrediction Predict(string text) => Predict([text])[0];
@@ -211,7 +134,7 @@ public sealed class TunedClassifier : IDisposable
         try
         {
             _chat ??= _model.CreateChat(contextLength: Math.Min(_model.MaxPositions, _maxLength + 32));
-            var request = new ChatRequest([new ChatMessage("system", _system), new ChatMessage("user", Fitted(text))], null, false,
+            var request = new ChatRequest(Transcript(Fitted(text), "").Messages.SkipLast(1).ToList(), null, false,
                 new GenerationOptions { Temperature = 0f, TopK = 1, TopP = 1f, RepeatPenalty = 1f, NumPredict = 16, ChunkSize = 1, NumCtx = Math.Min(_model.MaxPositions, _maxLength + 32) });
             await foreach (var chunk in _chat.StreamAsync(request, cancellationToken).ConfigureAwait(false))
             {
@@ -236,35 +159,35 @@ public sealed class TunedClassifier : IDisposable
         _gate.Dispose();
     }
 
-    private static string DefaultSystem(IEnumerable<string> labels) =>
-        $"Classify the user's message into one intent: {string.Join(", ", labels)}. Answer with the intent only.";
-
     // The message as it fits the model (see Sequence), for generation.
     private string Fitted(string text) => Fit(text, Labels[0]).Text;
 
-    // Messages are cut to leave room for the instruction and the answer within MaxLength tokens.
-    private string Clip(string text) => text.Length > 4 * _maxLength ? text[..(4 * _maxLength)] : text;
-
-    // The conversation (instruction, message, answer = label) as the training loss and the scoring see it.
-    private TrainingSequence? Sequence(string text, string label) => Fit(text, label).Sequence;
-
-    // A message too long for MaxLength tokens is shortened (its start kept) until the whole conversation fits.
-    private (string Text, TrainingSequence? Sequence) Fit(string text, string label)
+    // The conversation (instruction, message, answer = label) as the training saw it (nstune with the same system prompt).
+    private ChatTranscript Transcript(string text, string label)
     {
-        text = Clip(text);
-        for (int attempt = 0; attempt < 40 && text.Length > 0; attempt++)
+        var messages = new List<ChatMessage>();
+        if (_system.Length > 0)
         {
-            var sequence = _encoder.Encode(new ChatTranscript(
-                [new ChatMessage("system", _system), new ChatMessage("user", text), new ChatMessage("assistant", label)], [], Think: false), _maxLength);
-            if (sequence is not null && sequence.Trained.Skip(1).Any(t => t))
-            {
-                return (text, sequence);
-            }
-
-            text = text[..(text.Length * 3 / 4)];
+            messages.Add(new ChatMessage("system", _system));
         }
 
-        return (text, null);
+        messages.Add(new ChatMessage("user", text));
+        messages.Add(new ChatMessage("assistant", label));
+        return new ChatTranscript(messages, [], Think: false);
+    }
+
+    // A message too long for MaxLength tokens is shortened, its start kept, until the whole conversation fits (see
+    // ChatTranscriptEncoder.Fit); every intent is then scored on the same text (fitted to the longest intent).
+    private (string Text, TrainingSequence? Sequence) Fit(string text, string label)
+    {
+        text = text.Length > 8 * _maxLength ? text[..(8 * _maxLength)] : text;       // far longer than any fit
+        var fitted = _encoder.Fit(Transcript(text, label), _maxLength);
+        if (fitted is null)
+        {
+            return ("", null);
+        }
+
+        return (fitted.Messages[^2].Content, _encoder.Encode(fitted, _maxLength));
     }
 
     private TextPrediction Score(string text) => Score([text])[0];
@@ -371,11 +294,6 @@ public sealed class TunedClassifier : IDisposable
         }
 
         return [.. predictions];
-    }
-
-    private sealed class SynchronousProgress(Action<FineTuningProgress> report) : IProgress<FineTuningProgress>
-    {
-        public void Report(FineTuningProgress value) => report(value);
     }
 }
 

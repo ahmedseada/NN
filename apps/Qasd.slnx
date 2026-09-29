@@ -2,7 +2,6 @@
   <Project Path="Qasd/Qasd.csproj" />
   <Project Path="Qasd.Core/Qasd.Core.csproj" />
   <Project Path="Qasd.Api/Qasd.Api.csproj" />
-  <Project Path="Qasd.Tuned/Qasd.Tuned.csproj" />
   <Folder Name="/NeuralSharp/">
     <Project Path="../src/NeuralSharp/NeuralSharp.csproj" />
     <Project Path="../src/NeuralSharp.Datasets/NeuralSharp.Datasets.csproj" />

@@ -5,6 +5,7 @@ using System.Text.Json.Nodes;
 using NeuralSharp;
 using Qasd;
 using NeuralSharp.Datasets;
+using NeuralSharp.Pretrained;
 
 // qasd: trains and serves the intent model (an application built on NeuralSharp).
 const string Usage = """
@@ -16,6 +17,9 @@ const string Usage = """
       qasd predict [model] [text…]         classify texts (arguments, else one per line from standard input)
       qasd info [model]                    labels and settings of a model
     (model: a .nsm file; default apps/Qasd/models/intents.nsm)
+      qasd split <data…>                   write the train / test split the classifier uses (train.csv, test.csv in
+                                          apps/Qasd/data/split, or --out DIR), so a model tuned with nstune on train.csv
+                                          is scored on the same held-out messages (qasd evaluate --tuned …/test.csv)
       qasd benchmark <data…>               train and measure on each device (CPU, and CUDA when present): training time,
                                           held-out accuracy and F1, single-message latency and batch throughput
                                           (--devices cpu,cuda to choose)
@@ -30,6 +34,10 @@ const string Usage = """
                           evaluate and predict on the CPU; --cuda runs them on the GPU)
       --test-fraction F   train: distinct texts held out for the test (default 0.2; 0 = train on everything)
       --epochs N, --batch-size N, --buckets N (16384), --hidden N (256), --lr F (0.002), --seed N, --patience N (8)
+      --tuned             evaluate, predict, info: the tuned chat model (apps/Qasd/models/tuned, or --folder DIR) instead of the
+                          classifier; benchmark: measure it too (inference: accuracy, latency, first streamed token, throughput)
+      --labels a,b,…      predict --tuned: the intents (default: the classifier's)
+      --stream            predict --tuned: print the model's answer as it is generated
       --json              predict: one JSON object per text (label, confidence, probabilities)
       --min-confidence F  predict: print "unknown" below this confidence
     """;
@@ -37,7 +45,8 @@ const string Usage = """
 var positional = new List<string>();
 string? output = null, textColumn = null, labelColumn = null, deviceName = null, deviceList = null;
 double testFraction = 0.2, minConfidence = 0;
-bool json = false;
+bool json = false, tuned = false, stream = false;
+string? tunedFolder = null, labelList = null;
 var options = new TextClassifierOptions();
 try
 {
@@ -63,6 +72,10 @@ try
             case "--patience": options = options with { Patience = NextInt() }; break;
             case "--lr": options = options with { LearningRate = float.Parse(Next(), CultureInfo.InvariantCulture) }; break;
             case "--json": json = true; break;
+            case "--tuned": tuned = true; break;
+            case "--folder": tunedFolder = Next(); tuned = true; break;
+            case "--labels": labelList = Next(); break;
+            case "--stream": stream = true; break;
             case "--min-confidence": minConfidence = double.Parse(Next(), CultureInfo.InvariantCulture); break;
             case "-h" or "--help" or "help": Console.WriteLine(Usage); return 0;
             case ['-', '-', ..]: throw new ArgumentException($"Unknown option {args[i]}.");
@@ -79,7 +92,7 @@ catch (Exception ex) when (ex is ArgumentException or FormatException)
 string command = positional.Count > 0 ? positional[0] : "";
 bool valid = command switch
 {
-    "train" => positional.Count >= 2,
+    "train" or "split" => positional.Count >= 2,
     "benchmark" => positional.Count >= 2,
     "evaluate" => positional.Count >= 2,
     "predict" or "info" => positional.Count >= 1,
@@ -92,7 +105,8 @@ if (!valid)
 }
 
 Console.OutputEncoding = Encoding.UTF8;
-output ??= QasdPaths.Classifier;
+output ??= command == "split" ? Path.Combine(QasdPaths.Data, "split") : QasdPaths.Classifier;
+tunedFolder ??= QasdPaths.Tuned;
 
 // evaluate / predict / info: the model file first when given (a .nsm file), else the default one.
 bool modelGiven = positional.Count > 1 && positional[1].EndsWith(".nsm", StringComparison.OrdinalIgnoreCase);
@@ -132,6 +146,74 @@ try
             return 0;
         }
 
+        case "split":
+        {
+            var examples = ReadAll(positional.Skip(1));
+            var (train, test) = TextClassifier.Split(examples, testFraction > 0 ? testFraction : 0.2, options.Seed + 7);
+            Directory.CreateDirectory(output!);
+            string text = textColumn ?? "raw_question", label = labelColumn ?? "intent";
+            WriteCsv(Path.Combine(output!, "train.csv"), text, label, train);
+            WriteCsv(Path.Combine(output!, "test.csv"), text, label, test);
+            Console.WriteLine($"{examples.Count:N0} texts: {train.Count:N0} to train on, {test.Count:N0} held out (distinct texts, the split qasd train uses)");
+            Console.WriteLine($"wrote {Path.GetFullPath(Path.Combine(output!, "train.csv"))} and test.csv ({text}, {label})");
+            return 0;
+        }
+
+        case "evaluate" when tuned:
+        {
+            var examples = ReadAll(rest);
+            using var model = TunedClassifier.Load(tunedFolder, [.. examples.Select(e => e.Label)], device);
+            Console.WriteLine($"scoring {examples.Count:N0} messages with {model.BaseModel} (tuned) on {device.Name}…");
+            Console.WriteLine(model.Evaluate(examples, ConsoleTraining.Scoring()));
+            return 0;
+        }
+
+        case "info" when tuned:
+        {
+            var manifest = TuningManifest.Read(tunedFolder) ?? throw new InvalidDataException($"{tunedFolder}: no tuned model.");
+            Console.WriteLine($"{tunedFolder}: tuned from {manifest.BaseModel}, max length {manifest.MaxLength}, system prompt: {manifest.System ?? "(none)"}");
+            return 0;
+        }
+
+        case "predict" when tuned:
+        {
+            IReadOnlyList<string> labels = labelList is not null
+                ? labelList.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                : File.Exists(QasdPaths.Classifier) ? TextClassifier.Load(QasdPaths.Classifier, Device.Cpu) is var c ? Take(c) : []
+                : throw new ArgumentException("predict --tuned needs the intents: --labels a,b,… (or a trained classifier to take them from).");
+            using var model = TunedClassifier.Load(tunedFolder, labels, device);
+            var texts = rest.Count > 0 ? rest : ReadLines().ToList();
+            foreach (string text in texts)
+            {
+                TextPrediction prediction;
+                if (stream)
+                {
+                    Console.Write($"{text}\n  answer: ");
+                    TextPrediction? final = null;
+                    await foreach (var item in model.StreamAsync(text))
+                    {
+                        if (item.Token is { } token)
+                        {
+                            Console.Write(token);
+                        }
+
+                        final = item.Prediction ?? final;
+                    }
+
+                    Console.WriteLine();
+                    prediction = final!;
+                }
+                else
+                {
+                    prediction = model.Predict(text);
+                }
+
+                Print(text, prediction);
+            }
+
+            return 0;
+        }
+
         case "evaluate":
         {
             using var classifier = TextClassifier.Load(modelPath, device);
@@ -148,6 +230,12 @@ try
                 .Select(ParseDevice).ToList();
             Console.WriteLine($"{examples.Count:N0} texts: training on {train.Count:N0}, measuring on {test.Count:N0} held-out texts; same data, settings and seed on every device\n");
             var rows = new List<string[]>();
+            var tunedRows = new List<string[]>();
+            if (tuned && !TunedClassifier.IsTunedFolder(tunedFolder))
+            {
+                throw new InvalidDataException($"--tuned: no tuned model in {Path.GetFullPath(tunedFolder)} (tune one with nstune, see the README).");
+            }
+
             foreach (var target in devices)
             {
                 Console.WriteLine($"{target.Name}:");
@@ -197,6 +285,10 @@ try
                 rows.Add([target.Name.Length > 34 ? target.Name[..34] : target.Name, $"{trainSeconds:F1} s", $"{epochs}",
                     $"{train.Count * (double)epochs / trainSeconds:N0}/s", $"{report.Accuracy:P1}", $"{report.MacroF1:F3}",
                     $"{p50:F2} ms", $"{p95:F2} ms", $"{throughput:N0}/s"]);
+                if (tuned)
+                {
+                    tunedRows.Add(MeasureTuned(target, [.. test.Take(200)], classifier.Labels));
+                }
             }
 
             string[] header = ["device", "train", "epochs", "train speed", "accuracy", "macro F1", "latency p50", "latency p95", "batch speed"];
@@ -209,6 +301,21 @@ try
             }
 
             Console.WriteLine("\ntrain speed: training texts per second (texts × epochs / time); latency: one Predict call; batch speed: Predict on 256 texts at a time.");
+            if (tunedRows.Count > 0)
+            {
+                string[] tunedHeader = ["tuned model on", "accuracy", "macro F1", "latency p50", "latency p95", "first token", "batch speed"];
+                var tunedWidths = tunedHeader.Select((h, c) => Math.Max(h.Length, tunedRows.Max(r => r[c].Length)) + 2).ToArray();
+                Console.WriteLine();
+                Console.WriteLine(string.Concat(tunedHeader.Select((h, c) => c == 0 ? h.PadRight(tunedWidths[c]) : h.PadLeft(tunedWidths[c]))));
+                foreach (var row in tunedRows)
+                {
+                    Console.WriteLine(string.Concat(row.Select((v, c) => c == 0 ? v.PadRight(tunedWidths[c]) : v.PadLeft(tunedWidths[c]))));
+                }
+
+                Console.WriteLine("tuned: measured on up to 200 of the held-out texts (only if it was tuned on 'qasd split' train.csv are they unseen); "
+                                  + "first token: until the first streamed token of its answer.");
+            }
+
             return 0;
         }
 
@@ -225,24 +332,7 @@ try
             var texts = rest.Count > 0 ? rest : ReadLines().ToList();
             foreach (var (text, prediction) in texts.Zip(classifier.Predict(texts)))
             {
-                string label = prediction.Confidence < minConfidence ? "unknown" : prediction.Label;
-                if (json)
-                {
-                    var probabilities = new JsonObject();
-                    foreach (var (name, probability) in prediction.Probabilities)
-                    {
-                        probabilities[name] = Math.Round(probability, 4);
-                    }
-
-                    Console.WriteLine(new JsonObject
-                    {
-                        ["text"] = text, ["label"] = label, ["confidence"] = Math.Round(prediction.Confidence, 4), ["probabilities"] = probabilities,
-                    }.ToJsonString(jsonOutput));
-                }
-                else
-                {
-                    Console.WriteLine($"{label,-16}{prediction.Confidence,7:P1}  {text}");
-                }
+                Print(text, prediction);
             }
 
             return 0;
@@ -254,6 +344,98 @@ catch (Exception ex) when (ex is IOException or ArgumentException or InvalidData
 {
     Console.Error.WriteLine($"error: {ex.Message}");
     return 2;
+}
+
+// The tuned model's inference on the device: accuracy, latency of single messages, time to the first streamed token and
+// batch throughput.
+string[] MeasureTuned(Device target, List<LabeledText> probe, IReadOnlyList<string> labels)
+{
+    using var model = TunedClassifier.Load(tunedFolder, labels, target);
+    var texts = probe.Select(e => e.Text).ToList();
+    model.Predict([.. texts.Take(3)]);
+    var report = model.Evaluate(probe);
+    int singles = Math.Min(30, texts.Count);
+    var latencies = new double[singles];
+    for (int i = 0; i < singles; i++)
+    {
+        var one = Stopwatch.StartNew();
+        model.Predict(texts[i]);
+        latencies[i] = one.Elapsed.TotalMilliseconds;
+    }
+
+    Array.Sort(latencies);
+    var firsts = new List<double>();
+    foreach (string text in texts.Take(10))
+    {
+        var one = Stopwatch.StartNew();
+        var enumerator = model.StreamAsync(text).GetAsyncEnumerator();
+        try
+        {
+            if (enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+            {
+                firsts.Add(one.Elapsed.TotalMilliseconds);
+            }
+
+            while (enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+            {
+            }
+        }
+        finally
+        {
+            enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    firsts.Sort();
+    var batch = Stopwatch.StartNew();
+    model.Predict(texts);
+    double throughput = texts.Count / batch.Elapsed.TotalSeconds;
+    Console.WriteLine($"  tuned: accuracy {report.Accuracy:P1}, macro F1 {report.MacroF1:F3} on {probe.Count} texts; one message p50 {latencies[singles / 2]:F0} ms; {throughput:N1} messages/s");
+    return [target.Name.Length > 34 ? target.Name[..34] : target.Name, $"{report.Accuracy:P1}", $"{report.MacroF1:F3}", $"{latencies[singles / 2]:F0} ms",
+        $"{latencies[(int)(singles * 0.95)]:F0} ms", firsts.Count > 0 ? $"{firsts[firsts.Count / 2]:F0} ms" : "–", $"{throughput:N1}/s"];
+}
+
+// One prediction: a line, or a JSON object with --json; "unknown" below --min-confidence.
+void Print(string text, TextPrediction prediction)
+{
+    string label = prediction.Confidence < minConfidence ? "unknown" : prediction.Label;
+    if (json)
+    {
+        var probabilities = new JsonObject();
+        foreach (var (name, probability) in prediction.Probabilities)
+        {
+            probabilities[name] = Math.Round(probability, 4);
+        }
+
+        Console.WriteLine(new JsonObject
+        {
+            ["text"] = text, ["label"] = label, ["confidence"] = Math.Round(prediction.Confidence, 4), ["probabilities"] = probabilities,
+        }.ToJsonString(jsonOutput));
+    }
+    else
+    {
+        Console.WriteLine($"{label,-16}{prediction.Confidence,7:P1}  {text}");
+    }
+}
+
+static string[] Take(TextClassifier classifier)
+{
+    using (classifier)
+    {
+        return [.. classifier.Labels];
+    }
+}
+
+// Labeled texts as CSV (a header, then one quoted row per text).
+static void WriteCsv(string path, string textColumn, string labelColumn, IEnumerable<LabeledText> rows)
+{
+    static string Quote(string value) => "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+    using var writer = new StreamWriter(path, false, new UTF8Encoding(false));
+    writer.WriteLine($"{Quote(textColumn)},{Quote(labelColumn)}");
+    foreach (var row in rows)
+    {
+        writer.WriteLine($"{Quote(row.Text)},{Quote(row.Label)}");
+    }
 }
 
 // Labeled texts from every source; the columns default to raw_question / intent when the data has them, else text / label.

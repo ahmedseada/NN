@@ -6,16 +6,16 @@ or CPU from a CSV of labeled messages and serves predictions from one model file
 
 | Project | What it is |
 |---|---|
-| `Qasd.Core` | the model: training, evaluation, prediction, one-file save / load |
-| `Qasd` | the command line (`qasd`): train, evaluate, predict, info |
-| `Qasd.Tuned` | the command line (`qasd-tuned`) that tunes a pretrained chat model (LoRA) on the same data: train, evaluate, predict (streamed), benchmark |
+| `Qasd.Core` | the classifier (training, evaluation, prediction, one-file save / load) and the intent scoring over a tuned chat model |
+| `Qasd` | the command line (`qasd`): train, evaluate, predict, info, split, benchmark; `--tuned` for the tuned model |
 | `Qasd.Api` | the HTTP service (ASP.NET Core) serving both models, as one JSON response or streamed; test page and Scalar reference |
 
-`apps/Qasd.slnx` opens all four.
+`apps/Qasd.slnx` opens all three. The tuned model is tuned with **nstune**, NeuralSharp's general fine-tuning tool
+(`src/NeuralSharp.FineTuning.Cli`): Qasd has no fine-tuning code of its own.
 
-| | classifier (`qasd`) | tuned model (`qasd-tuned`) |
+| | classifier (`qasd train`) | tuned model (`nstune train`) |
 |---|---|---|
-| what it is | hashed n-grams and a small network | a pretrained chat model (default Qwen/Qwen2.5-0.5B-Instruct) taught to answer with the intent |
+| what it is | hashed n-grams and a small network | any pretrained chat model the library loads, taught to answer with the intent |
 | trains in | seconds on a CPU | minutes on a GPU (hours on a CPU) |
 | predicts in | about 0.1 ms per message on a CPU | tens of milliseconds per message |
 | result | intent, confidence, every intent's probability | the same (each intent scored as the model's answer), plus its answer streamed token by token |
@@ -45,38 +45,45 @@ dotnet run -c Release --project apps/Qasd -- evaluate new-labeled.csv
 
 ## Where the models go
 
-Each project keeps its own trained model: `qasd train` saves to `apps/Qasd/models/intents.nsm` and `qasd-tuned train`
-to `apps/Qasd.Tuned/models/qasd-tuned` (`--out` for elsewhere). `predict` and `evaluate` read them from there unless
+Both models live in the Qasd project: `qasd train` saves to `apps/Qasd/models/intents.nsm`, and the tuned adapter goes
+to `apps/Qasd/models/tuned` (`--out` for elsewhere). `predict` and `evaluate` read them from there unless
 given another model, and the service loads both from there with no settings (IntentModel:Path and IntentModel:TunedPath
 override; `"TunedPath": "none"` serves the classifier only). The service starts without the tuned model when it has
 not been trained yet. Both folders are git-ignored.
 
 ## Devices
 
-Training (`qasd train`, `qasd-tuned train`) runs on the GPU when there is one (else the CPU, with a notice); `--cpu`
+Training (`qasd train`, `nstune train`) runs on the GPU when there is one (else the CPU, with a notice); `--cpu`
 forces the CPU. Inference runs on the CPU unless asked: `predict` and `evaluate` take `--cuda`, and the service takes
 `IntentModel__Device=cuda` (classifier) and `IntentModel__TunedDevice=cuda` (tuned model). The classifier is fastest on
 the CPU (about 0.1 ms per message); the tuned model is a language model and gains most from the GPU. The benchmarks
 measure both devices when there is a GPU (`--devices cpu` or `--devices cuda` for one).
 
-## Tune a language model (Qasd.Tuned)
+## Tune a language model (nstune)
+
+Split the data once, so the classifier and the tuned model train on the same messages and are scored on the same held-out
+ones; then tune with nstune on the training part, with an instruction that lists the intents. Any chat model works
+(`$model`: a Hugging Face id, a folder, a .gguf file or `ollama:name`); the small one below is only the one tested here.
 
 ```
-dotnet run -c Release --project apps/Qasd.Tuned -- train apps/Qasd/data/plan-queries.csv
-dotnet run -c Release --project apps/Qasd.Tuned -- predict "Book me with Dr. Heba on Tuesday" --stream
+dotnet run -c Release --project apps/Qasd -- split apps/Qasd/data/plan-queries.csv
+$model = "Qwen/Qwen2.5-0.5B-Instruct"
+dotnet run -c Release --project src/NeuralSharp.FineTuning.Cli -- train $model "apps/Qasd/data/split/train.csv?user={raw_question}&assistant={intent}" --system "Classify the user's message into one intent: direct_reply, function_call, identity, retrieve. Answer with the intent only." --max-length 256 --no-dedup --out apps/Qasd/models/tuned
+dotnet run -c Release --project apps/Qasd -- evaluate --tuned apps/Qasd/data/split/test.csv --cuda
+dotnet run -c Release --project apps/Qasd -- predict --tuned "Book me with Dr. Heba on Tuesday" --stream
 ```
 
-It downloads the base model once (`--model` picks another: a Hugging Face id, a folder, a .gguf file or `ollama:name`),
-tunes LoRA adapters so each message is answered with its intent, and holds out the same messages as `qasd train`, so the
-two scores compare directly. The output folder holds the adapter and `qasd-tuned.json` (base model, intents,
-instruction). Predictions score every intent as the model's answer, so the label is always one of the trained intents.
+nstune writes the adapter and `neuralsharp-tuning.json` (the base model and the instruction it was tuned with), which is
+all Qasd needs to load it. Predictions score every intent as the model's answer, so the label is always one of the
+intents (taken from the data, the classifier, or `--labels`). A folder from the former `qasd-tuned` tool still loads
+(its settings are converted once).
 
-Compare both models on a device:
+Compare both models on a device (the tuned model's inference; tune it on `split/train.csv` so the measured messages are
+unseen):
 
 ```
-dotnet run -c Release --project apps/Qasd.Tuned -- benchmark apps/Qasd/data/plan-queries.csv                 (CPU)
-dotnet run -c Release --project apps/Qasd.Tuned -- benchmark apps/Qasd/data/plan-queries.csv --devices cpu,cuda
-dotnet run -c Release --project apps/Qasd.Tuned -- benchmark apps/Qasd/data/plan-queries.csv --sample 400      (quick CPU run)
+dotnet run -c Release --project apps/Qasd -- benchmark apps/Qasd/data/plan-queries.csv --tuned                   (CPU)
+dotnet run -c Release --project apps/Qasd -- benchmark apps/Qasd/data/plan-queries.csv --tuned --devices cpu,cuda
 ```
 
 ## Serve (Qasd.Api)
@@ -104,7 +111,7 @@ settings come from `appsettings.json` (section `IntentModel`), or environment va
 | `MaxBatch` | 256 | most messages per batch request |
 | `MaxTextLength` | 4000 | longest message in characters |
 | `AdminKey` | empty | the `X-Admin-Key` for `POST /v1/model/reload`; empty disables reloading |
-| `TunedPath` | empty | the folder from `qasd-tuned train`; empty: only the classifier is served |
+| `TunedPath` | empty | the tuned adapter folder (from `nstune train`); empty: `apps/Qasd/models/tuned` when it holds one; `none`: the classifier only |
 | `TunedDevice` | `cpu` | where the tuned model runs (`cuda` recommended) |
 | `MaxTunedBatch` | 32 | most messages per batch request to the tuned model |
 | `DefaultModel` | `classifier` | the model requests use when they name none |

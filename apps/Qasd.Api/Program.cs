@@ -8,8 +8,8 @@ using Qasd;
 using Qasd.Api;
 using Scalar.AspNetCore;
 
-// The intent service: serves the classifier from 'qasd train' and, when configured, the tuned language model from
-// 'qasd-tuned train'. Test page at /, API reference (Scalar) at /scalar.
+// The intent service: serves the classifier from 'qasd train' and, when there is one, the chat model tuned on the intents
+// with nstune (NeuralSharp's fine-tuning tool). Test page at /, API reference (Scalar) at /scalar.
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<IntentModelOptions>(builder.Configuration.GetSection("IntentModel"));
 builder.Services.AddSingleton<ModelHost>();
@@ -65,7 +65,7 @@ api.MapGet("/models", (ModelHost host, TunedHost tuned, IOptions<IntentModelOpti
             new ModelDescription("classifier", true, defaultModel != "tuned", "Hashed n-gram features and a small network: about 0.1 ms per message on a CPU.",
                 info.Labels, info.Device, info.Path, false),
             new ModelDescription("tuned", tuned.Classifier is not null, defaultModel == "tuned",
-                tuned.Classifier is { } t ? $"{t.BaseModel} tuned with LoRA to answer with the intent; streams its answer." : "A pretrained chat model tuned with LoRA (qasd-tuned train).",
+                tuned.Classifier is { } t ? $"{t.BaseModel} tuned with LoRA to answer with the intent; streams its answer." : "A pretrained chat model tuned with LoRA (nstune train, see the README).",
                 tuned.Classifier?.Labels ?? [], tuned.Classifier?.Device.Name, tuned.Status, true),
         ], options.Value.MinConfidence));
     })

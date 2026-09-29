@@ -5,7 +5,7 @@ namespace Qasd.Api;
 /// <summary>The tuned language model (IntentModel:TunedPath), loaded at startup when configured.</summary>
 public sealed class TunedHost : IDisposable
 {
-    public TunedHost(IOptions<IntentModelOptions> options, ILogger<TunedHost> logger)
+    public TunedHost(IOptions<IntentModelOptions> options, ModelHost classifier, ILogger<TunedHost> logger)
     {
         string? path = options.Value.TunedFolder;
         if (path is null)
@@ -16,13 +16,18 @@ public sealed class TunedHost : IDisposable
 
         if (!TunedClassifier.IsTunedFolder(path))
         {
-            Status = $"not trained yet: no tuned model in {System.IO.Path.GetFullPath(path)} (run 'qasd-tuned train apps/Qasd/data/plan-queries.csv', or set IntentModel:TunedPath)";
+            Status = $"not trained yet: no tuned model in {System.IO.Path.GetFullPath(path)} (tune one with nstune as the README shows, or set IntentModel:TunedPath)";
             logger.LogWarning("Serving the classifier only: {Status}", Status);
             return;
         }
 
         var device = ModelHost.ParseDevice(options.Value.TunedDevice);
-        Classifier = TunedClassifier.Load(path, device);
+        // The intents are the classifier's: both models answer with the same labels.
+        using (var lease = classifier.Lease())
+        {
+            Classifier = TunedClassifier.Load(path, lease.Classifier.Labels, device);
+        }
+
         Classifier.Predict(["warm up"]);
         LoadedAt = DateTimeOffset.UtcNow;
         Status = Classifier.Folder;

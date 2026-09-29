@@ -1,8 +1,9 @@
-using NeuralSharp.Pretrained;
+using System.Diagnostics;
+using NeuralSharp.Datasets;
 
 namespace Qasd;
 
-/// <summary>Training and scoring with a <see cref="ConsoleProgress"/> bar, for the command-line tools.</summary>
+/// <summary>Training and scoring with a progress bar (NeuralSharp's <see cref="ConsoleStatus"/>), for the command line.</summary>
 public static class ConsoleTraining
 {
     /// <summary>
@@ -12,8 +13,9 @@ public static class ConsoleTraining
     public static TextClassifier Classifier(IReadOnlyList<LabeledText> train, TextClassifierOptions options, bool epochLines = true,
         string label = "training", Action<TextClassifierEpoch>? onEpoch = null)
     {
-        ConsoleProgress? bar = null;
-        int epochs = Math.Max(1, options.Epochs), lastEpoch = 0;
+        var status = new ConsoleStatus();
+        var clock = Stopwatch.StartNew();
+        int epochs = Math.Max(1, options.Epochs), lastEpoch = 0, lastStep = 0;
         var classifier = TextClassifier.Train(train, options,
             epoch =>
             {
@@ -21,61 +23,35 @@ public static class ConsoleTraining
                 onEpoch?.Invoke(epoch);
                 if (epochLines)
                 {
-                    bar?.WriteLine($"  epoch {epoch.Epoch,3}: loss {epoch.Loss:F4}"
-                                   + (double.IsNaN(epoch.ValidationAccuracy) ? "" : $", validation accuracy {epoch.ValidationAccuracy:P1}")
-                                   + (epoch.Best ? "  *" : ""));
+                    status.Log($"  epoch {epoch.Epoch,3}: loss {epoch.Loss:F4}"
+                               + (double.IsNaN(epoch.ValidationAccuracy) ? "" : $", validation accuracy {epoch.ValidationAccuracy:P1}")
+                               + (epoch.Best ? "  *" : ""));
                 }
             },
             step =>
             {
-                bar ??= new ConsoleProgress(label, step.TotalSteps);
-                bar.Report(step.Step, $"epoch {step.Epoch}/{epochs}, loss {step.Loss:F4}");
+                lastStep = step.Step;
+                status.Progress(label, step.Step, step.TotalSteps, clock.Elapsed, $"epoch {step.Epoch}/{epochs}, loss {step.Loss:F4}");
             });
-        bar?.Complete(lastEpoch < epochs ? $"stopped early after epoch {lastEpoch}/{epochs} (no better validation)" : $"epoch {lastEpoch}/{epochs}");
+
+        // Stopped early: the bar shows the steps that ran as the whole.
+        status.Progress(label, lastStep, lastStep, clock.Elapsed,
+            lastEpoch < epochs ? $"stopped early after epoch {lastEpoch}/{epochs} (no better validation)" : $"epoch {lastEpoch}/{epochs}");
+        status.Finish();
         return classifier;
     }
 
-    /// <summary>Tunes a <see cref="TunedClassifier"/> with a bar over the optimizer steps.</summary>
-    public static TunedClassifier Tuned(IReadOnlyList<LabeledText> train, string outputFolder, TunedOptions options, string label = "tuning")
-    {
-        ConsoleProgress? bar = null;
-        var tuned = TunedClassifier.Train(train, outputFolder, options,
-            line =>
-            {
-                if (bar is null)
-                {
-                    Console.WriteLine($"  {line}");
-                }
-                else
-                {
-                    bar.WriteLine($"  {line}");
-                }
-            },
-            step =>
-            {
-                bar ??= new ConsoleProgress(label, step.TotalSteps);
-                bar.Report(step.Step, $"epoch {step.Epoch}/{options.Epochs}, loss {step.Loss:F4}, {step.TokensPerSecond:N0} tokens/s");
-            });
-        bar?.Complete();
-        return tuned;
-    }
-
-    /// <summary>A progress callback (done, total) that draws a scoring bar and completes it at the end.</summary>
+    /// <summary>A progress callback (done, total) that shows a scoring bar, kept on screen when done.</summary>
     public static Action<int, int> Scoring(string label = "scoring")
     {
-        ConsoleProgress? bar = null;
-        var clock = System.Diagnostics.Stopwatch.StartNew();          // from the call, so the first batch counts in the rate
+        var status = new ConsoleStatus();
+        var clock = Stopwatch.StartNew();
         return (done, total) =>
         {
-            bar ??= new ConsoleProgress(label, total, "messages");
-            string rate = $"{done / Math.Max(1e-9, clock.Elapsed.TotalSeconds):F1} messages/s";
+            status.Progress(label, done, total, clock.Elapsed, $"{done / Math.Max(1e-9, clock.Elapsed.TotalSeconds):F1} messages/s", "messages");
             if (done >= total)
             {
-                bar.Complete(rate, done);
-            }
-            else
-            {
-                bar.Report(done, rate);
+                status.Finish();
             }
         };
     }

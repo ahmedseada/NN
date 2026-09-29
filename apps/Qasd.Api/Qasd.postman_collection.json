@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Qasd: intent classifier",
-    "description": "Requests for Qasd.Api (apps/Qasd.Api). Start the service with\n\n    dotnet run -c Release --project apps/Qasd.Api\n\nthen run the collection (baseUrl defaults to http://localhost:5080). The reload request needs the service's IntentModel:AdminKey in the adminKey variable (set IntentModel__AdminKey when starting it).\n\nThe tuned-model requests need IntentModel:TunedPath (a folder from 'qasd-tuned train'); without it they check for the 400 the service returns.",
+    "description": "Requests for Qasd.Api (apps/Qasd.Api). Start the service with\n\n    dotnet run -c Release --project apps/Qasd.Api\n\nthen run the collection (baseUrl defaults to http://localhost:5080). The reload request needs the service's IntentModel:AdminKey in the adminKey variable (set IntentModel__AdminKey when starting it).\n\nThe tuned-model requests need a tuned model (apps/Qasd/models/tuned from nstune train, or IntentModel:TunedPath); without it they check for the 400 the service returns.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [

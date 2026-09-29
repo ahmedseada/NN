@@ -22,12 +22,12 @@ public sealed class IntentModelOptions
     public int MaxTextLength { get; set; } = 4000;
 
     /// <summary>
-    /// The folder written by 'qasd-tuned train' (adapter + qasd-tuned.json); empty: its default,
-    /// apps/Qasd.Tuned/models/qasd-tuned. The tuned model is served when the folder holds one; "none" turns it off.
+    /// The tuned model's folder (the adapter and neuralsharp-tuning.json written by nstune train); empty: its default,
+    /// apps/Qasd/models/tuned. The tuned model is served when the folder holds one; "none" turns it off.
     /// </summary>
     public string? TunedPath { get; set; }
 
-    /// <summary>The tuned model's folder: TunedPath, or the default place 'qasd-tuned train' saves to (null when turned off).</summary>
+    /// <summary>The tuned model's folder: TunedPath, or its default place (null when turned off).</summary>
     public string? TunedFolder => TunedPath is "none" ? null : string.IsNullOrWhiteSpace(TunedPath) ? QasdPaths.Tuned : TunedPath;
 
     /// <summary>Where the tuned model runs: cpu (default), cuda, cuda:N or auto (a language model is much faster on the GPU).</summary>
