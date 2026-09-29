@@ -32,7 +32,8 @@ const string Usage = """
 
     Data:      --eval F|spec (evaluation data), --eval-fraction F (hold out a fraction; evaluate with the same data and
                fraction scores that part), --system S (added to conversations without one), --kind auto|chat|text,
-               --max-rows N, --seed N, --min-chars N, --max-chars N, --no-dedup, --mix, --no-shuffle
+               --max-rows N, --seed N, --min-chars N, --max-chars N, --no-dedup, --mix, --no-shuffle, --balance N (answers from a
+               short list, such as labels: rarer answers repeated, up to N times, towards the most common one's count)
     Training:  --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048, --batch-tokens 4096, --accumulate 1,
                --targets q,k,v,o,gate,up,down, --save-every N, --eval-every N, --checkpointing | --no-checkpointing
                (default: off, turned on if a step runs out of device memory even with --recompute), --recompute (recompute the
@@ -55,6 +56,7 @@ bool int8 = false, bf16 = false, int4 = false, kv8 = false, kv16 = false, noThin
 bool shuffleRows = true, dedupRows = true, mixByWeight = false;
 int context = 4096, samples = 100, maxNew = 512, evaluationBatch = 8, seed = 0, minChars = 0, maxChars = 0;
 long maxRows = 0;
+int balance = 0;
 double evalFraction = 0;
 string? output = null, evalFile = null, adapterFolder = null, systemPrompt = null, choices = null;
 float? temperature = null;
@@ -137,6 +139,7 @@ try
             case "--max-chars": maxChars = NextInt(); break;
             case "--no-shuffle": shuffleRows = false; break;
             case "--no-dedup": dedupRows = false; break;
+            case "--balance": balance = NextInt(); break;
             case "--mix": mixByWeight = true; break;
             case "-h" or "--help":
                 Console.WriteLine(Usage);
@@ -264,6 +267,22 @@ int Train()
     {
         Console.Error.WriteLine("error: nothing to train on (no conversation with an assistant turn and no text).");
         return 1;
+    }
+
+    if (balance > 1)
+    {
+        var (balanced, answers) = FineTuner.BalanceAnswers(train, balance, seed: seed);
+        if (answers.Count is > 1 and <= 64)
+        {
+            Console.WriteLine($"balanced {answers.Count} answers (at most {balance}×): "
+                              + string.Join(", ", answers.OrderByDescending(a => a.Before).Select(a =>
+                                  $"{JsonValue.Create(model.Tokenizer!.Decode(a.Answer).Trim()).ToJsonString(readable)} {a.Before:N0}→{a.After:N0}")));
+            train = balanced;
+        }
+        else
+        {
+            Console.WriteLine($"--balance: {answers.Count:N0} distinct answers (free text, or one): the data is used as it is");
+        }
     }
 
     if (profileTraining)

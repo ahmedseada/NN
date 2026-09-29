@@ -110,8 +110,18 @@ public sealed record TextClassifierReport(IReadOnlyList<string> Labels, int[,] C
             scores.Add(new LabelScores(labels[c], precision, recall, precision + recall == 0 ? 0 : 2 * precision * recall / (precision + recall), actual));
         }
 
-        return new TextClassifierReport(labels, confusion, scores);
+        return new TextClassifierReport(labels, confusion, scores) { Examples = examples, Predictions = predictions };
     }
+
+    /// <summary>The evaluated texts, in order (empty for a report built otherwise).</summary>
+    public IReadOnlyList<LabeledText> Examples { get; init; } = [];
+
+    /// <summary>Their predictions, in the same order.</summary>
+    public IReadOnlyList<TextPrediction> Predictions { get; init; } = [];
+
+    /// <summary>The texts classified wrong, the most confident mistakes first (often labels worth a second look).</summary>
+    public IEnumerable<(LabeledText Example, TextPrediction Prediction)> Errors() =>
+        Examples.Zip(Predictions).Where(p => p.First.Label.Trim() != p.Second.Label).OrderByDescending(p => p.Second.Confidence);
 
     /// <summary>Mean F1 over the labels (each label counts the same, however rare).</summary>
     public double MacroF1 => Scores.Count == 0 ? 0 : Scores.Average(s => s.F1);

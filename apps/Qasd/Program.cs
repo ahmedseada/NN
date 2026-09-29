@@ -16,6 +16,9 @@ const string Usage = """
       qasd evaluate [model] <data…>        score a model on labeled texts (accuracy, per-label F1, confusion matrix)
       qasd predict [model] [text…]         classify texts (arguments, else one per line from standard input)
       qasd info [model]                    labels and settings of a model
+      qasd audit <data…>                   the labels' consistency: texts labelled differently in different rows, and
+                                          short messages per label (often a reply that only the conversation explains);
+                                          --out F.csv writes the conflicting texts with their label counts
     (model: a .nsm file; default apps/Qasd/models/intents.nsm)
       qasd split <data…>                   write the train / test split the classifier uses (train.csv, test.csv in
                                           apps/Qasd/data/split, or --out DIR), so a model tuned with nstune on train.csv
@@ -40,13 +43,15 @@ const string Usage = """
       --stream            predict --tuned: print the model's answer as it is generated
       --json              predict: one JSON object per text (label, confidence, probabilities)
       --min-confidence F  predict: print "unknown" below this confidence
+      --errors F.csv      evaluate: write the texts classified wrong (label, prediction, confidence, every probability),
+                          the most confident mistakes first
     """;
 
 var positional = new List<string>();
 string? output = null, textColumn = null, labelColumn = null, deviceName = null, deviceList = null;
 double testFraction = 0.2, minConfidence = 0;
 bool json = false, tuned = false, stream = false;
-string? tunedFolder = null, labelList = null;
+string? tunedFolder = null, labelList = null, errorsPath = null;
 var options = new TextClassifierOptions();
 try
 {
@@ -76,6 +81,7 @@ try
             case "--folder": tunedFolder = Next(); tuned = true; break;
             case "--labels": labelList = Next(); break;
             case "--stream": stream = true; break;
+            case "--errors": errorsPath = Next(); break;
             case "--min-confidence": minConfidence = double.Parse(Next(), CultureInfo.InvariantCulture); break;
             case "-h" or "--help" or "help": Console.WriteLine(Usage); return 0;
             case ['-', '-', ..]: throw new ArgumentException($"Unknown option {args[i]}.");
@@ -92,7 +98,7 @@ catch (Exception ex) when (ex is ArgumentException or FormatException)
 string command = positional.Count > 0 ? positional[0] : "";
 bool valid = command switch
 {
-    "train" or "split" => positional.Count >= 2,
+    "train" or "split" or "audit" => positional.Count >= 2,
     "benchmark" => positional.Count >= 2,
     "evaluate" => positional.Count >= 2,
     "predict" or "info" => positional.Count >= 1,
@@ -105,7 +111,12 @@ if (!valid)
 }
 
 Console.OutputEncoding = Encoding.UTF8;
-output ??= command == "split" ? Path.Combine(QasdPaths.Data, "split") : QasdPaths.Classifier;
+output ??= command switch
+{
+    "split" => Path.Combine(QasdPaths.Data, "split"),
+    "audit" => null,                                                    // only when asked: never over the model file
+    _ => QasdPaths.Classifier,
+};
 tunedFolder ??= QasdPaths.Tuned;
 
 // evaluate / predict / info: the model file first when given (a .nsm file), else the default one.
@@ -164,7 +175,9 @@ try
             var examples = ReadAll(rest);
             using var model = TunedClassifier.Load(tunedFolder, [.. examples.Select(e => e.Label)], device);
             Console.WriteLine($"scoring {examples.Count:N0} messages with {model.BaseModel} (tuned) on {device.Name}…");
-            Console.WriteLine(model.Evaluate(examples, ConsoleTraining.Scoring()));
+            var report = model.Evaluate(examples, ConsoleTraining.Scoring());
+            Console.WriteLine(report);
+            WriteErrors(report);
             return 0;
         }
 
@@ -218,7 +231,15 @@ try
         {
             using var classifier = TextClassifier.Load(modelPath, device);
             var examples = ReadAll(rest);
-            Console.WriteLine(classifier.Evaluate(examples));
+            var report = classifier.Evaluate(examples);
+            Console.WriteLine(report);
+            WriteErrors(report);
+            return 0;
+        }
+
+        case "audit":
+        {
+            Audit(ReadAll(positional.Skip(1)));
             return 0;
         }
 
@@ -427,6 +448,73 @@ static string[] Take(TextClassifier classifier)
 }
 
 // Labeled texts as CSV (a header, then one quoted row per text).
+// evaluate --errors: the texts classified wrong, with every probability, the most confident mistakes first.
+void WriteErrors(TextClassifierReport report)
+{
+    if (errorsPath is null)
+    {
+        return;
+    }
+
+    static string Quote(string value) => "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+    var errors = report.Errors().ToList();
+    using (var writer = new StreamWriter(errorsPath, false, new UTF8Encoding(false)))
+    {
+        writer.WriteLine(string.Join(",", new[] { "text", "label", "predicted", "confidence" }.Concat(report.Labels).Select(Quote)));
+        foreach (var (example, prediction) in errors)
+        {
+            var probabilities = report.Labels.Select(l => prediction.Probabilities.FirstOrDefault(p => p.Label == l).Probability.ToString("F4", CultureInfo.InvariantCulture));
+            writer.WriteLine(string.Join(",", new[] { Quote(example.Text), Quote(example.Label.Trim()), Quote(prediction.Label),
+                prediction.Confidence.ToString("F4", CultureInfo.InvariantCulture) }.Concat(probabilities)));
+        }
+    }
+
+    Console.WriteLine($"{errors.Count:N0} texts classified wrong written to {Path.GetFullPath(errorsPath)} (the most confident first)");
+}
+
+// audit: labels given differently to the same text (after trimming, lower-casing and joining spaces), and the share of
+// short messages per label: a two-word reply ("Tuesday", "yes", a phone number) is often only one intent in context.
+void Audit(List<LabeledText> examples)
+{
+    static string Key(string text) => string.Join(' ', text.Trim().ToLowerInvariant().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+    var labels = examples.GroupBy(e => e.Label.Trim()).OrderByDescending(g => g.Count()).ToList();
+    var texts = examples.GroupBy(e => Key(e.Text)).ToList();
+    var conflicts = texts.Where(g => g.Select(e => e.Label.Trim()).Distinct().Count() > 1).OrderByDescending(g => g.Count()).ToList();
+    int conflictRows = conflicts.Sum(g => g.Count());
+    Console.WriteLine($"{examples.Count:N0} rows, {texts.Count:N0} distinct texts, {labels.Count} labels");
+    Console.WriteLine($"{conflicts.Count:N0} texts have more than one label ({conflictRows:N0} rows, {conflictRows / (double)Math.Max(1, examples.Count):P1}); "
+                      + "the most frequent:");
+    foreach (var group in conflicts.Take(20))
+    {
+        var counts = group.GroupBy(e => e.Label.Trim()).OrderByDescending(g => g.Count()).Select(g => $"{g.Key} {g.Count()}");
+        Console.WriteLine($"  {group.Key,-50} {string.Join(", ", counts)}");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"{"label",-16}{"rows",9}{"≤ 3 words",11}{"conflicting",13}   short examples");
+    foreach (var label in labels)
+    {
+        var shortOnes = label.Where(e => Key(e.Text).Split(' ').Length <= 3).ToList();
+        int conflicting = label.Count(e => conflicts.Any(c => c.Key == Key(e.Text)));
+        string samples = string.Join(" | ", shortOnes.Select(e => e.Text.Trim()).Distinct().Take(6));
+        Console.WriteLine($"{label.Key,-16}{label.Count(),9:N0}{shortOnes.Count / (double)label.Count(),11:P1}{conflicting / (double)label.Count(),13:P1}   {samples}");
+    }
+
+    if (output is not null)
+    {
+        static string Quote(string value) => "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+        using var writer = new StreamWriter(output, false, new UTF8Encoding(false));
+        writer.WriteLine(string.Join(",", new[] { "text", "rows" }.Concat(labels.Select(l => l.Key)).Select(Quote)));
+        foreach (var group in conflicts)
+        {
+            writer.WriteLine(string.Join(",", new[] { Quote(group.First().Text.Trim()), group.Count().ToString(CultureInfo.InvariantCulture) }
+                .Concat(labels.Select(l => group.Count(e => e.Label.Trim() == l.Key).ToString(CultureInfo.InvariantCulture)))));
+        }
+
+        Console.WriteLine($"\n{conflicts.Count:N0} conflicting texts written to {Path.GetFullPath(output)}");
+    }
+}
+
 static void WriteCsv(string path, string textColumn, string labelColumn, IEnumerable<LabeledText> rows)
 {
     static string Quote(string value) => "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";

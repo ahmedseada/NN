@@ -619,6 +619,46 @@ public sealed record FineTuningProgress(int Step, int TotalSteps, int Epoch, flo
 public static class FineTuner
 {
     /// <summary>
+    /// Evens out how often each answer is trained when the answers come from a short list (labels, yes / no, one of a few
+    /// choices): sequences are grouped by their trained tokens, and a group smaller than the largest is repeated, at most
+    /// <paramref name="maxRepeats"/> times in all, towards the largest one's size. A rare answer then weighs more in the
+    /// loss (its recall rises, usually at some cost to its precision). With more than <paramref name="maxAnswers"/>
+    /// distinct answers (free text) the sequences are returned as they are. Deterministic for a <paramref name="seed"/>.
+    /// </summary>
+    /// <returns>The sequences (repeats included) and each answer's count before and after, by its tokens.</returns>
+    public static (List<TrainingSequence> Sequences, IReadOnlyList<(int[] Answer, int Before, int After)> Answers) BalanceAnswers(
+        IReadOnlyList<TrainingSequence> sequences, int maxRepeats = 4, int maxAnswers = 64, int seed = 0)
+    {
+        ArgumentNullException.ThrowIfNull(sequences);
+        static int[] Answer(TrainingSequence s) => [.. s.Tokens.Where((_, i) => s.Trained[i])];
+        var groups = sequences.GroupBy(s => string.Join(',', Answer(s))).Select(g => g.ToList()).ToList();
+        var result = new List<TrainingSequence>(sequences);
+        if (groups.Count < 2 || groups.Count > maxAnswers || maxRepeats <= 1)
+        {
+            return (result, [.. groups.Select(g => (Answer(g[0]), g.Count, g.Count))]);
+        }
+
+        int largest = groups.Max(g => g.Count);
+        var random = new Random(seed);
+        var answers = new List<(int[] Answer, int Before, int After)>();
+        foreach (var group in groups)
+        {
+            // Target: the largest group's size, at most maxRepeats times this one's: whole copies, then a seeded sample.
+            int target = (int)Math.Min(largest, (long)group.Count * maxRepeats);
+            for (int added = group.Count; added < target;)
+            {
+                int take = Math.Min(group.Count, target - added);
+                result.AddRange(take == group.Count ? group : group.OrderBy(_ => random.Next()).Take(take));
+                added += take;
+            }
+
+            answers.Add((Answer(group[0]), group.Count, Math.Max(group.Count, target)));
+        }
+
+        return (result, answers);
+    }
+
+    /// <summary>
     /// Adds adapters to <paramref name="model"/> (unless it already has some) and trains them on <paramref name="train"/>;
     /// evaluates on <paramref name="evaluation"/> when given, and writes the adapters to <paramref name="outputFolder"/>
     /// (PEFT format, see <see cref="PretrainedModel.SaveAdapter"/>) when given. Returns the evaluation losses.

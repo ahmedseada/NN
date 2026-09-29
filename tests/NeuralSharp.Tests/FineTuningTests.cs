@@ -16,6 +16,7 @@ internal static partial class Tests
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("fine-tuning: the input gradient through bfloat16 weights reads them as stored (with and without the adapter's term, odd widths, split k)", BFloat16InputGradient),
+        ("fine-tuning: answers from a short list are balanced (rarer ones repeated up to a limit, deterministically); free text is left alone", BalancedAnswers),
         ("scoring: log-probabilities of chosen tokens computed on the device match a log-softmax of the full logits (chunked, repeated rows)", TokenLogProbabilities),
         ("scoring: a cached forward pass without autograd frees each layer's intermediate results (only the cache and the output stay)", CachedForwardFreesLayers),
         ("scoring: given answers to chat prompts are scored as the model's own full forward pass scores them, each prompt run once from a cache or with every answer, whatever the batching; long messages are shortened to fit", AnswerScoring),
@@ -306,6 +307,25 @@ internal static partial class Tests
             Check(hidden.Shape.SequenceEqual([Rows, Steps, spec.Dim]), $"hidden states {string.Join("×", hidden.Shape.ToArray())}");
             Check(held < 2 * layer, $"only the cache and the output are held after the pass ({held:N0} bytes besides the cache; one feed-forward activation is {layer:N0})");
         }
+    }
+
+    private static void BalancedAnswers(Device device)
+    {
+        _ = device;
+        static TrainingSequence Row(int prompt, int[] answer) =>
+            new([prompt, 7, .. answer, 1], [false, false, .. answer.Select(_ => true), true]);
+        var rows = Enumerable.Range(0, 10).Select(i => Row(i, [40])).Concat(Enumerable.Range(0, 3).Select(i => Row(i, [41, 42])))
+            .Concat([Row(0, [43])]).ToList();
+        var (balanced, answers) = FineTuner.BalanceAnswers(rows, maxRepeats: 4, seed: 3);
+        string Counts(IEnumerable<(int[] Answer, int Before, int After)> a) => string.Join(" ", a.Select(x => $"{x.Answer[0]}:{x.Before}->{x.After}"));
+        Check(Counts(answers) == "40:10->10 41:3->10 43:1->4", $"counts {Counts(answers)}");
+        Check(balanced.Count == 24 && rows.All(balanced.Contains), $"{balanced.Count} sequences, every original kept");
+        Check(balanced.Count(s => s.Tokens[2] == 41) == 10 && balanced.Count(s => s.Tokens[2] == 43) == 4, "repeats per answer");
+        var again = FineTuner.BalanceAnswers(rows, maxRepeats: 4, seed: 3).Sequences;
+        Check(again.Select(s => s.Tokens[0] * 100 + s.Tokens[2]).SequenceEqual(balanced.Select(s => s.Tokens[0] * 100 + s.Tokens[2])), "the same for the same seed");
+
+        var free = Enumerable.Range(0, 100).Select(i => Row(i, [100 + i])).ToList();
+        Check(FineTuner.BalanceAnswers(free).Sequences.Count == 100, "free text (100 distinct answers) is left alone");
     }
 
     private static void TokenLogProbabilities(Device device)
