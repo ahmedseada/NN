@@ -19,7 +19,6 @@ internal static partial class Tests
         ("scoring: log-probabilities of chosen tokens computed on the device match a log-softmax of the full logits (chunked, repeated rows)", TokenLogProbabilities),
         ("scoring: a cached forward pass without autograd frees each layer's intermediate results (only the cache and the output stay)", CachedForwardFreesLayers),
         ("scoring: given answers to chat prompts are scored as the model's own full forward pass scores them, each prompt run once from a cache or with every answer, whatever the batching; long messages are shortened to fit", AnswerScoring),
-        ("fine-tuning: thin products (a rank of at most 32: x·A, g·Bᵀ, xᵀ·dt, (uᵀ·g)ᵀ) match the plain product: odd sizes, split chunks, scale, overwrite or add", SkinnyProducts),
         ("fine-tuning: the gated activation reads and writes bfloat16 words as packing and unpacking around the float kernels would (SiLU, GELU, ReLU, odd sizes)", PackedGatedActivation),
         ("fine-tuning: releasing results no backward step reads, and recomputing feed-forward activations, give the same loss and gradients with less memory (RoPE, biases, q/k norms, post norms, parallel blocks, layer norms, dropout)", ReleasedActivations),
         ("fine-tuning: checkpointing is off by default and turns on (the step run again) when a step runs out of memory; a lighter setting that fits is timed against checkpointing and the faster kept", AutomaticCheckpointing),
@@ -348,76 +347,6 @@ internal static partial class Tests
         }
 
         Check(Losses.TokenLogProbabilities(hidden, head.Forward, [], []).Length == 0, "no rows, no values");
-    }
-
-    private static void SkinnyProducts(Device device)
-    {
-        var r = new Random(55);
-        float[] Values(int n) => [.. Enumerable.Range(0, n).Select(_ => (float)(r.NextDouble() * 2 - 1))];
-        foreach (var (m, k, rank) in new[] { (1, 1, 1), (37, 5, 3), (300, 97, 16), (129, 4097, 16), (4096, 896, 16), (70, 1000, 32), (2050, 64, 7) })
-        {
-            using var scope = new TensorScope();
-            var x = Values(m * k);
-            var xt = Tensor.From(x, [m, k], device);
-            var backend = xt.Backend;
-            foreach (bool transposed in new[] { false, true })
-            {
-                foreach (float beta in new[] { 0f, 1f })
-                {
-                    const float Alpha = 0.75f;
-                    string what = $"{m}×{k}, rank {rank}, {(transposed ? "transposed" : "as stored")}, beta {beta}";
-
-                    // y[m, r] = alpha · x · W + beta · y, W = w [k, r] or w [r, k] transposed.
-                    var w = Values(k * rank);
-                    var start = Values(m * rank);
-                    var y = Tensor.From(start, [m, rank], device);
-                    if (backend.SkinnyMatMul(xt.Storage, Tensor.From(w, [transposed ? rank : k, transposed ? k : rank], device).Storage, y.Storage, m, k, rank, transposed, Alpha, beta))
-                    {
-                        var expected = new float[m * rank];
-                        for (int i = 0; i < m; i++)
-                        {
-                            for (int j = 0; j < rank; j++)
-                            {
-                                double sum = 0;
-                                for (int t = 0; t < k; t++)
-                                {
-                                    sum += (double)x[i * k + t] * (transposed ? w[j * k + t] : w[t * rank + j]);
-                                }
-
-                                expected[i * rank + j] = (float)(Alpha * sum + beta * start[i * rank + j]);
-                            }
-                        }
-
-                        CloseByNorm(expected, y.ToArray(), 1e-5f, $"x·W, {what}");
-                    }
-
-                    // out = alpha · xᵀ · d + beta · out, out [k, r] or [r, k] (transposed).
-                    var d = Values(m * rank);
-                    var outStart = Values(k * rank);
-                    var output = Tensor.From(outStart, [transposed ? rank : k, transposed ? k : rank], device);
-                    if (backend.SkinnyTransposedMatMul(xt.Storage, Tensor.From(d, [m, rank], device).Storage, output.Storage, m, k, rank, transposed, Alpha, beta))
-                    {
-                        var expected = new float[k * rank];
-                        for (int t = 0; t < k; t++)
-                        {
-                            for (int j = 0; j < rank; j++)
-                            {
-                                double sum = 0;
-                                for (int i = 0; i < m; i++)
-                                {
-                                    sum += (double)x[i * k + t] * d[i * rank + j];
-                                }
-
-                                int at = transposed ? j * k + t : t * rank + j;
-                                expected[at] = (float)(Alpha * sum + beta * outStart[at]);
-                            }
-                        }
-
-                        CloseByNorm(expected, output.ToArray(), 1e-5f, $"xᵀ·d, {what}");
-                    }
-                }
-            }
-        }
     }
 
     private static void PackedGatedActivation(Device device)

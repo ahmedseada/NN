@@ -583,20 +583,6 @@ internal abstract class Backend
     /// </summary>
     public abstract void SoftmaxCrossEntropyRows(Storage logits, Storage targets, Storage weights, Storage losses, int rows, int vocabulary, float scale);
 
-    /// <summary>
-    /// y[m, r] = alpha · x[m, k] · W + beta · y for a thin W of r ≤ 32 columns: w [k, r], or w [r, k] read transposed
-    /// (<paramref name="transW"/>) — a LoRA adapter's x·A or g·Bᵀ with its scale. beta is 0 or 1. False when the device has
-    /// no such kernel (callers then use <see cref="BatchedMatMul"/>).
-    /// </summary>
-    public virtual bool SkinnyMatMul(Storage x, Storage w, Storage y, int m, int k, int r, bool transW, float alpha, float beta) => false;
-
-    /// <summary>
-    /// output = alpha · x[m, k]ᵀ · d[m, r] + beta · output for a thin d of r ≤ 32 columns, output [k, r] or [r, k]
-    /// (<paramref name="transOutput"/>) — a LoRA adapter's gradients xᵀ·dt and (uᵀ·g)ᵀ, summed over every row. beta is 0 or
-    /// 1. False when the device has no such kernel.
-    /// </summary>
-    public virtual bool SkinnyTransposedMatMul(Storage x, Storage d, Storage output, int m, int k, int r, bool transOutput, float alpha, float beta) => false;
-
     /// <summary>y = act(gate) · up element-wise; kind 0 = SiLU, 1 = GELU (tanh approximation), 2 = ReLU.</summary>
     public abstract void GatedActivation(Storage gate, Storage up, Storage y, int n, int kind);
 

@@ -193,9 +193,8 @@ public sealed partial class Tensor
         long start = Telemetry.Start(TelemetryLevel.Operations);
         var backend = x.Backend;
         var u = Empty([m, rank], x.Device, zeroed: true);           // scale · x·A
-        if (!backend.SkinnyMatMul(x.Storage, a.Storage, u.Storage, m, inputs, rank, false, scale, 0f))
+        using (var t = Empty([m, rank], x.Device, track: false))
         {
-            using var t = Empty([m, rank], x.Device, track: false);
             backend.BatchedMatMul(x.Storage, a.Storage, t.Storage, 1, m, rank, inputs, false, false, 0f);
             backend.Axpy(t.Storage, u.Storage, m * rank, scale);
         }
@@ -207,26 +206,18 @@ public sealed partial class Tensor
         {
             y.Record("lora", g =>
             {
-                if (b.RequiresGrad && !backend.SkinnyTransposedMatMul(g.Storage, u.Storage, b.GradStorage(), m, outputs, rank, true, 1f, 1f))
+                if (b.RequiresGrad)
                 {
                     backend.BatchedMatMul(u.Storage, g.Storage, b.GradStorage(), 1, rank, outputs, m, true, false, 1f);       // dB += uᵀ·g
                 }
 
                 if (a.RequiresGrad || x.RequiresGrad)
                 {
+                    using var du = Empty([m, rank], x.Device, track: false);
                     using var dt = Empty([m, rank], x.Device, zeroed: true, track: false);
-                    if (!backend.SkinnyMatMul(g.Storage, b.Storage, dt.Storage, m, outputs, rank, true, scale, 0f))       // dt = scale · g·Bᵀ
-                    {
-                        using var du = Empty([m, rank], x.Device, track: false);
-                        backend.BatchedMatMul(g.Storage, b.Storage, du.Storage, 1, m, rank, outputs, false, true, 0f);    // du = g·Bᵀ
-                        backend.Axpy(du.Storage, dt.Storage, m * rank, scale);                                            // dt = scale · du
-                    }
-
-                    if (a.RequiresGrad && backend.SkinnyTransposedMatMul(x.Storage, dt.Storage, a.GradStorage(), m, inputs, rank, false, 1f, 1f))
-                    {
-                        // dA += xᵀ·dt
-                    }
-                    else if (a.RequiresGrad)
+                    backend.BatchedMatMul(g.Storage, b.Storage, du.Storage, 1, m, rank, outputs, false, true, 0f);        // du = g·Bᵀ
+                    backend.Axpy(du.Storage, dt.Storage, m * rank, scale);                                                // dt = scale · du
+                    if (a.RequiresGrad)
                     {
                         backend.BatchedMatMul(x.Storage, dt.Storage, a.GradStorage(), 1, inputs, rank, m, true, false, 1f);  // dA += xᵀ·dt
                     }
@@ -287,11 +278,8 @@ public sealed partial class Tensor
         {
             var adapter = layers[j].Adapter!;
             us[j] = Empty([m, rank], input.Device);                                      // scale · x·A (kept for dB)
-            if (!backend.SkinnyMatMul(flat.Storage, adapter.A.Storage, us[j].Storage, m, k, rank, false, adapter.Scale, 0f))
-            {
-                backend.BatchedMatMul(flat.Storage, adapter.A.Storage, us[j].Storage, 1, m, rank, k, false, false, 0f);
-                backend.Affine(us[j].Storage, us[j].Storage, m * rank, adapter.Scale, 0f);
-            }
+            backend.BatchedMatMul(flat.Storage, adapter.A.Storage, us[j].Storage, 1, m, rank, k, false, false, 0f);
+            backend.Affine(us[j].Storage, us[j].Storage, m * rank, adapter.Scale, 0f);
             outputs[j] = Empty([m, layers[j].OutFeatures], input.Device);
         }
 
@@ -351,19 +339,15 @@ public sealed partial class Tensor
             {
                 outputs[j].Record("lora_fused", g =>
                 {
-                    if (b.RequiresGrad && !backend.SkinnyTransposedMatMul(g.Storage, u.Storage, b.GradStorage(), m, n, rank, true, 1f, 1f))
+                    if (b.RequiresGrad)
                     {
                         backend.BatchedMatMul(u.Storage, g.Storage, b.GradStorage(), 1, rank, n, m, true, false, 1f);         // dB += uᵀ·g
                     }
 
                     using var dt = Empty([m, rank], flat.Device, track: false);
-                    if (!backend.SkinnyMatMul(g.Storage, b.Storage, dt.Storage, m, n, rank, true, scale, 0f))              // dt = scale · g·Bᵀ
-                    {
-                        backend.BatchedMatMul(g.Storage, b.Storage, dt.Storage, 1, m, rank, n, false, true, 0f);
-                        backend.Affine(dt.Storage, dt.Storage, m * rank, scale, 0f);
-                    }
-
-                    if (a.RequiresGrad && !backend.SkinnyTransposedMatMul(flat.Storage, dt.Storage, a.GradStorage(), m, k, rank, false, 1f, 1f))
+                    backend.BatchedMatMul(g.Storage, b.Storage, dt.Storage, 1, m, rank, n, false, true, 0f);                 // g·Bᵀ
+                    backend.Affine(dt.Storage, dt.Storage, m * rank, scale, 0f);                                            // dt = scale · g·Bᵀ
+                    if (a.RequiresGrad)
                     {
                         backend.BatchedMatMul(flat.Storage, dt.Storage, a.GradStorage(), 1, k, rank, m, true, false, 1f);   // dA += xᵀ·dt
                     }
