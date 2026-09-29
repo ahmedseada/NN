@@ -1,0 +1,790 @@
+{
+  "info": {
+    "name": "Qasd: intent classifier",
+    "description": "Requests for Qasd.Api (apps/Qasd.Api). Start the service with\n\n    dotnet run -c Release --project apps/Qasd.Api\n\nthen run the collection (baseUrl defaults to http://localhost:5080). The reload request needs the service's IntentModel:AdminKey in the adminKey variable (set IntentModel__AdminKey when starting it).\n\nThe tuned-model requests need a tuned model (apps/Qasd/models/tuned from idrak-tune train, or IntentModel:TunedPath); without it they check for the 400 the service returns.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5080"
+    },
+    {
+      "key": "adminKey",
+      "value": "change-me"
+    },
+    {
+      "key": "minConfidence",
+      "value": "0.6"
+    }
+  ],
+  "item": [
+    {
+      "name": "Classify",
+      "item": [
+        {
+          "name": "Book an appointment (English)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify"
+              ]
+            },
+            "description": "One message → the most likely intent, its confidence, accepted (confidence ≥ MinConfidence) and every intent's probability.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"Book me with Dr. Heba Mansour in neurology on Tuesday at 12:30\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test(\"has a label and confidence\", () => { pm.expect(r.label).to.be.a(\"string\"); pm.expect(r.confidence).to.be.within(0, 1); });",
+                  "pm.test(\"probabilities add up to 1\", () => pm.expect(r.probabilities.reduce((s, p) => s + p.probability, 0)).to.be.closeTo(1, 0.001));",
+                  "pm.test(\"accepted matches MinConfidence\", () => pm.expect(r.accepted).to.eql(r.confidence >= Number(pm.collectionVariables.get(\"minConfidence\") || 0.6)));",
+                  "pm.test(\"classified as function_call\", () => pm.expect(r.label).to.eql(\"function_call\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Available days (English)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"what are the available days?\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test(\"has a label and confidence\", () => { pm.expect(r.label).to.be.a(\"string\"); pm.expect(r.confidence).to.be.within(0, 1); });",
+                  "pm.test(\"probabilities add up to 1\", () => pm.expect(r.probabilities.reduce((s, p) => s + p.probability, 0)).to.be.closeTo(1, 0.001));",
+                  "pm.test(\"accepted matches MinConfidence\", () => pm.expect(r.accepted).to.eql(r.confidence >= Number(pm.collectionVariables.get(\"minConfidence\") || 0.6)));",
+                  "pm.test(\"classified as retrieve\", () => pm.expect(r.label).to.eql(\"retrieve\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Greeting (Arabic)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"هلا\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test(\"has a label and confidence\", () => { pm.expect(r.label).to.be.a(\"string\"); pm.expect(r.confidence).to.be.within(0, 1); });",
+                  "pm.test(\"probabilities add up to 1\", () => pm.expect(r.probabilities.reduce((s, p) => s + p.probability, 0)).to.be.closeTo(1, 0.001));",
+                  "pm.test(\"accepted matches MinConfidence\", () => pm.expect(r.accepted).to.eql(r.confidence >= Number(pm.collectionVariables.get(\"minConfidence\") || 0.6)));",
+                  "pm.test(\"classified as direct_reply\", () => pm.expect(r.label).to.eql(\"direct_reply\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Services (Arabic)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"ايه هي خدماتكم\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test(\"has a label and confidence\", () => { pm.expect(r.label).to.be.a(\"string\"); pm.expect(r.confidence).to.be.within(0, 1); });",
+                  "pm.test(\"probabilities add up to 1\", () => pm.expect(r.probabilities.reduce((s, p) => s + p.probability, 0)).to.be.closeTo(1, 0.001));",
+                  "pm.test(\"accepted matches MinConfidence\", () => pm.expect(r.accepted).to.eql(r.confidence >= Number(pm.collectionVariables.get(\"minConfidence\") || 0.6)));",
+                  "pm.test(\"classified as identity\", () => pm.expect(r.label).to.eql(\"identity\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Low confidence → fallback",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify"
+              ]
+            },
+            "description": "A short reply whose intent depends on the conversation: expect a low confidence and accepted = false, meaning: send it to the fallback.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"ok\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test(\"has a label and confidence\", () => { pm.expect(r.label).to.be.a(\"string\"); pm.expect(r.confidence).to.be.within(0, 1); });",
+                  "pm.test(\"probabilities add up to 1\", () => pm.expect(r.probabilities.reduce((s, p) => s + p.probability, 0)).to.be.closeTo(1, 0.001));",
+                  "pm.test(\"accepted matches MinConfidence\", () => pm.expect(r.accepted).to.eql(r.confidence >= Number(pm.collectionVariables.get(\"minConfidence\") || 0.6)));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Classify batch",
+      "item": [
+        {
+          "name": "Several messages",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify/batch",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify",
+                "batch"
+              ]
+            },
+            "description": "Up to MaxBatch (256) messages in one pass through the model; results in the order of the request.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"texts\": [\n    \"Book me with Dr. Heba Mansour in neurology on Tuesday at 12:30\",\n    \"what are the available days?\",\n    \"هلا\",\n    \"ايه هي خدماتكم\",\n    \"عايز احجز مع د. هبة يوم الخميس\",\n    \"where are you located?\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "const sent = JSON.parse(pm.request.body.raw).texts;",
+                  "pm.test(\"one result per message, in order\", () => { pm.expect(r.results.length).to.eql(sent.length); r.results.forEach((x, i) => pm.expect(x.text).to.eql(sent[i])); });",
+                  "pm.test(\"reports the model time\", () => pm.expect(r.elapsedMilliseconds).to.be.at.least(0));",
+                  "console.log(r.results.map(x => `${x.label} ${(x.confidence * 100).toFixed(1)}% ${x.accepted ? \"\" : \"(fallback)\"} ${x.text}`).join(\"\\n\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Tuned model and streaming",
+      "item": [
+        {
+          "name": "Tuned model: one message",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"Book me with Dr. Heba Mansour in neurology on Tuesday at 12:30\",\n  \"model\": \"tuned\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "The tuned language model (IntentModel:TunedPath). Returns 400 when the service has no tuned model."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 400) { pm.test(\"tuned model not configured (400)\", () => pm.expect(pm.response.json().errors).to.have.property(\"model\")); return; }",
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const r = pm.response.json();",
+                  "pm.test(\"classified by the tuned model\", () => { pm.expect(r.model).to.eql(\"tuned\"); pm.expect(r.probabilities.length).to.be.above(1); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Tuned model: streamed (SSE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"what are the available days?\",\n  \"model\": \"tuned\",\n  \"stream\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Server-Sent Events: token (the model's answer as it is generated), result, done."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 400) { pm.test(\"tuned model not configured (400)\", () => pm.expect(pm.response.json().errors).to.have.property(\"model\")); return; }",
+                  "pm.test(\"200 text/event-stream\", () => { pm.response.to.have.status(200); pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"text/event-stream\"); });",
+                  "const body = pm.response.text();",
+                  "pm.test(\"token, result and done events\", () => { pm.expect(body).to.include(\"event: token\"); pm.expect(body).to.include(\"event: result\"); pm.expect(body).to.include(\"event: done\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Classifier batch: streamed (SSE)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify/batch",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify",
+                "batch"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"texts\": [\n    \"hello\",\n    \"what are the available days?\",\n    \"ايه هي خدماتكم\"\n  ],\n  \"model\": \"classifier\",\n  \"stream\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "A result event per message as it is ready, then done."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 text/event-stream\", () => { pm.response.to.have.status(200); pm.expect(pm.response.headers.get(\"Content-Type\")).to.include(\"text/event-stream\"); });",
+                  "const body = pm.response.text();",
+                  "pm.test(\"a result event per message, then done\", () => { pm.expect((body.match(/event: result/g) || []).length).to.eql(3); pm.expect(body).to.include(\"event: done\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown model → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"hello\",\n  \"model\": \"gpt\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 naming the model field\", () => { pm.response.to.have.status(400); pm.expect(pm.response.json().errors).to.have.property(\"model\"); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Validation errors",
+      "item": [
+        {
+          "name": "Empty message → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"   \"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 with a validation problem\", () => { pm.response.to.have.status(400); pm.expect(pm.response.json().errors).to.be.an(\"object\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Empty batch → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json; charset=utf-8"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/classify/batch",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "classify",
+                "batch"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"texts\": []\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 with a validation problem\", () => { pm.response.to.have.status(400); pm.expect(pm.response.json().errors).to.have.property(\"texts\"); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Model and service",
+      "item": [
+        {
+          "name": "Models (classifier, tuned)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/models",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "models"
+              ]
+            },
+            "description": "Which models the service has, which one is the default, their intents and devices."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const m = pm.response.json();",
+                  "pm.test(\"classifier and tuned listed\", () => pm.expect(m.models.map(x => x.name)).to.eql([\"classifier\", \"tuned\"]));",
+                  "pm.collectionVariables.set(\"minConfidence\", m.minConfidence);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Model info",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/model",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "model"
+              ]
+            },
+            "description": "The model file, its intents, the device, when it was loaded and MinConfidence (saved to the minConfidence variable)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const m = pm.response.json();",
+                  "pm.test(\"lists the intents\", () => pm.expect(m.labels.length).to.be.above(1));",
+                  "pm.collectionVariables.set(\"minConfidence\", m.minConfidence);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reload the model (admin)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "X-Admin-Key",
+                "value": "{{adminKey}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/v1/model/reload",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "model",
+                "reload"
+              ]
+            },
+            "description": "After retraining: loads IntentModel:Path again without dropping requests in flight. Set adminKey to the service's IntentModel:AdminKey."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 with the key the service was started with, 401 otherwise\", () => pm.expect(pm.response.code).to.be.oneOf([200, 401]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reload without the key → 401",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/model/reload",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "model",
+                "reload"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"401 Unauthorized\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"Healthy\", () => { pm.response.to.have.status(200); pm.expect(pm.response.text()).to.eql(\"Healthy\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "OpenAPI document",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/openapi/v1.json",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "openapi",
+                "v1.json"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"OpenAPI 3\", () => pm.expect(pm.response.json().openapi).to.match(/^3\\./));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

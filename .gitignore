@@ -1,0 +1,8 @@
+bin/
+obj/
+*.user
+.vs/
+.idea/
+artifacts/
+apps/Qasd/models/
+apps/Qasd/data/split/

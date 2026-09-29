@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The command line: train, evaluate and try intent models. An application built on Idrak (the NuGet packages). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Qasd</RootNamespace>
+    <AssemblyName>qasd</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Qasd.Core\Qasd.Core.csproj" />
+  </ItemGroup>
+
+</Project>

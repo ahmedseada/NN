@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The intent model (training, evaluation, prediction, one-file save/load), shared by the command line and the API. -->
+  <PropertyGroup>
+    <RootNamespace>Qasd</RootNamespace>
+    <AssemblyName>Qasd.Core</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Idrak" Version="0.1.0" />
+    <PackageReference Include="Idrak.Datasets" Version="0.1.0" />
+    <PackageReference Include="Idrak.LanguageModels" Version="0.1.0" />
+  </ItemGroup>
+
+</Project>

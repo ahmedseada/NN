@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Qasd/Qasd.csproj" />
+  <Project Path="Qasd.Core/Qasd.Core.csproj" />
+  <Project Path="Qasd.Api/Qasd.Api.csproj" />
+</Solution>

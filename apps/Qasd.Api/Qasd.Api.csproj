@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- The HTTP service: serves a trained intent model (OpenAPI document, Scalar UI at /scalar). -->
+  <PropertyGroup>
+    <RootNamespace>Qasd.Api</RootNamespace>
+    <AssemblyName>Qasd.Api</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.*" />
+    <PackageReference Include="Scalar.AspNetCore" Version="2.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Qasd.Core\Qasd.Core.csproj" />
+  </ItemGroup>
+
+</Project>
