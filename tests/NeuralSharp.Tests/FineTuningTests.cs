@@ -629,17 +629,19 @@ internal static partial class Tests
                 packedGradients = [.. model.TrainableParameters().SelectMany(p => p.Grad!.ToArray())];
             }
 
-            // Alone: each sequence as its own batch, gradients summed.
-            foreach (var parameter in model.TrainableParameters())
+            // Alone: each sequence as its own batch, gradients summed; in the test's precision, and (on CUDA) in float32 too,
+            // which measures how far bfloat16 alone moves the results.
+            (List<float[]> Logits, float Loss, float[] Gradients) Alone(MatMulPrecision? precision)
             {
-                parameter.ZeroGrad();
-            }
+                using var scoped = precision is { } p ? MixedPrecision.Use(p) : default(MixedPrecision.Scope?);
+                foreach (var parameter in model.TrainableParameters())
+                {
+                    parameter.ZeroGrad();
+                }
 
-            var aloneLogits = new List<float[]>();
-            float aloneLoss = 0f;
-            float[] aloneGradients;
-            using (var scope = new TensorScope())
-            {
+                var logitsList = new List<float[]>();
+                float total = 0f;
+                using var scope = new TensorScope();
                 for (int r = 0; r < rows.Length; r++)
                 {
                     for (int j = 0; j < rows[r].Length; j++)
@@ -648,23 +650,24 @@ internal static partial class Tests
                         var logits = model.Forward(Tensor.From(tokens[r][j], [1, n], device));
                         var loss = (logits * Tensor.From(coefficients[r][j], [1, n, 50], device)).Sum();
                         loss.Backward();
-                        aloneLoss += loss.Item();
-                        aloneLogits.Add(logits.ToArray());
+                        total += loss.Item();
+                        logitsList.Add(logits.ToArray());
                     }
                 }
 
-                aloneGradients = [.. model.TrainableParameters().SelectMany(p => p.Grad!.ToArray())];
+                return (logitsList, total, [.. model.TrainableParameters().SelectMany(p => p.Grad!.ToArray())]);
             }
 
+            var alone = Alone(null);
+            var exact = device.Type == DeviceType.Cuda ? Alone(MatMulPrecision.Float32) : alone;
             string what = rotary ? "rotary positions" : "learned positions";
-            float tolerance = device.Type == DeviceType.Cuda ? 3e-2f : 1e-3f;
-            for (int i = 0; i < aloneLogits.Count; i++)
+            for (int i = 0; i < alone.Logits.Count; i++)
             {
-                CloseByNorm(aloneLogits[i], packedLogits[i], tolerance, $"{what}: logits of sequence {i}");
+                WithinPrecision(exact.Logits[i], alone.Logits[i], packedLogits[i], device, $"{what}: logits of sequence {i}");
             }
 
-            CloseByNorm([aloneLoss], [packedLoss], tolerance, $"{what}: loss");
-            CloseByNorm(aloneGradients, packedGradients, tolerance, $"{what}: adapter gradients");
+            WithinPrecision([exact.Loss], [alone.Loss], [packedLoss], device, $"{what}: loss");
+            WithinPrecision(exact.Gradients, alone.Gradients, packedGradients, device, $"{what}: adapter gradients");
         }
 
         // First fit, longest first: 6+4, 5+5, 3+2 in rows of 10.
@@ -674,6 +677,34 @@ internal static partial class Tests
         var filled = batches.SelectMany(b => b).Select(r => r.Sum(i => sequences[i].Tokens.Length - 1)).ToArray();
         Check(filled.SequenceEqual([10, 10, 5]) && batches.SelectMany(b => b).SelectMany(r => r).Order().SequenceEqual(Enumerable.Range(0, 6)),
             $"rows filled {string.Join(", ", filled)}");
+    }
+
+    // actual (from a batched, packed or ragged path) against exact (float32, the plain path): on the CPU within 1e-3; on
+    // CUDA within three times the error bfloat16 itself gives the plain path (reduced, its own error), at least 1e-2. A wrong
+    // position, mask or start gives errors of order one; rounding differences stay near the plain path's own.
+    private static void WithinPrecision(float[] exact, float[] reduced, float[] actual, Device device, string what)
+    {
+        if (device.Type != DeviceType.Cuda)
+        {
+            CloseByNorm(exact, actual, 1e-3f, what);
+            return;
+        }
+
+        float own = RelativeError(exact, reduced);
+        float error = RelativeError(exact, actual);
+        Check(error <= Math.Max(1e-2f, 3f * own), $"{what}: relative error {error:G3} against float32; bfloat16 alone gives {own:G3}");
+    }
+
+    private static float RelativeError(float[] expected, float[] actual)
+    {
+        double difference = 0, norm = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            difference += (double)(expected[i] - actual[i]) * (expected[i] - actual[i]);
+            norm += (double)expected[i] * expected[i];
+        }
+
+        return (float)Math.Sqrt(difference / Math.Max(norm, 1e-30));
     }
 
     // ‖expected - actual‖ ≤ tolerance · ‖expected‖ (products in bfloat16 differ element by element, not overall).
@@ -702,7 +733,7 @@ internal static partial class Tests
         var spec = new DecoderSpec
         {
             Vocabulary = 260, Dim = 128, Layers = 2, Heads = 2, KvHeads = 1, HeadDim = 64, FfDim = 256, MaxPositions = 512,
-            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, TieEmbeddings = true,
+            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, QkNorm = true, TieEmbeddings = true,   // a Qwen3 checkpoint: query/key norms
         };
         string folder = WriteChatModel(spec);
         try
@@ -761,7 +792,6 @@ internal static partial class Tests
         int[] lengths = [5, 12, 9];
         var prompts = lengths.Select(n => Enumerable.Range(0, n).Select(_ => (float)random.Next(250)).ToArray()).ToArray();
         var next = lengths.Select(_ => Enumerable.Range(0, 4).Select(_ => (float)random.Next(250)).ToArray()).ToArray();
-        float tolerance = device.Type == DeviceType.Cuda ? 3e-2f : 1e-4f;
         using (var model = spec.Build(new RandomWeights(42), new DecoderBuildOptions { Device = device }))
         using (Autograd.NoGrad())
         {
@@ -796,19 +826,28 @@ internal static partial class Tests
                 }
             }
 
-            for (int r = 0; r < lengths.Length; r++)
+            // Each row alone, in the test's precision and (on CUDA) in float32, which measures bfloat16's own error.
+            List<float[]> Alone(int r, MatMulPrecision? precision)
             {
+                using var scoped = precision is { } p ? MixedPrecision.Use(p) : default(MixedPrecision.Scope?);
                 using var scope = new TensorScope();
                 using var context = new DecodingContext(device, 1, 32) { LastPositionOnly = true };
-                var alone = new List<float[]> { model.ForwardCached(Tensor.From(prompts[r], [1, lengths[r]], device), context).ToArray() };
+                var steps = new List<float[]> { model.ForwardCached(Tensor.From(prompts[r], [1, lengths[r]], device), context).ToArray() };
                 for (int s = 0; s < 4; s++)
                 {
-                    alone.Add(model.ForwardCached(Tensor.From([next[r][s]], [1, 1], device), context).ToArray());
+                    steps.Add(model.ForwardCached(Tensor.From([next[r][s]], [1, 1], device), context).ToArray());
                 }
 
+                return steps;
+            }
+
+            for (int r = 0; r < lengths.Length; r++)
+            {
+                var alone = Alone(r, null);
+                var exact = device.Type == DeviceType.Cuda ? Alone(r, MatMulPrecision.Float32) : alone;
                 for (int s = 0; s < alone.Count; s++)
                 {
-                    CloseByNorm(alone[s], batched[r][s], tolerance, $"row {r} (prompt of {lengths[r]}), step {s}: logits");
+                    WithinPrecision(exact[s], alone[s], batched[r][s], device, $"row {r} (prompt of {lengths[r]}), step {s}: logits");
                 }
             }
         }
