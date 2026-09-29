@@ -636,6 +636,18 @@ public sealed partial class Tensor : IDisposable
         Backend.Axpy(gradient.Storage, GradStorage(), Size, 1f);
     }
 
+    /// <summary>
+    /// The gradient buffer for a kernel that can either overwrite or add to it: the first gradient is written into a
+    /// buffer that is not zeroed (<paramref name="beta"/> 0: every element must be written), later ones are added
+    /// (<paramref name="beta"/> 1). Saves a zero fill and a read of the buffer for the gradient that is the first.
+    /// </summary>
+    internal Storage GradientTarget(out float beta)
+    {
+        beta = Grad is null ? 0f : 1f;
+        Grad ??= Empty(_shape, Device, zeroed: false, track: false);
+        return Grad.Storage;
+    }
+
     /// <summary>The gradient buffer, allocated (zeroed and outside any scope) on first use.</summary>
     internal Storage GradStorage()
     {

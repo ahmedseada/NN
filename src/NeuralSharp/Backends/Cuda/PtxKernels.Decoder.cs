@@ -551,7 +551,7 @@ internal static partial class PtxKernels
             st.global.f32 [%a_y], %f5;
             """);
 
-        // dgate += dy · up · act'(gate) (flags & 1), dup += dy · act(gate) (flags & 2).
+        // dgate += dy · up · act'(gate) (flags & 1), dup += dy · act(gate) (flags & 2); flags & 4 / 8: written (= instead of +=).
         Elementwise(sb, "gated_act_bwd_f32", ["gate", "up", "dy", "dgate", "dup"], [("u32", "kind"), ("u32", "flags")],
             """
             ld.global.f32 %f1, [%a_gate];
@@ -562,14 +562,20 @@ internal static partial class PtxKernels
             setp.eq.u32 %p7, %r5, 0;
             @%p7 bra NO_DGATE;
             mul.f32 %f14, %f13, %f2;
-            ld.global.f32 %f15, [%a_dgate];
+            mov.f32 %f15, 0f00000000;
+            and.b32 %r6, %s_flags, 4;
+            setp.eq.u32 %p8, %r6, 0;
+            @%p8 ld.global.f32 %f15, [%a_dgate];
             fma.rn.f32 %f15, %f14, %f6, %f15;
             st.global.f32 [%a_dgate], %f15;
             NO_DGATE:
             and.b32 %r5, %s_flags, 2;
             setp.eq.u32 %p7, %r5, 0;
             @%p7 bra NO_DUP;
-            ld.global.f32 %f16, [%a_dup];
+            mov.f32 %f16, 0f00000000;
+            and.b32 %r6, %s_flags, 8;
+            setp.eq.u32 %p8, %r6, 0;
+            @%p8 ld.global.f32 %f16, [%a_dup];
             fma.rn.f32 %f16, %f13, %f5, %f16;
             st.global.f32 [%a_dup], %f16;
             NO_DUP:
@@ -685,7 +691,10 @@ internal static partial class PtxKernels
             @%p11 bra GB_NO_DGATE;
             mul.f32 %f14, %f13, %f2;
             add.u64 %rd2, %b_dgate, %rd1;
-            ld.global.f32 %f15, [%rd2];
+            mov.f32 %f15, 0f00000000;
+            and.b32 %r15, %s_flags, 4;
+            setp.eq.u32 %p13, %r15, 0;
+            @%p13 ld.global.f32 %f15, [%rd2];
             fma.rn.f32 %f15, %f14, %f6, %f15;
             st.global.f32 [%rd2], %f15;
             GB_NO_DGATE:
@@ -693,7 +702,10 @@ internal static partial class PtxKernels
             setp.eq.u32 %p11, %r15, 0;
             @%p11 bra GB_NO_DUP;
             add.u64 %rd2, %b_dup, %rd1;
-            ld.global.f32 %f16, [%rd2];
+            mov.f32 %f16, 0f00000000;
+            and.b32 %r15, %s_flags, 8;
+            setp.eq.u32 %p13, %r15, 0;
+            @%p13 ld.global.f32 %f16, [%rd2];
             fma.rn.f32 %f16, %f13, %f5, %f16;
             st.global.f32 [%rd2], %f16;
             GB_NO_DUP:

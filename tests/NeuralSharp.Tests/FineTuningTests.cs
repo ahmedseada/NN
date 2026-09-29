@@ -238,6 +238,24 @@ internal static partial class Tests
                     backend.GatedActivationBackwardPacked(pg.Storage, pu.Storage, dy.Storage, dg.Storage, du.Storage, n, kind, flags);
                     AssertClose(eg.ToArray(), dg.ToArray(), 1e-5f, $"{what}, flags {flags}: dgate");
                     AssertClose(eu.ToArray(), du.ToArray(), 1e-5f, $"{what}, flags {flags}: dup");
+
+                    // The first gradient written over whatever the buffers hold (flags 4 and 8), float and packed kernels.
+                    int written = flags | 4 | 8;
+                    var nan = Enumerable.Repeat(float.NaN, n).ToArray();
+                    var (zg, zu) = (Tensor.Zeros([n], device), Tensor.Zeros([n], device));
+                    backend.GatedActivationBackward(g16.Storage, u16.Storage, dy.Storage, zg.Storage, zu.Storage, n, kind, flags);
+                    var (wg, wu) = (Tensor.From(nan, [n], device), Tensor.From(nan, [n], device));
+                    backend.GatedActivationBackward(g16.Storage, u16.Storage, dy.Storage, wg.Storage, wu.Storage, n, kind, written);
+                    var (pwg, pwu) = (Tensor.From(nan, [n], device), Tensor.From(nan, [n], device));
+                    backend.GatedActivationBackwardPacked(pg.Storage, pu.Storage, dy.Storage, pwg.Storage, pwu.Storage, n, kind, written);
+                    foreach (var (expectedWritten, actual, part) in new[] { (zg, wg, "dgate"), (zu, wu, "dup"), (zg, pwg, "packed dgate"), (zu, pwu, "packed dup") })
+                    {
+                        bool used = part.EndsWith("dgate") ? (flags & 1) != 0 : (flags & 2) != 0;
+                        if (used)
+                        {
+                            AssertClose(expectedWritten.ToArray(), actual.ToArray(), 1e-5f, $"{what}, flags {written}: {part} written");
+                        }
+                    }
                 }
             }
         }

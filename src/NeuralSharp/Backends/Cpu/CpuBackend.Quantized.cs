@@ -649,12 +649,12 @@ internal sealed partial class CpuBackend
                 var (value, slope) = Activation(gv[i], kind);
                 if ((flags & 1) != 0)
                 {
-                    dg[i] += dv[i] * uv[i] * slope;
+                    dg[i] = ((flags & 4) != 0 ? 0f : dg[i]) + dv[i] * uv[i] * slope;
                 }
 
                 if ((flags & 2) != 0)
                 {
-                    du[i] += dv[i] * value;
+                    du[i] = ((flags & 8) != 0 ? 0f : du[i]) + dv[i] * value;
                 }
             }
         });

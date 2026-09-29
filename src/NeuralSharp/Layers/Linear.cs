@@ -180,6 +180,14 @@ public sealed class Linear : Module
             return [.. products.Select((product, j) => layers[j].Adapter is { } a ? Tensor.AddLowRank(product, input, a.A, a.B, a.Scale) : product)];
         }
 
+        // Training: the layers read one flattened view of the input, so their input gradients add up in its one buffer
+        // (each product adds into it) instead of each view's gradient being added into the input by a separate pass.
+        if (Autograd.IsEnabled && input.RequiresGrad && layers.Length > 1 && input.Rank > 2)
+        {
+            var flat = input.Reshape(-1, k);
+            return [.. layers.Select(l => l.Forward(flat) is var y && y.Rank == 2 ? y.Reshape([.. input.Shape[..^1], l.OutFeatures]) : y)];
+        }
+
         return [.. layers.Select(l => l.Forward(input))];
     }
 

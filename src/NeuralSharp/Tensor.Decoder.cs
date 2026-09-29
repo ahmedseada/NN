@@ -352,12 +352,14 @@ public sealed partial class Tensor
                         backend.BatchedMatMul(flat.Storage, dt.Storage, a.GradStorage(), 1, k, rank, m, true, false, 1f);   // dA += xᵀ·dt
                     }
 
-                    if (flat.RequiresGrad && kind == 2
-                        && backend.BFloat16TransposedMatMul(g.Storage, layer.BFloat16!.Packed.Storage, flat.GradStorage(), m, k, n, 1f, dt.Storage, a.Storage, rank))
+                    float beta = 1f;
+                    var dx = flat.RequiresGrad ? flat.GradientTarget(out beta) : null;         // the first gradient written, not added
+                    if (dx is not null && kind == 2
+                        && backend.BFloat16TransposedMatMul(g.Storage, layer.BFloat16!.Packed.Storage, dx, m, k, n, beta, dt.Storage, a.Storage, rank))
                     {
-                        // dx += g·Wᵀ + dt·Aᵀ with W read as the bfloat16 words it is stored in.
+                        // dx (+)= g·Wᵀ + dt·Aᵀ with W read as the bfloat16 words it is stored in.
                     }
-                    else if (flat.RequiresGrad)
+                    else if (dx is not null)
                     {
                         // dx += g·Wᵀ + dt·Aᵀ (W [k, n] as float32; packed weights expanded first).
                         Tensor? expanded = null;
@@ -377,10 +379,10 @@ public sealed partial class Tensor
                         using (expanded)
                         {
                             var w = (expanded ?? layer.Weight).Storage;
-                            if (!backend.MatMulLowRank(g.Storage, w, flat.GradStorage(), m, k, n, true, 1f, dt.Storage, a.Storage, rank))
+                            if (!backend.MatMulLowRank(g.Storage, w, dx, m, k, n, true, beta, dt.Storage, a.Storage, rank))
                             {
-                                backend.BatchedMatMul(g.Storage, w, flat.GradStorage(), 1, m, k, n, false, true, 1f);
-                                backend.BatchedMatMul(dt.Storage, a.Storage, flat.GradStorage(), 1, m, k, rank, false, true, 1f);
+                                backend.BatchedMatMul(g.Storage, w, dx, 1, m, k, n, false, true, beta);
+                                backend.BatchedMatMul(dt.Storage, a.Storage, dx, 1, m, k, rank, false, true, 1f);
                             }
                         }
                     }
@@ -936,8 +938,12 @@ public sealed partial class Tensor
 
         y.Record("gated_activation", g =>
         {
+            // Bits 2 and 3: the first gradient of gate / up, written rather than added.
             int flags = (gate.RequiresGrad ? 1 : 0) | (up.RequiresGrad ? 2 : 0);
-            var (dgate, dup) = (gate.RequiresGrad ? gate.GradStorage() : g.Storage, up.RequiresGrad ? up.GradStorage() : g.Storage);
+            float betaGate = 1f, betaUp = 1f;
+            var dgate = gate.RequiresGrad ? gate.GradientTarget(out betaGate) : g.Storage;
+            var dup = up.RequiresGrad ? up.GradientTarget(out betaUp) : g.Storage;
+            flags |= (betaGate == 0f ? 4 : 0) | (betaUp == 0f ? 8 : 0);
             if (gate.Storage is { Evicted: true, Packed: { } packedGate } && up.Storage is { Evicted: true, Packed: { } packedUp })
             {
                 gate.Backend.GatedActivationBackwardPacked(packedGate, packedUp, g.Storage, dgate, dup, gate.Size, kind, flags);   // read as words
