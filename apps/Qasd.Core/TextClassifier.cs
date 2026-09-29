@@ -163,15 +163,16 @@ public sealed record TextClassifierReport(IReadOnlyList<string> Labels, int[,] C
 /// var (train, test) = TextClassifier.Split(examples, 0.2);
 /// using var classifier = TextClassifier.Train(train, new TextClassifierOptions { Device = Device.Cuda() });
 /// Console.WriteLine(classifier.Evaluate(test));
-/// classifier.Save("intents.nsm");
+/// classifier.Save("intents.qasd");
 ///
-/// using var loaded = TextClassifier.Load("intents.nsm");
+/// using var loaded = TextClassifier.Load("intents.qasd");
 /// var prediction = loaded.Predict("book me with Dr. Heba on Tuesday");   // Label, Confidence, Probabilities
 /// </code>
 /// </example>
 public sealed class TextClassifier : IDisposable
 {
-    private const string Format = "neuralsharp-text-classifier/1";
+    private const string Format = "qasd-text-classifier/1";
+    private const string LegacyFormat = "neuralsharp-text-classifier/1";     // files trained before the move to Idrak: the same layout
     private readonly Sequential _model;
     private readonly TextFeatures _features;
     private readonly Lock _gate = new();
@@ -482,7 +483,7 @@ public sealed class TextClassifier : IDisposable
     {
         using var package = ModelPackage.Open(path);
         var settings = package.Json("text-classifier").AsObject();
-        if ((string?)settings["format"] != Format)
+        if ((string?)settings["format"] is not (Format or LegacyFormat))
         {
             throw new InvalidDataException($"{path} is not a text classifier ({settings["format"]}).");
         }

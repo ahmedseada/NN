@@ -66,7 +66,7 @@ dotnet run -c Release --project apps/Qasd -- evaluate new-labeled.csv
 
 ## Where the models go
 
-Both models live in the Qasd project: `qasd train` saves to `apps/Qasd/models/intents.nsm`, and the tuned adapter goes
+Both models live in the Qasd project: `qasd train` saves to `apps/Qasd/models/intents.qasd`, and the tuned adapter goes
 to `apps/Qasd/models/tuned` (`--out` for elsewhere). `predict` and `evaluate` read them from there unless
 given another model, and the service loads both from there with no settings (IntentModel:Path and IntentModel:TunedPath
 override; `"TunedPath": "none"` serves the classifier only). The service starts without the tuned model when it has
@@ -122,11 +122,11 @@ can be tried, is at http://localhost:5080/scalar.
 On the CPU, inference skips the dense product: a message sets a few hundred of the 16,384 features, so the first layer
 adds up those rows of its weights (about 0.1 ms per message, 40,000 messages per second in batches on 4 cores). The model file and
 settings come from `appsettings.json` (section `IntentModel`), or environment variables such as
-`IntentModel__Path=D:\models\intents.nsm`:
+`IntentModel__Path=D:\models\intents.qasd`:
 
 | Setting | Default | |
 |---|---|---|
-| `Path` | `apps/Qasd/models/intents.nsm` | the model file from `qasd train` |
+| `Path` | `apps/Qasd/models/intents.qasd` | the model file from `qasd train` |
 | `Device` | `cpu` | `auto`, `cpu`, `cuda` or `cuda:N` (the CPU is fast enough for single messages) |
 | `MinConfidence` | 0.6 | below it a result has `accepted: false`: send the message to your fallback (the LLM planner) |
 | `MaxBatch` | 256 | most messages per batch request |
@@ -167,7 +167,7 @@ request). Invalid input gets a 400 with ProblemDetails.
 From your own .NET code, reference `Qasd.Core` and load the model once:
 
 ```csharp
-using var classifier = Qasd.TextClassifier.Load("apps/Qasd/models/intents.nsm", Idrak.Device.Cpu);
+using var classifier = Qasd.TextClassifier.Load("apps/Qasd/models/intents.qasd", Idrak.Device.Cpu);
 var p = classifier.Predict(message);          // p.Label, p.Confidence, p.Probabilities; thread-safe
 ```
 

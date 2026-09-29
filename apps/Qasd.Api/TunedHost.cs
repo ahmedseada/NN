@@ -21,7 +21,7 @@ public sealed class TunedHost : IDisposable
             return;
         }
 
-        var device = ModelHost.ParseDevice(options.Value.TunedDevice);
+        var device = ModelHost.ParseDevice(options.Value.TunedDevice, logger);
         // The intents are the classifier's: both models answer with the same labels.
         using (var lease = classifier.Lease())
         {

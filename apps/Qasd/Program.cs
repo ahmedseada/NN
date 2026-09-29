@@ -12,14 +12,14 @@ const string Usage = """
     qasd: train, evaluate and run text classifiers (intents, topics, routing; any language)
 
       qasd train <data…> [--out F]         train on labeled texts, report the score on held-out texts, save the model
-                                          (default apps/Qasd/models/intents.nsm)
+                                          (default apps/Qasd/models/intents.qasd)
       qasd evaluate [model] <data…>        score a model on labeled texts (accuracy, per-label F1, confusion matrix)
       qasd predict [model] [text…]         classify texts (arguments, else one per line from standard input)
       qasd info [model]                    labels and settings of a model
       qasd audit <data…>                   the labels' consistency: texts labelled differently in different rows, and
                                           short messages per label (often a reply that only the conversation explains);
                                           --out F.csv writes the conflicting texts with their label counts
-    (model: a .nsm file; default apps/Qasd/models/intents.nsm)
+    (model: a .qasd file; default apps/Qasd/models/intents.qasd)
       qasd split <data…>                   write the train / test split the classifier uses (train.csv, test.csv in
                                           apps/Qasd/data/split, or --out DIR), so a model tuned with idrak-tune on train.csv
                                           is scored on the same held-out messages (qasd evaluate --tuned …/test.csv)
@@ -119,8 +119,8 @@ output ??= command switch
 };
 tunedFolder ??= QasdPaths.Tuned;
 
-// evaluate / predict / info: the model file first when given (a .nsm file), else the default one.
-bool modelGiven = positional.Count > 1 && positional[1].EndsWith(".nsm", StringComparison.OrdinalIgnoreCase);
+// evaluate / predict / info: the model file first when given (a .qasd file, or .nsm from before), else the default one.
+bool modelGiven = positional.Count > 1 && (positional[1].EndsWith(".qasd", StringComparison.OrdinalIgnoreCase) || positional[1].EndsWith(".nsm", StringComparison.OrdinalIgnoreCase));
 string modelPath = modelGiven ? positional[1] : QasdPaths.Classifier;
 var rest = positional.Skip(modelGiven ? 2 : 1).ToList();
 // JSON with Arabic and other text as written, not \u escapes (for people and pipelines, not HTML).

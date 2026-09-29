@@ -70,15 +70,30 @@ public sealed class ModelHost : IDisposable
             throw new FileNotFoundException($"No intent model at {Path.GetFullPath(path)}: {advice}", path);
         }
 
-        var device = ParseDevice(_options.Device);
+        var device = ParseDevice(_options.Device, _logger);
         var classifier = TextClassifier.Load(path, device);
         classifier.Predict(["warm up", "تسخين"]);                                 // compile and allocate now, not on the first request
         _logger.LogInformation("Loaded intent model {Path} on {Device}: {Labels}", Path.GetFullPath(path), device.Name, string.Join(", ", classifier.Labels));
         return new Handle(classifier, Path.GetFullPath(path), DateTimeOffset.UtcNow);
     }
 
-    /// <summary>auto (the GPU when there is one), cpu, cuda or cuda:N.</summary>
-    public static Device ParseDevice(string name) => name.ToLowerInvariant() switch
+    /// <summary>
+    /// auto (the GPU when there is one), cpu, cuda or cuda:N. A GPU asked for where CUDA is not available (no GPU, or
+    /// IDRAK_DISABLE_CUDA set) gives the CPU with a warning, so the service still starts.
+    /// </summary>
+    public static Device ParseDevice(string name, ILogger logger)
+    {
+        string lower = name.ToLowerInvariant();
+        if (lower is not ("auto" or "cpu") && !Idrak.Device.IsCudaAvailable)
+        {
+            logger.LogWarning("Device '{Device}' asked for, but CUDA is not available: running on the CPU", name);
+            return Idrak.Device.Cpu;
+        }
+
+        return ParseDevice(lower);
+    }
+
+    private static Device ParseDevice(string name) => name switch
     {
         "auto" => Idrak.Device.IsCudaAvailable ? Idrak.Device.Cuda() : Idrak.Device.Cpu,
         "cpu" => Idrak.Device.Cpu,

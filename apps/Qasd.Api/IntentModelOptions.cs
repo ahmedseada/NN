@@ -3,7 +3,7 @@ namespace Qasd.Api;
 /// <summary>The "IntentModel" configuration section.</summary>
 public sealed class IntentModelOptions
 {
-    /// <summary>The model file written by <c>qasd train</c> (empty: its default, apps/Qasd/models/intents.nsm).</summary>
+    /// <summary>The model file written by <c>qasd train</c> (empty: its default, apps/Qasd/models/intents.qasd).</summary>
     public string? Path { get; set; }
 
     /// <summary>The classifier's model file: Path, or the default place 'qasd train' saves to.</summary>
