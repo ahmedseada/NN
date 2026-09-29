@@ -219,6 +219,47 @@ internal sealed partial class CpuBackend : Backend
     public override void AdamStep(Storage p, Storage g, Storage m, Storage v, int n, float lr, float beta1, float beta2, float eps) =>
         Run(new AdamKernel(D(p), D(g), D(m), D(v), lr, beta1, beta2, eps), n);
 
+    public override bool FusedAdamW(ReadOnlySpan<(Storage P, Storage G, Storage M, Storage V, int N)> tensors, ref IDisposable? cache, float maxNorm,
+        float lr, float decay, float beta1, float beta2, float eps, bool zeroGradients)
+    {
+        float factor = 1f;
+        if (maxNorm > 0f)
+        {
+            double sum = 0;
+            foreach (var t in tensors)
+            {
+                foreach (float g in D(t.G).AsSpan(0, t.N))
+                {
+                    sum += (double)g * g;
+                }
+            }
+
+            factor = sum > 0 ? MathF.Min(1f, maxNorm / MathF.Sqrt((float)sum)) : 1f;
+        }
+
+        float c1 = 1f - beta1, c2 = 1f - beta2;
+        foreach (var t in tensors)
+        {
+            float[] p = D(t.P), g = D(t.G), m = D(t.M), v = D(t.V);
+            for (int i = 0; i < t.N; i++)
+            {
+                float grad = g[i] * factor;
+                // As ClipGradientNorm, the decoupled decay (Affine) and AdamKernel compute them, in the same order.
+                float mom = MathF.FusedMultiplyAdd(beta1, m[i], c1 * grad);
+                float vel = MathF.FusedMultiplyAdd(beta2, v[i], c2 * grad * grad);
+                m[i] = mom;
+                v[i] = vel;
+                p[i] = p[i] * decay - lr * mom / (MathF.Sqrt(vel) + eps);
+                if (zeroGradients)
+                {
+                    g[i] = 0f;
+                }
+            }
+        }
+
+        return true;
+    }
+
     public override void ClipFactor(Storage sumSquares, Storage factor, float maxNorm)
     {
         float sum = D(sumSquares)[0];

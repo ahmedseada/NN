@@ -21,9 +21,15 @@ public abstract class Optimizer : IDisposable
     /// <summary>Step size; can be changed between steps (e.g. by a schedule).</summary>
     public float LearningRate { get; set; }
 
-    /// <summary>Resets every parameter's gradient to zero.</summary>
+    /// <summary>Resets every parameter's gradient to zero (nothing to do right after a <see cref="ClipAndStep"/> that zeroed them).</summary>
     public void ZeroGrad()
     {
+        if (GradientsZeroed)
+        {
+            GradientsZeroed = false;
+            return;
+        }
+
         foreach (var p in Parameters)
         {
             p.ZeroGrad();
@@ -32,6 +38,25 @@ public abstract class Optimizer : IDisposable
 
     /// <summary>Applies one update using the current gradients.</summary>
     public abstract void Step();
+
+    /// <summary>
+    /// Clips the gradients' global norm to <paramref name="maxNorm"/> on the device (0: no clipping), applies one update,
+    /// and may leave the gradients zeroed for the next step (then <see cref="ZeroGrad"/> has nothing to do): optimizers
+    /// with a fused version (Adam, AdamW) do all of it in a few device passes over every parameter at once, instead of
+    /// several per parameter. The gradients are not to be read after it.
+    /// </summary>
+    public virtual void ClipAndStep(float maxNorm)
+    {
+        if (maxNorm > 0f)
+        {
+            ClipGradientNormOnDevice(maxNorm);
+        }
+
+        Step();
+    }
+
+    /// <summary>Set by a <see cref="ClipAndStep"/> that zeroed the gradients: the next <see cref="ZeroGrad"/> skips its pass.</summary>
+    protected bool GradientsZeroed { get; set; }
 
     /// <summary>Global L2 norm of all gradients (one device synchronization).</summary>
     public double GradientNorm()

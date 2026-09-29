@@ -819,14 +819,10 @@ public static class FineTuner
     // Clipping and the optimizer's update, after the gradients of a step.
     private static void Update(PretrainedModel model, AdamW optimizer, FineTuningOptions options)
     {
-        // Clipping on the device (no read of the norm) and no wait for the update: the next step's first read of the
-        // device orders everything, so the host prepares the next batch while the device finishes this step.
-        if (options.MaxGradientNorm > 0f)
-        {
-            optimizer.ClipGradientNormOnDevice(options.MaxGradientNorm);
-        }
-
-        optimizer.Step();
+        // Clipping and the update of every adapter matrix in a few device passes (which also zero the gradients for the next
+        // step), with no read of the norm and no wait: the next step's first read of the device orders everything, so the
+        // host prepares the next batch while the device finishes this step.
+        optimizer.ClipAndStep(options.MaxGradientNorm);
     }
 
     // One optimizer step over a group of batches (gradient accumulation): forward, backward, clipping, update. Returns

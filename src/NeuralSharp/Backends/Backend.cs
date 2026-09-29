@@ -428,6 +428,16 @@ internal abstract class Backend
     public abstract void SumSquares(Storage x, Storage total, int n);
 
     /// <summary>
+    /// AdamW over many tensors in a few passes: the global gradient norm clipped to <paramref name="maxNorm"/> (0: no
+    /// clipping), p ← p · <paramref name="decay"/>, then Adam with the bias-corrected <paramref name="lr"/>, as
+    /// <see cref="AdamStep"/> computes it; with <paramref name="zeroGradients"/> the gradients are zeroed for the next step.
+    /// <paramref name="cache"/> keeps the device tables between calls (dispose it when done). False when the device has no
+    /// such pass.
+    /// </summary>
+    public virtual bool FusedAdamW(ReadOnlySpan<(Storage P, Storage G, Storage M, Storage V, int N)> tensors, ref IDisposable? cache, float maxNorm,
+        float lr, float decay, float beta1, float beta2, float eps, bool zeroGradients) => false;
+
+    /// <summary>
     /// factor[0] = min(1, maxNorm / √sumSquares[0]) (1 when the sum is 0): the gradient-clipping factor computed where the
     /// gradients are, so clipping needs no host read of the norm.
     /// </summary>

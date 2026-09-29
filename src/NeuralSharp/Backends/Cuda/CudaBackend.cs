@@ -1344,6 +1344,116 @@ internal sealed unsafe partial class CudaBackend : Backend
             F(lr), F(beta1), F(beta2), F(1f - beta1), F(1f - beta2), F(eps), U(n), F(gradientScale), F(decay), U(blocks));
     }
 
+    // The device tables of FusedAdamW: chunks (tensor, first element) of 4096 elements, rebuilt when the sizes change; the
+    // tensors' pointers and sizes, uploaded again only when a pointer changes; the norm / factor value.
+    private sealed class FusedAdamState(CudaBackend backend) : IDisposable
+    {
+        public int[] Sizes = [];
+        public ulong[] Pointers = [];
+        public Storage? Chunks, Table, Factor;
+        public int ChunkCount;
+
+        public void Dispose()
+        {
+            foreach (var storage in new[] { Chunks, Table, Factor })
+            {
+                if (storage is not null)
+                {
+                    backend.Return(storage);
+                }
+            }
+
+            (Chunks, Table, Factor) = (null, null, null);
+        }
+    }
+
+    public override bool FusedAdamW(ReadOnlySpan<(Storage P, Storage G, Storage M, Storage V, int N)> tensors, ref IDisposable? cache, float maxNorm,
+        float lr, float decay, float beta1, float beta2, float eps, bool zeroGradients)
+    {
+        if (tensors.Length == 0 || !_kernels.TryGetValue("multi_adamw_f32", out var adam) || !_kernels.TryGetValue("multi_sumsq_f32", out var sumSquares))
+        {
+            return false;
+        }
+
+        var state = cache as FusedAdamState;
+        if (state is null)
+        {
+            cache?.Dispose();
+            cache = state = new FusedAdamState(this);
+        }
+
+        bool resized = state.Sizes.Length != tensors.Length;
+        for (int t = 0; t < tensors.Length && !resized; t++)
+        {
+            resized = state.Sizes[t] != tensors[t].N;
+        }
+
+        if (resized)
+        {
+            state.Sizes = new int[tensors.Length];
+            for (int t = 0; t < tensors.Length; t++)
+            {
+                state.Sizes[t] = tensors[t].N;
+            }
+
+            var chunks = new List<uint>();
+            for (int t = 0; t < tensors.Length; t++)
+            {
+                for (int start = 0; start < Math.Max(1, tensors[t].N); start += 4096)
+                {
+                    chunks.Add((uint)t);
+                    chunks.Add((uint)start);
+                }
+            }
+
+            if (state.Chunks is not null)
+            {
+                Return(state.Chunks);
+            }
+
+            state.ChunkCount = chunks.Count / 2;
+            state.Chunks = Allocate(chunks.Count, zeroed: false);
+            Upload(System.Runtime.InteropServices.MemoryMarshal.Cast<uint, float>(chunks.ToArray()), state.Chunks);
+            state.Pointers = [];
+        }
+
+        var pointers = new ulong[tensors.Length * 5];
+        for (int t = 0; t < tensors.Length; t++)
+        {
+            (pointers[5 * t], pointers[5 * t + 1], pointers[5 * t + 2], pointers[5 * t + 3], pointers[5 * t + 4]) =
+                (P(tensors[t].P), P(tensors[t].G), P(tensors[t].M), P(tensors[t].V), (ulong)(uint)tensors[t].N);
+        }
+
+        if (!pointers.AsSpan().SequenceEqual(state.Pointers))
+        {
+            state.Pointers = pointers;
+            state.Table ??= Allocate(tensors.Length * 10, zeroed: false);
+            if (state.Table.Length != tensors.Length * 10)
+            {
+                Return(state.Table);
+                state.Table = Allocate(tensors.Length * 10, zeroed: false);
+            }
+
+            Upload(System.Runtime.InteropServices.MemoryMarshal.Cast<ulong, float>(pointers), state.Table);
+        }
+
+        state.Factor ??= Allocate(1, zeroed: false);
+        if (maxNorm > 0f)
+        {
+            Check(cuMemsetD32Async(P(state.Factor), 0, 1, _stream), nameof(cuMemsetD32Async));
+            LaunchRows(sumSquares, state.ChunkCount, P(state.Chunks!), P(state.Table!), P(state.Factor), U(state.ChunkCount));
+            ClipFactor(state.Factor, state.Factor, maxNorm);
+        }
+        else
+        {
+            Fill(state.Factor, 1, 1f);
+        }
+
+        LaunchRows(adam, state.ChunkCount, P(state.Chunks!), P(state.Table!), P(state.Factor), F(lr), F(decay), F(beta1), F(beta2), F(1f - beta1),
+            F(1f - beta2), F(eps), U(zeroGradients ? 1 : 0), U(state.ChunkCount));
+        return true;
+    }
+
     public override void SumSquares(Storage x, Storage total, int n)
     {
         if (n > 0)

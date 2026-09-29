@@ -573,6 +573,60 @@ internal static partial class Tests
         r2.ZeroGrad();
         onDevice.ClipGradientNormOnDevice(1f);
         AssertClose([0f], r2.Grad!.ToArray(), 0f, "zero gradients stay zero");
+
+        // ClipAndStep (every tensor in a few fused passes where the device has them) matches clipping then stepping, and
+        // leaves the gradients zeroed; sizes across chunk boundaries, with and without clipping and weight decay.
+        var rng = new Random(33);
+        int[] sizes = [5, 4096, 4097, 9000, 1];
+        var initial = sizes.Select(n => Enumerable.Range(0, n).Select(_ => (float)(rng.NextDouble() * 2 - 1)).ToArray()).ToArray();
+        var targets = sizes.Select(n => Enumerable.Range(0, n).Select(_ => (float)(rng.NextDouble() * 4 - 2)).ToArray()).ToArray();
+        foreach (var (maxNorm, decay) in new[] { (0.5f, 0.1f), (0f, 0f), (1e6f, 0.01f) })
+        {
+            float[][] Train(bool fused)
+            {
+                var parameters = initial.Select((v, i) => Tensor.From(v, [sizes[i]], device, requiresGrad: true)).ToList();
+                using var optimizer = new AdamW(parameters, learningRate: 0.05f, weightDecay: decay);
+                for (int step = 0; step < 3; step++)
+                {
+                    optimizer.ZeroGrad();
+                    using (var scope = new TensorScope())
+                    {
+                        var loss = parameters.Select((p, i) => ((p - Tensor.From(targets[i], [sizes[i]], device)).Square().Sum())).Aggregate((a, b) => a + b);
+                        loss.Backward();
+                    }
+
+                    if (fused)
+                    {
+                        optimizer.ClipAndStep(maxNorm);
+                    }
+                    else
+                    {
+                        if (maxNorm > 0f)
+                        {
+                            optimizer.ClipGradientNormOnDevice(maxNorm);
+                        }
+
+                        optimizer.Step();
+                    }
+                }
+
+                if (fused)
+                {
+                    Check(parameters.All(p => p.Grad is null || p.Grad.ToArray().All(g => g == 0f)), "ClipAndStep leaves the gradients zeroed");
+                }
+
+                var values = parameters.Select(p => p.ToArray()).ToArray();
+                parameters.ForEach(p => p.Dispose());
+                return values;
+            }
+
+            var separate = Train(fused: false);
+            var together = Train(fused: true);
+            for (int i = 0; i < sizes.Length; i++)
+            {
+                AssertClose(separate[i], together[i], 1e-5f, $"ClipAndStep (max norm {maxNorm}, decay {decay}), tensor {i} of {sizes[i]}");
+            }
+        }
     }
 
     private static void NumberTypes(Device device)
