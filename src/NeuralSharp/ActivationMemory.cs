@@ -68,7 +68,14 @@ public static class ActivationMemory
     }
 
     /// <summary>Releases the values of results no backward step reads, while gradients are recorded.</summary>
-    internal static void Release(params Tensor?[] tensors)
+    internal static void Release(params Tensor?[] tensors) => Release([], tensors);
+
+    /// <summary>
+    /// Releases the values of <paramref name="tensors"/> except where they share memory with <paramref name="kept"/>:
+    /// a view (a reshape, or a permutation that only moves dimensions of size 1) of a result still needed shares its
+    /// memory, which must stay.
+    /// </summary>
+    internal static void Release(ReadOnlySpan<Tensor> kept, params Tensor?[] tensors)
     {
         if (!ReleaseUnused || !Autograd.IsEnabled)
         {
@@ -77,7 +84,21 @@ public static class ActivationMemory
 
         foreach (var tensor in tensors)
         {
-            tensor?.DropValue();
+            if (tensor is null)
+            {
+                continue;
+            }
+
+            bool shared = false;
+            foreach (var needed in kept)
+            {
+                shared |= ReferenceEquals(needed.Storage, tensor.Storage);
+            }
+
+            if (!shared)
+            {
+                tensor.DropValue();
+            }
         }
     }
 

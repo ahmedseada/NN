@@ -115,6 +115,8 @@ internal static partial class Tests
         var specs = new (string Name, DecoderSpec Spec)[]
         {
             ("rotary, q/k/v biases", SmallSpec with { QkvBias = true }),
+            ("one key/value head (its rearrangement is a view)", SmallSpec with { KvHeads = 1 }),
+            ("as many key/value heads as query heads", SmallSpec with { KvHeads = 4 }),
             ("q/k norms, post norms, tied", SmallSpec with { QkNorm = true, PostNorms = true, TieEmbeddings = true }),
             ("parallel blocks, layer norms, learned positions, dropout", SmallSpec with
             {

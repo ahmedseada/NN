@@ -484,7 +484,7 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         // Training: the projections, their normalized and rotated forms and the pre-rearrangement layout are read by no
         // backward step (rotation, rearrangement, bias and the projections themselves read only their inputs; a norm
         // reads its own normalized values, kept inside it): released now instead of at the end of the step.
-        ActivationMemory.Release(projected[0], projected[1], projected[2], normedQ, normedK, q, k, v);
+        ActivationMemory.Release([queries, keys, values], projected[0], projected[1], projected[2], normedQ, normedK, q, k, v);
         return (queries, keys, values);
     }
 
@@ -824,12 +824,12 @@ public sealed class DecoderBlock : Module, ICachedModule
                 var parallel = FeedForward.Forward(normalized);
                 var partial = Dropping ? ResidualDropout!.AddTo(input, attended) : input + attended;
                 var sum = Dropping ? ResidualDropout!.AddTo(partial, parallel) : partial + parallel;
-                ActivationMemory.Release(attended, parallel, partial);  // sums and projections: their backward reads no values
+                ActivationMemory.Release([sum, normalized], attended, parallel, partial);   // their backward reads no values
                 return sum;
             }
 
             x = Dropping ? ResidualDropout!.AddTo(input, attended) : input + attended;          // dropout fused in
-            ActivationMemory.Release(attended);
+            ActivationMemory.Release([x, normalized], attended);
             var fedInput = FeedForwardNorm!.Forward(x);
             fed = FeedForward.Forward(fedInput);
             ActivationMemory.Compress(fedInput);
@@ -855,7 +855,7 @@ public sealed class DecoderBlock : Module, ICachedModule
         var result = Dropping ? ResidualDropout!.AddTo(x, fed) : x + fed;
         // The residual sum is read by no backward step when its norm is an RMS norm (which keeps its own normalized values;
         // a layer norm reads its input).
-        ActivationMemory.Release(fed, FeedForwardNorm is RMSNorm ? x : null);
+        ActivationMemory.Release([result], fed, FeedForwardNorm is RMSNorm ? x : null);
         return result;
     }
 

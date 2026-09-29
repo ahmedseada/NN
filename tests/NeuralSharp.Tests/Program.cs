@@ -68,8 +68,15 @@ watchdog.Start();
 foreach (var device in devices)
 {
     Console.WriteLine($"== {device}: {device.Name}");
+    string? lostIn = null;
     foreach (var (name, test) in Tests.All.Where(t => Environment.GetEnvironmentVariable("NS_FILTER") is not { } f || t.Name.Contains(f, StringComparison.OrdinalIgnoreCase)))
     {
+        if (lostIn is not null)
+        {
+            failed++;
+            continue;                                                            // counted, not run: the device is unusable
+        }
+
         var sw = Stopwatch.StartNew();
         runningSince.Restart();
         Volatile.Write(ref running, $"[{device}] {name}");
@@ -87,6 +94,17 @@ foreach (var device in devices)
         {
             failed++;
             Console.WriteLine($"  FAIL {name}: {(Environment.GetEnvironmentVariable("NS_TRACE") == "1" ? ex.ToString() : ex.Message)}");
+
+            // A kernel that faults (illegal or misaligned address, illegal instruction, launch failure) ruins the CUDA
+            // context: every later call on it fails the same way. Name the test and skip the rest on this device.
+            if (device.Type == DeviceType.Cuda && ex.Message is var message
+                && (message.Contains("ILLEGAL", StringComparison.Ordinal) || message.Contains("MISALIGNED", StringComparison.Ordinal)
+                    || message.Contains("LAUNCH_FAILED", StringComparison.Ordinal) || message.Contains("HARDWARE_STACK_ERROR", StringComparison.Ordinal)))
+            {
+                lostIn = name;
+                Console.WriteLine($"  the CUDA context was lost in this test: the remaining {device} tests are skipped and counted as failed.");
+                Console.WriteLine("  (the fault is reported where the device is next used; NEURALSHARP_CUDA_DEBUG=1 names the kernel that faulted)");
+            }
         }
     }
 }
