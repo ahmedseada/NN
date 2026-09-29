@@ -17,6 +17,7 @@ internal static partial class Tests
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
         ("fine-tuning: agent transcripts through the chat template, assistant-only tokens, LoRA and QLoRA training, PEFT adapters, merged export", AgentFineTuning),
+        ("fine-tuning: a conversation too long for the maximum length keeps its whole answer (the user message is shortened, its start kept)", LongMessageKeepsAnswer),
     ];
 
     private static void HostOffload(Device device)
@@ -213,6 +214,50 @@ internal static partial class Tests
             ["chat_template"] = Qwen3Template, ["eos_token"] = "<|im_end|>", ["bos_token"] = null,
         }.ToJsonString());
         return folder;
+    }
+
+    private static void LongMessageKeepsAnswer(Device device)
+    {
+        if (device.Type != DeviceType.Cpu)
+        {
+            return;                                                              // tokenization only
+        }
+
+        var spec = new DecoderSpec
+        {
+            Vocabulary = 260, Dim = 32, Layers = 1, Heads = 2, KvHeads = 1, HeadDim = 16, FfDim = 32, MaxPositions = 512,
+            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, QkNorm = true, TieEmbeddings = true,
+        };
+        string folder = WriteChatModel(spec);
+        try
+        {
+            using var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device });
+            var tokenizer = model.Tokenizer!;
+            string message = "Please find the sales report " + string.Concat(Enumerable.Repeat("and the figures for every month ", 40));
+            var transcript = new ChatTranscript([new ChatMessage("system", "Answer with one word."), new ChatMessage("user", message),
+                new ChatMessage("assistant", "retrieve")], []);
+            string Trained(TrainingSequence s) => tokenizer.Decode(s.Tokens.Where((_, i) => s.Trained[i]));
+
+            var encoder = new ChatTranscriptEncoder(model.ChatTemplate!, tokenizer);
+            var whole = encoder.Encode(transcript, 2000)!;
+            Check(whole.Tokens.Length > 200, $"the conversation is long ({whole.Tokens.Length} tokens)");
+            var fitted = encoder.Encode(transcript, 120);
+            Check(fitted is not null && fitted.Tokens.Length <= 121 && Trained(fitted).EndsWith("retrieve<|im_end|>", StringComparison.Ordinal),
+                $"shortened: {fitted?.Tokens.Length} tokens, trained '{(fitted is null ? "" : Trained(fitted))}'");
+            var shortened = encoder.Fit(transcript, 120)!;
+            string kept = shortened.Messages[1].Content;
+            Check(kept.Length > 20 && kept.Length < message.Length && message.StartsWith(kept, StringComparison.Ordinal)
+                  && shortened.Messages[0] == transcript.Messages[0] && shortened.Messages[2] == transcript.Messages[2],
+                $"the message's start is kept ({kept.Length} of {message.Length} characters), the rest unchanged");
+            Check(ReferenceEquals(encoder.Fit(transcript, 2000), transcript), "a transcript that fits is left as it is");
+
+            var cutting = new ChatTranscriptEncoder(model.ChatTemplate!, tokenizer) { ShortenToFit = false };
+            Check(cutting.Encode(transcript, 120) is null, "without shortening, cutting the end leaves no answer to train");
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
     }
 
     private static void AgentFineTuning(Device device)

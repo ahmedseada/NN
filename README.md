@@ -44,6 +44,8 @@ src/NeuralSharp.Onnx/               optional package, no dependencies: export ne
 src/NeuralSharp.Onnx.Runtime/       optional package: run .onnx models with ONNX Runtime as NeuralSharp modules
 src/NeuralSharp.Pretrained/         optional package, no dependencies: Hugging Face models (safetensors, config.json,
                                     tokenizer.json, Jinja chat templates) as NeuralSharp decoders
+src/NeuralSharp.Datasets.Cli/       nsdata: inspect, download and assemble training datasets
+src/NeuralSharp.FineTuning.Cli/     nstune: fine-tune any pretrained model (LoRA / QLoRA) on any dataset, evaluate, chat, export
 samples/
   NeuralSharp.Samples.Xor             the classic XOR problem
   NeuralSharp.Samples.HousePrices     regression: predict house prices from a CSV file

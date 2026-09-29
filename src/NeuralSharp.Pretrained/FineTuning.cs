@@ -232,10 +232,115 @@ public sealed class ChatTranscriptEncoder
     }
 
     /// <summary>
-    /// The transcript's tokens, with the assistant's turns marked as trained, cut to <paramref name="maxLength"/> + 1
-    /// tokens (inputs and targets are the sequence shifted by one); null when nothing trainable remains.
+    /// Whether <see cref="Encode"/> shortens a transcript that is too long by cutting the end of the user message before
+    /// the last assistant turn (keeping its start) until the whole answer fits, instead of cutting the transcript's end,
+    /// which loses the answer. On by default.
+    /// </summary>
+    public bool ShortenToFit { get; init; } = true;
+
+    /// <summary>
+    /// The transcript's tokens, with the assistant's turns marked as trained, at most <paramref name="maxLength"/> + 1
+    /// tokens (inputs and targets are the sequence shifted by one); null when nothing trainable remains. A transcript that
+    /// is too long is shortened in its last user message (see <see cref="ShortenToFit"/>), else cut at the end.
     /// </summary>
     public TrainingSequence? Encode(ChatTranscript transcript, int maxLength)
+    {
+        var (tokens, trained) = Tokens(transcript);
+        if (tokens.Count > maxLength + 1 && ShortenToFit && Shortened(transcript, maxLength) is { } fitted)
+        {
+            return fitted;
+        }
+
+        int keep = Math.Min(tokens.Count, maxLength + 1);
+        var sequence = new TrainingSequence([.. tokens.Take(keep)], [.. trained.Take(keep)]);
+        return sequence.TrainedTokens > 0 ? sequence : null;
+    }
+
+    /// <summary>
+    /// <paramref name="transcript"/> with its last user message shortened (its start kept) so that the whole transcript
+    /// fits in <paramref name="maxLength"/> + 1 tokens; the transcript itself when it fits already; null when even an
+    /// empty message leaves no room (or the transcript has no user message before its last assistant turn).
+    /// </summary>
+    public ChatTranscript? Fit(ChatTranscript transcript, int maxLength)
+    {
+        ArgumentNullException.ThrowIfNull(transcript);
+        if (Tokens(transcript).Tokens.Count <= maxLength + 1)
+        {
+            return transcript;
+        }
+
+        return ShortenedTranscript(transcript, maxLength).Transcript;
+    }
+
+    private TrainingSequence? Shortened(ChatTranscript transcript, int maxLength)
+    {
+        var (fitted, tokens, trained) = ShortenedTranscript(transcript, maxLength);
+        if (fitted is null)
+        {
+            return null;
+        }
+
+        var sequence = new TrainingSequence([.. tokens], [.. trained]);
+        return sequence.TrainedTokens > 0 ? sequence : null;
+    }
+
+    // Cuts the end of the last user message before the last assistant turn until everything fits: a first cut from the
+    // tokens over, then 10% less each time the estimate falls short (tokens do not map to characters exactly).
+    private (ChatTranscript? Transcript, List<int> Tokens, List<bool> Trained) ShortenedTranscript(ChatTranscript transcript, int maxLength)
+    {
+        var messages = transcript.Messages;
+        int answer = -1;
+        for (int i = messages.Count - 1; i >= 0; i--)
+        {
+            if (messages[i].Role == "assistant")
+            {
+                answer = i;
+                break;
+            }
+        }
+
+        int user = -1;
+        for (int i = answer - 1; i >= 0; i--)
+        {
+            if (messages[i].Role == "user")
+            {
+                user = i;
+                break;
+            }
+        }
+
+        if (answer < 0 || user < 0 || messages[user].Content.Length == 0)
+        {
+            return (null, [], []);
+        }
+
+        string content = messages[user].Content;
+        int total = Tokens(transcript).Tokens.Count;
+        int contentTokens = Math.Max(1, Tokenizer.Encode(content).Count);
+        int keepTokens = contentTokens - (total - (maxLength + 1)) - 2;
+        int length = keepTokens <= 0 ? 0 : (int)((long)content.Length * keepTokens / contentTokens);
+        while (true)
+        {
+            var shorter = messages.ToArray();
+            shorter[user] = shorter[user] with { Content = content[..length] };
+            var candidate = transcript with { Messages = shorter };
+            var (tokens, trained) = Tokens(candidate);
+            if (tokens.Count <= maxLength + 1)
+            {
+                return (candidate, tokens, trained);
+            }
+
+            if (length == 0)
+            {
+                return (null, [], []);
+            }
+
+            length = length * 9 / 10;
+        }
+    }
+
+    // Every token of the rendered transcript, the assistant's turns marked as trained.
+    private (List<int> Tokens, List<bool> Trained) Tokens(ChatTranscript transcript)
     {
         var (text, spans) = Render(transcript);
         var tokens = new List<int>();
@@ -259,9 +364,7 @@ public sealed class ChatTranscriptEncoder
         }
 
         Add(position, text.Length, false);
-        int keep = Math.Min(tokens.Count, maxLength + 1);
-        var sequence = new TrainingSequence([.. tokens.Take(keep)], [.. trained.Take(keep)]);
-        return sequence.TrainedTokens > 0 ? sequence : null;
+        return (tokens, trained);
     }
 
     /// <summary>

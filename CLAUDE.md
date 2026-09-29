@@ -11,3 +11,6 @@
   the exact commands to run the GPU tests (`dotnet run -c Release --project tests/NeuralSharp.Tests`).
 - **Commands for the user** (Windows, PowerShell, `D:\Projects\NN`) always start with
   `git pull origin agentic-coding-tooling`.
+- **Fine-tuning is model-agnostic.** The tuner, the tools and the applications work with any model the library loads,
+  through its own tokenizer and chat template; a model used for testing (Qwen today) is only an example. Nothing outside
+  the library's architecture support may depend on a particular model family.

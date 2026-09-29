@@ -16,25 +16,9 @@ using NeuralSharp.Pretrained;
 //   check <reference.json>          compare with transformers: token ids, chat templates, logits, greedy output
 //                                   (make the reference with tools/pytorch/pretrained_reference.py)
 //
-//   finetune <folder> <data…> --out <dir>            (try: data/agent-demo-train.jsonl, data/agent-demo-eval.jsonl)
-//                                   LoRA / QLoRA on datasets: files, folders, hf:, github:, kaggle:, zenodo:, URLs or a
-//                                   recipe (as nsdata reads them); conversations train the assistant's turns, text rows
-//                                   every token; writes a PEFT adapter to <dir>
-//                                   (--eval F|spec, --eval-fraction 0.02, --system S, --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048,
-//                                   --batch-tokens 4096, --accumulate 1, --targets q,k,v,o,gate,up,down, --save-every N,
-//                                   --eval-every N, --no-checkpointing, --no-packing (pad instead of packing sequences into rows), --no-graphs (no CUDA graph replay), --fp8 (the frozen base's forward products in FP8, checked against bfloat16 first); with --int4 / --int8 / --bf16 the base stays quantized;
-//                                   --profile: measure a few steps instead of training: wall time, GPU time per kernel and
-//                                   per kind of work, host overhead)
 //   (<folder> may also be a Hugging Face model id, for example Qwen/Qwen3-0.6B: taken from the Hugging Face cache or
 //   NeuralSharp's, else downloaded once; HF_TOKEN or huggingface-cli login for gated models; a .gguf file; or an Ollama
 //   model such as ollama:qwen3:8b, read from Ollama's own store)
-//   evaluate <folder> <data…>       scores the model's answers to held-out conversations against their reference answers
-//                                   (greedy decoding): with --adapter DIR the base model and the adapter side by side;
-//                                   the same data and --eval-fraction as finetune evaluate on the rows it held out
-//                                   (--samples 100, --metric auto|number|exact|contains|f1, --max-new 512, --batch 8: answers generated together, --out F.jsonl)
-//   download <model id>             download a model (config, tokenizer, chat template, safetensors) and print its folder
-//
-//   (<data…> specs, recipes and the dataset tool: see src/NeuralSharp.Datasets.Cli, command nsdata)
 //   agent <folder> <task…> --workspace <dir>
 //                                   a coding agent (read, search, edit, write, run dotnet / npm …) working in <dir>
 //   agent-run <folder> <suite> --out <runs.jsonl>
@@ -43,8 +27,8 @@ using NeuralSharp.Pretrained;
 //                                   (--attempts N, --filter S, --work DIR, --rounds N, --temperature T)
 //   agent-check <suite>             checks every task without a model: verification fails on the starting files and
 //                                   passes with the task's solution/ folder (--filter S, --work DIR)
-//   export <folder> <adapter> --out <dir>
-//                                   merges a PEFT adapter into the float weights and writes a Hugging Face checkpoint
+//
+//   Fine-tuning, evaluating, exporting and downloading models: the nstune tool (src/NeuralSharp.FineTuning.Cli).
 //
 // Options: --offload (when the GPU is full, keep tensors in system memory: slower, but larger models and batches fit),
 //          --gpu-memory GiB (cap the GPU memory used), --adapter <dir> (chat, check, profile: load a PEFT adapter), --cuda / --cpu, --int8 (int8 weights), --int4 (4-bit weights), --bf16 (bfloat16 weights), --kv8 (int8 KV cache), --kv16 (bfloat16 KV cache), --context N (default 4096),
@@ -53,20 +37,11 @@ using NeuralSharp.Pretrained;
 var positional = new List<string>();
 bool int8 = false, bf16 = false, int4 = false, kv8 = false, kv16 = false, noThink = false;
 int context = 4096;
-string? folderOverride = null, output = null, evalFile = null, adapterFolder = null;
-string? workspace = null, workRoot = null, filter = null, systemPrompt = null;
-double evalFraction = 0;
-int samples = 100, maxNew = 512, evaluationBatch = 8;
-var metric = AnswerMetric.Auto;
-long maxRows = 0;
-int seed = 0, minChars = 0, maxChars = 0;
-bool profileTraining = false;
-bool shuffleRows = true, dedupRows = true, mixByWeight = false;
-var rowKind = NeuralSharp.Datasets.RowKind.Auto;
+string? folderOverride = null, output = null, adapterFolder = null;
+string? workspace = null, workRoot = null, filter = null;
 int attempts = 1, maxRounds = 40;
 float? temperature = null;
 MatMulPrecision? matmul = null;
-var tuning = new FineTuningOptions();
 Device device = Device.IsCudaAvailable ? Device.Cuda() : Device.Cpu;
 for (int i = 0; i < args.Length; i++)
 {
@@ -83,16 +58,7 @@ for (int i = 0; i < args.Length; i++)
         case "--context": context = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
         case "--folder": folderOverride = args[++i]; break;
         case "--out": output = args[++i]; break;
-        case "--eval": evalFile = args[++i]; break;
         case "--adapter": adapterFolder = args[++i]; break;
-        case "--rank": tuning = tuning with { Rank = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
-        case "--alpha": tuning = tuning with { Alpha = float.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
-        case "--lr": tuning = tuning with { LearningRate = float.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
-        case "--epochs": tuning = tuning with { Epochs = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
-        case "--max-length": tuning = tuning with { MaxLength = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
-        case "--batch-tokens": tuning = tuning with { BatchTokens = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
-        case "--accumulate": tuning = tuning with { GradientAccumulation = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
-        case "--save-every": tuning = tuning with { SaveEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
         case "--offload": ComputeResources.OffloadToHostMemory = true; break;
         case "--matmul":
             matmul = args[++i] switch
@@ -104,28 +70,7 @@ for (int i = 0; i < args.Length; i++)
             };
             break;
         case "--gpu-memory": ComputeResources.GpuMemoryLimit = (long)(double.Parse(args[++i], CultureInfo.InvariantCulture) * (1L << 30)); break;
-        case "--no-checkpointing": tuning = tuning with { Checkpointing = false }; break;
-        case "--no-packing": tuning = tuning with { Packing = false }; break;
-        case "--no-graphs": tuning = tuning with { CudaGraphs = false }; break;
-        case "--fp8": tuning = tuning with { Float8 = true }; break;
-        case "--eval-every": tuning = tuning with { EvaluateEvery = int.Parse(args[++i], CultureInfo.InvariantCulture) }; break;
-        case "--targets": tuning = tuning with { Targets = args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
         case "--workspace": workspace = args[++i]; break;
-        case "--samples": samples = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
-        case "--batch": evaluationBatch = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
-        case "--max-new": maxNew = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
-        case "--metric": metric = Enum.Parse<AnswerMetric>(args[++i], ignoreCase: true); break;
-        case "--eval-fraction": evalFraction = double.Parse(args[++i], CultureInfo.InvariantCulture); break;
-        case "--system": systemPrompt = args[++i]; break;
-        case "--max-rows": maxRows = long.Parse(args[++i], CultureInfo.InvariantCulture); break;
-        case "--seed": seed = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
-        case "--min-chars": minChars = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
-        case "--max-chars": maxChars = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
-        case "--no-shuffle": shuffleRows = false; break;
-        case "--profile": profileTraining = true; break;
-        case "--no-dedup": dedupRows = false; break;
-        case "--mix": mixByWeight = true; break;
-        case "--kind": rowKind = Enum.Parse<NeuralSharp.Datasets.RowKind>(args[++i], ignoreCase: true); break;
         case "--work": workRoot = args[++i]; break;
         case "--filter": filter = args[++i]; break;
         case "--attempts": attempts = int.Parse(args[++i], CultureInfo.InvariantCulture); break;
@@ -138,14 +83,13 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "finetune" or "export" or "agent" or "agent-run" or "agent-check" or "download" or "evaluate")
-    || positional[0] is "agent" && (positional.Count < 3 || workspace is null) || positional[0] is "agent-run" && (positional.Count < 3 || output is null)
-    || positional[0] is "finetune" && (positional.Count < 3 || output is null) || positional[0] is "export" && (positional.Count < 3 || output is null))
+if (positional.Count < 2 || positional[0] is not ("info" or "chat" or "check" or "profile" or "agent" or "agent-run" or "agent-check")
+    || positional[0] is "agent" && (positional.Count < 3 || workspace is null) || positional[0] is "agent-run" && (positional.Count < 3 || output is null))
 {
-    Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json> | finetune <folder> <train.jsonl> --out <dir> | export <folder> <adapter> --out <dir> | download <model id>");
-    Console.WriteLine("       evaluate <folder> <data…> [--adapter DIR] [--eval-fraction F] [--samples N] [--batch N] [--metric auto|number|exact|contains|f1] [--out F.jsonl]");
+    Console.WriteLine("usage: info <folder> | chat <folder> | profile <folder> | check <reference.json>");
     Console.WriteLine("       agent <folder> <task…> --workspace <dir> | agent-run <folder> <suite> --out <runs.jsonl> [--attempts N] | agent-check <suite>");
-    Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] [--matmul fp32|bf16|fp8] (fine-tuning options: see the top of Program.cs)");
+    Console.WriteLine("       [--cuda|--cpu] [--int8|--int4|--bf16] [--kv8|--kv16] [--context N] [--adapter DIR] [--folder F] [--no-think] [--matmul fp32|bf16|fp8]");
+    Console.WriteLine("fine-tuning, evaluating, exporting and downloading models: nstune (src/NeuralSharp.FineTuning.Cli)");
     return 1;
 }
 
@@ -205,295 +149,11 @@ PretrainedModel Load(string folder)
     return model;
 }
 
-// A training set from the command line: one recipe file, or sources with the recipe options given as flags.
-NeuralSharp.Datasets.DatasetRecipe Recipe(IReadOnlyList<string> specs, bool forTraining)
-{
-    if (specs is [var single] && single.EndsWith(".json", StringComparison.OrdinalIgnoreCase) && File.Exists(single)
-        && JsonNode.Parse(File.ReadAllText(single)) is JsonObject json && json.ContainsKey("sources"))
-    {
-        var loaded = NeuralSharp.Datasets.DatasetRecipe.Load(single);
-        return evalFraction > 0 ? loaded with { EvaluationFraction = evalFraction } : loaded;
-    }
-
-    return new NeuralSharp.Datasets.DatasetRecipe
-    {
-        Sources = [.. specs.Select(NeuralSharp.Datasets.DatasetSpec.Parse)],
-        Kind = rowKind,
-        System = systemPrompt,
-        MixByWeight = mixByWeight ? true : null,
-        Seed = seed,
-        Shuffle = shuffleRows && !forTraining,          // fine-tuning orders its batches itself
-        Deduplicate = dedupRows,
-        MinCharacters = minChars,
-        MaxCharacters = maxChars,
-        MaxRows = maxRows,
-        EvaluationFraction = evalFraction,
-    };
-}
-
 var status = new NeuralSharp.Datasets.ConsoleStatus();
 var downloads = status.CreateDownloader();
 
 switch (positional[0])
 {
-    case "evaluate":
-    {
-        if (positional.Count < 3)
-        {
-            Console.Error.WriteLine("evaluate needs a model and data: evaluate <folder> <data…>");
-            return 1;
-        }
-
-        // The rows: the held-out part when --eval-fraction splits the data as finetune did, else the data itself.
-        var recipe = Recipe(positional.Skip(2).ToList(), forTraining: true) with { Kind = NeuralSharp.Datasets.RowKind.Chat };
-        var (allRows, heldOut) = recipe.Build(downloads);
-        var rows = status.Track(heldOut ?? allRows, "reading").Take(samples).ToList();
-        Console.WriteLine($"{rows.Count} conversations from {(heldOut is null ? "the data" : $"the {recipe.EvaluationFraction:P1} held out of the data")}");
-        string? adapter = adapterFolder;
-        var runs = adapter is null ? new[] { (string?)null } : [null, adapter];
-        var reports = new List<(string Name, EvaluationReport Report)>();
-        foreach (var run in runs)
-        {
-            adapterFolder = run;
-            string name = run is null ? "base model" : $"adapter {Path.GetFileName(Path.TrimEndingDirectorySeparator(run))}";
-            Console.WriteLine($"\n{name}:");
-            using var model = Load(positional[1]);
-            var encoder = new ChatTranscriptEncoder(model.ChatTemplate ?? throw new InvalidOperationException("The model has no chat template."), model.Tokenizer!);
-            var sequences = rows.SelectMany(r => encoder.EncodeRow((JsonObject)r.DeepClone(), Math.Min(tuning.MaxLength, model.MaxPositions - 1))).ToList();
-            double loss = sequences.Count > 0 ? FineTuner.Evaluate(model, sequences, tuning.BatchTokens) : double.NaN;
-            var chat = model.CreateChat(cacheFormat, context);
-            int done = 0;
-            double sum = 0;
-            var clock = Stopwatch.StartNew();
-            var report = ChatEvaluation.Run(chat, rows.Select(r => (JsonObject)r.DeepClone()), metric, maxNew, noThink ? false : null,
-                new ConsoleProgress<EvaluatedAnswer>(a =>
-                {
-                    done++;
-                    sum += a.Score;
-                    status.Bar("answering", done, rows.Count, clock.Elapsed, $"{done}/{rows.Count}  score {sum / done:P1}");
-                }), context, batchSize: evaluationBatch);
-            status.Clear();
-            report = report with { Loss = loss };
-            reports.Add((name, report));
-            Console.WriteLine($"  loss {report.Loss:F4}, {report.Metric.ToString().ToLowerInvariant()} score {report.Score:P1} on {report.Answers.Count} answers, "
-                              + $"{report.MeanTokens:F0} tokens per answer, {report.TokensPerSecond:F0} tok/s ({report.Duration.TotalSeconds:F0} s)");
-        }
-
-        if (reports.Count == 2)
-        {
-            var (b, a) = (reports[0].Report, reports[1].Report);
-            int fixedCount = b.Answers.Zip(a.Answers).Count(p => p.First.Score < 0.5 && p.Second.Score >= 0.5);
-            int broken = b.Answers.Zip(a.Answers).Count(p => p.First.Score >= 0.5 && p.Second.Score < 0.5);
-            Console.WriteLine($"\n{"",-22}{"loss",10}{"score",10}{"tokens",9}");
-            foreach (var (name, r) in reports)
-            {
-                Console.WriteLine($"{name,-22}{r.Loss,10:F4}{r.Score,10:P1}{r.MeanTokens,9:F0}");
-            }
-
-            Console.WriteLine($"the adapter answers {fixedCount} questions right that the base model got wrong, and {broken} the other way round");
-        }
-
-        if (output is not null)
-        {
-            using var writer = new StreamWriter(output);
-            for (int i = 0; i < reports[0].Report.Answers.Count; i++)
-            {
-                var line = new JsonObject
-                {
-                    ["prompt"] = reports[0].Report.Answers[i].Prompt[^1].Content,
-                    ["reference"] = reports[0].Report.Answers[i].Reference,
-                };
-                foreach (var (name, r) in reports)
-                {
-                    line[name] = new JsonObject { ["answer"] = r.Answers[i].Answer, ["score"] = r.Answers[i].Score };
-                }
-
-                writer.WriteLine(line.ToJsonString(new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
-            }
-
-            Console.WriteLine($"answers written to {output}");
-        }
-
-        return 0;
-    }
-
-    case "download":
-    {
-        foreach (var id in positional.Skip(1))
-        {
-            string folder = ResolveModel(id);
-            Console.WriteLine($"{id}: {folder}");
-            foreach (var file in Directory.GetFiles(folder).Order(StringComparer.Ordinal))
-            {
-                Console.WriteLine($"  {NeuralSharp.Datasets.Downloader.Size(new FileInfo(file).Length),10}  {Path.GetFileName(file)}");
-            }
-        }
-
-        return 0;
-    }
-
-    case "finetune":
-    {
-        using var model = Load(positional[1]);
-        if (tuning.MaxLength >= model.MaxPositions)
-        {
-            Console.WriteLine($"--max-length {tuning.MaxLength} is beyond the model's context of {model.MaxPositions} positions; using {model.MaxPositions - 1}");
-            tuning = tuning with { MaxLength = model.MaxPositions - 1 };
-        }
-
-        var encoder = new ChatTranscriptEncoder(model.ChatTemplate ?? throw new InvalidOperationException("The model has no chat template."),
-            model.Tokenizer ?? throw new InvalidOperationException("The model has no tokenizer."));
-        List<TrainingSequence> Read(NeuralSharp.Datasets.Dataset rows, string what)
-        {
-            var watch = Stopwatch.StartNew();
-            var sequences = new List<TrainingSequence>();
-            long read = 0, skipped = 0, cut = 0, chats = 0, texts = 0, tokens = 0;
-            Console.WriteLine($"{what}: reading and tokenizing {rows.Name}");
-            foreach (var row in status.Track(rows, what, extra: () => $"  {tokens:N0} tokens"))
-            {
-                read++;
-                int before = sequences.Count;
-                foreach (var sequence in encoder.EncodeRow(row, tuning.MaxLength))
-                {
-                    tokens += sequence.Tokens.Length;
-                    cut += row.ContainsKey("messages") && sequence.Tokens.Length > tuning.MaxLength ? 1 : 0;
-                    sequences.Add(sequence);
-                }
-
-                if (sequences.Count == before)
-                {
-                    skipped++;
-                }
-                else if (row.ContainsKey("messages"))
-                {
-                    chats++;
-                }
-                else
-                {
-                    texts++;
-                }
-            }
-
-            Console.WriteLine($"{what}: {read:N0} rows ({chats:N0} conversations, {texts:N0} texts) → {sequences.Count:N0} sequences, "
-                              + $"{sequences.Sum(q => (long)q.Tokens.Length):N0} tokens, {sequences.Sum(q => (long)q.TrainedTokens):N0} trained; "
-                              + $"{cut:N0} conversations cut to {tuning.MaxLength} tokens, {skipped:N0} rows without trainable tokens skipped ({watch.Elapsed.TotalSeconds:F1} s)");
-            return sequences;
-        }
-
-        var recipe = Recipe(positional.Skip(2).ToList(), forTraining: true);
-        var (trainRows, heldOut) = recipe.Build(downloads);
-        var train = Read(trainRows, "training");
-        if (profileTraining)
-        {
-            Console.WriteLine("profiling: 3 warm-up steps, 3 timed steps, 3 steps with every GPU kernel timed…");
-            var measured = FineTuner.Profile(model, train, tuning);
-            Console.Write(GpuProfiler.Format(measured.Kernels, rows: 40));
-            double gpu = measured.GpuMillisecondsPerStep, wall = measured.SecondsPerStep * 1000;
-            if (device.Type != DeviceType.Cuda)
-            {
-                Console.WriteLine($"per step: {measured.TokensPerStep:N0} tokens, {wall:F0} ms ({measured.TokensPerSecond:N0} tok/s); kernel times need a CUDA device (--cuda)");
-                return 0;
-            }
-
-            Console.WriteLine($"\nper step: {measured.TokensPerStep:N0} tokens, {wall:F0} ms wall ({measured.TokensPerSecond:N0} tok/s), "
-                              + $"{gpu:F0} ms of GPU kernels, {Math.Max(0, wall - gpu):F0} ms of host overhead and waiting ({Math.Max(0, wall - gpu) / Math.Max(wall, 1e-9):P0})");
-            Console.WriteLine($"{"kind of work",-32} {"ms/step",9} {"share",7} {"launches",9}");
-            foreach (var (group, ms, calls) in measured.Groups)
-            {
-                Console.WriteLine($"{group,-32} {ms,9:F1} {ms / Math.Max(gpu, 1e-9),7:P1} {calls,9}");
-            }
-
-            Console.WriteLine($"GPU memory {ComputeResources.GetMemoryUsage(device)}");
-            return 0;
-        }
-
-        var evaluationRows = evalFile is not null ? Recipe([evalFile], forTraining: true) with { EvaluationFraction = 0 } is var e ? e.Build(downloads).Train : null : heldOut;
-        var evaluation = evaluationRows is null ? null : Read(evaluationRows, "evaluation");
-        var readable = new JsonSerializerOptions { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
-        Console.WriteLine($"assistant turns start with {JsonSerializer.Serialize(encoder.AssistantHeader, readable)} and end with {JsonSerializer.Serialize(encoder.AssistantEnd, readable)}");
-        var lastLine = Stopwatch.StartNew();
-        string phase = "starting";
-        void Say(string line)
-        {
-            lock (lastLine)
-            {
-                Console.WriteLine(line);
-                lastLine.Restart();
-            }
-        }
-
-        void Trace(string line)
-        {
-            phase = line.TrimStart();
-            Say("  " + line);
-        }
-
-        // A heartbeat while a batch runs long without output.
-        using var heartbeat = new Timer(_ =>
-        {
-            if (lastLine.Elapsed.TotalSeconds >= 15)
-            {
-                Say($"  … still working ({phase}), {lastLine.Elapsed.TotalSeconds:F0} s since the last line");
-            }
-        }, null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
-        if (evaluation is { Count: > 0 })
-        {
-            Console.WriteLine($"evaluating {evaluation.Count} transcripts before training…");
-            Console.WriteLine($"evaluation loss before training: {FineTuner.Evaluate(model, evaluation, tuning.BatchTokens, tuning.LossChunkRows, Trace):F4}");
-        }
-
-        Console.WriteLine("training…");
-
-        using var cancel = new CancellationTokenSource();
-        Console.CancelKeyPress += (_, e) =>
-        {
-            if (cancel.IsCancellationRequested)
-            {
-                return;                                                           // a second Ctrl+C quits at once
-            }
-
-            e.Cancel = true;
-            cancel.Cancel();
-            Console.WriteLine("stopping after the current batch and saving the adapter (Ctrl+C again to quit now)…");
-        };
-        var watch = Stopwatch.StartNew();
-        var progress = new ConsoleProgress<FineTuningProgress>(p =>
-        {
-            var remaining = TimeSpan.FromSeconds(watch.Elapsed.TotalSeconds / p.Step * (p.TotalSteps - p.Step));
-            Say($"step {p.Step}/{p.TotalSteps} (epoch {p.Epoch}): loss {p.Loss:F4}, lr {p.LearningRate:G3}, {p.TokensPerSecond:F0} tok/s"
-                + (p.EvaluationLoss is { } e ? $", evaluation loss {e:F4}" : "")
-                + $", GPU memory {ComputeResources.GetMemoryUsage(device)}"
-                + $", elapsed {watch.Elapsed:hh\\:mm\\:ss}, remaining ~{remaining:hh\\:mm\\:ss}");
-        });
-        try
-        {
-            FineTuner.Train(model, train, evaluation, tuning, output, progress, cancel.Token, Trace);
-            Console.WriteLine($"adapter written to {output}");
-        }
-        catch (OperationCanceledException)
-        {
-            model.SaveAdapter(output!);
-            Console.WriteLine($"stopped; adapter so far written to {output}");
-        }
-
-        return 0;
-    }
-
-    case "export":
-    {
-        adapterFolder = positional[2];
-        if (int8 || int4 || bf16)
-        {
-            Console.Error.WriteLine("export merges into float weights: leave out --int8, --int4 and --bf16.");
-            return 1;
-        }
-
-        using var model = Load(positional[1]);
-        model.SaveHuggingFace(output!);
-        Console.WriteLine($"merged model written to {output} (bfloat16 safetensors, config and tokenizer files)");
-        return 0;
-    }
-
     case "agent-check":
     {
         var suite = AgentTask.LoadSuite(positional[1]).Where(t => filter is null || t.Id.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();

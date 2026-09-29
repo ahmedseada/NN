@@ -25,12 +25,25 @@ public sealed class ConsoleStatus
         }
     }
 
-    /// <summary>Redraws the status line: a bar when <paramref name="total"/> is known, else a count (at most ten times a second).</summary>
+    /// <summary>
+    /// Redraws the status line for counted work: the bar and percentage, how many <paramref name="unit"/> are done, still
+    /// to do and in total, what is happening now (<paramref name="current"/>), the time elapsed and the estimated time left.
+    /// </summary>
+    /// <example><c>status.Progress("training", step, totalSteps, clock.Elapsed, $"epoch 1/3, loss {loss:F4}");</c></example>
+    public void Progress(string label, long done, long total, TimeSpan elapsed, string? current = null, string unit = "steps") =>
+        Bar(label, done, total, elapsed,
+            $"{unit}: done {done:N0}, still {Math.Max(0, total - done):N0}, total {total:N0}" + (string.IsNullOrEmpty(current) ? "" : $" | {current}"));
+
+    /// <summary>
+    /// Redraws the status line: a bar with the time elapsed and left when <paramref name="total"/> is known, else a count
+    /// (at most ten times a second, and once more when the work is done).
+    /// </summary>
     public void Bar(string label, long done, long? total, TimeSpan elapsed, string detail)
     {
         lock (_lock)
         {
-            if (_sinceDraw.ElapsedMilliseconds < (_interactive ? 100 : 5000))
+            bool finished = total is > 0 and var whole && done >= whole;
+            if (!finished && _sinceDraw.ElapsedMilliseconds < (_interactive ? 100 : 5000))
             {
                 return;
             }
@@ -41,12 +54,12 @@ public sealed class ConsoleStatus
             {
                 double fraction = Math.Clamp(done / (double)t, 0, 1);
                 int filled = (int)(fraction * 24);
-                var eta = fraction > 0 ? TimeSpan.FromSeconds(elapsed.TotalSeconds / fraction * (1 - fraction)) : TimeSpan.Zero;
-                text = $"  {label} [{new string('█', filled)}{new string('░', 24 - filled)}] {fraction,4:P0}  {detail}  ETA {eta:hh\\:mm\\:ss}";
+                string eta = finished ? "done" : fraction > 0 ? $"ETA {Time(TimeSpan.FromSeconds(elapsed.TotalSeconds / fraction * (1 - fraction)))}" : "ETA --:--";
+                text = $"  {label} [{new string('█', filled)}{new string('░', 24 - filled)}] {fraction,6:P1}  {detail} | elapsed {Time(elapsed)} | {eta}";
             }
             else
             {
-                text = $"  {label}  {detail}  {elapsed:hh\\:mm\\:ss}";
+                text = $"  {label}  {detail} | elapsed {Time(elapsed)}";
             }
 
             if (!_interactive)
@@ -59,6 +72,19 @@ public sealed class ConsoleStatus
             text = text.Length > width ? text[..width] : text;
             Console.Write("\r" + text.PadRight(Math.Max(_shown, text.Length)));
             _shown = text.Length;
+        }
+    }
+
+    /// <summary>Keeps the status line as it is (the finished bar) and moves below it; the next status starts a new line.</summary>
+    public void Finish()
+    {
+        lock (_lock)
+        {
+            if (_shown > 0)
+            {
+                Console.WriteLine();
+                _shown = 0;
+            }
         }
     }
 
@@ -79,6 +105,9 @@ public sealed class ConsoleStatus
             _shown = 0;
         }
     }
+
+    private static string Time(TimeSpan time) =>
+        time.TotalHours >= 1 ? $"{(int)time.TotalHours}:{time.Minutes:D2}:{time.Seconds:D2}" : $"{time.Minutes:D2}:{time.Seconds:D2}";
 
     private static int SafeWidth()
     {

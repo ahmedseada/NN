@@ -24,6 +24,7 @@
     <Project Path="src/NeuralSharp.Onnx/NeuralSharp.Onnx.csproj" />
     <Project Path="src/NeuralSharp.Datasets.Cli/NeuralSharp.Datasets.Cli.csproj" />
     <Project Path="src/NeuralSharp.Datasets/NeuralSharp.Datasets.csproj" />
+    <Project Path="src/NeuralSharp.FineTuning.Cli/NeuralSharp.FineTuning.Cli.csproj" />
     <Project Path="src/NeuralSharp.Pretrained/NeuralSharp.Pretrained.csproj" />
     <Project Path="src/NeuralSharp/NeuralSharp.csproj" />
   </Folder>

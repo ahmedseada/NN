@@ -1,0 +1,31 @@
+# nstune
+
+One command-line tool for every fine-tuning job: LoRA / QLoRA adapters for any pretrained model NeuralSharp loads
+(Hugging Face ids, folders, .gguf files, Ollama models), trained on any dataset `nsdata` reads, then evaluated, chatted
+with and exported. Nothing in it is specific to a model family or to an application: a project that needs a tuned model
+runs nstune with its data instead of writing its own tuner.
+
+```
+dotnet run -c Release --project src/NeuralSharp.FineTuning.Cli -- train <model> <data…> --out <dir>
+dotnet run -c Release --project src/NeuralSharp.FineTuning.Cli -- evaluate <adapter dir> <data…> --eval-fraction 0.02
+dotnet run -c Release --project src/NeuralSharp.FineTuning.Cli -- chat <adapter dir> "a message"
+dotnet run -c Release --project src/NeuralSharp.FineTuning.Cli -- export <adapter dir> --out <merged dir>
+```
+
+- **Data.** Conversations train the assistant's turns (OpenAI / Hugging Face messages, ShareGPT, Alpaca, question /
+  answer pairs are recognized); text rows train every token. Columns map into a conversation with templates:
+  `"data.csv?user={question}&assistant={answer}"`, and `--system` adds an instruction to conversations without one.
+  `--eval-fraction` holds out part of the data; `evaluate` with the same data and fraction scores that part.
+- **Long conversations.** A conversation longer than `--max-length` keeps its whole answer: the user message before it
+  is shortened (its start kept) rather than the answer cut.
+- **Progress.** A bar with the steps done, still to do and in total, the epoch and loss, elapsed time and ETA; notable
+  events (CUDA graph recording, FP8 checks, evaluation losses) print above it. Ctrl+C stops after the current step and
+  saves the adapter so far.
+- **Output.** The adapter in the PEFT format, and `neuralsharp-tuning.json`: the base model as named on the command line,
+  the system prompt and the maximum length. Any program can then load the folder (`TuningManifest.Read(folder)
+  .LoadModel(folder, device)`), and every nstune command accepts the adapter folder in place of the model.
+- **Speed.** Sequence packing, CUDA-graph replay of the training step, fused LoRA products on tensor cores, activation
+  checkpointing; `--fp8` for the frozen base's forward products (checked against bfloat16 first), `--int4` / `--int8`
+  for QLoRA. `train --profile` times a few steps per kernel instead of training.
+
+`nstune --help` lists every option.
