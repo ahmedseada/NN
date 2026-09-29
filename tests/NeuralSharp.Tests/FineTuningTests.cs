@@ -431,7 +431,7 @@ internal static partial class Tests
         using var precision = MixedPrecision.BFloat16();
         foreach (var activation in new[] { FeedForwardActivation.Silu, FeedForwardActivation.Gelu })
         {
-            var spec = SmallSpec with { Activation = activation, Dim = 64, FfDim = 200, HeadDim = 16 };
+            var spec = SmallSpec with { Activation = activation, Dim = 64, FfDim = 200, HeadDim = 16, MaxPositions = 128 };
             var r = new Random(84);
             var tokens = Enumerable.Range(0, 2 * 70).Select(_ => (float)r.Next(spec.Vocabulary)).ToArray();
             var weights = Enumerable.Range(0, 2 * 70 * spec.Vocabulary).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
