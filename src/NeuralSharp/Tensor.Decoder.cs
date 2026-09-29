@@ -1,3 +1,4 @@
+using NeuralSharp.Backends;
 using NeuralSharp.Diagnostics;
 
 namespace NeuralSharp;
@@ -875,17 +876,76 @@ public sealed partial class Tensor
         long start = Telemetry.Start(TelemetryLevel.Operations);
         var y = Empty(gate._shape, gate.Device);
         gate.Backend.GatedActivation(gate.Storage, up.Storage, y.Storage, gate.Size, kind);
-        if (WillRecord(gate, up))
+        RecordGatedActivation(gate, up, y, kind);
+        return Traced("gated_activation", y, start);
+    }
+
+    /// <summary>
+    /// <see cref="GatedActivation(Tensor, Tensor, int)"/> for training under <see cref="ActivationMemory.CompressToBFloat16"/>:
+    /// the one kernel also writes gate and up as bfloat16 words, and evicts them to those (the backward kernel reads the
+    /// words as they are, unpacking nothing), and with <paramref name="packOutput"/> writes the output's words too, for the
+    /// caller to evict the output to (<see cref="EvictToPacked"/>) once its forward uses are done. Null when gate and up
+    /// share memory (views of one product).
+    /// </summary>
+    internal static Tensor? GatedActivationCompressed(Tensor gate, Tensor up, int kind, bool packOutput, out Storage? packedOutput)
+    {
+        packedOutput = null;
+        gate.ThrowIfDisposed();
+        up.ThrowIfDisposed();
+        int n = gate.Size;
+        if (!gate._shape.AsSpan().SequenceEqual(up._shape) || ReferenceEquals(gate.Storage, up.Storage) || gate.Device != up.Device
+            || gate.Storage.Length != n || up.Storage.Length != n || gate.Storage.Evicted || up.Storage.Evicted || n < 2)
         {
-            y.Record("gated_activation", g =>
-            {
-                int flags = (gate.RequiresGrad ? 1 : 0) | (up.RequiresGrad ? 2 : 0);
-                gate.Backend.GatedActivationBackward(gate.Storage, up.Storage, g.Storage,
-                    gate.RequiresGrad ? gate.GradStorage() : g.Storage, up.RequiresGrad ? up.GradStorage() : g.Storage, gate.Size, kind, flags);
-            }, gate, up);
+            return null;
         }
 
+        long start = Telemetry.Start(TelemetryLevel.Operations);
+        var backend = gate.Backend;
+        var y = Empty(gate._shape, gate.Device);
+        var (packedGate, packedUp) = (backend.Allocate((n + 1) / 2, zeroed: false), backend.Allocate((n + 1) / 2, zeroed: false));
+        packedOutput = packOutput ? backend.Allocate((n + 1) / 2, zeroed: false) : null;
+        backend.GatedActivationPacked(gate.Storage, up.Storage, packedGate, packedUp, y.Storage, packedOutput ?? y.Storage, n, kind, 2 | 4 | (packOutput ? 8 : 0));
+        RecordGatedActivation(gate, up, y, kind);
+        gate.EvictToPacked(packedGate);                                  // read again only by the backward kernel, as words
+        up.EvictToPacked(packedUp);
         return Traced("gated_activation", y, start);
+    }
+
+    /// <summary>
+    /// Recomputes act(gate) · up into <paramref name="y"/> for <see cref="Evict"/>: from the bfloat16 words when gate and up
+    /// were evicted to them, else from their values.
+    /// </summary>
+    internal static void RecomputeGatedActivation(Tensor gate, Tensor up, Tensor y, int kind)
+    {
+        var (gs, us) = (gate.Storage, up.Storage);
+        if (gs is { Evicted: true, Packed: { } packedGate } && us is { Evicted: true, Packed: { } packedUp })
+        {
+            y.Backend.GatedActivationPacked(y.Storage, y.Storage, packedGate, packedUp, y.Storage, y.Storage, y.Size, kind, 1 | 4);
+            return;
+        }
+
+        WithValues([gate, up], () => y.Backend.GatedActivation(gate.Storage, up.Storage, y.Storage, y.Size, kind));
+    }
+
+    private static void RecordGatedActivation(Tensor gate, Tensor up, Tensor y, int kind)
+    {
+        if (!WillRecord(gate, up))
+        {
+            return;
+        }
+
+        y.Record("gated_activation", g =>
+        {
+            int flags = (gate.RequiresGrad ? 1 : 0) | (up.RequiresGrad ? 2 : 0);
+            var (dgate, dup) = (gate.RequiresGrad ? gate.GradStorage() : g.Storage, up.RequiresGrad ? up.GradStorage() : g.Storage);
+            if (gate.Storage is { Evicted: true, Packed: { } packedGate } && up.Storage is { Evicted: true, Packed: { } packedUp })
+            {
+                gate.Backend.GatedActivationBackwardPacked(packedGate, packedUp, g.Storage, dgate, dup, gate.Size, kind, flags);   // read as words
+                return;
+            }
+
+            WithValues([gate, up], () => gate.Backend.GatedActivationBackward(gate.Storage, up.Storage, g.Storage, dgate, dup, gate.Size, kind, flags));
+        }, gate, up);
     }
 
     /// <summary>

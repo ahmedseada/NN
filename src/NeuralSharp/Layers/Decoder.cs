@@ -653,19 +653,38 @@ public sealed class FeedForward : Module
                 return Down.Bias is null ? fused : fused + Down.Bias;                        // activation read by the down projection
             }
 
-            hidden = Tensor.GatedActivation(projected[0], projected[1], (int)Activation);    // act(gate) · up in one kernel
-            ActivationMemory.Compress(projected[0], projected[1]);                          // read again only by its backward
-            if (ActivationMemory.RecomputeFeedForward && Autograd.IsEnabled)
+            var (gate, up, kind) = (projected[0], projected[1], (int)Activation);
+            bool recompute = ActivationMemory.RecomputeFeedForward && Autograd.IsEnabled;
+            Backends.Storage? packedHidden = null;
+            if (ActivationMemory.BFloat16 && Autograd.IsEnabled
+                && Tensor.GatedActivationCompressed(gate, up, kind, packOutput: !recompute, out packedHidden) is { } compressed)
+            {
+                hidden = compressed;                                        // gate, up (and the result) kept as bfloat16 by the kernel
+            }
+            else
+            {
+                hidden = Tensor.GatedActivation(gate, up, kind);           // act(gate) · up in one kernel
+                ActivationMemory.Compress(gate, up);                        // read again only by its backward
+            }
+
+            if (recompute)
             {
                 // Released after the down projection reads it, recomputed from gate and up when a backward step needs it.
-                var (gate, up, kind) = (projected[0], projected[1], (int)Activation);
                 var down = Down.Forward(hidden);
-                hidden.Evict(h => Tensor.WithValues([gate, up], () => h.Backend.GatedActivation(gate.Storage, up.Storage, h.Storage, h.Size, kind)));
+                hidden.Evict(h => Tensor.RecomputeGatedActivation(gate, up, h, kind));
                 return down;
             }
 
             var result = Down.Forward(hidden);
-            ActivationMemory.Compress(hidden);
+            if (packedHidden is not null)
+            {
+                hidden.EvictToPacked(packedHidden);
+            }
+            else
+            {
+                ActivationMemory.Compress(hidden);
+            }
+
             return result;
         }
         return Down.Forward(hidden);

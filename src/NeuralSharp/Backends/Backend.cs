@@ -59,6 +59,7 @@ internal abstract class Storage(Backend backend, int length)
 
             Released?.Invoke();
             Released = null;
+            Packed = null;
         }
     }
 
@@ -73,6 +74,15 @@ internal abstract class Storage(Backend backend, int length)
 
     /// <summary>Called once when the storage is released for good (for what its recomputation keeps, such as a packed copy).</summary>
     public Action? Released { get; internal set; }
+
+    /// <summary>
+    /// A bfloat16 copy of the values (<see cref="Backend.PackBFloat16"/> words) kept while the storage is evicted, which
+    /// kernels that read bfloat16 inputs use without unpacking it; null when there is none.
+    /// </summary>
+    public Storage? Packed { get; internal set; }
+
+    /// <summary>Whether a tensor still holds the storage (it has not been released for good).</summary>
+    public bool Alive => Volatile.Read(ref _refs) > 0;
 }
 
 /// <summary>
@@ -578,6 +588,17 @@ internal abstract class Backend
 
     /// <summary>dgate += dy · up · act'(gate) when flags has bit 0, dup += dy · act(gate) when it has bit 1.</summary>
     public abstract void GatedActivationBackward(Storage gate, Storage up, Storage dy, Storage dgate, Storage dup, int n, int kind, int flags);
+
+    /// <summary>
+    /// <see cref="GatedActivation"/> with bfloat16 words (two values each, low half first, as <see cref="PackBFloat16"/>
+    /// writes them): gate and up read from <paramref name="packedGate"/> and <paramref name="packedUp"/> when flags has
+    /// bit 0 (else from <paramref name="gate"/> and <paramref name="up"/>); y written when it has bit 2, gate and up packed
+    /// when it has bit 1, y packed when it has bit 3. Storages a flag does not use may be any storage.
+    /// </summary>
+    public abstract void GatedActivationPacked(Storage gate, Storage up, Storage packedGate, Storage packedUp, Storage y, Storage packedY, int n, int kind, int flags);
+
+    /// <summary><see cref="GatedActivationBackward"/> reading gate and up as bfloat16 words.</summary>
+    public abstract void GatedActivationBackwardPacked(Storage packedGate, Storage packedUp, Storage dy, Storage dgate, Storage dup, int n, int kind, int flags);
 
     /// <summary>Quantizes source [heads·steps, dim] into the int8 cache at positions position[0] + step.</summary>
     public abstract void KeyValueWriteInt8(Storage source, Storage cache, Storage scales, Storage position, int heads, int steps, int capacity, int dim);

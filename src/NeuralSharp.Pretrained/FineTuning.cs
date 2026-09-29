@@ -540,7 +540,9 @@ public sealed record FineTuningOptions
     /// <summary>
     /// Recompute each block's feed-forward activation in the backward pass instead of keeping it (about a fifth less
     /// activation memory for one element-wise kernel per block; see <see cref="ActivationMemory"/>). Null (the default):
-    /// off, and the first thing turned on when a step runs out of device memory, before <see cref="Checkpointing"/>.
+    /// off, and the first thing turned on when a step runs out of device memory, before <see cref="Checkpointing"/>. With
+    /// all three of these null, the first setting that fits is timed over a step against checkpointing, and the faster one
+    /// kept for the rest of training.
     /// </summary>
     public bool? RecomputeFeedForward { get; init; }
 
@@ -718,20 +720,38 @@ public static class FineTuner
         /// <summary>Whether steps run with activation checkpointing (it can turn on during training, see <see cref="FineTuningOptions.Checkpointing"/>).</summary>
         public bool Checkpointing => _options.Checkpointing == true;
 
+        // Choosing by speed after the first out-of-memory step: the lightest setting that fits (recomputed feed-forward
+        // activations, then also bfloat16 ones) is timed over a step, then checkpointing is, and the faster is kept.
+        private readonly bool _choose = options.Checkpointing is null && options.RecomputeFeedForward is null && options.BFloat16Activations is null
+            && !ComputeResources.OffloadToHostMemory;
+        private int _probe;                         // 0: not measuring; 1: the fitting setting; 2: checkpointing; 3: chosen
+        private int _probeSteps;
+        private double _lightSeconds;
+        private FineTuningOptions? _light;
+
         public (float Loss, long Tokens) Run(IReadOnlyList<Batch> group, CancellationToken cancellationToken, Func<int, string> label, bool graphs = true)
         {
-            // Out of device memory: first recompute the feed-forward activations (cheap), then checkpoint every block (a
-            // third more compute); the step is run again each time and the graph, recorded without them, recorded again.
+            // Out of device memory: first recompute the feed-forward activations (cheap), then hold activations as
+            // bfloat16, then checkpoint every block (a third more compute); the step is run again each time and the graph,
+            // recorded without them, recorded again. Which of the setting that fits and checkpointing is faster is measured.
             while (true)
             {
                 try
                 {
-                    return RunOnce(group, cancellationToken, label, graphs);
+                    long started = Stopwatch.GetTimestamp();
+                    var result = RunOnce(group, cancellationToken, label, graphs && _probe is 0 or 3);
+                    Measured(Stopwatch.GetElapsedTime(started).TotalSeconds / Math.Max(1L, group.Sum(b => (long)b.Rows.Length * b.Length)));
+                    return result;
+                }
+                catch (ResourceLimitExceededException ex) when (_probe == 2)
+                {
+                    Choose(checkpointing: false, $"checkpointing ran out of device memory ({ex.Message.Split(':')[0]})");
                 }
                 catch (ResourceLimitExceededException ex) when (_automaticRecompute && _options.RecomputeFeedForward != true && !Checkpointing)
                 {
                     _options = _options with { RecomputeFeedForward = true };
                     Reset();
+                    StartProbe();
                     trace?.Invoke($"out of device memory ({ex.Message.Split(':')[0]}): feed-forward activations are recomputed in the backward pass "
                                   + "from this step (RecomputeFeedForward / --recompute to start with it)");
                 }
@@ -739,6 +759,7 @@ public static class FineTuner
                 {
                     _options = _options with { BFloat16Activations = true };
                     Reset();
+                    StartProbe();
                     trace?.Invoke($"out of device memory ({ex.Message.Split(':')[0]}): activations are held as bfloat16 between the passes "
                                   + "from this step (BFloat16Activations / --bf16-activations to start with it)");
                 }
@@ -746,14 +767,68 @@ public static class FineTuner
                 {
                     _options = _options with { Checkpointing = true };
                     Reset();
+                    _probe = 3;                                                  // nothing lighter fits
                     trace?.Invoke($"out of device memory without activation checkpointing ({ex.Message.Split(':')[0]}): checkpointing is on from this step "
                                   + "(set Checkpointing / --checkpointing to start with it)");
                 }
             }
         }
 
+        private void StartProbe()
+        {
+            if (_choose && _automatic && _probe != 3)
+            {
+                (_probe, _probeSteps) = (1, 0);
+            }
+        }
+
+        // Seconds per position of a step that finished: the second step of each measured setting counts (the first one
+        // allocates its memory).
+        private void Measured(double secondsPerPosition)
+        {
+            if (_probe is not (1 or 2) || ++_probeSteps < 2)
+            {
+                return;
+            }
+
+            if (_probe == 1)
+            {
+                (_light, _lightSeconds) = (_options, secondsPerPosition);
+                _options = _options with { Checkpointing = true, RecomputeFeedForward = false, BFloat16Activations = false };
+                Reset();
+                (_probe, _probeSteps) = (2, 0);
+                trace?.Invoke($"measuring: {Describe(_light)} took {secondsPerPosition * 1e6:F2} µs per position; timing checkpointing next");
+                return;
+            }
+
+            Choose(checkpointing: secondsPerPosition < _lightSeconds,
+                $"{Describe(_light!)} {_lightSeconds * 1e6:F2} µs per position, checkpointing {secondsPerPosition * 1e6:F2} µs");
+        }
+
+        private void Choose(bool checkpointing, string why)
+        {
+            if (!checkpointing)
+            {
+                _options = _light!;
+            }
+
+            Reset();
+            _probe = 3;
+            trace?.Invoke($"keeping {(checkpointing ? "checkpointing" : Describe(_light!))} for the rest of training ({why})");
+        }
+
+        private static string Describe(FineTuningOptions options) =>
+            options.BFloat16Activations == true ? "recomputed feed-forward and bfloat16 activations" : "recomputed feed-forward activations";
+
+        /// <summary>How many times the settings changed (out of memory, or a measured choice).</summary>
+        public int Changes { get; private set; }
+
+        /// <summary>Whether the settings are final (no measurement between two settings is running).</summary>
+        public bool Settled => _probe is 0 or 3;
+
         private void Reset()
         {
+            Changes++;
             _graph?.Dispose();
             (_graph, _graphs, _ordinary) = (null, null, 0);
         }
@@ -906,9 +981,15 @@ public static class FineTuner
             return (loss, tokens, watch.Elapsed.TotalSeconds);
         }
 
-        for (int i = 0; i < warmup; i++)
+        // Warm-up again after the runner changed settings (out of memory, or a measured choice): the timed steps run the
+        // settings training keeps.
+        for (int round = 0, changes = -1; round < 5 && changes != runner.Changes; round++)
         {
-            Step("warm-up");
+            changes = runner.Changes;
+            for (int i = 0; i < warmup || !runner.Settled && i < 8; i++)
+            {
+                Step("warm-up");
+            }
         }
 
         long timedTokens = 0;

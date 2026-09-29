@@ -660,6 +660,56 @@ internal sealed partial class CpuBackend
         });
     }
 
+    public override void GatedActivationPacked(Storage gate, Storage up, Storage packedGate, Storage packedUp, Storage y, Storage packedY, int n, int kind, int flags)
+    {
+        Storage? g = null, u = null, t = null;
+        try
+        {
+            if ((flags & 1) != 0)
+            {
+                (g, u) = (Allocate(n, false), Allocate(n, false));
+                BFloat16Dequantize(packedGate, g, 1, n);
+                BFloat16Dequantize(packedUp, u, 1, n);
+            }
+
+            var (gv, uv) = (g ?? gate, u ?? up);
+            if ((flags & 2) != 0 && (flags & 1) == 0)
+            {
+                PackBFloat16(gate, packedGate, n);
+                PackBFloat16(up, packedUp, n);
+            }
+
+            var target = (flags & 4) != 0 ? y : t = Allocate(n, false);
+            GatedActivation(gv, uv, target, n, kind);
+            if ((flags & 8) != 0)
+            {
+                PackBFloat16(target, packedY, n);
+            }
+        }
+        finally
+        {
+            g?.Release();
+            u?.Release();
+            t?.Release();
+        }
+    }
+
+    public override void GatedActivationBackwardPacked(Storage packedGate, Storage packedUp, Storage dy, Storage dgate, Storage dup, int n, int kind, int flags)
+    {
+        Storage g = Allocate(n, false), u = Allocate(n, false);
+        try
+        {
+            BFloat16Dequantize(packedGate, g, 1, n);
+            BFloat16Dequantize(packedUp, u, 1, n);
+            GatedActivationBackward(g, u, dy, dgate, dup, n, kind, flags);
+        }
+        finally
+        {
+            g.Release();
+            u.Release();
+        }
+    }
+
     public override void RmsNorm(Storage x, Storage y, Storage inv, int rows, int cols, float eps)
     {
         float[] xv = D(x), yv = D(y), iv = D(inv);

@@ -537,6 +537,12 @@ internal sealed unsafe partial class CudaBackend
     public override void GatedActivationBackward(Storage gate, Storage up, Storage dy, Storage dgate, Storage dup, int n, int kind, int flags) =>
         Launch1D(K("gated_act_bwd_f32"), n, P(gate), P(up), P(dy), P(dgate), P(dup), U(kind), U(flags), U(n));
 
+    public override void GatedActivationPacked(Storage gate, Storage up, Storage packedGate, Storage packedUp, Storage y, Storage packedY, int n, int kind, int flags) =>
+        Launch1D(K("gated_act_bf16_f32"), (n + 1) / 2, P(gate), P(up), P(packedGate), P(packedUp), P(y), P(packedY), U(kind), U(flags), U(n), U((n + 1) / 2));
+
+    public override void GatedActivationBackwardPacked(Storage packedGate, Storage packedUp, Storage dy, Storage dgate, Storage dup, int n, int kind, int flags) =>
+        Launch1D(K("gated_act_bwd_bf16_f32"), (n + 1) / 2, P(packedGate), P(packedUp), P(dy), P(dgate), P(dup), U(kind), U(flags), U(n), U((n + 1) / 2));
+
     public override void AttentionTiled(Storage q, Storage keys, Storage values, Storage position, Storage y, Storage? logSumExp, int heads,
         int rowsPerHead, int steps, int capacity, int dim, float scale)
     {

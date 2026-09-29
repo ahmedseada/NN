@@ -16,8 +16,9 @@ internal static partial class Tests
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("fine-tuning: the input gradient through bfloat16 weights reads them as stored (with and without the adapter's term, odd widths, split k)", BFloat16InputGradient),
+        ("fine-tuning: the gated activation reads and writes bfloat16 words as packing and unpacking around the float kernels would (SiLU, GELU, ReLU, odd sizes)", PackedGatedActivation),
         ("fine-tuning: releasing results no backward step reads, and recomputing feed-forward activations, give the same loss and gradients with less memory (RoPE, biases, q/k norms, post norms, parallel blocks, layer norms, dropout)", ReleasedActivations),
-        ("fine-tuning: checkpointing is off by default and turns on (the step run again) when a step runs out of memory", AutomaticCheckpointing),
+        ("fine-tuning: checkpointing is off by default and turns on (the step run again) when a step runs out of memory; a lighter setting that fits is timed against checkpointing and the faster kept", AutomaticCheckpointing),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
         ("fine-tuning: agent transcripts through the chat template, assistant-only tokens, LoRA and QLoRA training, PEFT adapters, merged export", AgentFineTuning),
         ("fine-tuning: a conversation too long for the maximum length keeps its whole answer (the user message is shortened, its start kept); rows encode on all cores in order", LongMessageKeepsAnswer),
@@ -181,6 +182,67 @@ internal static partial class Tests
         }
     }
 
+    private static void PackedGatedActivation(Device device)
+    {
+        var r = new Random(52);
+        float[] Values(int n) => [.. Enumerable.Range(0, n).Select(_ => (float)(r.NextDouble() * 6 - 3))];
+        foreach (int n in new[] { 1, 7, 1000, 4097 })
+        {
+            for (int kind = 0; kind < 3; kind++)
+            {
+                using var scope = new TensorScope();
+                var gate = Tensor.From(Values(n), [n], device);
+                var up = Tensor.From(Values(n), [n], device);
+                var backend = gate.Backend;
+                int words = (n + 1) / 2;
+                float[] Unpacked(Tensor packed)
+                {
+                    var values = Tensor.Zeros([n], device);
+                    backend.BFloat16Dequantize(packed.Storage, values.Storage, 1, n);
+                    return values.ToArray();
+                }
+
+                Tensor Packed(Tensor values)
+                {
+                    var packed = Tensor.Zeros([words], device);
+                    backend.PackBFloat16(values.Storage, packed.Storage, n);
+                    return packed;
+                }
+
+                // Forward: y from the floats, gate, up and y packed in the same pass.
+                var expected = Tensor.Zeros([n], device);
+                backend.GatedActivation(gate.Storage, up.Storage, expected.Storage, n, kind);
+                var (y, pg, pu, py) = (Tensor.Zeros([n], device), Tensor.Zeros([words], device), Tensor.Zeros([words], device), Tensor.Zeros([words], device));
+                backend.GatedActivationPacked(gate.Storage, up.Storage, pg.Storage, pu.Storage, y.Storage, py.Storage, n, kind, 2 | 4 | 8);
+                string what = $"n {n}, kind {kind}";
+                AssertClose(expected.ToArray(), y.ToArray(), 1e-5f, $"{what}: y");
+                AssertClose(Unpacked(Packed(gate)), Unpacked(pg), 0f, $"{what}: packed gate");
+                AssertClose(Unpacked(Packed(up)), Unpacked(pu), 0f, $"{what}: packed up");
+                AssertClose(Unpacked(Packed(expected)), Unpacked(py), 1e-2f, $"{what}: packed y");
+
+                // Recomputed from the words: as the float kernel over the unpacked values.
+                var (g16, u16) = (Tensor.From(Unpacked(pg), [n], device), Tensor.From(Unpacked(pu), [n], device));
+                backend.GatedActivation(g16.Storage, u16.Storage, expected.Storage, n, kind);
+                var recomputed = Tensor.Zeros([n], device);
+                backend.GatedActivationPacked(recomputed.Storage, recomputed.Storage, pg.Storage, pu.Storage, recomputed.Storage, recomputed.Storage, n, kind, 1 | 4);
+                AssertClose(expected.ToArray(), recomputed.ToArray(), 1e-5f, $"{what}: recomputed");
+
+                // Backward from the words, accumulating (flags: gate, up, both).
+                for (int flags = 1; flags <= 3; flags++)
+                {
+                    var dy = Tensor.From(Values(n), [n], device);
+                    var start = Values(n);
+                    var (dg, du) = (Tensor.From(start, [n], device), Tensor.From(start, [n], device));
+                    var (eg, eu) = (Tensor.From(start, [n], device), Tensor.From(start, [n], device));
+                    backend.GatedActivationBackward(g16.Storage, u16.Storage, dy.Storage, eg.Storage, eu.Storage, n, kind, flags);
+                    backend.GatedActivationBackwardPacked(pg.Storage, pu.Storage, dy.Storage, dg.Storage, du.Storage, n, kind, flags);
+                    AssertClose(eg.ToArray(), dg.ToArray(), 1e-5f, $"{what}, flags {flags}: dgate");
+                    AssertClose(eu.ToArray(), du.ToArray(), 1e-5f, $"{what}, flags {flags}: dup");
+                }
+            }
+        }
+    }
+
     private static void BFloat16InputGradient(Device device)
     {
         if (device.Type != DeviceType.Cuda || MixedPrecision.TensorCoresUnavailable(device) is not null)
@@ -234,7 +296,7 @@ internal static partial class Tests
         var sequences = Enumerable.Range(0, 16).Select(_ =>
             new TrainingSequence([.. Enumerable.Range(0, 257).Select(_ => random.Next(256))], [.. Enumerable.Range(0, 257).Select(i => i > 128)])).ToList();
         var options = new FineTuningOptions { Rank = 4, Alpha = 8, BatchTokens = 2048, Seed = 1, Packing = false };
-        (bool Done, string Trace, List<float> Losses) Train(bool? checkpointing, long? extra)
+        (bool Done, string Trace, List<float> Losses) Train(bool? checkpointing, long? extra, int epochs = 1)
         {
             using var pretrained = PretrainedModel.Load(folder, new PretrainedOptions { Device = device });
             var trace = new System.Text.StringBuilder();
@@ -243,7 +305,7 @@ internal static partial class Tests
             ComputeResources.CpuMemoryLimit = extra is { } e ? before + e : null;
             try
             {
-                FineTuner.Train(pretrained, sequences, null, options with { Checkpointing = checkpointing },
+                FineTuner.Train(pretrained, sequences, null, options with { Checkpointing = checkpointing, Epochs = epochs },
                     progress: new SynchronousProgress<FineTuningProgress>(p => losses.Add(p.Loss)), trace: line => trace.AppendLine(line));
                 return (true, trace.ToString(), losses);
             }
@@ -278,6 +340,13 @@ internal static partial class Tests
             CloseByNorm([.. checkpointed.Losses], [.. automatic.Losses], 1e-4f, "the same losses as checkpointed training");
             var roomy = Train(null, null);
             Check(roomy.Done && !roomy.Trace.Contains("checkpointing is on"), "with room, training runs without checkpointing");
+
+            // A budget where recomputing the feed-forward activations (or also holding them as bfloat16) fits: that
+            // setting and checkpointing are each timed, and training finishes with one of them.
+            var plain = Enumerable.Range(1, 32).Select(i => budget!.Value + ((long)i << 23)).First(b => Train(false, b).Done);
+            var lighter = Enumerable.Range(1, 15).Select(i => plain - (plain - budget!.Value) * i / 16)
+                .Select(b => Train(null, b, epochs: 3)).FirstOrDefault(t => t.Trace.Contains("measuring:"));
+            Check(lighter.Done && lighter.Trace.Contains("keeping "), $"a lighter setting is measured against checkpointing, one kept: {lighter.Trace}");
         }
         finally
         {

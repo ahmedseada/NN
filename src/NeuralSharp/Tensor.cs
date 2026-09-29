@@ -385,34 +385,32 @@ public sealed partial class Tensor : IDisposable
         "matmul", "matmul_bias", "matmul_frozen", "matmul_bf16", "matmul_int8", "matmul_int4", "matmul_packed", "embedding",
     ];
 
-    // The evicted storages a node's backward step may read (its own and its inputs'), given memory and recomputed.
-    private static List<Storage>? RestoreEvicted(Tensor node)
-    {
-        List<Storage>? restored = null;
-        void Check(Storage storage)
-        {
-            if (storage.Evicted && storage.Backend.Restore(storage))
-            {
-                (restored ??= []).Add(storage);
-            }
-        }
+    // Operations whose backward step reads its inputs' bfloat16 words (Storage.Packed) itself: an input evicted with a
+    // packed copy is not unpacked for them.
+    private static readonly HashSet<string> ReadsPackedInputs = ["gated_activation"];
 
+    // The storages a node's backward step may read (its own and its inputs'), into reads.
+    private static void Reads(Tensor node, List<Storage> reads)
+    {
+        reads.Clear();
         if (node._operation == "reshape")
         {
-            return null;                                                 // a view passes its gradient on, reading no values
+            return;                                                      // a view passes its gradient on, reading no values
         }
 
         if (!ReferenceEquals(node.Storage.RecomputedFor, node) && !OwnValuesUnread.Contains(node._operation ?? ""))
         {
-            Check(node.Storage);
+            reads.Add(node.Storage);
         }
 
+        bool packedInputs = ReadsPackedInputs.Contains(node._operation ?? "");
         foreach (var parent in node._parents ?? [])
         {
-            Check(parent.Storage);
+            if (!(packedInputs && parent.Storage.Evicted && parent.Storage.Packed is not null))
+            {
+                reads.Add(parent.Storage);
+            }
         }
-
-        return restored;
     }
 
     /// <summary>
@@ -422,15 +420,31 @@ public sealed partial class Tensor : IDisposable
     /// </summary>
     internal void CompressToBFloat16()
     {
-        if (_disposed != 0 || Storage.Evicted || Size < 2)
+        if (_disposed != 0 || Storage.Evicted || Storage.Packed is not null || Size < 2)
         {
             return;
         }
 
+        var packed = Backend.Allocate((Size + 1) / 2, zeroed: false);
+        Backend.PackBFloat16(Storage, packed, Size);
+        EvictToPacked(packed);
+    }
+
+    /// <summary>
+    /// Releases the values, keeping <paramref name="packed"/> (their bfloat16 words, which this tensor now owns) to unpack
+    /// them from when a backward step needs them, or for kernels that read the words themselves (<see cref="Storage.Packed"/>).
+    /// </summary>
+    internal void EvictToPacked(Storage packed)
+    {
+        if (_disposed != 0 || Storage.Evicted || Storage.Packed is not null)
+        {
+            packed.Release();
+            return;
+        }
+
         int n = Size;
-        var packed = Backend.Allocate((n + 1) / 2, zeroed: false);
-        Backend.PackBFloat16(Storage, packed, n);
         Backend.Evict(Storage, s => s.Backend.BFloat16Dequantize(packed, s, 1, n));
+        Storage.Packed = packed;
         Storage.Released = packed.Release;
     }
 
@@ -493,6 +507,31 @@ public sealed partial class Tensor : IDisposable
         CheckSameShape(this, gradient);
         Backend.Axpy(gradient.Storage, GradStorage(), Size, 1f);
 
+        var (reads, held) = (new List<Storage>(), new List<Storage>());
+        try
+        {
+            BackwardNodes(reads, held);
+        }
+        finally
+        {
+            foreach (var storage in held)
+            {
+                Reevict(storage);
+            }
+        }
+    }
+
+    // Gives a restored activation's memory back again until another step needs it (unless it was released meanwhile).
+    private static void Reevict(Storage storage)
+    {
+        if (storage.Alive)
+        {
+            storage.Backend.Evict(storage, storage.Recompute);
+        }
+    }
+
+    private void BackwardNodes(List<Storage> reads, List<Storage> held)
+    {
         foreach (var node in TopologicalOrder())
         {
             if (node._backward is null || node.Grad is null)
@@ -501,15 +540,28 @@ public sealed partial class Tensor : IDisposable
             }
 
             long start = Telemetry.Start(TelemetryLevel.Operations);
-            var restored = RestoreEvicted(node);                         // recomputed activations this step reads
-            node._backward(node.Grad);
-            if (restored is not null)
+
+            // Recomputed (or unpacked) activations this step reads: given memory for it, and kept while the following steps
+            // read them too (the projections of one input, one after another), then released again.
+            Reads(node, reads);
+            for (int i = held.Count - 1; i >= 0; i--)
             {
-                foreach (var storage in restored)
+                if (!reads.Contains(held[i]))
                 {
-                    storage.Backend.Evict(storage, storage.Recompute);      // released again until another step needs them
+                    Reevict(held[i]);
+                    held.RemoveAt(i);
                 }
             }
+
+            foreach (var storage in reads)
+            {
+                if (storage.Evicted && storage.Backend.Restore(storage))
+                {
+                    held.Add(storage);
+                }
+            }
+
+            node._backward(node.Grad);
 
             if (start != 0)
             {
