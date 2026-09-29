@@ -126,7 +126,7 @@ internal static partial class Tests
         {
             var tokens = Enumerable.Range(0, 3 * 11).Select(_ => (float)r.Next(spec.Vocabulary)).ToArray();
             var weights = Enumerable.Range(0, 3 * 11 * spec.Vocabulary).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
-            (float Loss, float[] Gradients, long Held) Run(bool release, bool recompute)
+            (float Loss, float[] Gradients, long Held) Run(bool release, bool recompute, bool compress = false)
             {
                 bool previous = ActivationMemory.ReleaseUnused;
                 ActivationMemory.ReleaseUnused = release;
@@ -142,6 +142,7 @@ internal static partial class Tests
                     model.Train();
                     using var scope = new TensorScope();
                     using var recomputing = recompute ? ActivationMemory.Recompute() : (ActivationMemory.Scope?)null;
+                    using var compressing = compress ? ActivationMemory.CompressToBFloat16() : (ActivationMemory.Scope?)null;
                     long before = ComputeResources.GetMemoryUsage(device).InUse;
                     var logits = model.Forward(Tensor.From(tokens, [3, 11], device));
                     var loss = (logits * Tensor.From(weights, [3, 11, spec.Vocabulary], device)).Sum();
@@ -165,6 +166,15 @@ internal static partial class Tests
             }
 
             Check(released.Held < kept.Held, $"{name}: releasing holds less after the forward pass ({released.Held:N0} vs {kept.Held:N0} bytes)");
+
+            // Held as bfloat16 between the passes: the same loss (computed before), gradients within bfloat16's rounding,
+            // less memory still; also with the feed-forward activations recomputed from compressed gate and up.
+            foreach (var (what, run) in new[] { ("bfloat16", Run(true, false, compress: true)), ("bfloat16, recomputed", Run(true, true, compress: true)) })
+            {
+                AssertClose([kept.Loss], [run.Loss], 1e-5f, $"{name}, {what}: loss");
+                CloseByNorm(kept.Gradients, run.Gradients, 2e-2f, $"{name}, {what}: adapter gradients");
+                Check(run.Held < released.Held, $"{name}, {what}: holds less than released alone ({run.Held:N0} vs {released.Held:N0} bytes)");
+            }
             Check(spec.Gated == false || recomputed.Held < released.Held, $"{name}: recomputing holds less still ({recomputed.Held:N0} vs {released.Held:N0} bytes)");
         }
     }

@@ -544,6 +544,14 @@ public sealed record FineTuningOptions
     /// </summary>
     public bool? RecomputeFeedForward { get; init; }
 
+    /// <summary>
+    /// Hold the activations the backward pass reads as bfloat16 between the passes (half their memory, one pack and one
+    /// unpack pass each; the inputs of tensor-core products lose nothing, see <see cref="ActivationMemory.CompressToBFloat16"/>).
+    /// Null (the default): off, and turned on when a step runs out of device memory with <see cref="RecomputeFeedForward"/>
+    /// on already, before <see cref="Checkpointing"/>.
+    /// </summary>
+    public bool? BFloat16Activations { get; init; }
+
     /// <summary>Seed for the adapters' initial values and the batch order.</summary>
     public int Seed { get; init; }
 }
@@ -705,6 +713,7 @@ public static class FineTuner
         private int _ordinary;
 
         private readonly bool _automaticRecompute = options.RecomputeFeedForward is null && options.Checkpointing is null && !ComputeResources.OffloadToHostMemory;
+        private readonly bool _automaticBFloat16 = options.BFloat16Activations is null && options.Checkpointing is null && !ComputeResources.OffloadToHostMemory;
 
         /// <summary>Whether steps run with activation checkpointing (it can turn on during training, see <see cref="FineTuningOptions.Checkpointing"/>).</summary>
         public bool Checkpointing => _options.Checkpointing == true;
@@ -725,6 +734,13 @@ public static class FineTuner
                     Reset();
                     trace?.Invoke($"out of device memory ({ex.Message.Split(':')[0]}): feed-forward activations are recomputed in the backward pass "
                                   + "from this step (RecomputeFeedForward / --recompute to start with it)");
+                }
+                catch (ResourceLimitExceededException ex) when (_automaticBFloat16 && _options.BFloat16Activations != true && !Checkpointing)
+                {
+                    _options = _options with { BFloat16Activations = true };
+                    Reset();
+                    trace?.Invoke($"out of device memory ({ex.Message.Split(':')[0]}): activations are held as bfloat16 between the passes "
+                                  + "from this step (BFloat16Activations / --bf16-activations to start with it)");
                 }
                 catch (ResourceLimitExceededException ex) when (_automatic && !Checkpointing)
                 {
@@ -846,6 +862,7 @@ public static class FineTuner
             using var packing = batch.Packed ? PackedSequences.Create([.. batch.Rows.Select(r => r.Select(i => train[i].Tokens.Length - 1).ToArray())], batch.Length, model.Device) : null;
             using var packed = packing?.Use();                                // forward and backward (checkpointed blocks run again)
             using var recompute = options.RecomputeFeedForward == true ? ActivationMemory.Recompute() : (ActivationMemory.Scope?)null;
+            using var compress = options.BFloat16Activations == true ? ActivationMemory.CompressToBFloat16() : (ActivationMemory.Scope?)null;
             var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing == true);
             lossTensor.Backward();                                           // queued behind the forward pass, no wait between
             float batchLoss = lossTensor.Item();                             // waits for the batch's forward and backward
@@ -1244,6 +1261,7 @@ public static class FineTuner
                 using (var scope = new TensorScope())
                 using (graph._packing.Use())
                 using (options.RecomputeFeedForward == true ? ActivationMemory.Recompute() : (ActivationMemory.Scope?)null)
+                using (options.BFloat16Activations == true ? ActivationMemory.CompressToBFloat16() : (ActivationMemory.Scope?)null)
                 {
                     var loss = NetworkLoss(model, graph._tokens, (hidden, head) => Tensor.TokenCrossEntropyRows(hidden, h => head.Forward(h),
                         graph._rows, graph._targets, graph._weights, 1f, options.LossChunkRows), options.Checkpointing == true);

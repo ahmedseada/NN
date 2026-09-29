@@ -24,8 +24,13 @@ dotnet run -c Release --project src/NeuralSharp.FineTuning.Cli -- export <adapte
 - **Output.** The adapter in the PEFT format, and `neuralsharp-tuning.json`: the base model as named on the command line,
   the system prompt and the maximum length. Any program can then load the folder (`TuningManifest.Read(folder)
   .LoadModel(folder, device)`), and every nstune command accepts the adapter folder in place of the model.
-- **Speed.** Sequence packing, CUDA-graph replay of the training step, fused LoRA products on tensor cores, activation
-  checkpointing; `--fp8` for the frozen base's forward products (checked against bfloat16 first), `--int4` / `--int8`
-  for QLoRA. `train --profile` times a few steps per kernel instead of training.
+- **Speed.** Sequence packing, CUDA-graph replay of the training step, fused LoRA products on tensor cores (a frozen
+  bfloat16 or 4-bit base read as stored in both directions), the optimizer over every adapter matrix in three passes;
+  `--fp8` for the frozen base's forward products (checked against bfloat16 first), `--int4` / `--int8` for QLoRA.
+  `train --profile` times a few steps per kernel instead of training.
+- **Memory.** Results no backward step reads are released during the forward pass. When a step runs out of device memory
+  the tuner steps down, each step at a small cost, and says so: feed-forward activations recomputed in the backward pass
+  (`--recompute`), then activations held as bfloat16 between the passes (`--bf16-activations`), then activation
+  checkpointing (`--checkpointing`, a third more compute). The flags start a run at that step.
 
 `nstune --help` lists every option.

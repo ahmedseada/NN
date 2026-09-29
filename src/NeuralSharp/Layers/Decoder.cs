@@ -317,14 +317,18 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         if (packing is not null)
         {
             // Several sequences per row: each position attends within its own sequence only.
-            return Merge(Tensor.CausalAttentionSegmented(q, k, v, packing, KvHeads, scale)
-                ?? throw new NotSupportedException($"Packed sequences need attention within each sequence, which {input.Device} does not provide for head size {HeadDim} (on CUDA: bfloat16 tensor cores, head size 64 or 128)."), n, t);
+            var segmented = Tensor.CausalAttentionSegmented(q, k, v, packing, KvHeads, scale)
+                ?? throw new NotSupportedException($"Packed sequences need attention within each sequence, which {input.Device} does not provide for head size {HeadDim} (on CUDA: bfloat16 tensor cores, head size 64 or 128).");
+            ActivationMemory.Compress(q, k, v);
+            return Merge(segmented, n, t);
         }
 
         if (HeadDim <= Backends.Cuda.PtxKernels.FlashMaxDim)
         {
             // Tiled attention, forward and backward: no [t, t] weights stored (positions[0] = 0 is the causal offset).
-            return Merge(Tensor.CausalAttention(q, k, v, positions, t, scale), n, t);
+            var attended = Tensor.CausalAttention(q, k, v, positions, t, scale);
+            ActivationMemory.Compress(q, k, v);
+            return Merge(attended, n, t);
         }
 
         var raw = q.MatMul(k, transposeB: true);                                  // [n·kv, group·t, t]
@@ -485,7 +489,13 @@ public sealed class CausalSelfAttention : Module, ICachedModule
     }
 
     // [n·kv, group·t, d] → [n, t, heads·d] → output projection (query head h = kv · group + g, as the heads were split).
-    private Tensor Merge(Tensor context, int n, int t) => Output.Forward(MergeHeads(context, n, t));
+    private Tensor Merge(Tensor context, int n, int t)
+    {
+        var merged = MergeHeads(context, n, t);
+        var output = Output.Forward(merged);
+        ActivationMemory.Compress(context, merged);                  // read again only by the attention's and projection's backward
+        return output;
+    }
 
     private Tensor MergeHeads(Tensor context, int n, int t) =>
         context.Reshape(n, KvHeads, Group, t, HeadDim).Permute(0, 3, 1, 2, 4).Reshape(n, t, Heads * HeadDim);
@@ -644,14 +654,19 @@ public sealed class FeedForward : Module
             }
 
             hidden = Tensor.GatedActivation(projected[0], projected[1], (int)Activation);    // act(gate) · up in one kernel
+            ActivationMemory.Compress(projected[0], projected[1]);                          // read again only by its backward
             if (ActivationMemory.RecomputeFeedForward && Autograd.IsEnabled)
             {
                 // Released after the down projection reads it, recomputed from gate and up when a backward step needs it.
                 var (gate, up, kind) = (projected[0], projected[1], (int)Activation);
                 var down = Down.Forward(hidden);
-                hidden.Evict(h => h.Backend.GatedActivation(gate.Storage, up.Storage, h.Storage, h.Size, kind));
+                hidden.Evict(h => Tensor.WithValues([gate, up], () => h.Backend.GatedActivation(gate.Storage, up.Storage, h.Storage, h.Size, kind)));
                 return down;
             }
+
+            var result = Down.Forward(hidden);
+            ActivationMemory.Compress(hidden);
+            return result;
         }
         return Down.Forward(hidden);
     }
@@ -783,6 +798,7 @@ public sealed class DecoderBlock : Module, ICachedModule
     private Tensor Run(Tensor input, Func<Tensor, Tensor> attend, Func<Tensor, Tensor>? attendHeads = null)
     {
         var normalized = AttentionNorm.Forward(input);
+        using var compressNormalized = new CompressAfter(normalized);
         bool inference = !Autograd.IsEnabled && !Dropping;
         Tensor x, fed;
         if (!Parallel && inference && FeedForwardNorm is RMSNorm norm)
@@ -814,7 +830,9 @@ public sealed class DecoderBlock : Module, ICachedModule
 
             x = Dropping ? ResidualDropout!.AddTo(input, attended) : input + attended;          // dropout fused in
             ActivationMemory.Release(attended);
-            fed = FeedForward.Forward(FeedForwardNorm!.Forward(x));
+            var fedInput = FeedForwardNorm!.Forward(x);
+            fed = FeedForward.Forward(fedInput);
+            ActivationMemory.Compress(fedInput);
         }
 
         if (PostFeedForwardNorm is not null)

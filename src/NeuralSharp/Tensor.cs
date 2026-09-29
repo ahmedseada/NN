@@ -377,6 +377,14 @@ public sealed partial class Tensor : IDisposable
         }
     }
 
+    // Operations whose backward step does not read their own output (only inputs, or nothing): an evicted output is not
+    // restored for them.
+    private static readonly HashSet<string> OwnValuesUnread =
+    [
+        "reshape", "permute", "add_bias", "add_dropout", "rope", "group_affine", "lora", "lora_fused", "gated_activation",
+        "matmul", "matmul_bias", "matmul_frozen", "matmul_bf16", "matmul_int8", "matmul_int4", "matmul_packed", "embedding",
+    ];
+
     // The evicted storages a node's backward step may read (its own and its inputs'), given memory and recomputed.
     private static List<Storage>? RestoreEvicted(Tensor node)
     {
@@ -394,7 +402,7 @@ public sealed partial class Tensor : IDisposable
             return null;                                                 // a view passes its gradient on, reading no values
         }
 
-        if (!ReferenceEquals(node.Storage.RecomputedFor, node))
+        if (!ReferenceEquals(node.Storage.RecomputedFor, node) && !OwnValuesUnread.Contains(node._operation ?? ""))
         {
             Check(node.Storage);
         }
@@ -405,6 +413,44 @@ public sealed partial class Tensor : IDisposable
         }
 
         return restored;
+    }
+
+    /// <summary>
+    /// Keeps this tensor's values as bfloat16 until a backward step reads them: a packed copy (half the memory) replaces
+    /// the float values, which are unpacked when needed (<see cref="Evict"/>). For activations that only backward steps
+    /// read, and whose precision bfloat16 keeps (inputs of tensor-core products, which round them to bfloat16 anyway).
+    /// </summary>
+    internal void CompressToBFloat16()
+    {
+        if (_disposed != 0 || Storage.Evicted || Size < 2)
+        {
+            return;
+        }
+
+        int n = Size;
+        var packed = Backend.Allocate((n + 1) / 2, zeroed: false);
+        Backend.PackBFloat16(Storage, packed, n);
+        Backend.Evict(Storage, s => s.Backend.BFloat16Dequantize(packed, s, 1, n));
+        Storage.Released = packed.Release;
+    }
+
+    /// <summary>Runs <paramref name="action"/> with the values of <paramref name="tensors"/> in memory (evicted ones restored, then evicted again).</summary>
+    internal static void WithValues(ReadOnlySpan<Tensor> tensors, Action action)
+    {
+        var restored = new List<Storage>();
+        foreach (var tensor in tensors)
+        {
+            if (tensor.Storage.Evicted && tensor.Backend.Restore(tensor.Storage))
+            {
+                restored.Add(tensor.Storage);
+            }
+        }
+
+        action();
+        foreach (var storage in restored)
+        {
+            storage.Backend.Evict(storage, storage.Recompute);
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

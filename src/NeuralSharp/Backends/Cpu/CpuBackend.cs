@@ -260,6 +260,23 @@ internal sealed partial class CpuBackend : Backend
         return true;
     }
 
+    public override void PackBFloat16(Storage x, Storage packed, int n)
+    {
+        float[] values = D(x), words = D(packed);
+        var bits = System.Runtime.InteropServices.MemoryMarshal.Cast<float, uint>(words.AsSpan());
+        static uint Round(float v)
+        {
+            uint u = BitConverter.SingleToUInt32Bits(v);
+            return float.IsNaN(v) ? 0x7FC0u : (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+        }
+
+        for (int w = 0; w < (n + 1) / 2; w++)
+        {
+            uint low = Round(values[2 * w]), high = 2 * w + 1 < n ? Round(values[2 * w + 1]) : 0u;
+            bits[w] = low | high << 16;
+        }
+    }
+
     public override void ClipFactor(Storage sumSquares, Storage factor, float maxNorm)
     {
         float sum = D(sumSquares)[0];

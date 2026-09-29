@@ -695,6 +695,9 @@ internal sealed unsafe partial class CudaBackend : Backend
 
     public override void Affine(Storage x, Storage y, int n, float alpha, float beta) => Launch1D(_affine, n, P(x), P(y), F(alpha), F(beta), U(n));
 
+    public override void PackBFloat16(Storage x, Storage packed, int n) =>
+        Launch1D(K("bf16_pack_f32"), (n + 1) / 2, P(x), P(packed), U(n), U((n + 1) / 2));
+
     public override void ClipFactor(Storage sumSquares, Storage factor, float maxNorm) => Launch1D(_clipFactor, 1, P(sumSquares), P(factor), F(maxNorm), U(1));
 
     public override void Axpy(Storage x, Storage y, int n, float alpha) => Launch1D(_axpy, n, P(x), P(y), F(alpha), U(n));

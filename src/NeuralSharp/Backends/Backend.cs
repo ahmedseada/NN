@@ -50,9 +50,15 @@ internal abstract class Storage(Backend backend, int length)
 
     public void Release()
     {
-        if (Interlocked.Decrement(ref _refs) == 0 && !Evicted)
+        if (Interlocked.Decrement(ref _refs) == 0)
         {
-            Backend.Return(this);
+            if (!Evicted)
+            {
+                Backend.Return(this);
+            }
+
+            Released?.Invoke();
+            Released = null;
         }
     }
 
@@ -64,6 +70,9 @@ internal abstract class Storage(Backend backend, int length)
 
     /// <summary>The tensor whose values are recomputed (its own backward step does not read them), or null.</summary>
     public object? RecomputedFor { get; internal set; }
+
+    /// <summary>Called once when the storage is released for good (for what its recomputation keeps, such as a packed copy).</summary>
+    public Action? Released { get; internal set; }
 }
 
 /// <summary>
@@ -484,6 +493,12 @@ internal abstract class Backend
 
     /// <summary>w[k, n] = the float32 values of bfloat16 weights packed as in <see cref="BFloat16MatMul"/>.</summary>
     public abstract void BFloat16Dequantize(Storage packed, Storage w, int k, int n);
+
+    /// <summary>
+    /// Rounds x [n] to bfloat16 (to nearest, ties to even), two values per word as <see cref="BFloat16Dequantize"/> reads
+    /// them back with k = 1: packed holds (n + 1) / 2 words.
+    /// </summary>
+    public abstract void PackBFloat16(Storage x, Storage packed, int n);
 
     /// <summary>w[k, n] = q[k, n] · scales[n] (see <see cref="Int8MatMul"/> for the packing).</summary>
     public abstract void Int8Dequantize(Storage q, Storage scales, Storage w, int k, int n);

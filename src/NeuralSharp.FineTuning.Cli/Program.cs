@@ -37,7 +37,8 @@ const string Usage = """
                --targets q,k,v,o,gate,up,down, --save-every N, --eval-every N, --checkpointing | --no-checkpointing
                (default: off, turned on if a step runs out of device memory even with --recompute), --recompute (recompute the
                feed-forward activations in the backward pass: a fifth less activation memory for one kernel per block;
-               default: turned on first when a step runs out of device memory), --no-packing,
+               default: turned on first when a step runs out of device memory), --bf16-activations (hold the activations
+               as bfloat16 between the passes: half their memory; default: turned on second), --no-packing,
                --no-graphs, --fp8 (the frozen base's forward products in FP8, checked against bfloat16 first),
                --adapter DIR (continue training an adapter), --profile (time a few steps instead of training)
     Evaluate:  --adapter DIR, --samples 100, --batch 8, --max-new 512, --metric auto|number|exact|contains|f1, --out F.jsonl
@@ -93,6 +94,7 @@ try
             case "--no-checkpointing": tuning = tuning with { Checkpointing = false }; break;
             case "--checkpointing": tuning = tuning with { Checkpointing = true }; break;
             case "--recompute": tuning = tuning with { RecomputeFeedForward = true }; break;
+            case "--bf16-activations": tuning = tuning with { BFloat16Activations = true }; break;
             case "--no-packing": tuning = tuning with { Packing = false }; break;
             case "--no-graphs": tuning = tuning with { CudaGraphs = false }; break;
             case "--fp8": tuning = tuning with { Float8 = true }; break;
