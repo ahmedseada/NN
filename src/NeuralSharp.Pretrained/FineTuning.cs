@@ -537,6 +537,13 @@ public sealed record FineTuningOptions
     /// </summary>
     public bool? Checkpointing { get; init; }
 
+    /// <summary>
+    /// Recompute each block's feed-forward activation in the backward pass instead of keeping it (about a fifth less
+    /// activation memory for one element-wise kernel per block; see <see cref="ActivationMemory"/>). Null (the default):
+    /// off, and the first thing turned on when a step runs out of device memory, before <see cref="Checkpointing"/>.
+    /// </summary>
+    public bool? RecomputeFeedForward { get; init; }
+
     /// <summary>Seed for the adapters' initial values and the batch order.</summary>
     public int Seed { get; init; }
 }
@@ -697,25 +704,42 @@ public static class FineTuner
         private bool? _graphs;
         private int _ordinary;
 
+        private readonly bool _automaticRecompute = options.RecomputeFeedForward is null && options.Checkpointing is null && !ComputeResources.OffloadToHostMemory;
+
         /// <summary>Whether steps run with activation checkpointing (it can turn on during training, see <see cref="FineTuningOptions.Checkpointing"/>).</summary>
         public bool Checkpointing => _options.Checkpointing == true;
 
         public (float Loss, long Tokens) Run(IReadOnlyList<Batch> group, CancellationToken cancellationToken, Func<int, string> label, bool graphs = true)
         {
-            try
+            // Out of device memory: first recompute the feed-forward activations (cheap), then checkpoint every block (a
+            // third more compute); the step is run again each time and the graph, recorded without them, recorded again.
+            while (true)
             {
-                return RunOnce(group, cancellationToken, label, graphs);
+                try
+                {
+                    return RunOnce(group, cancellationToken, label, graphs);
+                }
+                catch (ResourceLimitExceededException ex) when (_automaticRecompute && _options.RecomputeFeedForward != true && !Checkpointing)
+                {
+                    _options = _options with { RecomputeFeedForward = true };
+                    Reset();
+                    trace?.Invoke($"out of device memory ({ex.Message.Split(':')[0]}): feed-forward activations are recomputed in the backward pass "
+                                  + "from this step (RecomputeFeedForward / --recompute to start with it)");
+                }
+                catch (ResourceLimitExceededException ex) when (_automatic && !Checkpointing)
+                {
+                    _options = _options with { Checkpointing = true };
+                    Reset();
+                    trace?.Invoke($"out of device memory without activation checkpointing ({ex.Message.Split(':')[0]}): checkpointing is on from this step "
+                                  + "(set Checkpointing / --checkpointing to start with it)");
+                }
             }
-            catch (ResourceLimitExceededException ex) when (_automatic && !Checkpointing)
-            {
-                // The activations did not fit: checkpointing from here on, the graph (recorded without it) recorded again.
-                _options = _options with { Checkpointing = true };
-                _graph?.Dispose();
-                (_graph, _graphs, _ordinary) = (null, null, 0);
-                trace?.Invoke($"out of device memory without activation checkpointing ({ex.Message.Split(':')[0]}): checkpointing is on from this step "
-                              + "(set Checkpointing / --checkpointing to start with it)");
-                return RunOnce(group, cancellationToken, label, graphs);
-            }
+        }
+
+        private void Reset()
+        {
+            _graph?.Dispose();
+            (_graph, _graphs, _ordinary) = (null, null, 0);
         }
 
         private (float Loss, long Tokens) RunOnce(IReadOnlyList<Batch> group, CancellationToken cancellationToken, Func<int, string> label, bool graphs)
@@ -825,6 +849,7 @@ public static class FineTuner
             trace?.Invoke($"{label(b)}: {batch.Describe(train)}…");
             using var packing = batch.Packed ? PackedSequences.Create([.. batch.Rows.Select(r => r.Select(i => train[i].Tokens.Length - 1).ToArray())], batch.Length, model.Device) : null;
             using var packed = packing?.Use();                                // forward and backward (checkpointed blocks run again)
+            using var recompute = options.RecomputeFeedForward == true ? ActivationMemory.Recompute() : (ActivationMemory.Scope?)null;
             var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing == true);
             lossTensor.Backward();                                           // queued behind the forward pass, no wait between
             float batchLoss = lossTensor.Item();                             // waits for the batch's forward and backward
@@ -1146,11 +1171,26 @@ public static class FineTuner
             }
             else
             {
+                var input = hidden;
                 hidden = modules[i].Forward(hidden);
+
+                // A block's input is read by no backward step once the block has run when its first norm is an RMS norm
+                // (which keeps its own normalized values), nor the final norm's input: released now, not at the step's end.
+                if (i > 0 && !ReferenceEquals(input, hidden) && modules[i] is DecoderBlock { AttentionNorm: RMSNorm } or RMSNorm)
+                {
+                    ActivationMemory.Release(input);
+                }
             }
         }
 
-        return loss(hidden.Reshape(tokens.Size, hidden.Shape[^1]), head);
+        var flat = hidden.Reshape(tokens.Size, hidden.Shape[^1]);
+        var result = loss(flat, head);
+        if (!checkpointing)
+        {
+            ActivationMemory.Release(flat);                                  // the loss read its rows; its backward scatters only
+        }
+
+        return result;
     }
 
     // One training step's forward and backward pass over a packed batch, recorded as a CUDA graph: its inputs (tokens,
@@ -1207,6 +1247,7 @@ public static class FineTuner
                 optimizer.ZeroGrad();
                 using (var scope = new TensorScope())
                 using (graph._packing.Use())
+                using (options.RecomputeFeedForward == true ? ActivationMemory.Recompute() : (ActivationMemory.Scope?)null)
                 {
                     var loss = NetworkLoss(model, graph._tokens, (hidden, head) => Tensor.TokenCrossEntropyRows(hidden, h => head.Forward(h),
                         graph._rows, graph._targets, graph._weights, 1f, options.LossChunkRows), options.Checkpointing == true);

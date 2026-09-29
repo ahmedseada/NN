@@ -347,6 +347,66 @@ public sealed partial class Tensor : IDisposable
 
     internal static string FormatShape(ReadOnlySpan<int> shape) => "[" + string.Join(", ", shape.ToArray()) + "]";
 
+    /// <summary>
+    /// Releases the memory of this tensor's values while it stays in the autograd graph (its gradient still flows through
+    /// it): for a training result whose values no backward step reads, once its last forward use is done, so it is not
+    /// kept until the end of the step. The memory is shared with every view of the values, which lose them too: call it
+    /// only where every tensor sharing the values is done with them and no consumer's backward reads them. Kernels given
+    /// the values afterwards fail.
+    /// </summary>
+    internal void DropValue()
+    {
+        if (_disposed == 0)
+        {
+            Backend.Evict(Storage, null);
+        }
+    }
+
+    /// <summary>
+    /// Releases the memory of this tensor's values like <see cref="DropValue"/>, but <paramref name="recompute"/> fills
+    /// them in again when a backward step needs them (see <see cref="Backward(Tensor)"/>): activations cheaper to recompute
+    /// than to keep. The recomputation must only read tensors that are still kept.
+    /// </summary>
+    internal void Evict(Action<Tensor> recompute)
+    {
+        if (_disposed == 0)
+        {
+            var self = this;
+            Backend.Evict(Storage, _ => recompute(self));
+            Storage.RecomputedFor = self;                                // its own backward step needs no recomputation
+        }
+    }
+
+    // The evicted storages a node's backward step may read (its own and its inputs'), given memory and recomputed.
+    private static List<Storage>? RestoreEvicted(Tensor node)
+    {
+        List<Storage>? restored = null;
+        void Check(Storage storage)
+        {
+            if (storage.Evicted && storage.Backend.Restore(storage))
+            {
+                (restored ??= []).Add(storage);
+            }
+        }
+
+        if (node._operation == "reshape")
+        {
+            return null;                                                 // a view passes its gradient on, reading no values
+        }
+
+        if (!ReferenceEquals(node.Storage.RecomputedFor, node))
+        {
+            Check(node.Storage);
+        }
+
+        foreach (var parent in node._parents ?? [])
+        {
+            Check(parent.Storage);
+        }
+
+        return restored;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void ThrowIfDisposed()
     {
@@ -395,7 +455,16 @@ public sealed partial class Tensor : IDisposable
             }
 
             long start = Telemetry.Start(TelemetryLevel.Operations);
+            var restored = RestoreEvicted(node);                         // recomputed activations this step reads
             node._backward(node.Grad);
+            if (restored is not null)
+            {
+                foreach (var storage in restored)
+                {
+                    storage.Backend.Evict(storage, storage.Recompute);      // released again until another step needs them
+                }
+            }
+
             if (start != 0)
             {
                 Telemetry.Operation(node._operation ?? "?", node, start, backward: true);

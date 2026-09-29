@@ -6,7 +6,7 @@ namespace NeuralSharp.Backends.Cpu;
 
 internal sealed class CpuStorage(CpuBackend backend, float[] data, int length) : Storage(backend, length)
 {
-    public readonly float[] Data = data;
+    public float[] Data = data;                                         // null while evicted (Backend.Evict)
 }
 
 /// <summary>
@@ -59,6 +59,10 @@ internal sealed partial class CpuBackend : Backend
 
         return new CpuStorage(this, data, length);
     }
+
+    private protected override void Detach(Storage storage) => ((CpuStorage)storage).Data = null!;
+
+    private protected override void Attach(Storage storage, Storage fresh) => ((CpuStorage)storage).Data = ((CpuStorage)fresh).Data;
 
     public override void Return(Storage storage)
     {

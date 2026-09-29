@@ -123,7 +123,14 @@ public sealed class Linear : Module
         }
 
         var product = ProjectWithoutBias(input);
-        return Bias is null ? product : product + Bias;
+        if (Bias is null)
+        {
+            return product;
+        }
+
+        var biased = product + Bias;
+        ActivationMemory.Release(product);                              // the bias's backward does not read it
+        return biased;
     }
 
     /// <summary>
@@ -184,8 +191,10 @@ public sealed class Linear : Module
         return Adapter is { } a ? Tensor.AddLowRank(product, input, a.A, a.B, a.Scale) : product;
     }
 
-    // The tied head (x · Eᵀ). While the table is frozen, large products read a transposed copy made once (the tensor-core
-    // kernels would otherwise copy the whole table transposed on every call, 0.9 GB for a 152k × 1536 float table).
+    // The tied head (x · Eᵀ). While the table is frozen, large products read a transposed bfloat16 copy made once (the
+    // tensor-core kernels would otherwise copy the whole table transposed on every call; bfloat16 is what they multiply in
+    // anyway, at half the memory of a float copy: 0.45 GB instead of 0.9 GB for a 152k × 1536 table). The input's gradient
+    // reads the table as stored.
     private Tensor TiedProduct(Tensor input, Tensor table)
     {
         int rows = input.Size / Math.Max(1, InFeatures);
@@ -196,11 +205,11 @@ public sealed class Linear : Module
             return input.MatMul(table, transposeB: true);
         }
 
-        _tiedTransposed ??= Tensor.TransposedCopy(table);
+        _tiedTransposed ??= BFloat16Weight.FromValues(HostParallel.Transpose(table.ToArray(), OutFeatures, InFeatures), InFeatures, OutFeatures, table.Device);
         return Tensor.MatMulFrozenTransposed(input, table, _tiedTransposed);
     }
 
-    private Tensor? _tiedTransposed;
+    private BFloat16Weight? _tiedTransposed;
 
     /// <summary>An FP8 copy of the frozen weight used for forward products (see <see cref="AttachFloat8"/>), else null.</summary>
     internal Float8Weight? Float8 { get; private set; }

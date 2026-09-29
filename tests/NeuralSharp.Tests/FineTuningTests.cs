@@ -15,6 +15,7 @@ internal static partial class Tests
         ("generation: prompts of different lengths decoded together (left-padded, per-row starts) give each row its own logits and greedy replies", RaggedBatchDecoding),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
+        ("fine-tuning: releasing results no backward step reads, and recomputing feed-forward activations, give the same loss and gradients with less memory (RoPE, biases, q/k norms, post norms, parallel blocks, layer norms, dropout)", ReleasedActivations),
         ("fine-tuning: checkpointing is off by default and turns on (the step run again) when a step runs out of memory", AutomaticCheckpointing),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
         ("fine-tuning: agent transcripts through the chat template, assistant-only tokens, LoRA and QLoRA training, PEFT adapters, merged export", AgentFineTuning),
@@ -106,6 +107,65 @@ internal static partial class Tests
         AssertClose([plain.Loss], [checkpointed.Loss], 1e-4f, "loss");
         AssertClose(plain.Input, checkpointed.Input, 1e-4f, "input gradient");
         AssertClose(plain.Adapters, checkpointed.Adapters, 1e-4f, "adapter gradients");
+    }
+
+    private static void ReleasedActivations(Device device)
+    {
+        var specs = new (string Name, DecoderSpec Spec)[]
+        {
+            ("rotary, q/k/v biases", SmallSpec with { QkvBias = true }),
+            ("q/k norms, post norms, tied", SmallSpec with { QkNorm = true, PostNorms = true, TieEmbeddings = true }),
+            ("parallel blocks, layer norms, learned positions, dropout", SmallSpec with
+            {
+                ParallelBlocks = true, Norm = DecoderNorm.Layer, Rope = null, LearnedPositions = true, Dropout = 0.1f, FeedForwardBias = true, OutputBias = true,
+            }),
+        };
+        var r = new Random(81);
+        foreach (var (name, spec) in specs)
+        {
+            var tokens = Enumerable.Range(0, 3 * 11).Select(_ => (float)r.Next(spec.Vocabulary)).ToArray();
+            var weights = Enumerable.Range(0, 3 * 11 * spec.Vocabulary).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
+            (float Loss, float[] Gradients, long Held) Run(bool release, bool recompute)
+            {
+                bool previous = ActivationMemory.ReleaseUnused;
+                ActivationMemory.ReleaseUnused = release;
+                try
+                {
+                    using var model = spec.Build(new RandomWeights(82), new DecoderBuildOptions { Device = device });
+                    model.AddLora(rank: 2, alpha: 4, targets: _ => true, freezeBase: true, random: new Random(83));
+                    foreach (var adapter in model.Descendants().OfType<Linear>().Select(l => l.Adapter).OfType<LoraAdapter>())
+                    {
+                        adapter.B.Load([.. Enumerable.Range(0, adapter.B.Size).Select(i => 0.1f * MathF.Sin(i))]);
+                    }
+
+                    model.Train();
+                    using var scope = new TensorScope();
+                    using var recomputing = recompute ? ActivationMemory.Recompute() : (ActivationMemory.Scope?)null;
+                    long before = ComputeResources.GetMemoryUsage(device).InUse;
+                    var logits = model.Forward(Tensor.From(tokens, [3, 11], device));
+                    var loss = (logits * Tensor.From(weights, [3, 11, spec.Vocabulary], device)).Sum();
+                    long held = ComputeResources.GetMemoryUsage(device).InUse - before;
+                    loss.Backward();
+                    return (loss.Item(), [.. model.TrainableParameters().SelectMany(p => p.Grad!.ToArray())], held);
+                }
+                finally
+                {
+                    ActivationMemory.ReleaseUnused = previous;
+                }
+            }
+
+            var kept = Run(release: false, recompute: false);
+            var released = Run(release: true, recompute: false);
+            var recomputed = Run(release: true, recompute: true);
+            foreach (var (what, run) in new[] { ("released", released), ("recomputed", recomputed) })
+            {
+                AssertClose([kept.Loss], [run.Loss], 1e-5f, $"{name}, {what}: loss");
+                AssertClose(kept.Gradients, run.Gradients, 1e-5f, $"{name}, {what}: adapter gradients");
+            }
+
+            Check(released.Held < kept.Held, $"{name}: releasing holds less after the forward pass ({released.Held:N0} vs {kept.Held:N0} bytes)");
+            Check(spec.Gated == false || recomputed.Held < released.Held, $"{name}: recomputing holds less still ({recomputed.Held:N0} vs {released.Held:N0} bytes)");
+        }
     }
 
     private static void AutomaticCheckpointing(Device device)
@@ -568,22 +628,42 @@ internal static partial class Tests
         AssertClose(expectedHidden, rowsHidden, 1e-4f, "hidden gradient, trained rows only");
         AssertClose(expectedAdapter, rowsAdapter, 1e-4f, "adapter gradient, trained rows only");
 
-        // A frozen matrix used through a transposed copy: same product and input gradient as x · Wᵀ.
+        // A frozen matrix used through a transposed bfloat16 copy: the product of x and the table rounded to bfloat16 (as the
+        // tensor cores round it), and the input gradient through the table as stored.
         var tableValues = Random(Vocabulary * Dim);
+        static float Round(float v)
+        {
+            int bits = BitConverter.SingleToInt32Bits(v);
+            bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & unchecked((int)0xFFFF0000);
+            return BitConverter.Int32BitsToSingle(bits);
+        }
+
         float[] Tied(bool cached, out float[] inputGrad)
         {
             using var scope = new TensorScope();
             var table = Tensor.From(tableValues, [Vocabulary, Dim], device);
             var x = Tensor.From(hiddenValues, [Rows, Dim], device, requiresGrad: true);
-            using var transposed = Tensor.TransposedCopy(table);
-            var y = cached ? Tensor.MatMulFrozenTransposed(x, table, transposed) : x.MatMul(table, transposeB: true);
-            (y * y).Sum().Backward();
-            inputGrad = x.Grad!.ToArray();
-            return y.ToArray();
+            if (cached)
+            {
+                using var transposed = BFloat16Weight.FromValues([.. Enumerable.Range(0, Dim * Vocabulary).Select(i => tableValues[i % Vocabulary * Dim + i / Vocabulary])], Dim, Vocabulary, device);
+                var y = Tensor.MatMulFrozenTransposed(x, table, transposed);
+                (y * y).Sum().Backward();
+                inputGrad = x.Grad!.ToArray();
+                return y.ToArray();
+            }
+
+            // Reference: y with the rounded table, dx = 2y · E with the table as stored.
+            var rounded = Tensor.From([.. tableValues.Select(Round)], [Vocabulary, Dim], device);
+            using (Autograd.NoGrad())
+            {
+                var y = x.MatMul(rounded, transposeB: true);
+                inputGrad = (y * 2f).MatMul(table).ToArray();
+                return y.ToArray();
+            }
         }
 
-        AssertClose(Tied(false, out var plainGrad), Tied(true, out var cachedGrad), 1e-4f, "frozen transposed product");
-        AssertClose(plainGrad, cachedGrad, 1e-4f, "frozen transposed product: input gradient");
+        AssertClose(Tied(false, out var plainGrad), Tied(true, out var cachedGrad), 1e-4f, "frozen transposed product (bfloat16 copy)");
+        AssertClose(plainGrad, cachedGrad, 1e-3f, "frozen transposed product: input gradient");
 
         // The fused LoRA term: same output and gradients (input, A, B, base weight) as product + x·A·B·scale.
         var w0 = Random(Dim * Vocabulary);

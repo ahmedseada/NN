@@ -6,10 +6,10 @@ namespace NeuralSharp.Backends.Cuda;
 
 internal sealed class CudaStorage(CudaBackend backend, ulong pointer, int length, int capacity) : Storage(backend, length)
 {
-    public readonly ulong Pointer = pointer;
+    public ulong Pointer = pointer;                                     // 0 while evicted (Backend.Evict)
 
     /// <summary>Floats in the device block (at least <see cref="Storage.Length"/>: a cached block a little larger may be reused).</summary>
-    public readonly int Capacity = capacity;
+    public int Capacity = capacity;
 
     public CudaStorage(CudaBackend backend, ulong pointer, int length) : this(backend, pointer, length, length)
     {
@@ -558,6 +558,14 @@ internal sealed unsafe partial class CudaBackend : Backend
 
     // Called when the last reference is released, possibly from the finalizer thread, so it only
     // touches the pool and never the driver.
+    private protected override void Detach(Storage storage) => ((CudaStorage)storage).Pointer = 0;
+
+    private protected override void Attach(Storage storage, Storage fresh)
+    {
+        var (s, f) = ((CudaStorage)storage, (CudaStorage)fresh);
+        (s.Pointer, s.Capacity) = (f.Pointer, f.Capacity);                // the fresh storage object is dropped, its block kept
+    }
+
     public override void Return(Storage storage)
     {
         var s = (CudaStorage)storage;

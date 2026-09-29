@@ -436,6 +436,7 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         var q = projected[0].Reshape(n, t, Heads, d);
         var k = projected[1].Reshape(n, t, KvHeads, d);
         var v = projected[2].Reshape(n, t, KvHeads, d);
+        Tensor? normedQ = null, normedK = null;
         if (Rope is not null && QueryNorm is not null && KeyNorm is not null && !Autograd.IsEnabled && !packed)
         {
             // Inference: each head's normalization and rotation in one pass.
@@ -447,12 +448,12 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         {
             if (QueryNorm is not null)
             {
-                q = QueryNorm.Forward(q);
+                q = normedQ = QueryNorm.Forward(q);
             }
 
             if (KeyNorm is not null)
             {
-                k = KeyNorm.Forward(k);
+                k = normedK = KeyNorm.Forward(k);
             }
 
             if (Rope is not null)
@@ -475,6 +476,11 @@ public sealed class CausalSelfAttention : Module, ICachedModule
         var queries = q.Reshape(n, t, KvHeads, Group, d).Permute(0, 2, 3, 1, 4).Reshape(n * KvHeads, Group * t, d);
         var keys = k.Permute(0, 2, 1, 3).Reshape(n * KvHeads, t, d);
         var values = v.Permute(0, 2, 1, 3).Reshape(n * KvHeads, t, d);
+
+        // Training: the projections, their normalized and rotated forms and the pre-rearrangement layout are read by no
+        // backward step (rotation, rearrangement, bias and the projections themselves read only their inputs; a norm
+        // reads its own normalized values, kept inside it): released now instead of at the end of the step.
+        ActivationMemory.Release(projected[0], projected[1], projected[2], normedQ, normedK, q, k, v);
         return (queries, keys, values);
     }
 
@@ -638,6 +644,14 @@ public sealed class FeedForward : Module
             }
 
             hidden = Tensor.GatedActivation(projected[0], projected[1], (int)Activation);    // act(gate) · up in one kernel
+            if (ActivationMemory.RecomputeFeedForward && Autograd.IsEnabled)
+            {
+                // Released after the down projection reads it, recomputed from gate and up when a backward step needs it.
+                var (gate, up, kind) = (projected[0], projected[1], (int)Activation);
+                var down = Down.Forward(hidden);
+                hidden.Evict(h => h.Backend.GatedActivation(gate.Storage, up.Storage, h.Storage, h.Size, kind));
+                return down;
+            }
         }
         return Down.Forward(hidden);
     }
@@ -792,16 +806,25 @@ public sealed class DecoderBlock : Module, ICachedModule
             if (Parallel)
             {
                 var parallel = FeedForward.Forward(normalized);
-                return Dropping ? ResidualDropout!.AddTo(ResidualDropout.AddTo(input, attended), parallel) : input + attended + parallel;
+                var partial = Dropping ? ResidualDropout!.AddTo(input, attended) : input + attended;
+                var sum = Dropping ? ResidualDropout!.AddTo(partial, parallel) : partial + parallel;
+                ActivationMemory.Release(attended, parallel, partial);  // sums and projections: their backward reads no values
+                return sum;
             }
 
             x = Dropping ? ResidualDropout!.AddTo(input, attended) : input + attended;          // dropout fused in
+            ActivationMemory.Release(attended);
             fed = FeedForward.Forward(FeedForwardNorm!.Forward(x));
         }
 
         if (PostFeedForwardNorm is not null)
         {
+            var unnormed = fed;
             fed = PostFeedForwardNorm.Forward(fed);
+            if (PostFeedForwardNorm is RMSNorm)
+            {
+                ActivationMemory.Release(unnormed);
+            }
         }
 
         if (NextNorm is { } next && !Autograd.IsEnabled && !Dropping)
@@ -811,13 +834,28 @@ public sealed class DecoderBlock : Module, ICachedModule
             return output;
         }
 
-        return Dropping ? ResidualDropout!.AddTo(x, fed) : x + fed;
+        var result = Dropping ? ResidualDropout!.AddTo(x, fed) : x + fed;
+        // The residual sum is read by no backward step when its norm is an RMS norm (which keeps its own normalized values;
+        // a layer norm reads its input).
+        ActivationMemory.Release(fed, FeedForwardNorm is RMSNorm ? x : null);
+        return result;
     }
 
     private Tensor Attend(Tensor normalized, Func<Tensor, Tensor> attend)
     {
         var attended = attend(normalized);
-        return PostAttentionNorm is null ? attended : PostAttentionNorm.Forward(attended);
+        if (PostAttentionNorm is null)
+        {
+            return attended;
+        }
+
+        var normed = PostAttentionNorm.Forward(attended);
+        if (PostAttentionNorm is RMSNorm)
+        {
+            ActivationMemory.Release(attended);                       // an RMS norm keeps its own normalized values
+        }
+
+        return normed;
     }
 
     // residual + projection(h) and its normalization: one pass for packed weights and few rows, else the projection

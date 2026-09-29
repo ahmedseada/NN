@@ -425,12 +425,12 @@ public sealed partial class Tensor
     /// direction makes a transposed copy of W (the tensor-core kernels copy transposed operands into place first).
     /// W receives no gradient.
     /// </summary>
-    internal static Tensor MatMulFrozenTransposed(Tensor input, Tensor weight, Tensor transposed)
+    internal static Tensor MatMulFrozenTransposed(Tensor input, Tensor weight, Layers.BFloat16Weight transposed)
     {
         Tensor output;
         using (Autograd.NoGrad())
         {
-            output = input.MatMul(transposed);
+            output = input.MatMulBFloat16(transposed);
         }
 
         if (WillRecord(input))

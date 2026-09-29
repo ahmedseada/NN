@@ -50,11 +50,20 @@ internal abstract class Storage(Backend backend, int length)
 
     public void Release()
     {
-        if (Interlocked.Decrement(ref _refs) == 0)
+        if (Interlocked.Decrement(ref _refs) == 0 && !Evicted)
         {
             Backend.Return(this);
         }
     }
+
+    /// <summary>Whether the memory was given back by <see cref="Backend.Evict"/> (the values are recomputed on <see cref="Backend.Restore"/>).</summary>
+    public bool Evicted { get; internal set; }
+
+    /// <summary>Recomputes the values into this storage after <see cref="Backend.Restore"/> gave it memory again.</summary>
+    public Action<Storage>? Recompute { get; internal set; }
+
+    /// <summary>The tensor whose values are recomputed (its own backward step does not read them), or null.</summary>
+    public object? RecomputedFor { get; internal set; }
 }
 
 /// <summary>
@@ -68,6 +77,43 @@ internal abstract class Backend
     public abstract Storage Allocate(int length, bool zeroed);
 
     public abstract void Return(Storage storage);
+
+    /// <summary>
+    /// Gives the storage's memory back to the pool while the storage (shared by every view of it) stays: kernels given it
+    /// fail until <see cref="Restore"/> gives it memory again and <paramref name="recompute"/> refills it (null: the values
+    /// are gone for good).
+    /// </summary>
+    public void Evict(Storage storage, Action<Storage>? recompute)
+    {
+        if (storage.Evicted)
+        {
+            return;
+        }
+
+        storage.Recompute = recompute;
+        Return(storage);
+        Detach(storage);
+        storage.Evicted = true;
+    }
+
+    /// <summary>Gives an evicted storage memory again and recomputes its values; false when it was not evicted or cannot be recomputed.</summary>
+    public bool Restore(Storage storage)
+    {
+        if (!storage.Evicted || storage.Recompute is null)
+        {
+            return false;
+        }
+
+        Attach(storage, Allocate(storage.Length, zeroed: false));
+        storage.Evicted = false;
+        storage.Recompute!(storage);
+        return true;
+    }
+
+    // Points the storage at no memory (after its memory went back to the pool), or at the memory of a fresh allocation.
+    private protected abstract void Detach(Storage storage);
+
+    private protected abstract void Attach(Storage storage, Storage fresh);
 
     public abstract MemoryUsage GetMemoryUsage();
 
