@@ -17,8 +17,8 @@ public sealed record AnswerChoice(int Best, IReadOnlyList<double> Probabilities,
 /// </summary>
 /// <remarks>
 /// A pass takes <see cref="PromptsPerPass"/> prompts of similar length. Each prompt runs once for all its answers (a
-/// key/value cache, then only the answers' tokens; see <see cref="SharePrompts"/>), and the output layer and the
-/// log-softmax run on the device on the answer positions only (<see cref="Losses.TokenLogProbabilities"/>).
+/// key/value cache, then only the answers' tokens; see <see cref="SharePrompts"/> and <see cref="Precision"/>), and the
+/// output layer and the log-softmax run on the device on the answer positions only (<see cref="Losses.TokenLogProbabilities"/>).
 /// A prompt too long for <see cref="MaxLength"/> has its last user message shortened (its start kept) until it fits with
 /// the longest answer, so every answer is scored on the same text.
 /// </remarks>
@@ -33,7 +33,7 @@ public sealed class AnswerScorer
 {
     private readonly PretrainedModel _model;
     private readonly List<Module> _modules;
-    private readonly bool _shared;
+    private readonly TextGenerator _batches;
 
     /// <summary>Creates a scorer for <paramref name="model"/> (which needs a chat template and a tokenizer).</summary>
     /// <param name="model">The chat model (in evaluation mode, e.g. from <see cref="TuningManifest.LoadModel"/>).</param>
@@ -46,7 +46,7 @@ public sealed class AnswerScorer
             model.Tokenizer ?? throw new InvalidOperationException("The model has no tokenizer."));
         MaxLength = Math.Max(2, Math.Min(maxLength, model.MaxPositions));
         _modules = [.. model.Network];
-        _shared = new TextGenerator(model.Network, model.Tokenizer, model.MaxPositions).SupportsBatches;   // rows of different lengths from a cache
+        _batches = new TextGenerator(model.Network, model.Tokenizer, model.MaxPositions);
     }
 
     /// <summary>The encoder rendering prompts and answers with the model's chat template.</summary>
@@ -64,6 +64,32 @@ public sealed class AnswerScorer
     /// row runs the whole prompt. Both give the same scores. On by default.
     /// </summary>
     public bool SharePrompts { get; init; } = true;
+
+    /// <summary>
+    /// The precision of the matrix products and attention while scoring. Null (the default): bfloat16 tensor cores where
+    /// the model's GPU has them (the precision bfloat16 weights are multiplied in anyway, and what attention over rows of
+    /// different lengths needs to run each prompt once), else the thread's <see cref="MixedPrecision.Current"/>.
+    /// </summary>
+    public MatMulPrecision? Precision { get; init; }
+
+    /// <summary>The precision scoring uses (see <see cref="Precision"/>).</summary>
+    public MatMulPrecision EffectivePrecision => Precision
+        ?? (_model.Device.Type == DeviceType.Cuda && MixedPrecision.Current == MatMulPrecision.Float32 && MixedPrecision.TensorCoresUnavailable(_model.Device) is null
+            ? MatMulPrecision.BFloat16
+            : MixedPrecision.Current);
+
+    /// <summary>
+    /// Whether each prompt runs once for all its answers (<see cref="SharePrompts"/> and a model whose attention batches
+    /// rows of different lengths from a cache at <see cref="EffectivePrecision"/>).
+    /// </summary>
+    public bool SharesPrompts
+    {
+        get
+        {
+            using var precision = MixedPrecision.Use(EffectivePrecision);
+            return SharePrompts && _batches.SupportsBatches;
+        }
+    }
 
     /// <summary>
     /// <paramref name="prompt"/> as it is scored: its last user message shortened (its start kept) so that the prompt with
@@ -92,6 +118,8 @@ public sealed class AnswerScorer
         }
 
         string longest = Longest(answers);
+        bool share = SharesPrompts;
+        using var precision = MixedPrecision.Use(EffectivePrecision);
         var results = new double[prompts.Count][];
         var order = Enumerable.Range(0, prompts.Count).OrderBy(i => prompts[i].Sum(m => m.Content.Length)).ToArray();
         int perPass = Math.Max(1, PromptsPerPass), done = 0;
@@ -111,7 +139,7 @@ public sealed class AnswerScorer
                 }
             }
 
-            var scores = SharePrompts && _shared ? SharedPass(sequences, answers.Count) : RowPass(sequences);
+            var scores = share ? SharedPass(sequences, answers.Count) : RowPass(sequences);
 
             for (int p = 0; p < indices.Length; p++)
             {

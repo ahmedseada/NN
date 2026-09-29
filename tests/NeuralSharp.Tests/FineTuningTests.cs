@@ -215,9 +215,10 @@ internal static partial class Tests
             var scores = scorer.LogLikelihoods(prompts, answers);
             var single = new AnswerScorer(model, maxLength: 96) { PromptsPerPass = 1 }.LogLikelihoods(prompts, answers);
             var unshared = new AnswerScorer(model, maxLength: 96) { SharePrompts = false }.LogLikelihoods(prompts, answers);
-            bool shares = new TextGenerator(model.Network, model.Tokenizer!, model.MaxPositions).SupportsBatches;
+            // With the default precision (bfloat16 tensor cores where the GPU has them), each prompt runs once.
             bool mustShare = device.Type == DeviceType.Cpu || spec.HeadDim == 64 && MixedPrecision.TensorCoresUnavailable(device) is null;
-            Check(shares || !mustShare, $"head size {spec.HeadDim}: each prompt runs once for all its answers");
+            Check(scorer.SharesPrompts || !mustShare, $"head size {spec.HeadDim}: each prompt runs once for all its answers ({scorer.EffectivePrecision})");
+            using var precision = MixedPrecision.Use(scorer.EffectivePrecision);                  // the reference at the same precision
 
             // The same values from the whole network's logits over each (fitted prompt, answer) sequence alone.
             for (int p = 0; p < prompts.Length; p++)
