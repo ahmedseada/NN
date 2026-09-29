@@ -1,4 +1,5 @@
 using NeuralSharp.Generation;
+using NeuralSharp.Layers;
 
 namespace NeuralSharp.Pretrained;
 
@@ -15,8 +16,8 @@ public sealed record AnswerChoice(int Best, IReadOnlyList<double> Probabilities,
 /// always comes from the list, with every candidate's probability, and nothing is generated.
 /// </summary>
 /// <remarks>
-/// A pass holds a row per (prompt, answer), prompts of similar length together; the network frees each layer's
-/// intermediate results as it goes (<see cref="Layers.Sequential.ForwardFirst"/>), and the output layer and the
+/// A pass takes <see cref="PromptsPerPass"/> prompts of similar length. Each prompt runs once for all its answers (a
+/// key/value cache, then only the answers' tokens; see <see cref="SharePrompts"/>), and the output layer and the
 /// log-softmax run on the device on the answer positions only (<see cref="Losses.TokenLogProbabilities"/>).
 /// A prompt too long for <see cref="MaxLength"/> has its last user message shortened (its start kept) until it fits with
 /// the longest answer, so every answer is scored on the same text.
@@ -31,6 +32,8 @@ public sealed record AnswerChoice(int Best, IReadOnlyList<double> Probabilities,
 public sealed class AnswerScorer
 {
     private readonly PretrainedModel _model;
+    private readonly List<Module> _modules;
+    private readonly bool _shared;
 
     /// <summary>Creates a scorer for <paramref name="model"/> (which needs a chat template and a tokenizer).</summary>
     /// <param name="model">The chat model (in evaluation mode, e.g. from <see cref="TuningManifest.LoadModel"/>).</param>
@@ -42,6 +45,8 @@ public sealed class AnswerScorer
         Encoder = new ChatTranscriptEncoder(model.ChatTemplate ?? throw new InvalidOperationException("The model has no chat template."),
             model.Tokenizer ?? throw new InvalidOperationException("The model has no tokenizer."));
         MaxLength = Math.Max(2, Math.Min(maxLength, model.MaxPositions));
+        _modules = [.. model.Network];
+        _shared = new TextGenerator(model.Network, model.Tokenizer, model.MaxPositions).SupportsBatches;   // rows of different lengths from a cache
     }
 
     /// <summary>The encoder rendering prompts and answers with the model's chat template.</summary>
@@ -52,6 +57,13 @@ public sealed class AnswerScorer
 
     /// <summary>Prompts per device pass (each with a row per answer). 32 by default.</summary>
     public int PromptsPerPass { get; init; } = 32;
+
+    /// <summary>
+    /// Run each prompt once for all its answers (from a key/value cache), where the model's attention can batch rows of
+    /// different lengths (<see cref="TextGenerator.SupportsBatches"/>); otherwise, or when false, every (prompt, answer)
+    /// row runs the whole prompt. Both give the same scores. On by default.
+    /// </summary>
+    public bool SharePrompts { get; init; } = true;
 
     /// <summary>
     /// <paramref name="prompt"/> as it is scored: its last user message shortened (its start kept) so that the prompt with
@@ -82,8 +94,6 @@ public sealed class AnswerScorer
         string longest = Longest(answers);
         var results = new double[prompts.Count][];
         var order = Enumerable.Range(0, prompts.Count).OrderBy(i => prompts[i].Sum(m => m.Content.Length)).ToArray();
-        var modules = _model.Network.ToList();
-        var head = modules[^1];
         int perPass = Math.Max(1, PromptsPerPass), done = 0;
         for (int first = 0; first < order.Length; first += perPass)
         {
@@ -101,41 +111,7 @@ public sealed class AnswerScorer
                 }
             }
 
-            int rows = sequences.Count, length = Math.Max(1, sequences.Max(s => s?.Tokens.Length ?? 2) - 1);
-            var input = new float[rows * length];
-            var positions = new List<int>();
-            var targets = new List<int>();
-            var owners = new List<int>();
-            for (int r = 0; r < rows; r++)
-            {
-                if (sequences[r] is not { } s)
-                {
-                    continue;
-                }
-
-                for (int t = 0; t + 1 < s.Tokens.Length; t++)
-                {
-                    input[r * length + t] = s.Tokens[t];
-                    if (s.Trained[t + 1])
-                    {
-                        positions.Add(r * length + t);
-                        targets.Add(s.Tokens[t + 1]);
-                        owners.Add(r);
-                    }
-                }
-            }
-
-            var scores = new double[rows];
-            using (Autograd.NoGrad())
-            using (new TensorScope())
-            {
-                var hidden = _model.Network.ForwardFirst(Tensor.From(input, [rows, length], _model.Device), modules.Count - 1);
-                var logProbabilities = Losses.TokenLogProbabilities(hidden.Reshape(-1, hidden.Shape[^1]), head.Forward, [.. positions], [.. targets]);
-                for (int i = 0; i < logProbabilities.Length; i++)
-                {
-                    scores[owners[i]] += logProbabilities[i];
-                }
-            }
+            var scores = SharePrompts && _shared ? SharedPass(sequences, answers.Count) : RowPass(sequences);
 
             for (int p = 0; p < indices.Length; p++)
             {
@@ -162,6 +138,187 @@ public sealed class AnswerScorer
     public AnswerChoice[] Choose(IReadOnlyList<IReadOnlyList<ChatMessage>> prompts, IReadOnlyList<string> answers, Action<int>? progress = null,
         CancellationToken cancellationToken = default) =>
         [.. LogLikelihoods(prompts, answers, progress, cancellationToken).Select(Choice)];
+
+    // One row per (prompt, answer), each running the whole prompt: for models whose attention cannot batch rows of
+    // different lengths from a cache.
+    private double[] RowPass(List<TrainingSequence?> sequences)
+    {
+        int rows = sequences.Count, length = Math.Max(1, sequences.Max(s => s?.Tokens.Length ?? 2) - 1);
+        var input = new float[rows * length];
+        var positions = new List<int>();
+        var targets = new List<int>();
+        var owners = new List<int>();
+        for (int r = 0; r < rows; r++)
+        {
+            if (sequences[r] is not { } s)
+            {
+                continue;
+            }
+
+            for (int t = 0; t + 1 < s.Tokens.Length; t++)
+            {
+                input[r * length + t] = s.Tokens[t];
+                if (s.Trained[t + 1])
+                {
+                    positions.Add(r * length + t);
+                    targets.Add(s.Tokens[t + 1]);
+                    owners.Add(r);
+                }
+            }
+        }
+
+        var scores = new double[rows];
+        using (Autograd.NoGrad())
+        using (new TensorScope())
+        {
+            var hidden = _model.Network.ForwardFirst(Tensor.From(input, [rows, length], _model.Device), _modules.Count - 1);
+            Add(scores, hidden, positions, targets, owners);
+        }
+
+        return scores;
+    }
+
+    // Each prompt runs once: the tokens its rows share (the prompt and the assistant turn's start) go through the network
+    // with a key/value cache, prompts padded on the left to end together; then, per answer, the cache goes back to that
+    // end (DecodingContext.Truncate) and only the answer's tokens run, for every prompt at once. The answer's first token
+    // is scored from the prompt's last position, the others from the answer pass.
+    private double[] SharedPass(List<TrainingSequence?> sequences, int answerCount)
+    {
+        var scores = new double[sequences.Count];
+        int prompts = sequences.Count / answerCount;
+        var live = Enumerable.Range(0, prompts).Where(p => sequences[p * answerCount] is not null).ToArray();
+        if (live.Length == 0)
+        {
+            return scores;
+        }
+
+        // The shared length of each prompt's rows: their common first tokens, leaving each row at least one more.
+        var shared = new int[live.Length];
+        for (int i = 0; i < live.Length; i++)
+        {
+            var rows = Enumerable.Range(0, answerCount).Select(a => sequences[live[i] * answerCount + a]!.Tokens).ToArray();
+            int common = rows.Min(r => r.Length) - 1;
+            for (int a = 1; a < rows.Length; a++)
+            {
+                int same = 0;
+                while (same < common && rows[a][same] == rows[0][same])
+                {
+                    same++;
+                }
+
+                common = same;
+            }
+
+            shared[i] = common;
+        }
+
+        if (shared.Any(c => c < 1))
+        {
+            return RowPass(sequences);                               // nothing shared to run once
+        }
+
+        int end = shared.Max();
+        int longestAnswer = 0;
+        for (int i = 0; i < live.Length; i++)
+        {
+            for (int a = 0; a < answerCount; a++)
+            {
+                longestAnswer = Math.Max(longestAnswer, sequences[live[i] * answerCount + a]!.Tokens.Length - 1 - shared[i]);
+            }
+        }
+
+        var device = _model.Device;
+        int layers = _modules.Count - 1;
+        using var context = new DecodingContext(device, live.Length, end + Math.Max(1, longestAnswer));
+        context.SetRowStarts([.. shared.Select(c => end - c)]);
+        using (Autograd.NoGrad())
+        {
+            // The prompts, once. Trained tokens inside the shared part (a template's fixed start of the assistant turn)
+            // count for every answer; the last shared position predicts each answer's own next token.
+            using (new TensorScope())
+            {
+                var input = new float[live.Length * end];
+                var (positions, targets, owners) = (new List<int>(), new List<int>(), new List<int>());
+                for (int i = 0; i < live.Length; i++)
+                {
+                    int offset = end - shared[i];
+                    var first = sequences[live[i] * answerCount]!;
+                    for (int t = 0; t < shared[i]; t++)
+                    {
+                        input[i * end + offset + t] = first.Tokens[t];
+                    }
+
+                    for (int a = 0; a < answerCount; a++)
+                    {
+                        int row = live[i] * answerCount + a;
+                        var s = sequences[row]!;
+                        for (int t = 0; t < shared[i]; t++)
+                        {
+                            if (s.Trained[t + 1])
+                            {
+                                positions.Add(i * end + offset + t);
+                                targets.Add(s.Tokens[t + 1]);
+                                owners.Add(row);
+                            }
+                        }
+                    }
+                }
+
+                var hidden = _model.Network.ForwardCached(Tensor.From(input, [live.Length, end], device), context, layers);
+                Add(scores, hidden, positions, targets, owners);
+            }
+
+            // Each answer's remaining tokens, all prompts together, from the cached prompts.
+            for (int a = 0; a < answerCount; a++)
+            {
+                int steps = 0;
+                for (int i = 0; i < live.Length; i++)
+                {
+                    steps = Math.Max(steps, sequences[live[i] * answerCount + a]!.Tokens.Length - 1 - shared[i]);
+                }
+
+                if (steps == 0)
+                {
+                    continue;
+                }
+
+                using var scope = new TensorScope();
+                context.Truncate(end);
+                var input = new float[live.Length * steps];
+                var (positions, targets, owners) = (new List<int>(), new List<int>(), new List<int>());
+                for (int i = 0; i < live.Length; i++)
+                {
+                    int row = live[i] * answerCount + a;
+                    var s = sequences[row]!;
+                    for (int t = shared[i]; t + 1 < s.Tokens.Length; t++)
+                    {
+                        input[i * steps + t - shared[i]] = s.Tokens[t];
+                        if (s.Trained[t + 1])
+                        {
+                            positions.Add(i * steps + t - shared[i]);
+                            targets.Add(s.Tokens[t + 1]);
+                            owners.Add(row);
+                        }
+                    }
+                }
+
+                var hidden = _model.Network.ForwardCached(Tensor.From(input, [live.Length, steps], device), context, layers);
+                Add(scores, hidden, positions, targets, owners);
+            }
+        }
+
+        return scores;
+    }
+
+    // scores[owners[i]] += log p(targets[i] | hidden position positions[i]), on the device (only these values come back).
+    private void Add(double[] scores, Tensor hidden, List<int> positions, List<int> targets, List<int> owners)
+    {
+        var values = Losses.TokenLogProbabilities(hidden.Reshape(-1, hidden.Shape[^1]), _modules[^1].Forward, [.. positions], [.. targets]);
+        for (int i = 0; i < values.Length; i++)
+        {
+            scores[owners[i]] += values[i];
+        }
+    }
 
     private static AnswerChoice Choice(double[] logLikelihoods)
     {

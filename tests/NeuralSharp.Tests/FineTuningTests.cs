@@ -17,7 +17,7 @@ internal static partial class Tests
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("fine-tuning: the input gradient through bfloat16 weights reads them as stored (with and without the adapter's term, odd widths, split k)", BFloat16InputGradient),
         ("scoring: log-probabilities of chosen tokens computed on the device match a log-softmax of the full logits (chunked, repeated rows)", TokenLogProbabilities),
-        ("scoring: given answers to chat prompts are scored as the model's own full forward pass scores them, whatever the batching; long messages are shortened to fit", AnswerScoring),
+        ("scoring: given answers to chat prompts are scored as the model's own full forward pass scores them, each prompt run once from a cache or with every answer, whatever the batching; long messages are shortened to fit", AnswerScoring),
         ("fine-tuning: the gated activation reads and writes bfloat16 words as packing and unpacking around the float kernels would (SiLU, GELU, ReLU, odd sizes)", PackedGatedActivation),
         ("fine-tuning: releasing results no backward step reads, and recomputing feed-forward activations, give the same loss and gradients with less memory (RoPE, biases, q/k norms, post norms, parallel blocks, layer norms, dropout)", ReleasedActivations),
         ("fine-tuning: checkpointing is off by default and turns on (the step run again) when a step runs out of memory; a lighter setting that fits is timed against checkpointing and the faster kept", AutomaticCheckpointing),
@@ -186,11 +186,19 @@ internal static partial class Tests
 
     private static void AnswerScoring(Device device)
     {
-        var spec = new DecoderSpec
+        var small = new DecoderSpec
         {
             Vocabulary = 260, Dim = 32, Layers = 2, Heads = 4, KvHeads = 2, HeadDim = 8, FfDim = 64, MaxPositions = 256,
             Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, QkNorm = true, TieEmbeddings = true,
         };
+
+        // Head size 64: what CUDA's attention over rows of different lengths needs, so the GPU also runs prompts once.
+        AnswerScoring(device, small);
+        AnswerScoring(device, small with { Dim = 128, Heads = 2, KvHeads = 1, HeadDim = 64, FfDim = 256 });
+    }
+
+    private static void AnswerScoring(Device device, DecoderSpec spec)
+    {
         string folder = WriteChatModel(spec);
         try
         {
@@ -206,6 +214,10 @@ internal static partial class Tests
             var scorer = new AnswerScorer(model, maxLength: 96);
             var scores = scorer.LogLikelihoods(prompts, answers);
             var single = new AnswerScorer(model, maxLength: 96) { PromptsPerPass = 1 }.LogLikelihoods(prompts, answers);
+            var unshared = new AnswerScorer(model, maxLength: 96) { SharePrompts = false }.LogLikelihoods(prompts, answers);
+            bool shares = new TextGenerator(model.Network, model.Tokenizer!, model.MaxPositions).SupportsBatches;
+            bool mustShare = device.Type == DeviceType.Cpu || spec.HeadDim == 64 && MixedPrecision.TensorCoresUnavailable(device) is null;
+            Check(shares || !mustShare, $"head size {spec.HeadDim}: each prompt runs once for all its answers");
 
             // The same values from the whole network's logits over each (fitted prompt, answer) sequence alone.
             for (int p = 0; p < prompts.Length; p++)
@@ -248,6 +260,7 @@ internal static partial class Tests
 
                     AssertClose([(float)expected], [(float)scores[p][a]], 2e-2f, $"prompt {p}, answer {a}: log-likelihood");
                     AssertClose([(float)scores[p][a]], [(float)single[p][a]], 2e-2f, $"prompt {p}, answer {a}: one prompt per pass");
+                    AssertClose([(float)scores[p][a]], [(float)unshared[p][a]], 2e-2f, $"prompt {p}, answer {a}: every row running the whole prompt");
                 }
             }
 

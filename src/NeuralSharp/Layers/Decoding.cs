@@ -159,7 +159,7 @@ public sealed class DecodingContext : IDisposable
     public bool InStep { get; private set; }
 
     /// <summary>
-    /// When set, <see cref="Sequential.ForwardCached"/> returns only the last new position's outputs: the layers after the
+    /// When set, <see cref="Sequential.ForwardCached(Tensor, DecodingContext)"/> returns only the last new position's outputs: the layers after the
     /// last cached (attention) layer — final norm and output head — run on one position instead of every prompt position
     /// (sampling reads only the last one; a long prompt's full logits would be prompt × vocabulary floats).
     /// </summary>
@@ -247,7 +247,7 @@ public sealed class DecodingContext : IDisposable
 
     /// <summary>
     /// Records one decoding step (which must call <see cref="BeginStep"/>/<see cref="EndStep"/>, e.g. via
-    /// <see cref="Sequential.ForwardCached"/>) as a <see cref="ComputeGraph"/>. Because positions, masks and cache
+    /// <see cref="Sequential.ForwardCached(Tensor, DecodingContext)"/>) as a <see cref="ComputeGraph"/>. Because positions, masks and cache
     /// offsets are computed on the device from <see cref="Position"/>, the same graph is valid at every position.
     /// </summary>
     public ComputeGraph CaptureStep(Action step)

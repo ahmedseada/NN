@@ -103,8 +103,16 @@ public sealed class Sequential : Module, IEnumerable<Module>, ICachedModule
     /// normally on the new positions only. Brackets the pass with <see cref="DecodingContext.BeginStep"/> /
     /// <see cref="DecodingContext.EndStep"/> when called at the top level.
     /// </summary>
-    public Tensor ForwardCached(Tensor input, DecodingContext context)
+    public Tensor ForwardCached(Tensor input, DecodingContext context) => ForwardCached(input, context, _modules.Count);
+
+    /// <summary>
+    /// <see cref="ForwardCached(Tensor, DecodingContext)"/> through the first <paramref name="layers"/> modules only (for
+    /// example all but the output head, to read hidden states rather than logits).
+    /// </summary>
+    public Tensor ForwardCached(Tensor input, DecodingContext context, int layers)
     {
+        ArgumentOutOfRangeException.ThrowIfNegative(layers);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(layers, _modules.Count);
         bool outermost = !context.InStep;
         int steps = input.Shape[1];
         if (outermost)
@@ -115,7 +123,7 @@ public sealed class Sequential : Module, IEnumerable<Module>, ICachedModule
         // With LastPositionOnly, the layers after the last cached one see only the last position.
         int lastCached = outermost && context.LastPositionOnly && steps > 1 ? _modules.FindLastIndex(m => m is ICachedModule) : -1;
         var x = input;
-        for (int i = 0; i < _modules.Count; i++)
+        for (int i = 0; i < layers; i++)
         {
             var module = _modules[i];
             x = module is ICachedModule cached ? cached.ForwardCached(x, context) : module.Forward(x);
