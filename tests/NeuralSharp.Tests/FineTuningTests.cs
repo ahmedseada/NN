@@ -711,7 +711,14 @@ internal static partial class Tests
                 WithinPrecision(exact.Logits[i], alone.Logits[i], packedLogits[i], device, $"{what}: logits of sequence {i}");
             }
 
-            WithinPrecision([exact.Loss], [alone.Loss], [packedLoss], device, $"{what}: loss");
+            // The loss sums logits times random coefficients of both signs, which nearly cancel: its error is bounded by the
+            // logits' error times the size of the terms (Cauchy-Schwarz), not by the loss itself.
+            var weightsBySequence = rows.SelectMany((row, r) => row.Select((_, j) => coefficients[r][j])).ToList();
+            double terms = exact.Logits.Select((l, i) => Norm(l) * Norm(weightsBySequence[i])).Sum();
+            float own = device.Type == DeviceType.Cuda ? exact.Logits.Select((l, i) => RelativeError(l, alone.Logits[i])).Max() : 0f;
+            float allowed = Math.Max(device.Type == DeviceType.Cuda ? 1e-2f : 1e-3f, 3f * own);
+            Check(Math.Abs(packedLoss - exact.Loss) <= allowed * terms,
+                $"{what}: loss {packedLoss} against {exact.Loss} (float32), difference {Math.Abs(packedLoss - exact.Loss):G3}, allowed {allowed * terms:G3}");
             WithinPrecision(exact.Gradients, alone.Gradients, packedGradients, device, $"{what}: adapter gradients");
         }
 
@@ -739,6 +746,8 @@ internal static partial class Tests
         float error = RelativeError(exact, actual);
         Check(error <= Math.Max(1e-2f, 3f * own), $"{what}: relative error {error:G3} against float32; bfloat16 alone gives {own:G3}");
     }
+
+    private static double Norm(float[] values) => Math.Sqrt(values.Sum(v => (double)v * v));
 
     private static float RelativeError(float[] expected, float[] actual)
     {
@@ -871,12 +880,18 @@ internal static partial class Tests
                 }
             }
 
-            // Each row alone, in the test's precision and (on CUDA) in float32, which measures bfloat16's own error.
-            List<float[]> Alone(int r, MatMulPrecision? precision)
+            // Each row alone: exact (float32, the plain path), and on CUDA also through the batched path's own bfloat16 kernels
+            // (per-row starts, one row starting at 0), which measures how far bfloat16 alone moves that computation.
+            List<float[]> Alone(int r, MatMulPrecision? precision, bool rowStarts)
             {
                 using var scoped = precision is { } p ? MixedPrecision.Use(p) : default(MixedPrecision.Scope?);
                 using var scope = new TensorScope();
                 using var context = new DecodingContext(device, 1, 32) { LastPositionOnly = true };
+                if (rowStarts)
+                {
+                    context.SetRowStarts([0]);
+                }
+
                 var steps = new List<float[]> { model.ForwardCached(Tensor.From(prompts[r], [1, lengths[r]], device), context).ToArray() };
                 for (int s = 0; s < 4; s++)
                 {
@@ -888,8 +903,9 @@ internal static partial class Tests
 
             for (int r = 0; r < lengths.Length; r++)
             {
-                var alone = Alone(r, null);
-                var exact = device.Type == DeviceType.Cuda ? Alone(r, MatMulPrecision.Float32) : alone;
+                bool cuda = device.Type == DeviceType.Cuda;
+                var exact = Alone(r, cuda ? MatMulPrecision.Float32 : null, rowStarts: false);
+                var alone = cuda ? Alone(r, null, rowStarts: true) : exact;
                 for (int s = 0; s < alone.Count; s++)
                 {
                     WithinPrecision(exact[s], alone[s], batched[r][s], device, $"row {r} (prompt of {lengths[r]}), step {s}: logits");
