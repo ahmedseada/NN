@@ -58,6 +58,7 @@ internal static partial class PtxKernels
 
             // LoRA: the adapter's low-rank term as one more k step of the product (…_lr_f32).
             TensorCoreGemm(sb, false, false, 0, lowRank: true);
+            TensorCoreGemm(sb, false, false, 3, lowRank: true);                 // the up projection writing act(gate) · up too
             TensorCoreGemm(sb, false, true, 0, lowRank: true);
             TensorCoreGemm(sb, false, true, 0, lowRank: true, bf16B: true);     // dx = g · Wᵀ (+ dt · Aᵀ) over bfloat16 weights
             foreach (int packed in new[] { 2, 3 })
@@ -155,7 +156,7 @@ internal static partial class PtxKernels
     private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode, int packed = 0, bool multi = false, int tileM = TensorTile,
         bool lowRank = false, bool bf16B = false)
     {
-        if (lowRank && (ta || mode != 0 || packed == 1 || tileM != TensorTile))
+        if (lowRank && (ta || mode is not (0 or 3) || packed == 1 || tileM != TensorTile) || mode == 3 && (!lowRank || tb || packed != 0 || multi))
         {
             throw new ArgumentException("The low-rank stage needs A as stored, no epilogue, no int8 column scales and 128-row tiles.");
         }
@@ -165,7 +166,7 @@ internal static partial class PtxKernels
             throw new ArgumentException("bfloat16 B words need B transposed, A as stored, no epilogue and no other packing.");
         }
 
-        string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}{mode switch { 1 => "_gelu", 2 => "_gelugrad", _ => "" }}"
+        string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}{mode switch { 1 => "_gelu", 2 => "_gelugrad", 3 => "_gated", _ => "" }}"
                       + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}{(bf16B ? "_bf16w" : "")}{(multi ? "_multi" : "")}{(tileM == 64 ? "_m64" : "")}{(lowRank ? "_lr" : "")}_f32";
         int mts = tileM / 32, warpRowShift = (int)Math.Log2(tileM / 2);          // m16 slices per warp; the warp's first row
         int cpw = packed switch { 1 => 4, 2 => 8, _ => 2 }, tileWords = TensorTile / cpw, wordRows = TensorThreads / tileWords;
@@ -190,6 +191,9 @@ internal static partial class PtxKernels
                 """ : "")}}{{(lowRank && multi ? """
                 ,
                                 .param .u64 p_u1, .param .u64 p_v1, .param .u64 p_u2, .param .u64 p_v2
+                """ : "")}}{{(mode == 3 ? """
+                ,
+                                .param .u64 p_hidden, .param .u32 p_act
                 """ : "")}}
             )
             {
@@ -816,6 +820,21 @@ internal static partial class PtxKernels
                 setp.ne.u64 %pbias, %rd18, 0;
                 cvta.to.global.u64 %rd18, %rd18;
             """);
+        if (mode == 3)
+        {
+            // The gated feed-forward's hidden values: act(gate) · c into p_hidden (same layout as c, at c + %rd27); gate
+            // is the auxiliary tensor. Pairs only when hidden is 8-byte aligned too.
+            s.AppendLine("""
+                    ld.param.u64 %rd27, [p_hidden];
+                    cvt.u32.u64 %r48, %rd27;
+                    and.b32 %r48, %r48, 7;
+                    setp.eq.and.u32 %peven, %r48, 0, %peven;
+                    cvta.to.global.u64 %rd27, %rd27;
+                    sub.u64 %rd27, %rd27, %rd3;
+                    ld.param.u32 %lr6, [p_act];
+                """);
+        }
+
         if (splitK)
         {
             s.AppendLine("""
@@ -887,9 +906,9 @@ internal static partial class PtxKernels
 
                 s.AppendLine($"EPI_AUX_{group}:");
                 s.AppendLine("add.u64 %rd23, %rd17, %rd22;");
-                if (mode == 2)
+                if (mode is 2 or 3)
                 {
-                    // The pre-activations (same layout as c, at c + %rd22).
+                    // The pre-activations or the gate (same layout as c, at c + %rd22).
                     for (int nt = 0; nt < 4; nt++)
                     {
                         s.AppendLine($$"""
@@ -900,8 +919,8 @@ internal static partial class PtxKernels
                     }
                 }
 
-                // Mode 0.
-                for (int nt = 0; nt < 4 && mode == 0; nt++)
+                // Mode 0 (and 3: c as in mode 0, then the hidden values).
+                for (int nt = 0; nt < 4 && mode is 0 or 3; nt++)
                 {
                     int c = (mt * 4 + nt) * 4 + half * 2;
                     s.AppendLine($$"""
@@ -910,6 +929,46 @@ internal static partial class PtxKernels
                             add.f32 %e{{2 * nt}}, %e{{2 * nt}}, %bias{{2 * nt}};
                             add.f32 %e{{2 * nt + 1}}, %e{{2 * nt + 1}}, %bias{{2 * nt + 1}};
                         """);
+                }
+
+                // Mode 3: hidden = act(gate) · c (act as gated_act_f32's kind: 0 SiLU, 1 GELU tanh, 2 ReLU), stored beside c.
+                for (int nt = 0; nt < 4 && mode == 3; nt++)
+                {
+                    for (int j = 0; j < 2; j++)
+                    {
+                        string g = $"%h{2 * nt + j}";
+                        s.AppendLine(GeluTerms(g));
+                        s.AppendLine($"""
+                                add.f32 %t6, %t5, 0f3F800000;
+                                mul.f32 %t6, %t6, {g};
+                                mul.f32 %t6, %t6, 0f3F000000;
+                                mul.f32 %t7, {g}, {F(-1.4426950408889634f)};
+                                ex2.approx.ftz.f32 %t7, %t7;
+                                add.f32 %t7, %t7, 0f3F800000;
+                                rcp.rn.f32 %t7, %t7;
+                                mul.f32 %t7, %t7, {g};
+                                setp.eq.u32 %p12, %lr6, 1;
+                                selp.f32 %t7, %t6, %t7, %p12;
+                                max.f32 %t6, {g}, 0f00000000;
+                                setp.eq.u32 %p12, %lr6, 2;
+                                selp.f32 %t7, %t6, %t7, %p12;
+                                mul.f32 %gx{2 * nt + j}, %t7, %e{2 * nt + j};
+                            """);
+                    }
+                }
+
+                if (mode == 3)
+                {
+                    // The hidden values (in %gx, which only packed weights use) at c + %rd27.
+                    s.AppendLine("add.u64 %rd28, %rd17, %rd27;");
+                    for (int nt = 0; nt < 4; nt++)
+                    {
+                        s.AppendLine($$"""
+                                @%q{{3 * nt}} st.global.v2.f32 [%rd28+{{nt * 32}}], {%gx{{2 * nt}}, %gx{{2 * nt + 1}}};
+                                @%q{{3 * nt + 1}} st.global.f32 [%rd28+{{nt * 32}}], %gx{{2 * nt}};
+                                @%q{{3 * nt + 2}} st.global.f32 [%rd28+{{nt * 32 + 4}}], %gx{{2 * nt + 1}};
+                            """);
+                    }
                 }
 
                 // Mode 1: pre = acc + bias (stored when aux is given), c = beta·c + gelu(pre).

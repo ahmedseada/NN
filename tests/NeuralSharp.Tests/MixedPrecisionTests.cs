@@ -1021,7 +1021,7 @@ internal static partial class Tests
 
     private static void TensorCoreProducts(Device device)
     {
-        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm_tc")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == (k.Contains("_multi") ? 23 : 15) + (k.Contains("_lr_") ? (k.Contains("_multi") ? 7 : 3) : 0))
+        Check(PtxKernels.TensorCoreNames.Where(k => k.StartsWith("gemm_tc")).All(k => PtxKernels.TensorCoreParameterCounts.TryGetValue(k, out int n) && n == (k.Contains("_multi") ? 23 : 15) + (k.Contains("_lr_") ? (k.Contains("_multi") ? 7 : 3) : 0) + (k.Contains("_gated") ? 2 : 0))
               && PtxKernels.TensorCoreNames.All(PtxKernels.TensorCoreParameterCounts.ContainsKey), "tensor-core kernel signatures");
         var random = new Random(3);
         // A GPU that has tensor cores must load the module: a JIT error would otherwise fall back to float32 silently.

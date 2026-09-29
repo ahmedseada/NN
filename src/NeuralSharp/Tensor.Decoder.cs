@@ -255,8 +255,66 @@ public sealed partial class Tensor
     /// version; callers then run the base products and <see cref="AddLowRank"/>. A frozen bias is added to each output in
     /// place (a bias that trains is not: null then).
     /// </summary>
-    internal static Tensor[]? LoraProducts(Tensor input, IReadOnlyList<Layers.Linear> layers, bool withBias = true)
+    internal static Tensor[]? LoraProducts(Tensor input, IReadOnlyList<Layers.Linear> layers, bool withBias = true) =>
+        LoraProducts(input, layers, withBias, null, 0, out _);
+
+    /// <summary>
+    /// A gated feed-forward's gate and up projections (float32 weights with LoRA adapters) for training, with
+    /// act(gate) · up written by the up projection's product (one pass fewer over gate and up); recorded as the separate
+    /// operations would be. Null (nothing computed) where the layers do not qualify.
+    /// </summary>
+    internal static (Tensor Gate, Tensor Up, Tensor Hidden)? LoraGated(Tensor input, Layers.Linear gate, Layers.Linear up, int kind)
     {
+        input.ThrowIfDisposed();
+        if (!FuseGatedActivation)
+        {
+            return null;
+        }
+
+        int k = input._shape[^1], m = input.Size / Math.Max(1, k);
+        static bool Float(Layers.Linear l) => l.Adapter is { Rank: <= 32 } && l.BFloat16 is null && l.Int4 is null && l.Int8 is null && l.TiedTo is null
+                                              && l.Float8 is null && !l.Weight.RequiresGrad;
+        if (input.Device.Type != DeviceType.Cuda || !MixedPrecision.UsesTensorCores || MixedPrecision.Current == MatMulPrecision.Float8
+            || m < 64 || k < 32 || !Float(gate) || !Float(up) || up.Bias is not null || gate.Bias is { RequiresGrad: true }
+            || gate.InFeatures != k || up.InFeatures != k || gate.OutFeatures != up.OutFeatures)
+        {
+            return null;
+        }
+
+        var flat = input.Rank == 2 ? input : input.Reshape(-1, k);           // one input buffer: its gradients add up in place
+        var g = gate.Forward(flat);
+        Tensor u, hidden;
+        if (g.Rank == 2 && g.Storage.Length == g.Size && !g.Storage.Evicted
+            && LoraProducts(flat, [up], true, g, kind, out var fused) is [var product] && fused is not null)
+        {
+            (u, hidden) = (product, fused);
+        }
+        else
+        {
+            u = up.Forward(flat);
+            hidden = GatedActivation(g, u, kind);
+        }
+
+        if (input.Rank == 2)
+        {
+            return (g, u, hidden);
+        }
+
+        int[] shape = [.. input._shape[..^1], up.OutFeatures];
+        return (g.Reshape(shape), u.Reshape(shape), hidden.Reshape(shape));
+    }
+
+    /// <summary>Whether <see cref="LoraGated"/> runs (tests compare it with the separate activation).</summary>
+    internal static bool FuseGatedActivation = true;
+
+    /// <summary>Up projections that wrote their gated activation (tests check the fused pass ran).</summary>
+    internal static long GatedActivationsFused;
+
+    // With gate (one float32 layer, no bias): the product also writes act(gate) · output into hidden (null when the
+    // device has no such pass; the caller then applies the activation itself).
+    private static Tensor[]? LoraProducts(Tensor input, IReadOnlyList<Layers.Linear> layers, bool withBias, Tensor? gate, int gateKind, out Tensor? hidden)
+    {
+        hidden = null;
         input.ThrowIfDisposed();
         int k = input._shape[^1], m = input.Size / Math.Max(1, k);
         if (input.Device.Type != DeviceType.Cuda || layers.Count is < 1 or > 3 || m < 64 || k < 32 || !MixedPrecision.UsesTensorCores
@@ -305,6 +363,22 @@ public sealed partial class Tensor
                 var f8 = layers[j].Float8!;
                 backend.BatchedMatMul(us[j].Storage, layers[j].Adapter!.B.Storage, outputs[j].Storage, 1, m, layers[j].OutFeatures, rank, false, false, 0f);
                 done = backend.Float8MatMul(flat.Storage, m, k, f8.Values.Storage, f8.Scales.Storage, f8.Columns, outputs[j].Storage, 1f);
+            }
+        }
+
+        if (!done && kind == 3 && gate is not null && input.Rank == 2 && layers[0].Bias is null && gate._shape.AsSpan().SequenceEqual(outputs[0]._shape))
+        {
+            hidden = Empty([m, layers[0].OutFeatures], input.Device);
+            done = backend.MatMulLowRankGated(flat.Storage, layers[0].Weight.Storage, outputs[0].Storage, m, layers[0].OutFeatures, k,
+                us[0].Storage, layers[0].Adapter!.B.Storage, rank, gate.Storage, hidden.Storage, gateKind);
+            if (done)
+            {
+                Interlocked.Increment(ref GatedActivationsFused);
+            }
+            else
+            {
+                hidden.Dispose();
+                hidden = null;
             }
         }
 
@@ -411,6 +485,14 @@ public sealed partial class Tensor
 
             results[j] = input.Rank == 2 ? outputs[j] : outputs[j].Reshape([.. input._shape[..^1], n]);
             Traced("lora_fused", results[j], start);
+        }
+
+        if (hidden is not null)
+        {
+            // act(gate) · up, written by the product ([m, n] like gate and the flat input's output): the gated activation's
+            // own backward, as if it had run separately.
+            RecordGatedActivation(gate!, results[0], hidden, gateKind);
+            Traced("gated_activation", hidden, start);
         }
 
         return results;
