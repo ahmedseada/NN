@@ -260,13 +260,6 @@ internal abstract class Backend
     public virtual bool MatMulLowRank(Storage a, Storage b, Storage c, int m, int n, int k, bool transB, float beta, Storage u, Storage v, int rank) => false;
 
     /// <summary>
-    /// c = a·b + u·v as <see cref="MatMulLowRank"/> (b as stored, beta 0), and in the same pass hidden = act(gate) · c for
-    /// gate and hidden laid out as c ([m, n]; act as <see cref="GatedActivation"/>'s kind): a gated feed-forward's up
-    /// projection writing its activation too. False when the device has no such pass.
-    /// </summary>
-    public virtual bool MatMulLowRankGated(Storage a, Storage b, Storage c, int m, int n, int k, Storage u, Storage v, int rank, Storage gate, Storage hidden, int kind) => false;
-
-    /// <summary>
     /// c = beta·c + a · Wᵀ (+ u · vᵀ) with W a bfloat16 weight [n, k] as <see cref="Layers.BFloat16Weight"/> packs it (two
     /// values per word along k), read as stored: the input gradient through a frozen bfloat16 layer (and its adapter's
     /// dt · Aᵀ with u = dt [m, rank], v = A [n, rank]) without expanding the weight to float. u null: no low-rank term.

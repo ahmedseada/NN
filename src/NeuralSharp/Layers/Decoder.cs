@@ -646,9 +646,7 @@ public sealed class FeedForward : Module
         }
         else
         {
-            // Training without bfloat16 activations: the up projection's product also writes act(gate) · up.
-            var paired = Autograd.IsEnabled && !ActivationMemory.BFloat16 ? Tensor.LoraGated(input, Gate, Up, (int)Activation) : null;
-            var projected = paired is { } p ? [p.Gate, p.Up] : Linear.ForwardMany(input, Gate, Up);
+            var projected = Linear.ForwardMany(input, Gate, Up);
             if (!Autograd.IsEnabled && Down.Adapter is null && Activation is FeedForwardActivation.Silu or FeedForwardActivation.Gelu
                 && Tensor.MatMulPackedGated(projected[0], projected[1], (int)Activation, Down) is { } fused)
             {
@@ -658,11 +656,7 @@ public sealed class FeedForward : Module
             var (gate, up, kind) = (projected[0], projected[1], (int)Activation);
             bool recompute = ActivationMemory.RecomputeFeedForward && Autograd.IsEnabled;
             Backends.Storage? packedHidden = null;
-            if (paired is { } fusedPair)
-            {
-                hidden = fusedPair.Hidden;                                  // written by the up projection
-            }
-            else if (ActivationMemory.BFloat16 && Autograd.IsEnabled
+            if (ActivationMemory.BFloat16 && Autograd.IsEnabled
                 && Tensor.GatedActivationCompressed(gate, up, kind, packOutput: !recompute, out packedHidden) is { } compressed)
             {
                 hidden = compressed;                                        // gate, up (and the result) kept as bfloat16 by the kernel

@@ -942,29 +942,6 @@ internal sealed unsafe partial class CudaBackend : Backend
         return true;
     }
 
-    public override bool MatMulLowRankGated(Storage a, Storage b, Storage c, int m, int n, int k, Storage u, Storage v, int rank, Storage gate, Storage hidden, int kind)
-    {
-        if (m == 0 || n == 0 || k < 16 || rank is < 1 or > 32 || kind is < 0 or > 2 || !MixedPrecision.UsesTensorCores
-            || MixedPrecision.Current == MatMulPrecision.Float8 || TensorCoreKernels() is not { } tensorCore
-            || !tensorCore.TryGetValue("gemm_tc_nn_gated_lr_f32", out var function))
-        {
-            return false;
-        }
-
-        if (_profile is not null)
-        {
-            _profileLabel = $"gemm_tc_nn_gated_lr {m}x{n}x{k}+{rank}";
-            _profileFlops = 2.0 * m * n * (k + rank);
-        }
-
-        // No split k: the activation needs each value complete.
-        Launch(function, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
-            1, PtxKernels.TensorThreads, 1, P(a), P(b), P(c), U(m), U(n), U(k), F(0f), 0UL, 0UL, 0UL, 0UL,
-            U(k), U(n), U(n), P(gate), P(u), P(v), U(rank), P(hidden), U(kind));
-        Interlocked.Increment(ref TensorCoreLaunches);
-        return true;
-    }
-
     public override bool BFloat16TransposedMatMul(Storage a, Storage packed, Storage c, int m, int n, int k, float beta, Storage? u, Storage? v, int rank)
     {
         if (m == 0 || n == 0 || k < 16 || u is not null && rank is < 1 or > 32 || !MixedPrecision.UsesTensorCores

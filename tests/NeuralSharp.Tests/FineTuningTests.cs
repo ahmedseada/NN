@@ -20,7 +20,6 @@ internal static partial class Tests
         ("scoring: a cached forward pass without autograd frees each layer's intermediate results (only the cache and the output stay)", CachedForwardFreesLayers),
         ("scoring: given answers to chat prompts are scored as the model's own full forward pass scores them, each prompt run once from a cache or with every answer, whatever the batching; long messages are shortened to fit", AnswerScoring),
         ("fine-tuning: thin products (a rank of at most 32: x·A, g·Bᵀ, xᵀ·dt, (uᵀ·g)ᵀ) match the plain product: odd sizes, split chunks, scale, overwrite or add", SkinnyProducts),
-        ("fine-tuning: a gated feed-forward's up projection writing act(gate) · up gives the separate activation's loss and gradients (SiLU, GELU)", FusedGatedActivation),
         ("fine-tuning: the gated activation reads and writes bfloat16 words as packing and unpacking around the float kernels would (SiLU, GELU, ReLU, odd sizes)", PackedGatedActivation),
         ("fine-tuning: releasing results no backward step reads, and recomputing feed-forward activations, give the same loss and gradients with less memory (RoPE, biases, q/k norms, post norms, parallel blocks, layer norms, dropout)", ReleasedActivations),
         ("fine-tuning: checkpointing is off by default and turns on (the step run again) when a step runs out of memory; a lighter setting that fits is timed against checkpointing and the faster kept", AutomaticCheckpointing),
@@ -418,55 +417,6 @@ internal static partial class Tests
                     }
                 }
             }
-        }
-    }
-
-    private static void FusedGatedActivation(Device device)
-    {
-        if (device.Type != DeviceType.Cuda || MixedPrecision.TensorCoresUnavailable(device) is not null)
-        {
-            return;                                                              // a tensor-core product's epilogue
-        }
-
-        using var precision = MixedPrecision.BFloat16();
-        foreach (var activation in new[] { FeedForwardActivation.Silu, FeedForwardActivation.Gelu })
-        {
-            var spec = SmallSpec with { Activation = activation, Dim = 64, FfDim = 200, HeadDim = 16 };
-            var r = new Random(84);
-            var tokens = Enumerable.Range(0, 2 * 70).Select(_ => (float)r.Next(spec.Vocabulary)).ToArray();
-            var weights = Enumerable.Range(0, 2 * 70 * spec.Vocabulary).Select(_ => (float)(r.NextDouble() * 2 - 1)).ToArray();
-            (float Loss, float[] Gradients) Run(bool fused)
-            {
-                bool previous = Tensor.FuseGatedActivation;
-                Tensor.FuseGatedActivation = fused;
-                try
-                {
-                    using var model = spec.Build(new RandomWeights(85), new DecoderBuildOptions { Device = device });
-                    model.AddLora(rank: 8, alpha: 16, targets: _ => true, freezeBase: true, random: new Random(86));
-                    foreach (var adapter in model.Descendants().OfType<Linear>().Select(l => l.Adapter).OfType<LoraAdapter>())
-                    {
-                        adapter.B.Load([.. Enumerable.Range(0, adapter.B.Size).Select(i => 0.1f * MathF.Sin(i))]);
-                    }
-
-                    model.Train();
-                    using var scope = new TensorScope();
-                    var logits = model.Forward(Tensor.From(tokens, [2, 70], device));
-                    var loss = (logits * Tensor.From(weights, [2, 70, spec.Vocabulary], device)).Sum();
-                    loss.Backward();
-                    return (loss.Item(), [.. model.TrainableParameters().SelectMany(p => p.Grad!.ToArray())]);
-                }
-                finally
-                {
-                    Tensor.FuseGatedActivation = previous;
-                }
-            }
-
-            long before = Tensor.GatedActivationsFused;
-            var fused = Run(true);
-            Check(Tensor.GatedActivationsFused > before, $"{activation}: the up projections wrote the activation");
-            var separate = Run(false);
-            AssertClose([separate.Loss], [fused.Loss], 1e-4f, $"{activation}: loss");
-            CloseByNorm(separate.Gradients, fused.Gradients, 1e-4f, $"{activation}: adapter gradients");
         }
     }
 
