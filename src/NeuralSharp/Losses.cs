@@ -62,6 +62,15 @@ public static class Losses
         Tensor.TokenCrossEntropyRows(hidden, head, rows, targets, weights, normalizer, chunkRows);
 
     /// <summary>
+    /// The log-probability of chosen tokens: log p(<paramref name="targets"/>[i] | position <paramref name="rows"/>[i]) under
+    /// <paramref name="head"/>(hidden) for hidden [positions, dim], for scoring given answers (the likelihood of each
+    /// candidate continuation, perplexity). Computed on the device <paramref name="chunkRows"/> rows at a time with a fused
+    /// log-softmax, so only one value per listed row leaves it (never the [rows, vocabulary] logits). Not recorded.
+    /// </summary>
+    public static float[] TokenLogProbabilities(Tensor hidden, Func<Tensor, Tensor> head, int[] rows, int[] targets, int chunkRows = 1024) =>
+        Tensor.TokenLogProbabilities(hidden, head, rows, targets, chunkRows);
+
+    /// <summary>
     /// Binary cross-entropy for probabilities in (0, 1), e.g. after a <see cref="Layers.Sigmoid"/> layer:
     /// -mean(y·log p + (1 - y)·log(1 - p)). Prefer <see cref="BinaryCrossEntropyWithLogits"/> for stability.
     /// </summary>

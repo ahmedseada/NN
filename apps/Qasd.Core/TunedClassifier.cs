@@ -17,7 +17,7 @@ namespace Qasd;
 public sealed class TunedClassifier : IDisposable
 {
     private readonly PretrainedModel _model;
-    private readonly ChatTranscriptEncoder _encoder;
+    private readonly AnswerScorer _scorer;
     private readonly string _system;
     private readonly int _maxLength;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -26,8 +26,12 @@ public sealed class TunedClassifier : IDisposable
     private TunedClassifier(PretrainedModel model, string[] labels, string system, int maxLength, string baseModel, string folder)
     {
         _model = model;
-        _encoder = new ChatTranscriptEncoder(model.ChatTemplate ?? throw new InvalidDataException($"{baseModel} has no chat template."),
-            model.Tokenizer ?? throw new InvalidDataException($"{baseModel} has no tokenizer."));
+        if (model.ChatTemplate is null || model.Tokenizer is null)
+        {
+            throw new InvalidDataException($"{baseModel} has no chat template or tokenizer.");
+        }
+
+        _scorer = new AnswerScorer(model, maxLength);
         Labels = labels;
         _system = system;
         _maxLength = maxLength;
@@ -134,7 +138,7 @@ public sealed class TunedClassifier : IDisposable
         try
         {
             _chat ??= _model.CreateChat(contextLength: Math.Min(_model.MaxPositions, _maxLength + 32));
-            var request = new ChatRequest(Transcript(Fitted(text), "").Messages.SkipLast(1).ToList(), null, false,
+            var request = new ChatRequest(_scorer.Fit(Prompt(text), Labels) ?? Prompt(""), null, false,
                 new GenerationOptions { Temperature = 0f, TopK = 1, TopP = 1f, RepeatPenalty = 1f, NumPredict = 16, ChunkSize = 1, NumCtx = Math.Min(_model.MaxPositions, _maxLength + 32) });
             await foreach (var chunk in _chat.StreamAsync(request, cancellationToken).ConfigureAwait(false))
             {
@@ -159,141 +163,22 @@ public sealed class TunedClassifier : IDisposable
         _gate.Dispose();
     }
 
-    // The message as it fits the model (see Sequence), for generation.
-    private string Fitted(string text) => Fit(text, Labels[0]).Text;
-
-    // The conversation (instruction, message, answer = label) as the training saw it (nstune with the same system prompt).
-    private ChatTranscript Transcript(string text, string label)
-    {
-        var messages = new List<ChatMessage>();
-        if (_system.Length > 0)
-        {
-            messages.Add(new ChatMessage("system", _system));
-        }
-
-        messages.Add(new ChatMessage("user", text));
-        messages.Add(new ChatMessage("assistant", label));
-        return new ChatTranscript(messages, [], Think: false);
-    }
-
-    // A message too long for MaxLength tokens is shortened, its start kept, until the whole conversation fits (see
-    // ChatTranscriptEncoder.Fit); every intent is then scored on the same text (fitted to the longest intent).
-    private (string Text, TrainingSequence? Sequence) Fit(string text, string label)
-    {
-        text = text.Length > 8 * _maxLength ? text[..(8 * _maxLength)] : text;       // far longer than any fit
-        var fitted = _encoder.Fit(Transcript(text, label), _maxLength);
-        if (fitted is null)
-        {
-            return ("", null);
-        }
-
-        return (fitted.Messages[^2].Content, _encoder.Encode(fitted, _maxLength));
-    }
+    // The conversation as the training saw it (nstune with the same system prompt), up to the answer.
+    private IReadOnlyList<ChatMessage> Prompt(string text) =>
+        _system.Length > 0 ? [new ChatMessage("system", _system), new ChatMessage("user", text)] : [new ChatMessage("user", text)];
 
     private TextPrediction Score(string text) => Score([text])[0];
 
-    // log p(label's answer tokens | instruction, message) for each intent, softmaxed over the intents. A batch holds a row
-    // per (message, intent), right-padded; the network runs up to its final normalization and the output layer only on the
-    // answer rows. Messages go 16 at a time (64 rows with four intents), those of similar length together (less padding);
-    // the network frees each layer's intermediate results as it goes (see Sequential.ForwardFirst).
+    // Each intent scored as the model's answer by the library's AnswerScorer (log p of its tokens, softmaxed over the
+    // intents); a message too long for the tuning's length is shortened there, its start kept.
     private List<TextPrediction> Score(IReadOnlyList<string> texts, Action<int>? progress = null)
     {
-        const int MessagesPerPass = 16;
-        string longest = Labels.MaxBy(l => _model.Tokenizer!.Encode(l).Count)!;
-        var predictions = new TextPrediction[texts.Count];
-        var order = Enumerable.Range(0, texts.Count).OrderBy(i => texts[i].Length).ToArray();
-        var modules = _model.Network.ToList();
-        var head = (Linear)modules[^1];
-        for (int first = 0; first < texts.Count; first += MessagesPerPass)
+        var choices = _scorer.Choose([.. texts.Select(Prompt)], Labels, progress);
+        return [.. choices.Select(c =>
         {
-            var indices = order.AsSpan(first, Math.Min(MessagesPerPass, texts.Count - first)).ToArray();
-            var chunk = indices.Select(i => texts[i]).ToList();
-
-            // One shortened message for every intent: fitted to the longest answer, so each intent is scored on the same text.
-            var sequences = new List<TrainingSequence?>();
-            foreach (string text in chunk)
-            {
-                string fitted = Fit(text, longest).Text;
-                sequences.AddRange(Labels.Select(l => Fit(fitted, l).Sequence));
-            }
-
-            int rows = sequences.Count, length = sequences.Max(s => s?.Tokens.Length ?? 2) - 1;
-            var input = new float[rows * length];
-            var targets = new List<(int Row, int Position, int Token)>();
-            for (int r = 0; r < rows; r++)
-            {
-                if (sequences[r] is not { } s)
-                {
-                    continue;
-                }
-
-                for (int t = 0; t + 1 < s.Tokens.Length; t++)
-                {
-                    input[r * length + t] = s.Tokens[t];
-                    if (s.Trained[t + 1])
-                    {
-                        targets.Add((r, t, s.Tokens[t + 1]));
-                    }
-                }
-            }
-
-            var scores = new double[rows];
-            using (Autograd.NoGrad())
-            using (var scope = new TensorScope())
-            {
-                var hidden = _model.Network.ForwardFirst(Tensor.From(input, [rows, length], Device), modules.Count - 1);
-
-                int dim = hidden.Shape[^1];
-                var all = hidden.ToArray();
-                var picked = new float[targets.Count * dim];
-                for (int i = 0; i < targets.Count; i++)
-                {
-                    Array.Copy(all, (targets[i].Row * length + targets[i].Position) * dim, picked, i * dim, dim);
-                }
-
-                var logits = head.Forward(Tensor.From(picked, [targets.Count, dim], Device)).ToArray();
-                int vocabulary = logits.Length / targets.Count;
-                for (int i = 0; i < targets.Count; i++)
-                {
-                    var row = logits.AsSpan(i * vocabulary, vocabulary);
-                    float max = float.NegativeInfinity;
-                    foreach (float v in row)
-                    {
-                        max = MathF.Max(max, v);
-                    }
-
-                    double sum = 0;
-                    foreach (float v in row)
-                    {
-                        sum += Math.Exp(v - max);
-                    }
-
-                    scores[targets[i].Row] += row[targets[i].Token] - max - Math.Log(sum);    // log p(token)
-                }
-            }
-
-            for (int m = 0; m < chunk.Count; m++)
-            {
-                var own = scores.AsSpan(m * Labels.Count, Labels.Count).ToArray();
-                if (sequences.Skip(m * Labels.Count).Take(Labels.Count).Any(s => s is null))
-                {
-                    // Not even an empty message fits: MaxLength is too small for the instruction; no intent can be preferred.
-                    float even = 1f / Labels.Count;
-                    predictions[indices[m]] = new TextPrediction(Labels[0], even, [.. Labels.Select(l => (l, even))]);
-                    continue;
-                }
-
-                double best = own.Max();
-                var weights = own.Select(x => Math.Exp(x - best)).ToArray();
-                double total = weights.Sum();
-                var probabilities = Labels.Select((l, i) => (Label: l, Probability: (float)(weights[i] / total))).OrderByDescending(p => p.Probability).ToList();
-                predictions[indices[m]] = new TextPrediction(probabilities[0].Label, probabilities[0].Probability, probabilities);
-            }
-
-            progress?.Invoke(first + chunk.Count);
-        }
-
-        return [.. predictions];
+            var probabilities = Labels.Select((l, i) => (Label: l, Probability: (float)c.Probabilities[i])).OrderByDescending(p => p.Probability).ToList();
+            return new TextPrediction(Labels[c.Best], probabilities[0].Probability, probabilities);
+        })];
     }
 }
 

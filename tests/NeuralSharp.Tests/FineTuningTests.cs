@@ -16,6 +16,8 @@ internal static partial class Tests
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("fine-tuning: the input gradient through bfloat16 weights reads them as stored (with and without the adapter's term, odd widths, split k)", BFloat16InputGradient),
+        ("scoring: log-probabilities of chosen tokens computed on the device match a log-softmax of the full logits (chunked, repeated rows)", TokenLogProbabilities),
+        ("scoring: given answers to chat prompts are scored as the model's own full forward pass scores them, whatever the batching; long messages are shortened to fit", AnswerScoring),
         ("fine-tuning: the gated activation reads and writes bfloat16 words as packing and unpacking around the float kernels would (SiLU, GELU, ReLU, odd sizes)", PackedGatedActivation),
         ("fine-tuning: releasing results no backward step reads, and recomputing feed-forward activations, give the same loss and gradients with less memory (RoPE, biases, q/k norms, post norms, parallel blocks, layer norms, dropout)", ReleasedActivations),
         ("fine-tuning: checkpointing is off by default and turns on (the step run again) when a step runs out of memory; a lighter setting that fits is timed against checkpointing and the faster kept", AutomaticCheckpointing),
@@ -180,6 +182,130 @@ internal static partial class Tests
             }
             Check(spec.Gated == false || recomputed.Held < released.Held, $"{name}: recomputing holds less still ({recomputed.Held:N0} vs {released.Held:N0} bytes)");
         }
+    }
+
+    private static void AnswerScoring(Device device)
+    {
+        var spec = new DecoderSpec
+        {
+            Vocabulary = 260, Dim = 32, Layers = 2, Heads = 4, KvHeads = 2, HeadDim = 8, FfDim = 64, MaxPositions = 256,
+            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, QkNorm = true, TieEmbeddings = true,
+        };
+        string folder = WriteChatModel(spec);
+        try
+        {
+            using var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device });
+            model.Network.Eval();
+            string[] answers = ["yes", "no", "maybe later"];
+            IReadOnlyList<ChatMessage>[] prompts =
+            [
+                [new ChatMessage("system", "Answer yes or no."), new ChatMessage("user", "Is it raining?")],
+                [new ChatMessage("user", "Short.")],
+                [new ChatMessage("system", "Answer yes or no."), new ChatMessage("user", new string('x', 2000))],   // shortened to fit
+            ];
+            var scorer = new AnswerScorer(model, maxLength: 96);
+            var scores = scorer.LogLikelihoods(prompts, answers);
+            var single = new AnswerScorer(model, maxLength: 96) { PromptsPerPass = 1 }.LogLikelihoods(prompts, answers);
+
+            // The same values from the whole network's logits over each (fitted prompt, answer) sequence alone.
+            for (int p = 0; p < prompts.Length; p++)
+            {
+                var fitted = scorer.Fit(prompts[p], answers);
+                Check(fitted is not null, $"prompt {p} fits");
+                for (int a = 0; a < answers.Length; a++)
+                {
+                    var sequence = scorer.Encoder.Encode(new ChatTranscript([.. fitted!, new ChatMessage("assistant", answers[a])], [], false), 96)!;
+                    Check(sequence.Tokens.Length <= 97, $"prompt {p}, answer {a}: within the length ({sequence.Tokens.Length} tokens)");
+                    double expected = 0;
+                    using (Autograd.NoGrad())
+                    using (new TensorScope())
+                    {
+                        int n = sequence.Tokens.Length - 1;
+                        var logits = model.Network.Forward(Tensor.From([.. sequence.Tokens.Take(n).Select(t => (float)t)], [1, n], device)).ToArray();
+                        int vocabulary = logits.Length / n;
+                        for (int t = 0; t < n; t++)
+                        {
+                            if (!sequence.Trained[t + 1])
+                            {
+                                continue;
+                            }
+
+                            var row = logits.AsSpan(t * vocabulary, vocabulary);
+                            double max = double.NegativeInfinity, sum = 0;
+                            foreach (float v in row)
+                            {
+                                max = Math.Max(max, v);
+                            }
+
+                            foreach (float v in row)
+                            {
+                                sum += Math.Exp(v - max);
+                            }
+
+                            expected += row[sequence.Tokens[t + 1]] - max - Math.Log(sum);
+                        }
+                    }
+
+                    AssertClose([(float)expected], [(float)scores[p][a]], 2e-2f, $"prompt {p}, answer {a}: log-likelihood");
+                    AssertClose([(float)scores[p][a]], [(float)single[p][a]], 2e-2f, $"prompt {p}, answer {a}: one prompt per pass");
+                }
+            }
+
+            var choices = scorer.Choose(prompts, answers);
+            foreach (var choice in choices)
+            {
+                AssertClose([1f], [(float)choice.Probabilities.Sum()], 1e-5f, "probabilities sum to one");
+                Check(choice.Best == Array.IndexOf([.. choice.LogLikelihoods], choice.LogLikelihoods.Max()), "the best is the most likely");
+            }
+
+            Check(new AnswerScorer(model, maxLength: 4).Choose([prompts[0]], answers)[0].Probabilities.All(x => Math.Abs(x - 1.0 / 3) < 1e-9),
+                "a prompt that cannot fit gets even probabilities");
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
+    }
+
+    private static void TokenLogProbabilities(Device device)
+    {
+        var r = new Random(53);
+        const int Positions = 37, Dim = 24, Vocabulary = 301;
+        float[] Values(int n, float scale) => [.. Enumerable.Range(0, n).Select(_ => (float)(r.NextDouble() * 2 - 1) * scale)];
+        using var scope = new TensorScope();
+        var hiddenValues = Values(Positions * Dim, 1f);
+        var hidden = Tensor.From(hiddenValues, [Positions, Dim], device);
+        var head = new Linear(Dim, Vocabulary, bias: true, device: device, random: new Random(54));
+        int[] rows = [0, 5, 5, 36, 12, 7, 20, 20, 3];
+        int[] targets = [.. rows.Select(_ => r.Next(Vocabulary))];
+        float[] expected;
+        using (Autograd.NoGrad())
+        {
+            var logits = head.Forward(hidden).ToArray();
+            expected = [.. rows.Select((row, i) =>
+            {
+                var span = logits.AsSpan(row * Vocabulary, Vocabulary);
+                double max = double.NegativeInfinity, sum = 0;
+                foreach (float v in span)
+                {
+                    max = Math.Max(max, v);
+                }
+
+                foreach (float v in span)
+                {
+                    sum += Math.Exp(v - max);
+                }
+
+                return (float)(span[targets[i]] - max - Math.Log(sum));
+            })];
+        }
+
+        foreach (int chunk in new[] { 1024, 4 })
+        {
+            AssertClose(expected, Losses.TokenLogProbabilities(hidden, head.Forward, rows, targets, chunk), 1e-2f, $"chunks of {chunk}");
+        }
+
+        Check(Losses.TokenLogProbabilities(hidden, head.Forward, [], []).Length == 0, "no rows, no values");
     }
 
     private static void PackedGatedActivation(Device device)

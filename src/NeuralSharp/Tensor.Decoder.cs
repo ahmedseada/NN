@@ -503,6 +503,73 @@ public sealed partial class Tensor
     }
 
     /// <summary>
+    /// log p(targets[i] | position rows[i]) under <paramref name="head"/>(hidden) for each listed row of hidden [positions,
+    /// dim], computed on the device (the head and a fused log-softmax over <paramref name="chunkRows"/> rows at a time):
+    /// only the listed values come back, not the [rows, vocabulary] logits. Not recorded.
+    /// </summary>
+    internal static float[] TokenLogProbabilities(Tensor hidden, Func<Tensor, Tensor> head, int[] rows, int[] targets, int chunkRows)
+    {
+        hidden.ThrowIfDisposed();
+        if (hidden.Rank != 2 || targets.Length != rows.Length)
+        {
+            throw new ArgumentException("TokenLogProbabilities needs hidden [positions, dim] and one target per listed row.");
+        }
+
+        int total = hidden._shape[0], dim = hidden._shape[1], count = rows.Length;
+        var result = new float[count];
+        if (count == 0)
+        {
+            return result;
+        }
+
+        foreach (int row in rows)
+        {
+            if ((uint)row >= (uint)total)
+            {
+                throw new ArgumentOutOfRangeException(nameof(rows), $"Row {row} is outside the {total} positions.");
+            }
+        }
+
+        chunkRows = Math.Max(1, chunkRows);
+        var (device, backend) = (hidden.Device, hidden.Backend);
+        using var noGrad = Autograd.NoGrad();
+        for (int r0 = 0; r0 < count; r0 += chunkRows)
+        {
+            int n = Math.Min(chunkRows, count - r0);
+            using var scope = new TensorScope();
+            var index = From([.. rows.AsSpan(r0, n).ToArray().Select(r => (float)r)], [n], device);
+            var chunkTargets = From([.. targets.AsSpan(r0, n).ToArray().Select(t => (float)t)], [n], device);
+            var ones = Full([n], 1f, device);
+            var chunk = Empty([n, dim], device);
+            backend.Gather(hidden.Storage, index.Storage, chunk.Storage, n, dim, total);
+            var logits = head(chunk);
+            int vocabulary = logits._shape[^1];
+            if (logits.Size != n * vocabulary)
+            {
+                throw new ArgumentException($"The head must map [{n}, {dim}] to [{n}, vocabulary], got {FormatShape(logits._shape)}.");
+            }
+
+            foreach (int t in targets.AsSpan(r0, n))
+            {
+                if ((uint)t >= (uint)vocabulary)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(targets), $"Token {t} is outside the vocabulary of {vocabulary}.");
+                }
+            }
+
+            var losses = Empty([n], device);
+            backend.SoftmaxCrossEntropyRows(logits.Storage, chunkTargets.Storage, ones.Storage, losses.Storage, n, vocabulary, 1f);   // -log p
+            var values = losses.ToArray();
+            for (int i = 0; i < n; i++)
+            {
+                result[r0 + i] = -values[i];
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// <see cref="TokenCrossEntropyRows(Tensor, Func{Tensor, Tensor}, int[], float[], float[], float, int)"/> with the rows,
     /// targets and weights already on the device ([count] floats each; a row with weight 0 adds nothing): no host data, so
     /// the pass can be recorded as a graph and replayed with new values in those tensors.
