@@ -5,6 +5,7 @@
     <RootNamespace>Qasd.Api</RootNamespace>
     <AssemblyName>Qasd.Api</AssemblyName>
     <IsPackable>false</IsPackable>
+    <InvariantGlobalization>true</InvariantGlobalization>   <!-- no ICU needed (a bare Linux runs the published service) -->
   </PropertyGroup>
 
   <ItemGroup>
