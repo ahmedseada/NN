@@ -276,7 +276,7 @@ int Train()
         {
             Console.WriteLine($"balanced {answers.Count} answers (at most {balance}×): "
                               + string.Join(", ", answers.OrderByDescending(a => a.Before).Select(a =>
-                                  $"{JsonValue.Create(model.Tokenizer!.Decode(a.Answer).Trim()).ToJsonString(readable)} {a.Before:N0}→{a.After:N0}")));
+                                  $"{JsonValue.Create(model.Tokenizer!.Decode(a.Answer).Replace(encoder.AssistantEnd, "", StringComparison.Ordinal).Trim()).ToJsonString(readable)} {a.Before:N0}→{a.After:N0}")));
             train = balanced;
         }
         else
