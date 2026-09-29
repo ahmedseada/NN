@@ -43,7 +43,8 @@ const string Usage = """
                --adapter DIR (continue training an adapter), --profile (time a few steps instead of training)
     Evaluate:  --adapter DIR, --samples 100, --batch 8, --max-new 512, --metric auto|number|exact|contains|f1, --out F.jsonl
     Chat:      --system S, --max-new N, --temperature T (0: greedy)
-    Model:     --cuda | --cpu (default: the GPU when there is one), --int8 | --int4 | --bf16 (base weights), --context N,
+    Model:     --cuda | --cpu | --device cuda:N (default: the first GPU when there is one; any CUDA GPU works, the faster
+               kernels load where the GPU has them), --int8 | --int4 | --bf16 (base weights), --context N,
                --kv8 | --kv16, --no-think, --matmul fp32|bf16|fp8, --offload, --gpu-memory GiB
     """;
 
@@ -70,6 +71,15 @@ try
         switch (args[i])
         {
             case "--cuda" or "--gpu": device = Device.Cuda(); break;
+            case "--device":
+                device = Next() switch
+                {
+                    "cpu" => Device.Cpu,
+                    "cuda" or "gpu" => Device.Cuda(),
+                    ['c', 'u', 'd', 'a', ':', .. var ordinal] => Device.Cuda(int.Parse(ordinal, CultureInfo.InvariantCulture)),
+                    var other => throw new ArgumentException($"--device {other}: use cpu, cuda or cuda:N."),
+                };
+                break;
             case "--cpu": device = Device.Cpu; break;
             case "--int8": int8 = true; break;
             case "--bf16": bf16 = true; break;

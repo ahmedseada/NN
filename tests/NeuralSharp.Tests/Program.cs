@@ -1,4 +1,5 @@
-// Self-contained test runner (no test framework dependency).
+// Self-contained test runner (no test framework dependency). Runs on the CPU and every CUDA GPU;
+//   NS_DEVICES=cpu,cuda:0,cuda:2 …   only these devices
 //   dotnet run --project tests/NeuralSharp.Tests                  run every test on every available device
 //   dotnet run --project tests/NeuralSharp.Tests -- --dump-ptx f  write the generated CUDA kernels to f
 //   … -- --bench-gemm / --bench-gemv / --bench-fp8                               time large products / decoding-sized packed products
@@ -37,10 +38,21 @@ if (args is ["--dump-ptx", var ptxPath])
     return 0;
 }
 
+// Every device: the CPU and each CUDA GPU (NS_DEVICES=cpu,cuda:1 … to choose), since the library runs on any of them.
 var devices = new List<Device> { Device.Cpu };
 if (Device.IsCudaAvailable)
 {
-    devices.Add(Device.Cuda());
+    for (int i = 0; i < Device.CudaDeviceCount; i++)
+    {
+        devices.Add(Device.Cuda(i));
+    }
+
+    if (Environment.GetEnvironmentVariable("NS_DEVICES") is { Length: > 0 } chosen)
+    {
+        var names = chosen.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        devices = [.. devices.Where(d => names.Contains(d.ToString(), StringComparer.OrdinalIgnoreCase)
+                                         || d.Type == DeviceType.Cuda && d.Ordinal == 0 && names.Contains("cuda", StringComparer.OrdinalIgnoreCase))];
+    }
 }
 else
 {

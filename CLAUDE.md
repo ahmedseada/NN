@@ -14,3 +14,7 @@
 - **Fine-tuning is model-agnostic.** The tuner, the tools and the applications work with any model the library loads,
   through its own tokenizer and chat template; a model used for testing (Qwen today) is only an example. Nothing outside
   the library's architecture support may depend on a particular model family.
+- **Any CUDA GPU.** The library runs on every CUDA GPU the driver supports, not one card: core kernels target sm_50,
+  faster ones load by compute capability (bfloat16 tensor cores, flash attention, packing: 8.0+; FP8: 8.9+) with a
+  fallback everywhere, and sizes (split-k, grids) come from the device's own counts. Memory adapts to the card (the
+  out-of-memory ladder, 4-bit / bfloat16 bases). The tests run on every GPU present (NS_DEVICES to choose).
