@@ -156,8 +156,36 @@ public sealed record ChatTranscript(IReadOnlyList<ChatMessage> Messages, IReadOn
 /// </summary>
 public sealed record TrainingSequence(int[] Tokens, bool[] Trained)
 {
+    private (bool[]? Of, int Count) _trained;
+
     /// <summary>Tokens the loss is computed on (a token is predicted from the ones before it, so the first never is).</summary>
-    public int TrainedTokens => Trained.Skip(1).Count(t => t);
+    public int TrainedTokens
+    {
+        get
+        {
+            // Counted once per Trained array (batching asks for it many times per step).
+            var cached = _trained;
+            if (!ReferenceEquals(cached.Of, Trained))
+            {
+                int count = 0;
+                for (int i = 1; i < Trained.Length; i++)
+                {
+                    count += Trained[i] ? 1 : 0;
+                }
+
+                _trained = cached = (Trained, count);
+            }
+
+            return cached.Count;
+        }
+    }
+
+    /// <summary>Equal when both hold the same token and trained arrays (the cached count is not compared).</summary>
+    public bool Equals(TrainingSequence? other) =>
+        other is not null && ReferenceEquals(Tokens, other.Tokens) && ReferenceEquals(Trained, other.Trained);
+
+    /// <inheritdoc />
+    public override int GetHashCode() => HashCode.Combine(Tokens, Trained);
 }
 
 /// <summary>
@@ -767,13 +795,14 @@ public static class FineTuner
     // Clipping and the optimizer's update, after the gradients of a step.
     private static void Update(PretrainedModel model, AdamW optimizer, FineTuningOptions options)
     {
+        // Clipping on the device (no read of the norm) and no wait for the update: the next step's first read of the
+        // device orders everything, so the host prepares the next batch while the device finishes this step.
         if (options.MaxGradientNorm > 0f)
         {
-            optimizer.ClipGradientNorm(options.MaxGradientNorm);
+            optimizer.ClipGradientNormOnDevice(options.MaxGradientNorm);
         }
 
         optimizer.Step();
-        model.Device.Synchronize();
     }
 
     // One optimizer step over a group of batches (gradient accumulation): forward, backward, clipping, update. Returns
@@ -797,13 +826,11 @@ public static class FineTuner
             using var packing = batch.Packed ? PackedSequences.Create([.. batch.Rows.Select(r => r.Select(i => train[i].Tokens.Length - 1).ToArray())], batch.Length, model.Device) : null;
             using var packed = packing?.Use();                                // forward and backward (checkpointed blocks run again)
             var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing == true);
-            float batchLoss = lossTensor.Item();                             // waits for the forward pass
-            double forward = batchWatch.Elapsed.TotalSeconds;
-            lossTensor.Backward();
-            model.Device.Synchronize();
+            lossTensor.Backward();                                           // queued behind the forward pass, no wait between
+            float batchLoss = lossTensor.Item();                             // waits for the batch's forward and backward
             loss += batchLoss;
             tokens += count;
-            trace?.Invoke($"  forward {forward:F2} s, backward {batchWatch.Elapsed.TotalSeconds - forward:F2} s, loss {batchLoss * normalizer / Math.Max(1, batch.Sequences.Sum(i => train[i].TrainedTokens)):F4}");
+            trace?.Invoke($"  forward and backward {batchWatch.Elapsed.TotalSeconds:F2} s, loss {batchLoss * normalizer / Math.Max(1, batch.Sequences.Sum(i => train[i].TrainedTokens)):F4}");
         }
 
         Update(model, optimizer, options);

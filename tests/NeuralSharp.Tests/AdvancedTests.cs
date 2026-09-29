@@ -558,6 +558,21 @@ internal static partial class Tests
         double norm = clipper.ClipGradientNorm(1f);
         AssertClose([10f], [(float)norm], 1e-5f, "norm before clipping");
         AssertClose([0.6f, 0.8f], q.Grad!.ToArray(), 1e-5f, "clipped gradient");
+
+        // The same on the device (no host read of the norm), across several tensors; unchanged within the limit.
+        using var r1 = Tensor.From([3f, 0f], device, requiresGrad: true);
+        using var r2 = Tensor.From([4f], device, requiresGrad: true);
+        using var onDevice = new Sgd([r1, r2], 0f);
+        ((r1 * r1).Sum() + (r2 * r2).Sum()).Backward();   // gradients (6, 0) and (8): norm 10
+        onDevice.ClipGradientNormOnDevice(1f);
+        AssertClose([0.6f, 0f], r1.Grad!.ToArray(), 1e-5f, "clipped on the device (first tensor)");
+        AssertClose([0.8f], r2.Grad!.ToArray(), 1e-5f, "clipped on the device (second tensor)");
+        onDevice.ClipGradientNormOnDevice(5f);
+        AssertClose([0.6f, 0f], r1.Grad!.ToArray(), 1e-5f, "within the limit: unchanged");
+        r1.ZeroGrad();
+        r2.ZeroGrad();
+        onDevice.ClipGradientNormOnDevice(1f);
+        AssertClose([0f], r2.Grad!.ToArray(), 0f, "zero gradients stay zero");
     }
 
     private static void NumberTypes(Device device)

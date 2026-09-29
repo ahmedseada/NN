@@ -215,6 +215,12 @@ internal sealed partial class CpuBackend : Backend
     public override void AdamStep(Storage p, Storage g, Storage m, Storage v, int n, float lr, float beta1, float beta2, float eps) =>
         Run(new AdamKernel(D(p), D(g), D(m), D(v), lr, beta1, beta2, eps), n);
 
+    public override void ClipFactor(Storage sumSquares, Storage factor, float maxNorm)
+    {
+        float sum = D(sumSquares)[0];
+        D(factor)[0] = sum > 0f ? MathF.Min(1f, maxNorm / MathF.Sqrt(sum)) : 1f;
+    }
+
     public override void SumSquares(Storage x, Storage total, int n)
     {
         var values = D(x).AsSpan(0, n);

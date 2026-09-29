@@ -80,6 +80,33 @@ public abstract class Optimizer : IDisposable
     }
 
     /// <summary>
+    /// <see cref="ClipGradientNorm"/> without reading the norm on the host: the norm and the clipping factor are computed
+    /// on the device and the gradients scaled there (by 1 when the norm is within <paramref name="maxNorm"/>), so a training
+    /// step need not wait for the device. Returns nothing: reading the norm would be that wait.
+    /// </summary>
+    public void ClipGradientNormOnDevice(float maxNorm)
+    {
+        var withGrad = Parameters.Where(p => p.Grad is not null).ToList();
+        if (withGrad.Count == 0)
+        {
+            return;
+        }
+
+        var backend = withGrad[0].Backend;
+        using var factor = Tensor.PersistentZeros([1], withGrad[0].Device);
+        foreach (var p in withGrad)
+        {
+            backend.SumSquares(p.Grad!.Storage, factor.Storage, p.Size);
+        }
+
+        backend.ClipFactor(factor.Storage, factor.Storage, maxNorm);
+        foreach (var p in withGrad)
+        {
+            backend.GroupScaleShift(p.Grad!.Storage, factor.Storage, null, p.Grad.Storage, p.Size, 1, p.Size, false);
+        }
+    }
+
+    /// <summary>
     /// True when <see cref="Step"/> multiplies the gradients by <see cref="GradientScale"/> as it reads them (so
     /// <see cref="ClipGradientNorm"/> needs no separate pass over them); the step then resets it to 1.
     /// </summary>

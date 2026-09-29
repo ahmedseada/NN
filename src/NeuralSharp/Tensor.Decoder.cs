@@ -275,10 +275,9 @@ public sealed partial class Tensor
         for (int j = 0; j < layers.Count; j++)
         {
             var adapter = layers[j].Adapter!;
-            us[j] = Empty([m, rank], input.Device, zeroed: true);                        // scale · x·A (kept for dB)
-            using var t = Empty([m, rank], input.Device, track: false);
-            backend.BatchedMatMul(flat.Storage, adapter.A.Storage, t.Storage, 1, m, rank, k, false, false, 0f);
-            backend.Axpy(t.Storage, us[j].Storage, m * rank, adapter.Scale);
+            us[j] = Empty([m, rank], input.Device);                                      // scale · x·A (kept for dB)
+            backend.BatchedMatMul(flat.Storage, adapter.A.Storage, us[j].Storage, 1, m, rank, k, false, false, 0f);
+            backend.Affine(us[j].Storage, us[j].Storage, m * rank, adapter.Scale, 0f);
             outputs[j] = Empty([m, layers[j].OutFeatures], input.Device);
         }
 
@@ -338,10 +337,9 @@ public sealed partial class Tensor
                         backend.BatchedMatMul(u.Storage, g.Storage, b.GradStorage(), 1, rank, n, m, true, false, 1f);         // dB += uᵀ·g
                     }
 
-                    using var du = Empty([m, rank], flat.Device, track: false);
-                    using var dt = Empty([m, rank], flat.Device, zeroed: true, track: false);
-                    backend.BatchedMatMul(g.Storage, b.Storage, du.Storage, 1, m, rank, n, false, true, 0f);                 // du = g·Bᵀ
-                    backend.Axpy(du.Storage, dt.Storage, m * rank, scale);                                                  // dt = scale · du
+                    using var dt = Empty([m, rank], flat.Device, track: false);
+                    backend.BatchedMatMul(g.Storage, b.Storage, dt.Storage, 1, m, rank, n, false, true, 0f);                 // g·Bᵀ
+                    backend.Affine(dt.Storage, dt.Storage, m * rank, scale, 0f);                                            // dt = scale · g·Bᵀ
                     if (a.RequiresGrad)
                     {
                         backend.BatchedMatMul(flat.Storage, dt.Storage, a.GradStorage(), 1, k, rank, m, true, false, 1f);   // dA += xᵀ·dt
@@ -437,13 +435,11 @@ public sealed partial class Tensor
 
         if (WillRecord(input))
         {
+            int outputs = weight._shape[0], inputs = weight._shape[1];
             output.Record("matmul_frozen", g =>
             {
-                using (Autograd.NoGrad())
-                {
-                    using var gradient = g.MatMul(weight);
-                    input.Backend.Axpy(gradient.Storage, input.GradStorage(), input.Size, 1f);
-                }
+                // dx += g · W, accumulated by the product itself (no temporary).
+                input.Backend.BatchedMatMul(g.Storage, weight.Storage, input.GradStorage(), 1, g.Size / outputs, inputs, outputs, false, false, 1f);
             }, input);
         }
 
@@ -506,7 +502,15 @@ public sealed partial class Tensor
         var device = hidden.Device;
         var backend = hidden.Backend;
         bool record = WillRecord(hidden);
-        var gradient = record ? Empty([total, dim], device, zeroed: true) : null;
+        // The gradient of the listed rows only ([count, dim], not [total, dim]): scattered into the hidden gradient in the
+        // backward pass, with the positions they came from.
+        var gradient = record ? Empty([count, dim], device, zeroed: true) : null;
+        var gradientRows = record ? Empty([count], device) : null;
+        if (gradientRows is not null)
+        {
+            backend.Copy2D(rows.Storage, 0, count, gradientRows.Storage, 0, count, 1, count, accumulate: false);
+        }
+
         var losses = Empty([count], device, zeroed: true);
         for (int r0 = 0; r0 < count; r0 += chunkRows)
         {
@@ -534,7 +538,7 @@ public sealed partial class Tensor
             if (record && logits.RequiresGrad)
             {
                 logits.Backward(logits);                                         // the logits now hold their gradient
-                backend.ScatterAdd(chunk.GradStorage(), index.Storage, gradient!.Storage, n, dim, total);
+                backend.Copy2D(chunk.GradStorage(), 0, dim, gradient!.Storage, r0 * dim, dim, n, dim, accumulate: false);
             }
         }
 
@@ -542,8 +546,12 @@ public sealed partial class Tensor
         backend.Sum(losses.Storage, loss.Storage, count, 1f / normalizer);
         if (record)
         {
-            // dhidden += gradient · g, with g read on the device (no host read: recordable as a graph).
-            loss.Record("token_cross_entropy", g => backend.GroupScaleShift(gradient!.Storage, g.Storage, null, hidden.GradStorage(), total * dim, 1, total * dim, true), hidden);
+            // dhidden[rows] += gradient · g, with g read on the device (no host read: recordable as a graph).
+            loss.Record("token_cross_entropy", g =>
+            {
+                backend.GroupScaleShift(gradient!.Storage, g.Storage, null, gradient.Storage, count * dim, 1, count * dim, false);
+                backend.ScatterAdd(gradient.Storage, gradientRows!.Storage, hidden.GradStorage(), count, dim, total);
+            }, hidden);
         }
 
         return Traced("token_cross_entropy", loss, start);

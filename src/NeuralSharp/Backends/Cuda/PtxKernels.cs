@@ -26,7 +26,7 @@ internal static partial class PtxKernels
         "sigmoid_f32", "tanh_f32", "relu_f32", "square_f32", "abs_f32",
         "sigmoid_bwd_f32", "tanh_bwd_f32", "relu_bwd_f32", "square_bwd_f32", "abs_bwd_f32", "dropout_f32", "add_dropout_f32",
         "add_rowvec_f32", "add_scalar_f32", "sum_rows_f32", "sum_f32",
-        "sgd_momentum_f32", "adam_f32", "matmul_f32",
+        "sgd_momentum_f32", "adam_f32", "matmul_f32", "clip_factor_f32",
     ];
 
     // Built on first use (not in a static initializer): the kernels read static fields declared in the other
@@ -58,6 +58,20 @@ internal static partial class PtxKernels
             ld.global.f32 %f1, [%a_x];
             fma.rn.f32 %f2, %f1, %s_alpha, %s_beta;
             st.global.f32 [%a_y], %f2;
+            """);
+
+        // y = min(1, maxNorm / √x) for one value (1 when x ≤ 0): the gradient-clipping factor.
+        Elementwise(sb, "clip_factor_f32", ["x", "y"], [("f32", "maxnorm")],
+            $"""
+            ld.global.f32 %f1, [%a_x];
+            mov.f32 %f4, {One};
+            setp.le.f32 %p1, %f1, {Zero};
+            @%p1 bra CLIP_STORE;
+            sqrt.rn.f32 %f2, %f1;
+            div.rn.f32 %f3, %s_maxnorm, %f2;
+            min.f32 %f4, %f3, %f4;
+            CLIP_STORE:
+            st.global.f32 [%a_y], %f4;
             """);
 
         Elementwise(sb, "axpy_f32", ["x", "y"], [("f32", "alpha")],

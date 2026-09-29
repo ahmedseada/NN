@@ -373,6 +373,12 @@ internal abstract class Backend
     /// <summary>total[0] += Σ x² over <paramref name="n"/> elements (a gradient norm without temporary tensors).</summary>
     public abstract void SumSquares(Storage x, Storage total, int n);
 
+    /// <summary>
+    /// factor[0] = min(1, maxNorm / √sumSquares[0]) (1 when the sum is 0): the gradient-clipping factor computed where the
+    /// gradients are, so clipping needs no host read of the norm.
+    /// </summary>
+    public abstract void ClipFactor(Storage sumSquares, Storage factor, float maxNorm);
+
     /// <summary>Inverted dropout: y = keep(i) ? x / (1 - p) : 0, where keep(i) comes from <see cref="DropoutMask"/>.</summary>
     public abstract void Dropout(Storage x, Storage y, int n, float p, uint seed);
 
