@@ -16,8 +16,46 @@ internal static partial class Tests
         ("datasets: select, filter, shuffle, deduplicate, split and mix are lazy, streamed and reproducible", DatasetOperations),
         ("datasets: downloads are cached, resumed, retried, and explain missing access", DatasetDownloads),
         ("datasets: rows of common layouts (messages, ShareGPT, Alpaca, question/answer, TRL, templates) become conversations or text; specs and recipes", DatasetChatAndRecipes),
+        ("datasets: recipes hold out prompts (a question and all its answers, however spaced or cased, on one side) and count repeats dropped", RecipeHeldOutPrompts),
         ("datasets: Hugging Face (splits, pages, tokens, Parquet fallback), GitHub (repositories, files, releases), Kaggle and Zenodo against a fake server", DatasetSources),
     ];
+
+    private static void RecipeHeldOutPrompts(Device device)
+    {
+        _ = device;
+        string folder = Path.Combine(Path.GetTempPath(), $"ns-recipe-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(folder);
+        try
+        {
+            // 300 questions, each asked three ways (cased, spaced, repeated exactly) with answers that sometimes disagree.
+            string file = Path.Combine(folder, "data.csv");
+            var lines = new List<string> { "question,answer" };
+            for (int i = 0; i < 300; i++)
+            {
+                lines.Add($"what is item {i},a{i % 3}");
+                lines.Add($"What is  Item {i},a{(i + 1) % 3}");
+                lines.Add($"what is item {i},a{i % 3}");
+            }
+
+            File.WriteAllLines(file, lines);
+            var recipe = new DatasetRecipe
+            {
+                Sources = [DatasetSpec.Parse(file + "?user={question}&assistant={answer}")], EvaluationFraction = 0.2, Seed = 3, Shuffle = false,
+            };
+            var counts = new RecipeCounts();
+            var (train, evaluation) = recipe.Build(null, counts);
+            string Question(JsonObject row) => string.Join(' ', ((string)row["messages"]![0]!["content"]!).Split(' ', StringSplitOptions.RemoveEmptyEntries)).ToLowerInvariant();
+            var trainQuestions = train.Select(Question).ToHashSet();
+            Check(counts.Rows == 900 && counts.Duplicates == 300 && counts.Kept == 600, $"counts: {counts.Rows} rows, {counts.Duplicates} repeats, {counts.Kept} kept");
+            var heldOut = evaluation!.Select(Question).ToList();
+            Check(heldOut.Count is > 60 and < 180, $"about a fifth held out: {heldOut.Count} of 600");
+            Check(heldOut.All(q => !trainQuestions.Contains(q)), "no held-out question is also trained on (in any casing or spacing, with any answer)");
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
+    }
 
     private static void DatasetChatAndRecipes(Device device)
     {

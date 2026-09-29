@@ -388,6 +388,18 @@ public sealed class ChatTranscriptEncoder
     }
 
     /// <summary>
+    /// <see cref="EncodeRow"/> for many rows on all cores (rendering the chat template and tokenizing is most of the time
+    /// data preparation takes), each row with its sequences, in the rows' order. The rows are read on the calling thread.
+    /// </summary>
+    public IEnumerable<(JsonObject Row, IReadOnlyList<TrainingSequence> Sequences)> EncodeRows(IEnumerable<JsonObject> rows, int maxLength,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        return rows.AsParallel().AsOrdered().WithCancellation(cancellationToken)
+            .Select(row => (row, (IReadOnlyList<TrainingSequence>)[.. EncodeRow(row, maxLength)]));
+    }
+
+    /// <summary>
     /// A dataset row as training sequences: a conversation (<c>{"messages": [...], "tools": [...]}</c>, see
     /// <see cref="ChatTranscript.FromJson"/>) trains the assistant's turns; a text row (<c>{"text": ...}</c>) trains every
     /// token. Other rows give nothing.
@@ -490,9 +502,12 @@ public sealed record FineTuningOptions
 
     /// <summary>
     /// Recompute each decoder block's activations in the backward pass instead of storing them (about 20× less
-    /// activation memory for about a third more compute): needed for long sequences or large batches.
+    /// activation memory for about a third more compute): needed for long sequences, large batches or large models on
+    /// small devices. Null (the default): off while the activations fit, turned on for the rest of training the first time
+    /// a step runs out of device memory (that step is run again); on when <see cref="ComputeResources.OffloadToHostMemory"/>
+    /// is set (a full device then spills to system memory instead of failing, which is slower than recomputing).
     /// </summary>
-    public bool Checkpointing { get; init; } = true;
+    public bool? Checkpointing { get; init; }
 
     /// <summary>Seed for the adapters' initial values and the batch order.</summary>
     public int Seed { get; init; }
@@ -645,16 +660,42 @@ public static class FineTuner
     private sealed class StepRunner(PretrainedModel model, IReadOnlyList<TrainingSequence> train, AdamW optimizer, FineTuningOptions options,
         int lossRows, Action<string>? trace) : IDisposable
     {
-        private TrainingGraph? _graph;
-        private bool _graphs = options.CudaGraphs && options.GradientAccumulation <= 1 && model.Device.Type == DeviceType.Cuda
+        private readonly bool _graphsAllowed = options.CudaGraphs && options.GradientAccumulation <= 1 && model.Device.Type == DeviceType.Cuda
             && model.Device.Backend.SupportsGraphs
             && !model.Network.Descendants().Any(m => m is Dropout { Probability: > 0f });   // a recorded pass would reuse its masks
+        private readonly bool _automatic = options.Checkpointing is null && !ComputeResources.OffloadToHostMemory;
+        private FineTuningOptions _options = options with { Checkpointing = options.Checkpointing ?? ComputeResources.OffloadToHostMemory };
+        private TrainingGraph? _graph;
+        private bool? _graphs;
         private int _ordinary;
+
+        /// <summary>Whether steps run with activation checkpointing (it can turn on during training, see <see cref="FineTuningOptions.Checkpointing"/>).</summary>
+        public bool Checkpointing => _options.Checkpointing == true;
 
         public (float Loss, long Tokens) Run(IReadOnlyList<Batch> group, CancellationToken cancellationToken, Func<int, string> label, bool graphs = true)
         {
+            try
+            {
+                return RunOnce(group, cancellationToken, label, graphs);
+            }
+            catch (ResourceLimitExceededException ex) when (_automatic && !Checkpointing)
+            {
+                // The activations did not fit: checkpointing from here on, the graph (recorded without it) recorded again.
+                _options = _options with { Checkpointing = true };
+                _graph?.Dispose();
+                (_graph, _graphs, _ordinary) = (null, null, 0);
+                trace?.Invoke($"out of device memory without activation checkpointing ({ex.Message.Split(':')[0]}): checkpointing is on from this step "
+                              + "(set Checkpointing / --checkpointing to start with it)");
+                return RunOnce(group, cancellationToken, label, graphs);
+            }
+        }
+
+        private (float Loss, long Tokens) RunOnce(IReadOnlyList<Batch> group, CancellationToken cancellationToken, Func<int, string> label, bool graphs)
+        {
+            var options = _options;
+            _graphs ??= _graphsAllowed;
             var batch = group[0];
-            if (graphs && _graphs && group.Count == 1 && batch.Packed)
+            if (graphs && _graphs == true && group.Count == 1 && batch.Packed)
             {
                 if (_graph is null && _ordinary >= 2)
                 {
@@ -755,7 +796,7 @@ public static class FineTuner
             trace?.Invoke($"{label(b)}: {batch.Describe(train)}…");
             using var packing = batch.Packed ? PackedSequences.Create([.. batch.Rows.Select(r => r.Select(i => train[i].Tokens.Length - 1).ToArray())], batch.Length, model.Device) : null;
             using var packed = packing?.Use();                                // forward and backward (checkpointed blocks run again)
-            var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing);
+            var (lossTensor, count) = BatchLoss(model, train, batch, normalizer, options.LossChunkRows, options.Checkpointing == true);
             float batchLoss = lossTensor.Item();                             // waits for the forward pass
             double forward = batchWatch.Elapsed.TotalSeconds;
             lossTensor.Backward();
@@ -1141,7 +1182,7 @@ public static class FineTuner
                 using (graph._packing.Use())
                 {
                     var loss = NetworkLoss(model, graph._tokens, (hidden, head) => Tensor.TokenCrossEntropyRows(hidden, h => head.Forward(h),
-                        graph._rows, graph._targets, graph._weights, 1f, options.LossChunkRows), options.Checkpointing);
+                        graph._rows, graph._targets, graph._weights, 1f, options.LossChunkRows), options.Checkpointing == true);
                     loss.Backward();
                     backend.Copy(loss.Storage, graph._loss.Storage, 1);
                 }

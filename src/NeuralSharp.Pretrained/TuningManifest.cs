@@ -57,14 +57,15 @@ public sealed record TuningManifest
         };
     }
 
-    /// <summary>Writes the manifest into <paramref name="folder"/> (created if needed).</summary>
+    /// <summary>Writes the manifest into <paramref name="folder"/> (created if needed); a local base model is written as a full path.</summary>
     public void Save(string folder)
     {
         Directory.CreateDirectory(folder);
         var json = new JsonObject
         {
             ["format"] = Format,
-            ["baseModel"] = BaseModel,
+            // A local folder or file as a full path, so the adapter loads from any working directory.
+            ["baseModel"] = Directory.Exists(BaseModel) || File.Exists(BaseModel) ? Path.GetFullPath(BaseModel) : BaseModel,
             ["maxLength"] = MaxLength,
         };
         if (System is not null)

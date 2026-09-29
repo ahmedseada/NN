@@ -243,7 +243,11 @@ public sealed record DatasetRecipe
     /// <summary>At most this many rows (0: all).</summary>
     public long MaxRows { get; init; }
 
-    /// <summary>Share of rows held out for evaluation (by content hash, see <see cref="Dataset.Split"/>).</summary>
+    /// <summary>
+    /// Share of rows held out for evaluation, by a hash of each row's prompt (see <see cref="Dataset.Split"/>): everything
+    /// but the assistant's turns, lower-cased with whitespace collapsed, or a text row's text. The same question with
+    /// different answers, or differently spaced or cased, lands on one side, so the evaluation holds only unseen prompts.
+    /// </summary>
     public double EvaluationFraction { get; init; }
 
     /// <summary>A recipe of the given sources with the defaults.</summary>
@@ -300,7 +304,13 @@ public sealed record DatasetRecipe
     /// The training rows and, with <see cref="EvaluationFraction"/> &gt; 0, the evaluation rows: conversations
     /// ({"messages", "tools"}) and / or texts ({"text"}), as <see cref="ChatRows"/> normalizes them.
     /// </summary>
-    public (Dataset Train, Dataset? Evaluation) Build(Downloader? downloader = null)
+    public (Dataset Train, Dataset? Evaluation) Build(Downloader? downloader = null) => Build(downloader, null);
+
+    /// <summary>
+    /// <see cref="Build(Downloader?)"/>, with <paramref name="counts"/> filled as the rows are read: how many the
+    /// sources gave, and how many the length limits and the deduplication dropped (for the last pass over the rows).
+    /// </summary>
+    public (Dataset Train, Dataset? Evaluation) Build(Downloader? downloader, RecipeCounts? counts)
     {
         if (Sources.Count == 0)
         {
@@ -310,18 +320,39 @@ public sealed record DatasetRecipe
         var parts = Sources.Select(s => (Data: ChatRows.Normalize(s.Open(downloader), Kind, s.Mapping, System), s.Weight)).ToList();
         bool mix = MixByWeight ?? Sources.Any(s => s.Options.ContainsKey("weight"));
         var data = parts.Count == 1 ? parts[0].Data : mix ? Dataset.Mix(parts, Seed, Stop) : Dataset.Concat([.. parts.Select(p => p.Data)]);
+        if (counts is not null)
+        {
+            var sources = data;
+            data = new Dataset(() => Count(sources, counts), sources.Name);
+        }
+
         if (MinCharacters > 0 || MaxCharacters > 0)
         {
             data = data.Where(row =>
             {
                 long length = Length(row);
-                return length >= MinCharacters && (MaxCharacters <= 0 || length <= MaxCharacters);
+                bool kept = length >= MinCharacters && (MaxCharacters <= 0 || length <= MaxCharacters);
+                if (!kept && counts is not null)
+                {
+                    counts.OutsideLengths++;
+                }
+
+                return kept;
             });
         }
 
         if (Deduplicate)
         {
             data = data.Deduplicate();
+            if (counts is not null)
+            {
+                var distinct = data;
+                data = distinct.Select(row =>
+                {
+                    counts.Kept++;
+                    return row;
+                });
+            }
         }
 
         if (Shuffle)
@@ -334,11 +365,49 @@ public sealed record DatasetRecipe
             return (MaxRows > 0 ? data.Take(MaxRows) : data, null);
         }
 
-        var (train, evaluation) = data.Split(EvaluationFraction, Seed);
+        var (train, evaluation) = data.Split(EvaluationFraction, Seed, Prompt);
         return (MaxRows > 0 ? train.Take(MaxRows) : train, evaluation);
+    }
+
+    // Each pass over the rows starts the counts again.
+    private static IEnumerable<JsonObject> Count(Dataset rows, RecipeCounts counts)
+    {
+        counts.Reset();
+        foreach (var row in rows)
+        {
+            counts.Rows++;
+            yield return row;
+        }
+    }
+
+    // What a row asks: every message but the assistant's (or the text), lower-cased, whitespace collapsed.
+    private static string Prompt(JsonObject row)
+    {
+        string text = row["messages"] is JsonArray messages
+            ? string.Join("\u0001", messages.Where(m => (string?)m?["role"] != "assistant").Select(m => $"{m?["role"]}:{m?["content"]}"))
+            : ((string?)row["text"]) ?? row.ToJsonString();
+        return string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).ToLowerInvariant();
     }
 
     private static long Length(JsonObject row) => row["messages"] is JsonArray messages
         ? messages.Sum(m => (long)(((string?)m?["content"])?.Length ?? 0))
         : ((string?)row["text"])?.Length ?? 0;
+}
+
+/// <summary>What one pass over a <see cref="DatasetRecipe"/>'s rows read and dropped (see <see cref="DatasetRecipe.Build(Downloader?, RecipeCounts?)"/>).</summary>
+public sealed class RecipeCounts
+{
+    /// <summary>Rows the sources gave (conversations and texts).</summary>
+    public long Rows { get; internal set; }
+
+    /// <summary>Rows dropped by the length limits.</summary>
+    public long OutsideLengths { get; internal set; }
+
+    /// <summary>Rows kept by the deduplication (when on).</summary>
+    public long Kept { get; internal set; }
+
+    /// <summary>Rows dropped as repeats of earlier ones (when deduplicating).</summary>
+    public long Duplicates => Kept == 0 ? 0 : Rows - OutsideLengths - Kept;
+
+    internal void Reset() => (Rows, OutsideLengths, Kept) = (0, 0, 0);
 }

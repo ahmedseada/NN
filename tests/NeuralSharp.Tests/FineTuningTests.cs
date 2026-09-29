@@ -15,9 +15,11 @@ internal static partial class Tests
         ("generation: prompts of different lengths decoded together (left-padded, per-row starts) give each row its own logits and greedy replies", RaggedBatchDecoding),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
+        ("fine-tuning: checkpointing is off by default and turns on (the step run again) when a step runs out of memory", AutomaticCheckpointing),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
         ("fine-tuning: agent transcripts through the chat template, assistant-only tokens, LoRA and QLoRA training, PEFT adapters, merged export", AgentFineTuning),
-        ("fine-tuning: a conversation too long for the maximum length keeps its whole answer (the user message is shortened, its start kept)", LongMessageKeepsAnswer),
+        ("fine-tuning: a conversation too long for the maximum length keeps its whole answer (the user message is shortened, its start kept); rows encode on all cores in order", LongMessageKeepsAnswer),
+        ("fine-tuning: an adapter folder's manifest round-trips, names a local base model by its full path, and loads the model with the adapter merged", ManifestRoundTrip),
     ];
 
     private static void HostOffload(Device device)
@@ -104,6 +106,74 @@ internal static partial class Tests
         AssertClose([plain.Loss], [checkpointed.Loss], 1e-4f, "loss");
         AssertClose(plain.Input, checkpointed.Input, 1e-4f, "input gradient");
         AssertClose(plain.Adapters, checkpointed.Adapters, 1e-4f, "adapter gradients");
+    }
+
+    private static void AutomaticCheckpointing(Device device)
+    {
+        if (device.Type != DeviceType.Cpu)
+        {
+            return;                                                              // the CPU memory limit makes a small full device
+        }
+
+        var spec = new DecoderSpec
+        {
+            Vocabulary = 260, Dim = 128, Layers = 4, Heads = 4, KvHeads = 2, HeadDim = 32, FfDim = 512, MaxPositions = 512,
+            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, QkNorm = true, TieEmbeddings = true,
+        };
+        string folder = WriteChatModel(spec);
+        var random = new Random(71);
+        var sequences = Enumerable.Range(0, 16).Select(_ =>
+            new TrainingSequence([.. Enumerable.Range(0, 257).Select(_ => random.Next(256))], [.. Enumerable.Range(0, 257).Select(i => i > 128)])).ToList();
+        var options = new FineTuningOptions { Rank = 4, Alpha = 8, BatchTokens = 2048, Seed = 1, Packing = false };
+        (bool Done, string Trace, List<float> Losses) Train(bool? checkpointing, long? extra)
+        {
+            using var pretrained = PretrainedModel.Load(folder, new PretrainedOptions { Device = device });
+            var trace = new System.Text.StringBuilder();
+            var losses = new List<float>();
+            long before = ComputeResources.GetMemoryUsage(device).InUse;
+            ComputeResources.CpuMemoryLimit = extra is { } e ? before + e : null;
+            try
+            {
+                FineTuner.Train(pretrained, sequences, null, options with { Checkpointing = checkpointing },
+                    progress: new SynchronousProgress<FineTuningProgress>(p => losses.Add(p.Loss)), trace: line => trace.AppendLine(line));
+                return (true, trace.ToString(), losses);
+            }
+            catch (ResourceLimitExceededException)
+            {
+                return (false, trace.ToString(), losses);
+            }
+            finally
+            {
+                ComputeResources.CpuMemoryLimit = null;
+            }
+        }
+
+        try
+        {
+            // A memory budget that fits the training with checkpointing but not without.
+            long? budget = null;
+            foreach (long megabytes in new long[] { 4, 8, 12, 16, 24, 32, 48, 64, 96, 128 })
+            {
+                if (Train(true, megabytes << 20).Done)
+                {
+                    budget = Train(false, megabytes << 20).Done ? null : megabytes << 20;
+                    break;
+                }
+            }
+
+            Check(budget is not null, "a budget where only checkpointed training fits");
+            var automatic = Train(null, budget);
+            Check(automatic.Done && automatic.Trace.Contains("checkpointing is on"), $"automatic: finished {automatic.Done}, trace:\n{automatic.Trace}");
+            var checkpointed = Train(true, null);
+            Check(automatic.Losses.Count == checkpointed.Losses.Count, $"steps: {automatic.Losses.Count} and {checkpointed.Losses.Count}");
+            CloseByNorm([.. checkpointed.Losses], [.. automatic.Losses], 1e-4f, "the same losses as checkpointed training");
+            var roomy = Train(null, null);
+            Check(roomy.Done && !roomy.Trace.Contains("checkpointing is on"), "with room, training runs without checkpointing");
+        }
+        finally
+        {
+            Directory.Delete(folder, true);
+        }
     }
 
     // A tiny Qwen3-style model folder: byte-level tokenizer with ChatML tokens, Qwen3's chat template, random weights.
@@ -216,6 +286,66 @@ internal static partial class Tests
         return folder;
     }
 
+    private static void ManifestRoundTrip(Device device)
+    {
+        if (device.Type != DeviceType.Cpu)
+        {
+            return;
+        }
+
+        var spec = new DecoderSpec
+        {
+            Vocabulary = 260, Dim = 32, Layers = 1, Heads = 2, KvHeads = 1, HeadDim = 16, FfDim = 32, MaxPositions = 128,
+            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f, QkNorm = true, TieEmbeddings = true,
+        };
+        string folder = WriteChatModel(spec), adapter = Path.Combine(folder, "adapter");
+        string previous = Directory.GetCurrentDirectory();
+        try
+        {
+            using (var model = PretrainedModel.Load(folder, new PretrainedOptions { Device = device }))
+            {
+                model.AddAdapters(2, 4, ["q", "v"], seed: 5);
+                foreach (var a in model.Network.Descendants().OfType<Linear>().Select(l => l.Adapter).OfType<LoraAdapter>())
+                {
+                    a.B.Load([.. Enumerable.Range(0, a.B.Size).Select(i => 0.05f * MathF.Sin(i))]);
+                }
+
+                model.SaveAdapter(adapter);
+            }
+
+            // Named relative to the working directory, as a user types it.
+            Directory.SetCurrentDirectory(Path.GetDirectoryName(folder)!);
+            new TuningManifest { BaseModel = Path.GetFileName(folder), System = "Be brief.", MaxLength = 100 }.Save(adapter);
+            Directory.SetCurrentDirectory(previous);
+            var read = TuningManifest.Read(adapter)!;
+            Check(read.BaseModel == folder && read.System == "Be brief." && read.MaxLength == 100 && TuningManifest.Exists(adapter),
+                $"read back: {read.BaseModel}, {read.System}, {read.MaxLength}");
+            Check(TuningManifest.Read(folder) is null, "a folder without a manifest has none");
+            new TuningManifest { BaseModel = "owner/model" }.Save(adapter);
+            Check(TuningManifest.Read(adapter)!.BaseModel == "owner/model", "a model id is kept as written");
+
+            new TuningManifest { BaseModel = folder }.Save(adapter);
+            using var merged = TuningManifest.Read(adapter)!.LoadModel(adapter, device);
+            using var plain = PretrainedModel.Load(folder, new PretrainedOptions { Device = device, MergeAdapter = adapter });
+            plain.Network.Eval();
+            using var scope = new TensorScope();
+            var tokens = Tensor.From([1f, 2f, 3f, 4f], [1, 4], device);
+            float[] a1, a2;
+            using (Autograd.NoGrad())
+            {
+                a1 = merged.Network.Forward(tokens).ToArray();
+                a2 = plain.Network.Forward(tokens).ToArray();
+            }
+
+            Check(a1.SequenceEqual(a2), "LoadModel is the base model with the adapter merged");
+        }
+        finally
+        {
+            Directory.SetCurrentDirectory(previous);
+            Directory.Delete(folder, true);
+        }
+    }
+
     private static void LongMessageKeepsAnswer(Device device)
     {
         if (device.Type != DeviceType.Cpu)
@@ -250,6 +380,19 @@ internal static partial class Tests
                   && shortened.Messages[0] == transcript.Messages[0] && shortened.Messages[2] == transcript.Messages[2],
                 $"the message's start is kept ({kept.Length} of {message.Length} characters), the rest unchanged");
             Check(ReferenceEquals(encoder.Fit(transcript, 2000), transcript), "a transcript that fits is left as it is");
+
+            // Many rows on all cores: the same sequences, in the same order, as one by one.
+            var rows = Enumerable.Range(0, 400).Select(i => (JsonObject)JsonNode.Parse(i % 5 == 0
+                ? $"{{\"text\": \"plain text number {i} {new string('x', i % 37)}\"}}"
+                : $"{{\"messages\": [{{\"role\": \"user\", \"content\": \"question {i} {new string('y', i % 53)}\"}}, {{\"role\": \"assistant\", \"content\": \"answer {i}\"}}]}}")!).ToList();
+            var parallel = encoder.EncodeRows(rows, 120).ToList();
+            Check(parallel.Count == rows.Count && parallel.Select(p => p.Row).SequenceEqual(rows), "every row, in order");
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var one = encoder.EncodeRow(rows[i], 120).ToList();
+                Check(one.Count == parallel[i].Sequences.Count && one.Zip(parallel[i].Sequences).All(p => p.First.Tokens.SequenceEqual(p.Second.Tokens)
+                      && p.First.Trained.SequenceEqual(p.Second.Trained)), $"row {i}: the same sequences as encoded alone");
+            }
 
             var cutting = new ChatTranscriptEncoder(model.ChatTemplate!, tokenizer) { ShortenToFit = false };
             Check(cutting.Encode(transcript, 120) is null, "without shortening, cutting the end leaves no answer to train");

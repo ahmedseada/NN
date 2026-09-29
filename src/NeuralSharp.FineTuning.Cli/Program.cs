@@ -34,7 +34,8 @@ const string Usage = """
                fraction scores that part), --system S (added to conversations without one), --kind auto|chat|text,
                --max-rows N, --seed N, --min-chars N, --max-chars N, --no-dedup, --mix, --no-shuffle
     Training:  --rank 16, --alpha 32, --lr 2e-4, --epochs 1, --max-length 2048, --batch-tokens 4096, --accumulate 1,
-               --targets q,k,v,o,gate,up,down, --save-every N, --eval-every N, --no-checkpointing, --no-packing,
+               --targets q,k,v,o,gate,up,down, --save-every N, --eval-every N, --checkpointing | --no-checkpointing
+               (default: off, turned on if a step runs out of device memory), --no-packing,
                --no-graphs, --fp8 (the frozen base's forward products in FP8, checked against bfloat16 first),
                --adapter DIR (continue training an adapter), --profile (time a few steps instead of training)
     Evaluate:  --adapter DIR, --samples 100, --batch 8, --max-new 512, --metric auto|number|exact|contains|f1, --out F.jsonl
@@ -88,6 +89,7 @@ try
             case "--eval-every": tuning = tuning with { EvaluateEvery = NextInt() }; break;
             case "--targets": tuning = tuning with { Targets = Next().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) }; break;
             case "--no-checkpointing": tuning = tuning with { Checkpointing = false }; break;
+            case "--checkpointing": tuning = tuning with { Checkpointing = true }; break;
             case "--no-packing": tuning = tuning with { Packing = false }; break;
             case "--no-graphs": tuning = tuning with { CudaGraphs = false }; break;
             case "--fp8": tuning = tuning with { Float8 = true }; break;
@@ -233,8 +235,13 @@ int Train()
     var encoder = new ChatTranscriptEncoder(model.ChatTemplate ?? throw new InvalidOperationException("The model has no chat template."),
         model.Tokenizer ?? throw new InvalidOperationException("The model has no tokenizer."));
     var recipe = Recipe(positional.Skip(2).ToList(), forTraining: true);
-    var (trainRows, heldOut) = recipe.Build(downloads);
+    var counts = new RecipeCounts();
+    var (trainRows, heldOut) = recipe.Build(downloads, counts);
     var train = ReadSequences(encoder, trainRows, "training");
+    Console.WriteLine($"data: {counts.Rows:N0} rows"
+                      + (recipe.Deduplicate ? $", {counts.Duplicates:N0} repeats dropped (--no-dedup keeps them: repeats weigh what is common)" : "")
+                      + (counts.OutsideLengths > 0 ? $", {counts.OutsideLengths:N0} outside the length limits" : "")
+                      + (heldOut is not null ? $"; prompts held out for evaluation: {recipe.EvaluationFraction:P1}" : ""));
     if (train.Count == 0)
     {
         Console.Error.WriteLine("error: nothing to train on (no conversation with an assistant turn and no text).");
@@ -562,13 +569,13 @@ List<TrainingSequence> ReadSequences(ChatTranscriptEncoder encoder, Dataset rows
     var sequences = new List<TrainingSequence>();
     long read = 0, skipped = 0, chats = 0, texts = 0, tokens = 0;
     Console.WriteLine($"{what}: reading and tokenizing {rows.Name}");
-    foreach (var row in status.Track(rows, what, extra: () => $"  {tokens:N0} tokens"))
+    foreach (var (row, encoded) in encoder.EncodeRows(status.Track(rows, what, extra: () => $"  {Interlocked.Read(ref tokens):N0} tokens"), tuning.MaxLength))
     {
         read++;
         int before = sequences.Count;
-        foreach (var sequence in encoder.EncodeRow(row, tuning.MaxLength))
+        foreach (var sequence in encoded)
         {
-            tokens += sequence.Tokens.Length;
+            Interlocked.Add(ref tokens, sequence.Tokens.Length);
             sequences.Add(sequence);
         }
 
