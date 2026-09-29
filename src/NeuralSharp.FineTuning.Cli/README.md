@@ -16,6 +16,11 @@ dotnet run -c Release --project src/NeuralSharp.FineTuning.Cli -- export <adapte
   answer pairs are recognized); text rows train every token. Columns map into a conversation with templates:
   `"data.csv?user={question}&assistant={answer}"`, and `--system` adds an instruction to conversations without one.
   `--eval-fraction` holds out part of the data; `evaluate` with the same data and fraction scores that part.
+- **Fixed answers.** When every answer is one of a known list (labels, yes / no, multiple choice), `evaluate --choices
+  a,b,c` (or `--choices auto`: the distinct answers in the data) scores each as the model's answer after the prompt and
+  takes the most likely, generating nothing (the library's `AnswerScorer`: each prompt runs once for all its answers).
+  It prints accuracy and recall per answer, the base model and the adapter side by side; `--out F.jsonl` writes each
+  conversation's answer and every probability, for an application's own reports. `--samples 0` scores all rows.
 - **Long conversations.** A conversation longer than `--max-length` keeps its whole answer: the user message before it
   is shortened (its start kept) rather than the answer cut.
 - **Progress.** A bar with the steps done, still to do and in total, the epoch and loss, elapsed time and ETA; notable

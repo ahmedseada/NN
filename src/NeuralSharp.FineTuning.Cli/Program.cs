@@ -41,7 +41,9 @@ const string Usage = """
                as bfloat16 between the passes: half their memory; default: turned on second), --no-packing,
                --no-graphs, --fp8 (the frozen base's forward products in FP8, checked against bfloat16 first),
                --adapter DIR (continue training an adapter), --profile (time a few steps instead of training)
-    Evaluate:  --adapter DIR, --samples 100, --batch 8, --max-new 512, --metric auto|number|exact|contains|f1, --out F.jsonl
+    Evaluate:  --adapter DIR, --samples 100 (0: all), --batch 8, --max-new 512, --metric auto|number|exact|contains|f1, --out F.jsonl,
+               --choices a,b,c | auto (the answer is one of these: each is scored as the model's answer, the most likely one
+               taken, nothing generated; auto: the distinct answers in the data; accuracy and recall per answer)
     Chat:      --system S, --max-new N, --temperature T (0: greedy)
     Model:     --cuda | --cpu | --device cuda:N (default: the first GPU when there is one; any CUDA GPU works, the faster
                kernels load where the GPU has them), --int8 | --int4 | --bf16 (base weights), --context N,
@@ -54,7 +56,7 @@ bool shuffleRows = true, dedupRows = true, mixByWeight = false;
 int context = 4096, samples = 100, maxNew = 512, evaluationBatch = 8, seed = 0, minChars = 0, maxChars = 0;
 long maxRows = 0;
 double evalFraction = 0;
-string? output = null, evalFile = null, adapterFolder = null, systemPrompt = null;
+string? output = null, evalFile = null, adapterFolder = null, systemPrompt = null, choices = null;
 float? temperature = null;
 var metric = AnswerMetric.Auto;
 var rowKind = RowKind.Auto;
@@ -124,6 +126,7 @@ try
             case "--batch": evaluationBatch = NextInt(); break;
             case "--max-new": maxNew = NextInt(); break;
             case "--metric": metric = Enum.Parse<AnswerMetric>(Next(), ignoreCase: true); break;
+            case "--choices": choices = Next(); break;
             case "--temperature": temperature = NextFloat(); break;
             case "--eval-fraction": evalFraction = double.Parse(Next(), CultureInfo.InvariantCulture); break;
             case "--system": systemPrompt = Next(); break;
@@ -363,8 +366,13 @@ int Evaluate()
     // The rows: the held-out part when --eval-fraction splits the data as train did, else the data itself.
     var recipe = Recipe(positional.Skip(2).ToList(), forTraining: true) with { Kind = RowKind.Chat };
     var (allRows, heldOut) = recipe.Build(downloads);
-    var rows = status.Track(heldOut ?? allRows, "reading").Take(samples).ToList();
+    var rows = status.Track(heldOut ?? allRows, "reading").Take(samples > 0 ? samples : int.MaxValue).ToList();
     Console.WriteLine($"{rows.Count} conversations from {(heldOut is null ? "the data" : $"the {recipe.EvaluationFraction:P1} held out of the data")}");
+    if (choices is not null)
+    {
+        return EvaluateChoices(rows);
+    }
+
     var runs = adapterFolder is null ? new[] { (string?)null } : [null, adapterFolder];
     var reports = new List<(string Name, EvaluationReport Report)>();
     string? adapter = adapterFolder;
@@ -423,6 +431,88 @@ int Evaluate()
             foreach (var (name, r) in reports)
             {
                 line[name] = new JsonObject { ["answer"] = r.Answers[i].Answer, ["score"] = r.Answers[i].Score };
+            }
+
+            writer.WriteLine(line.ToJsonString(readable));
+        }
+
+        Console.WriteLine($"answers written to {output}");
+    }
+
+    return 0;
+}
+
+// --choices: every conversation's answer is one of a known list. Each is scored as the model's answer after the prompt
+// (AnswerScorer: the probability of its tokens), the most likely one is the prediction; accuracy and recall per answer.
+int EvaluateChoices(List<JsonObject> rows)
+{
+    var items = rows.Select(ChatTranscript.FromJson)
+        .Where(t => t.Messages.Count > 1 && t.Messages[^1].Role == "assistant")
+        .Select(t => (Prompt: (IReadOnlyList<ChatMessage>)[.. t.Messages.Take(t.Messages.Count - 1)], Reference: t.Messages[^1].Content.Trim()))
+        .ToList();
+    string[] answers = choices == "auto"
+        ? [.. items.Select(i => i.Reference).Where(r => r.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)]
+        : [.. choices!.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.Ordinal)];
+    if (answers.Length < 2)
+    {
+        Console.Error.WriteLine($"--choices needs at least two answers (got {answers.Length}).");
+        return 1;
+    }
+
+    int outside = items.Count(i => !answers.Contains(i.Reference, StringComparer.Ordinal));
+    Console.WriteLine($"{items.Count} answers to score among {answers.Length}: {string.Join(", ", answers)}"
+                      + (outside > 0 ? $" ({outside} references are none of them and count as wrong)" : ""));
+    var runs = adapterFolder is null ? new[] { (string?)null } : [null, adapterFolder];
+    var results = new List<(string Name, AnswerChoice[] Choices)>();
+    string? adapter = adapterFolder;
+    foreach (var run in runs)
+    {
+        adapterFolder = run;
+        string name = run is null ? "base model" : $"adapter {Path.GetFileName(Path.TrimEndingDirectorySeparator(run))}";
+        using var model = Load(merge: true);
+        var scorer = new AnswerScorer(model, Math.Min(tuning.MaxLength, model.MaxPositions - 1));
+        var clock = Stopwatch.StartNew();
+        var chosen = scorer.Choose([.. items.Select(i => i.Prompt)], answers,
+            done => status.Progress($"scoring ({name})", done, items.Count, clock.Elapsed, $"{done / Math.Max(1e-9, clock.Elapsed.TotalSeconds):F1} answers/s", "answers"));
+        status.Finish();
+        results.Add((name, chosen));
+        int right = items.Zip(chosen).Count(p => answers[p.Second.Best] == p.First.Reference);
+        Console.WriteLine($"\n{name}: accuracy {right / (double)Math.Max(1, items.Count):P1} ({right} of {items.Count}) in {clock.Elapsed.TotalSeconds:F1} s"
+                          + $" ({items.Count / Math.Max(1e-9, clock.Elapsed.TotalSeconds):F0} answers/s)");
+        Console.WriteLine($"  {"answer",-24}{"references",12}{"predicted",11}{"recall",9}");
+        foreach (string answer in answers)
+        {
+            int references = items.Count(i => i.Reference == answer);
+            int predicted = chosen.Count(c => answers[c.Best] == answer);
+            int hits = items.Zip(chosen).Count(p => p.First.Reference == answer && answers[p.Second.Best] == answer);
+            Console.WriteLine($"  {answer,-24}{references,12}{predicted,11}{(references > 0 ? hits / (double)references : double.NaN),9:P1}");
+        }
+    }
+
+    adapterFolder = adapter;
+    if (results.Count == 2)
+    {
+        int fixedCount = items.Select((item, i) => (item, i)).Count(p => answers[results[0].Choices[p.i].Best] != p.item.Reference && answers[results[1].Choices[p.i].Best] == p.item.Reference);
+        int broken = items.Select((item, i) => (item, i)).Count(p => answers[results[0].Choices[p.i].Best] == p.item.Reference && answers[results[1].Choices[p.i].Best] != p.item.Reference);
+        Console.WriteLine($"\nthe adapter answers {fixedCount} right that the base model got wrong, and {broken} the other way round");
+    }
+
+    if (output is not null)
+    {
+        // One line per conversation: the prompt's last message, the reference, and each run's answer with every probability.
+        using var writer = new StreamWriter(output);
+        for (int i = 0; i < items.Count; i++)
+        {
+            var line = new JsonObject { ["prompt"] = items[i].Prompt[^1].Content, ["reference"] = items[i].Reference };
+            foreach (var (name, chosen) in results)
+            {
+                var probabilities = new JsonObject();
+                for (int a = 0; a < answers.Length; a++)
+                {
+                    probabilities[answers[a]] = Math.Round(chosen[i].Probabilities[a], 6);
+                }
+
+                line[name] = new JsonObject { ["answer"] = answers[chosen[i].Best], ["probabilities"] = probabilities };
             }
 
             writer.WriteLine(line.ToJsonString(readable));
