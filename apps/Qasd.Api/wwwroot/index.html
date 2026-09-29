@@ -60,6 +60,12 @@
   .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; font-size: 13px; color: var(--muted); }
   .legend span::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 3px; background: var(--c); margin-right: 6px; }
   .results { display: flex; flex-direction: column; gap: 10px; }
+  table.timing { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  table.timing th { text-align: right; font-weight: 600; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  table.timing td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  table.timing th:first-child, table.timing td:first-child { text-align: left; color: var(--muted); white-space: normal; }
+  table.timing td.best { color: var(--text); font-weight: 600; }
+  table.timing tr:last-child td { border-bottom: none; }
   .result { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; background: var(--panel-2); }
   .result .top { display: flex; gap: 12px; align-items: center; }
   .result .text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; unicode-bidi: plaintext; }
@@ -145,6 +151,10 @@
       <div class="legend" id="legend"></div>
     </div>
     <div class="card">
+      <h2>Timing</h2>
+      <table class="timing" id="timing"><tbody><tr><td>Classify messages to see their timing.</td></tr></tbody></table>
+    </div>
+    <div class="card">
       <h2>Results</h2>
       <div class="results" id="results"><div class="empty">Write messages on the left and press Classify.</div></div>
     </div>
@@ -169,6 +179,30 @@ const $ = id => document.getElementById(id);
 let labels = [], minConfidence = 0.6;
 
 const color = label => `var(--c${Math.max(0, labels.indexOf(label)) % 8})`;
+// A duration in milliseconds in the unit that reads best: ns, µs, ms, s or min (three significant digits).
+function duration(ms) {
+  if (ms === null || ms === undefined || !isFinite(ms)) return { value: "–", unit: "" };
+  const sig = v => v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
+  if (ms >= 60000) {
+    const minutes = Math.floor(ms / 60000), seconds = (ms - minutes * 60000) / 1000;
+    return { value: `${minutes}:${seconds.toFixed(1).padStart(4, "0")}`, unit: "min" };
+  }
+  if (ms >= 1000) return { value: sig(ms / 1000), unit: "s" };
+  if (ms >= 1) return { value: sig(ms), unit: "ms" };
+  if (ms >= 0.001) return { value: sig(ms * 1000), unit: "µs" };
+  return { value: sig(ms * 1e6), unit: "ns" };
+}
+const durationHtml = ms => { const d = duration(ms); return `${d.value}<small>${d.unit}</small>`; };
+const durationText = ms => { const d = duration(ms); return `${d.value} ${d.unit}`; };
+const number = (v, digits) => v.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits });
+
+// Every timing of the last request: in the unit that reads best, in milliseconds and in microseconds.
+function timingTable(rows) {
+  const body = rows.filter(r => r.ms !== null && r.ms !== undefined && isFinite(r.ms)).map(r => `
+    <tr><td>${esc(r.name)}</td><td class="best">${durationText(r.ms)}</td><td>${number(r.ms, 3)}</td><td>${number(r.ms * 1000, 1)}</td></tr>`).join("");
+  $("timing").innerHTML = `<thead><tr><th>metric</th><th>value</th><th>ms</th><th>µs</th></tr></thead><tbody>${body}</tbody>`;
+}
+
 const pct = p => { const v = p * 100; return (Number.isInteger(Math.round(v * 10) / 10) || v >= 99.5 || v < 10 ? Math.round(v) : v.toFixed(1)) + "%"; };
 const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const lines = () => $("input").value.split("\n").map(l => l.trim()).filter(l => l.length > 0);
@@ -188,7 +222,7 @@ function selectModel(name) {
   $("stream-switch").hidden = name !== "tuned";
   const m = current();
   labels = m?.labels ?? labels;
-  $("model-note").textContent = name === "tuned" ? "language model: slower, streams its answer" : "about 0.1 ms per message";
+  $("model-note").textContent = name === "tuned" ? "language model: slower, streams its answer" : "about 100 µs per message";
   $("device").textContent = m?.device ?? "";
   $("device").hidden = !m?.device;
   $("model").innerHTML = m ? `
@@ -327,11 +361,21 @@ function summarize(results, roundTrip, serverMs, firstToken) {
   const done = results.filter(r => !r.pending);
   const accepted = done.filter(r => r.accepted).length;
   $("m-count").textContent = done.length;
-  if (roundTrip !== null) $("m-round").innerHTML = `${roundTrip.toFixed(1)}<small>ms</small>`;
-  $("m-server").innerHTML = serverMs === null ? "…" : `${serverMs.toFixed(2)}<small>ms</small>`;
+  if (roundTrip !== null) $("m-round").innerHTML = durationHtml(roundTrip);
+  $("m-server").innerHTML = serverMs === null ? "…" : durationHtml(serverMs);
   $("m-accepted").innerHTML = `${accepted}<small>/ ${done.length}</small>`;
-  $("per").textContent = (firstToken !== null ? `first token ${firstToken.toFixed(0)} ms · ` : "")
-    + (serverMs !== null && done.length ? `${(serverMs / done.length).toFixed(3)} ms per message in the model` : "");
+  const perMessage = serverMs !== null && done.length ? serverMs / done.length : null;
+  $("per").textContent = (firstToken !== null ? `first token ${durationText(firstToken)} · ` : "")
+    + (perMessage !== null ? `${durationText(perMessage)} per message in the model` : "");
+  const n = Math.max(1, done.length);
+  timingTable([
+    { name: "round trip (browser to server and back)", ms: roundTrip },
+    { name: "model time (on the server)", ms: serverMs },
+    { name: "first token (streamed answer)", ms: firstToken },
+    { name: "round trip per message", ms: roundTrip === null ? null : roundTrip / n },
+    { name: "model time per message", ms: perMessage },
+    { name: "outside the model (network, JSON, queueing)", ms: roundTrip !== null && serverMs !== null ? Math.max(0, roundTrip - serverMs) : null },
+  ]);
 
   const counts = Object.fromEntries(labels.map(l => [l, 0]));
   done.forEach(r => counts[r.label] = (counts[r.label] || 0) + 1);
