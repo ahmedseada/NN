@@ -473,31 +473,39 @@ void WriteErrors(TextClassifierReport report)
 }
 
 // audit: labels given differently to the same text (after trimming, lower-casing and joining spaces), and the share of
-// short messages per label: a two-word reply ("Tuesday", "yes", a phone number) is often only one intent in context.
+// short messages per label: a two-word reply ("Tuesday", "yes", a phone number) is often only one intent in context. The
+// ceiling is the accuracy a model that sees only the message could reach at best: each text's most common label.
 void Audit(List<LabeledText> examples)
 {
     static string Key(string text) => string.Join(' ', text.Trim().ToLowerInvariant().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-    var labels = examples.GroupBy(e => e.Label.Trim()).OrderByDescending(g => g.Count()).ToList();
-    var texts = examples.GroupBy(e => Key(e.Text)).ToList();
-    var conflicts = texts.Where(g => g.Select(e => e.Label.Trim()).Distinct().Count() > 1).OrderByDescending(g => g.Count()).ToList();
-    int conflictRows = conflicts.Sum(g => g.Count());
-    Console.WriteLine($"{examples.Count:N0} rows, {texts.Count:N0} distinct texts, {labels.Count} labels");
-    Console.WriteLine($"{conflicts.Count:N0} texts have more than one label ({conflictRows:N0} rows, {conflictRows / (double)Math.Max(1, examples.Count):P1}); "
+    var rows = examples.Select(e => (Key: Key(e.Text), Label: e.Label.Trim(), e.Text)).ToList();         // each key computed once
+    var texts = rows.GroupBy(r => r.Key).Select(g => (g.Key, Rows: g.ToList(), Labels: g.GroupBy(r => r.Label).ToDictionary(l => l.Key, l => l.Count()))).ToList();
+    var conflicts = texts.Where(t => t.Labels.Count > 1).OrderByDescending(t => t.Rows.Count).ToList();
+    var conflicting = conflicts.Select(t => t.Key).ToHashSet(StringComparer.Ordinal);
+    var majority = texts.ToDictionary(t => t.Key, t => t.Labels.MaxBy(l => l.Value).Key, StringComparer.Ordinal);
+    var labels = rows.GroupBy(r => r.Label).OrderByDescending(g => g.Count()).ToList();
+    int conflictRows = conflicts.Sum(t => t.Rows.Count);
+    int reachable = rows.Count(r => majority[r.Key] == r.Label);
+    Console.WriteLine($"{rows.Count:N0} rows, {texts.Count:N0} distinct texts, {labels.Count} labels");
+    Console.WriteLine($"{conflicts.Count:N0} texts have more than one label ({conflictRows:N0} rows, {conflictRows / (double)Math.Max(1, rows.Count):P1}); "
                       + "the most frequent:");
-    foreach (var group in conflicts.Take(20))
+    foreach (var t in conflicts.Take(20))
     {
-        var counts = group.GroupBy(e => e.Label.Trim()).OrderByDescending(g => g.Count()).Select(g => $"{g.Key} {g.Count()}");
-        Console.WriteLine($"  {group.Key,-50} {string.Join(", ", counts)}");
+        Console.WriteLine($"  {t.Key,-50} {string.Join(", ", t.Labels.OrderByDescending(l => l.Value).Select(l => $"{l.Key} {l.Value:N0}"))}");
     }
 
     Console.WriteLine();
-    Console.WriteLine($"{"label",-16}{"rows",9}{"≤ 3 words",11}{"conflicting",13}   short examples");
+    Console.WriteLine($"ceiling: a model that sees only the message is right on at most {reachable / (double)Math.Max(1, rows.Count):P1} of the rows "
+                      + "(each text's most common label; the rest carry another label for the same text)");
+    Console.WriteLine($"{"label",-16}{"rows",10}{"≤ 3 words",11}{"conflicting",13}{"max recall",12}   short examples");
     foreach (var label in labels)
     {
-        var shortOnes = label.Where(e => Key(e.Text).Split(' ').Length <= 3).ToList();
-        int conflicting = label.Count(e => conflicts.Any(c => c.Key == Key(e.Text)));
-        string samples = string.Join(" | ", shortOnes.Select(e => e.Text.Trim()).Distinct().Take(6));
-        Console.WriteLine($"{label.Key,-16}{label.Count(),9:N0}{shortOnes.Count / (double)label.Count(),11:P1}{conflicting / (double)label.Count(),13:P1}   {samples}");
+        int count = label.Count();
+        int shortCount = label.Count(r => r.Key.Split(' ').Length <= 3);
+        int inConflict = label.Count(r => conflicting.Contains(r.Key));
+        int best = label.Count(r => majority[r.Key] == label.Key);
+        string samples = string.Join(" | ", label.Where(r => r.Key.Split(' ').Length <= 3).Select(r => r.Text.Trim()).Distinct().Take(6));
+        Console.WriteLine($"{label.Key,-16}{count,10:N0}{shortCount / (double)count,11:P1}{inConflict / (double)count,13:P1}{best / (double)count,12:P1}   {samples}");
     }
 
     if (output is not null)
@@ -505,10 +513,10 @@ void Audit(List<LabeledText> examples)
         static string Quote(string value) => "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
         using var writer = new StreamWriter(output, false, new UTF8Encoding(false));
         writer.WriteLine(string.Join(",", new[] { "text", "rows" }.Concat(labels.Select(l => l.Key)).Select(Quote)));
-        foreach (var group in conflicts)
+        foreach (var t in conflicts)
         {
-            writer.WriteLine(string.Join(",", new[] { Quote(group.First().Text.Trim()), group.Count().ToString(CultureInfo.InvariantCulture) }
-                .Concat(labels.Select(l => group.Count(e => e.Label.Trim() == l.Key).ToString(CultureInfo.InvariantCulture)))));
+            writer.WriteLine(string.Join(",", new[] { Quote(t.Rows[0].Text.Trim()), t.Rows.Count.ToString(CultureInfo.InvariantCulture) }
+                .Concat(labels.Select(l => t.Labels.GetValueOrDefault(l.Key).ToString(CultureInfo.InvariantCulture)))));
         }
 
         Console.WriteLine($"\n{conflicts.Count:N0} conflicting texts written to {Path.GetFullPath(output)}");
