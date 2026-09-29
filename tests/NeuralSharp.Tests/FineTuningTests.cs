@@ -16,7 +16,7 @@ internal static partial class Tests
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("fine-tuning: the input gradient through bfloat16 weights reads them as stored (with and without the adapter's term, odd widths, split k)", BFloat16InputGradient),
-        ("fine-tuning: answers from a short list are balanced (rarer ones repeated up to a limit, deterministically); free text is left alone", BalancedAnswers),
+        ("fine-tuning: answers from a short list are balanced (rarer ones repeated up to a limit, deterministically, spread among the others); free text is left alone; batches mix neighbouring sequences", BalancedAnswers),
         ("scoring: log-probabilities of chosen tokens computed on the device match a log-softmax of the full logits (chunked, repeated rows)", TokenLogProbabilities),
         ("scoring: a cached forward pass without autograd frees each layer's intermediate results (only the cache and the output stay)", CachedForwardFreesLayers),
         ("scoring: given answers to chat prompts are scored as the model's own full forward pass scores them, each prompt run once from a cache or with every answer, whatever the batching; long messages are shortened to fit", AnswerScoring),
@@ -326,6 +326,15 @@ internal static partial class Tests
 
         var free = Enumerable.Range(0, 100).Select(i => Row(i, [100 + i])).ToList();
         Check(FineTuner.BalanceAnswers(free).Sequences.Count == 100, "free text (100 distinct answers) is left alone");
+
+        // Neighbours in the list do not fill rows together: 200 sequences of one length, the first half one answer and
+        // the second half another, packed 20 to a row, give rows of both (a row of one answer teaches that answer alone).
+        var halves = Enumerable.Range(0, 200).Select(i => Row(i, [i < 100 ? 50 : 51])).ToList();
+        var packed = FineTuner.PackedBatches(halves, 20 * 4, 1, new Random(5));
+        int mixed = packed.Count(b => b[0].Select(i => halves[i].Tokens[2]).Distinct().Count() == 2);
+        Check(packed.Count > 1 && mixed == packed.Count, $"{mixed} of {packed.Count} rows hold both answers");
+        var padded = FineTuner.Batches(halves, 20 * 5, new Random(5));
+        Check(padded.Count(b => b.Select(i => halves[i].Tokens[2]).Distinct().Count() == 2) >= padded.Count - 1, "padded batches mix them too");
     }
 
     private static void TokenLogProbabilities(Device device)

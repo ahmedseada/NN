@@ -625,7 +625,7 @@ public static class FineTuner
     /// loss (its recall rises, usually at some cost to its precision). With more than <paramref name="maxAnswers"/>
     /// distinct answers (free text) the sequences are returned as they are. Deterministic for a <paramref name="seed"/>.
     /// </summary>
-    /// <returns>The sequences (repeats included) and each answer's count before and after, by its tokens.</returns>
+    /// <returns>The sequences (repeats included, all in a seeded random order) and each answer's count before and after, by its tokens.</returns>
     public static (List<TrainingSequence> Sequences, IReadOnlyList<(int[] Answer, int Before, int After)> Answers) BalanceAnswers(
         IReadOnlyList<TrainingSequence> sequences, int maxRepeats = 4, int maxAnswers = 64, int seed = 0)
     {
@@ -655,6 +655,7 @@ public static class FineTuner
             answers.Add((Answer(group[0]), group.Count, Math.Max(group.Count, target)));
         }
 
+        random.Shuffle(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(result));   // repeats spread among the originals
         return (result, answers);
     }
 
@@ -1117,8 +1118,11 @@ public static class FineTuner
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(length);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(rows);
+        // Sequences of one length in a random order (not the list's): neighbours in the list (a repeated answer, one
+        // source file) would otherwise fill whole rows, and a batch of one kind teaches that kind, not the distinction.
+        var tie = TieOrder(sequences.Count, random);
         var order = Enumerable.Range(0, sequences.Count).Where(i => sequences[i].Tokens.Length - 1 is >= 1 and var n && n <= length)
-            .OrderByDescending(i => sequences[i].Tokens.Length).ThenBy(i => i).ToList();
+            .OrderByDescending(i => sequences[i].Tokens.Length).ThenBy(i => tie[i]).ToList();
         var bins = new List<List<int>>();
         var free = new List<int>();
         // First fit: the first row with room (rows are kept in creation order; `fullest` skips rows too full for
@@ -1178,7 +1182,8 @@ public static class FineTuner
     /// </summary>
     public static List<int[]> Batches(IReadOnlyList<TrainingSequence> sequences, int batchTokens, Random? random)
     {
-        var order = Enumerable.Range(0, sequences.Count).OrderBy(i => sequences[i].Tokens.Length).ToList();
+        var tie = TieOrder(sequences.Count, random);
+        var order = Enumerable.Range(0, sequences.Count).OrderBy(i => sequences[i].Tokens.Length).ThenBy(i => tie[i]).ToList();
         var batches = new List<int[]>();
         var current = new List<int>();
         int longest = 0;
@@ -1216,6 +1221,19 @@ public static class FineTuner
         }
 
         return batches;
+    }
+
+    // The rank of each sequence among those of its length: random when a random source is given (see PackedBatches), else
+    // the list's order.
+    private static int[] TieOrder(int count, Random? random)
+    {
+        var rank = Enumerable.Range(0, count).ToArray();
+        if (random is not null)
+        {
+            random.Shuffle(rank);
+        }
+
+        return rank;
     }
 
     // The summed weighted loss of one batch divided by normalizer (padding and untrained positions weigh 0), and the
