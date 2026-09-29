@@ -64,14 +64,14 @@ public static class ConsoleTraining
     public static Action<int, int> Scoring(string label = "scoring")
     {
         ConsoleProgress? bar = null;
+        var clock = System.Diagnostics.Stopwatch.StartNew();          // from the call, so the first batch counts in the rate
         return (done, total) =>
         {
             bar ??= new ConsoleProgress(label, total, "messages");
-            string rate = $"{done / Math.Max(1e-9, bar.Elapsed.TotalSeconds):F1} messages/s";
+            string rate = $"{done / Math.Max(1e-9, clock.Elapsed.TotalSeconds):F1} messages/s";
             if (done >= total)
             {
-                bar.Report(done, rate);
-                bar.Complete(rate);
+                bar.Complete(rate, done);
             }
             else
             {

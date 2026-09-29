@@ -93,8 +93,11 @@ public sealed class ConsoleProgress
         }
     }
 
-    /// <summary>Marks the whole done and ends the bar's line.</summary>
-    public void Complete(string? current = null)
+    /// <summary>
+    /// Marks the whole done (at <paramref name="done"/> units when given, else at the last reported count: fewer than
+    /// <see cref="Total"/> when the work stopped early) and ends the bar's line.
+    /// </summary>
+    public void Complete(string? current = null, int? done = null)
     {
         lock (_gate)
         {
@@ -103,6 +106,7 @@ public sealed class ConsoleProgress
                 return;
             }
 
+            _done = done ?? _done;
             Total = Math.Max(1, _done);
             _done = Total;
             _current = current ?? _current;

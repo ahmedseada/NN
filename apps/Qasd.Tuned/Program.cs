@@ -27,12 +27,14 @@ const string Usage = """
       --cpu | --cuda      where to run (default: train on the GPU when there is one; evaluate and predict on the CPU, --cuda for the GPU)
       --text C, --label C columns with the message and the intent
       --test-fraction F   distinct messages held out (default 0.2; 0 = tune on everything)
+      --held-out          evaluate: score only the messages train held out (same --test-fraction), not the whole data
       --epochs N (1), --rank N (16), --lr F (0.0002), --batch-tokens N (4096), --max-length N (256), --seed N
     """;
 
 var positional = new List<string>();
 string? output = null, textColumn = null, labelColumn = null, deviceList = null;
 int sample = 0;
+bool heldOut = false;
 double testFraction = 0.2;
 bool stream = false;
 Device? device = null;
@@ -62,6 +64,7 @@ try
             case "--max-length": options = options with { MaxLength = NextInt() }; break;
             case "--seed": options = options with { Seed = NextInt() }; break;
             case "--stream": stream = true; break;
+            case "--held-out": heldOut = true; break;
             case "--devices": deviceList = Next(); break;
             case "--sample": sample = NextInt(); break;
             case "-h" or "--help" or "help": Console.WriteLine(Usage); return 0;
@@ -189,7 +192,13 @@ try
         {
             using var tuned = TunedClassifier.Load(folder, device);
             var examples = ReadAll(rest);
-            Console.WriteLine($"scoring {examples.Count:N0} messages on {device.Name}…");
+            if (heldOut)
+            {
+                // The messages train held out (same split and seed), for a score after tuning without scoring again there.
+                examples = TextClassifier.Split(examples, testFraction > 0 ? testFraction : 0.2, 7).Test;
+            }
+
+            Console.WriteLine($"scoring {examples.Count:N0}{(heldOut ? " held-out" : "")} messages on {device.Name}…");
             Console.WriteLine(tuned.Evaluate(examples, ConsoleTraining.Scoring()));
             return 0;
         }

@@ -131,14 +131,27 @@ public sealed class TunedClassifier : IDisposable
                 ["system"] = system,
                 ["maxLength"] = options.MaxLength,
             }.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
-            model.Network.Eval();
-            return classifier;
         }
         catch
         {
             classifier.Dispose();
             throw;
         }
+
+        // Training leaves tensors to the garbage collector (which does not see device memory): free them, then load the
+        // saved model with the adapter merged, as it is served, so scoring has the device to itself.
+        classifier.Dispose();
+        FreeDeviceMemory(device);
+        log?.Invoke("loading the tuned model with the adapter merged");
+        return Load(outputFolder, device);
+    }
+
+    private static void FreeDeviceMemory(Device device)
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        ComputeResources.ReleaseCachedMemory(device);
     }
 
     /// <summary>Loads a tuned model folder written by <see cref="Train"/> (the adapter merged into the base weights, for speed).</summary>
@@ -309,9 +322,22 @@ public sealed class TunedClassifier : IDisposable
             }
 
             var scores = new double[rows];
-            using (Autograd.NoGrad())
-            using (var scope = new TensorScope())
+            try
             {
+                Pass();
+            }
+            catch (ResourceLimitExceededException)
+            {
+                // Memory the garbage collector has not returned yet: collect it and try the pass once more.
+                Array.Clear(scores);
+                FreeDeviceMemory(Device);
+                Pass();
+            }
+
+            void Pass()
+            {
+                using var noGrad = Autograd.NoGrad();
+                using var scope = new TensorScope();
                 var hidden = Tensor.From(input, [rows, length], Device);
                 for (int i = 0; i < modules.Count - 1; i++)
                 {
