@@ -53,16 +53,24 @@ public sealed class Sequential : Module, IEnumerable<Module>, ICachedModule
 
     private Tensor Run(Tensor input, int layers)
     {
-        var x = input;
-        if (Autograd.IsEnabled || ComputeGraph.IsCapturing)
-        {
-            for (int i = 0; i < layers; i++)
-            {
-                x = _modules[i].Forward(x);
-            }
+        Tensor Layer(int i, Tensor x) => _modules[i].Forward(x);
+        return Autograd.IsEnabled || ComputeGraph.IsCapturing ? RunLayers(input, layers, Layer) : RunFreeing(input, layers, Layer);
+    }
 
-            return x;
+    private static Tensor RunLayers(Tensor input, int layers, Func<int, Tensor, Tensor> layer)
+    {
+        var x = input;
+        for (int i = 0; i < layers; i++)
+        {
+            x = layer(i, x);
         }
+
+        return x;
+    }
+
+    private static Tensor RunFreeing(Tensor input, int layers, Func<int, Tensor, Tensor> layer)
+    {
+        var x = input;
 
         // Without autograd, nothing needs a layer's intermediate results once the next layer has its input: each layer
         // runs in a scope of its own that frees them, and the previous layer's output goes as soon as it is used. A pass
@@ -73,11 +81,11 @@ public sealed class Sequential : Module, IEnumerable<Module>, ICachedModule
         {
             Tensor next;
             bool created;
-            using (var layer = new TensorScope())
+            using (var scope = new TensorScope())
             {
-                next = _modules[i].Forward(x);
-                created = layer.Owns(next);
-                layer.Keep(next);
+                next = layer(i, x);
+                created = scope.Owns(next);
+                scope.Keep(next);
             }
 
             if (!ReferenceEquals(next, x))
@@ -122,16 +130,14 @@ public sealed class Sequential : Module, IEnumerable<Module>, ICachedModule
 
         // With LastPositionOnly, the layers after the last cached one see only the last position.
         int lastCached = outermost && context.LastPositionOnly && steps > 1 ? _modules.FindLastIndex(m => m is ICachedModule) : -1;
-        var x = input;
-        for (int i = 0; i < layers; i++)
+        Tensor Layer(int i, Tensor x)
         {
             var module = _modules[i];
             x = module is ICachedModule cached ? cached.ForwardCached(x, context) : module.Forward(x);
-            if (i == lastCached && x.Rank == 3)
-            {
-                x = x.Narrow(1, x.Shape[1] - 1, 1);
-            }
+            return i == lastCached && x.Rank == 3 ? x.Narrow(1, x.Shape[1] - 1, 1) : x;
         }
+
+        var x = Autograd.IsEnabled || ComputeGraph.IsCapturing ? RunLayers(input, layers, Layer) : RunFreeing(input, layers, Layer);
 
         if (outermost)
         {

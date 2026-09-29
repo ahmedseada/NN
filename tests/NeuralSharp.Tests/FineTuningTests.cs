@@ -17,6 +17,7 @@ internal static partial class Tests
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
         ("fine-tuning: the input gradient through bfloat16 weights reads them as stored (with and without the adapter's term, odd widths, split k)", BFloat16InputGradient),
         ("scoring: log-probabilities of chosen tokens computed on the device match a log-softmax of the full logits (chunked, repeated rows)", TokenLogProbabilities),
+        ("scoring: a cached forward pass without autograd frees each layer's intermediate results (only the cache and the output stay)", CachedForwardFreesLayers),
         ("scoring: given answers to chat prompts are scored as the model's own full forward pass scores them, each prompt run once from a cache or with every answer, whatever the batching; long messages are shortened to fit", AnswerScoring),
         ("fine-tuning: the gated activation reads and writes bfloat16 words as packing and unpacking around the float kernels would (SiLU, GELU, ReLU, odd sizes)", PackedGatedActivation),
         ("fine-tuning: releasing results no backward step reads, and recomputing feed-forward activations, give the same loss and gradients with less memory (RoPE, biases, q/k norms, post norms, parallel blocks, layer norms, dropout)", ReleasedActivations),
@@ -214,6 +215,7 @@ internal static partial class Tests
             var scorer = new AnswerScorer(model, maxLength: 96);
             var scores = scorer.LogLikelihoods(prompts, answers);
             var single = new AnswerScorer(model, maxLength: 96) { PromptsPerPass = 1 }.LogLikelihoods(prompts, answers);
+            var bounded = new AnswerScorer(model, maxLength: 96) { PositionsPerPass = 1 }.LogLikelihoods(prompts, answers);   // one prompt a pass
             var unshared = new AnswerScorer(model, maxLength: 96) { SharePrompts = false }.LogLikelihoods(prompts, answers);
             // With the default precision (bfloat16 tensor cores where the GPU has them), each prompt runs once.
             bool mustShare = device.Type == DeviceType.Cpu || spec.HeadDim == 64 && MixedPrecision.TensorCoresUnavailable(device) is null;
@@ -261,6 +263,7 @@ internal static partial class Tests
 
                     AssertClose([(float)expected], [(float)scores[p][a]], 2e-2f, $"prompt {p}, answer {a}: log-likelihood");
                     AssertClose([(float)scores[p][a]], [(float)single[p][a]], 2e-2f, $"prompt {p}, answer {a}: one prompt per pass");
+                    AssertClose([(float)scores[p][a]], [(float)bounded[p][a]], 2e-2f, $"prompt {p}, answer {a}: passes bounded by positions");
                     AssertClose([(float)scores[p][a]], [(float)unshared[p][a]], 2e-2f, $"prompt {p}, answer {a}: every row running the whole prompt");
                 }
             }
@@ -278,6 +281,30 @@ internal static partial class Tests
         finally
         {
             Directory.Delete(folder, true);
+        }
+    }
+
+    private static void CachedForwardFreesLayers(Device device)
+    {
+        var spec = new DecoderSpec
+        {
+            Vocabulary = 260, Dim = 128, Layers = 4, Heads = 2, KvHeads = 1, HeadDim = 64, FfDim = 512, MaxPositions = 256,
+            Rope = new RopeSettings(10000f), NormEpsilon = 1e-6f,
+        };
+        using var model = spec.Build(new RandomWeights(61), new DecoderBuildOptions { Device = device });
+        model.Eval();
+        const int Rows = 4, Steps = 64;
+        var tokens = Enumerable.Range(0, Rows * Steps).Select(i => (float)(i * 7 % 260)).ToArray();
+        using var context = new DecodingContext(device, Rows, Steps);
+        using (Autograd.NoGrad())
+        using (new TensorScope())
+        {
+            long before = ComputeResources.GetMemoryUsage(device).InUse;
+            var hidden = model.ForwardCached(Tensor.From(tokens, [Rows, Steps], device), context, model.Count - 1);
+            long held = ComputeResources.GetMemoryUsage(device).InUse - before - context.CacheBytes;
+            long layer = (long)Rows * Steps * spec.FfDim * sizeof(float);                    // one feed-forward activation
+            Check(hidden.Shape.SequenceEqual([Rows, Steps, spec.Dim]), $"hidden states {string.Join("×", hidden.Shape.ToArray())}");
+            Check(held < 2 * layer, $"only the cache and the output are held after the pass ({held:N0} bytes besides the cache; one feed-forward activation is {layer:N0})");
         }
     }
 

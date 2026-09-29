@@ -16,7 +16,7 @@ public sealed record AnswerChoice(int Best, IReadOnlyList<double> Probabilities,
 /// always comes from the list, with every candidate's probability, and nothing is generated.
 /// </summary>
 /// <remarks>
-/// A pass takes <see cref="PromptsPerPass"/> prompts of similar length. Each prompt runs once for all its answers (a
+/// A pass takes up to <see cref="PromptsPerPass"/> prompts of similar length (and <see cref="PositionsPerPass"/> positions). Each prompt runs once for all its answers (a
 /// key/value cache, then only the answers' tokens; see <see cref="SharePrompts"/> and <see cref="Precision"/>), and the
 /// output layer and the log-softmax run on the device on the answer positions only (<see cref="Losses.TokenLogProbabilities"/>).
 /// A prompt too long for <see cref="MaxLength"/> has its last user message shortened (its start kept) until it fits with
@@ -55,8 +55,14 @@ public sealed class AnswerScorer
     /// <summary>Longest prompt plus answer in tokens.</summary>
     public int MaxLength { get; }
 
-    /// <summary>Prompts per device pass (each with a row per answer). 32 by default.</summary>
+    /// <summary>Most prompts per device pass (each with a row per answer). 32 by default.</summary>
     public int PromptsPerPass { get; init; } = 32;
+
+    /// <summary>
+    /// Most token positions a pass runs through the network at once (rows times their padded length; a pass has at least
+    /// one prompt): bounds the memory of a pass of long prompts. 8192 by default.
+    /// </summary>
+    public int PositionsPerPass { get; init; } = 8192;
 
     /// <summary>
     /// Run each prompt once for all its answers (from a key/value cache), where the model's attention can batch rows of
@@ -122,26 +128,37 @@ public sealed class AnswerScorer
         using var precision = MixedPrecision.Use(EffectivePrecision);
         var results = new double[prompts.Count][];
         var order = Enumerable.Range(0, prompts.Count).OrderBy(i => prompts[i].Sum(m => m.Content.Length)).ToArray();
-        int perPass = Math.Max(1, PromptsPerPass), done = 0;
-        for (int first = 0; first < order.Length; first += perPass)
+        int perPass = Math.Max(1, PromptsPerPass), budget = Math.Max(1, PositionsPerPass), done = 0;
+        for (int first = 0; first < order.Length;)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var indices = order.AsSpan(first, Math.Min(perPass, order.Length - first)).ToArray();
 
-            // A row per (prompt, answer): the fitted prompt with the answer as the assistant's turn.
+            // A row per (prompt, answer): the fitted prompt with the answer as the assistant's turn. Prompts join the pass
+            // while it holds fewer than PromptsPerPass of them and PositionsPerPass positions (at least one prompt).
+            var indices = new List<int>();
             var sequences = new List<TrainingSequence?>();
-            foreach (int i in indices)
+            int longestRow = 0;
+            while (first < order.Length && indices.Count < perPass)
             {
+                int i = order[first];
                 var fitted = Fitted(prompts[i], longest);
-                foreach (string answer in answers)
+                var rows = answers.Select(a => fitted is null ? null : Encoder.Encode(Transcript(fitted, a), MaxLength)).ToList();
+                int length = Math.Max(longestRow, rows.Max(r => r?.Tokens.Length ?? 1));
+                int needed = (indices.Count + 1) * length * (share ? 1 : answers.Count);   // rows are padded to the longest
+                if (indices.Count > 0 && needed > budget)
                 {
-                    sequences.Add(fitted is null ? null : Encoder.Encode(Transcript(fitted, answer), MaxLength));
+                    break;
                 }
+
+                longestRow = length;
+                indices.Add(i);
+                sequences.AddRange(rows);
+                first++;
             }
 
             var scores = share ? SharedPass(sequences, answers.Count) : RowPass(sequences);
 
-            for (int p = 0; p < indices.Length; p++)
+            for (int p = 0; p < indices.Count; p++)
             {
                 var own = new double[answers.Count];
                 for (int a = 0; a < answers.Count; a++)
@@ -152,7 +169,7 @@ public sealed class AnswerScorer
                 results[indices[p]] = own;
             }
 
-            done += indices.Length;
+            done += indices.Count;
             progress?.Invoke(done);
         }
 
