@@ -138,20 +138,10 @@ public sealed class TunedClassifier : IDisposable
             throw;
         }
 
-        // Training leaves tensors to the garbage collector (which does not see device memory): free them, then load the
-        // saved model with the adapter merged, as it is served, so scoring has the device to itself.
+        // Scores come from the saved model with the adapter merged, as it is served (and faster than the adapter beside).
         classifier.Dispose();
-        FreeDeviceMemory(device);
         log?.Invoke("loading the tuned model with the adapter merged");
         return Load(outputFolder, device);
-    }
-
-    private static void FreeDeviceMemory(Device device)
-    {
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
-        ComputeResources.ReleaseCachedMemory(device);
     }
 
     /// <summary>Loads a tuned model folder written by <see cref="Train"/> (the adapter merged into the base weights, for speed).</summary>
@@ -281,17 +271,20 @@ public sealed class TunedClassifier : IDisposable
 
     // log p(label's answer tokens | instruction, message) for each intent, softmaxed over the intents. A batch holds a row
     // per (message, intent), right-padded; the network runs up to its final normalization and the output layer only on the
-    // answer rows. Messages go 16 at a time (64 rows with four intents).
+    // answer rows. Messages go 16 at a time (64 rows with four intents), those of similar length together (less padding);
+    // the network frees each layer's intermediate results as it goes (see Sequential.ForwardFirst).
     private List<TextPrediction> Score(IReadOnlyList<string> texts, Action<int>? progress = null)
     {
         const int MessagesPerPass = 16;
         string longest = Labels.MaxBy(l => _model.Tokenizer!.Encode(l).Count)!;
-        var predictions = new List<TextPrediction>(texts.Count);
+        var predictions = new TextPrediction[texts.Count];
+        var order = Enumerable.Range(0, texts.Count).OrderBy(i => texts[i].Length).ToArray();
         var modules = _model.Network.ToList();
         var head = (Linear)modules[^1];
         for (int first = 0; first < texts.Count; first += MessagesPerPass)
         {
-            var chunk = texts.Skip(first).Take(MessagesPerPass).ToList();
+            var indices = order.AsSpan(first, Math.Min(MessagesPerPass, texts.Count - first)).ToArray();
+            var chunk = indices.Select(i => texts[i]).ToList();
 
             // One shortened message for every intent: fitted to the longest answer, so each intent is scored on the same text.
             var sequences = new List<TrainingSequence?>();
@@ -322,27 +315,10 @@ public sealed class TunedClassifier : IDisposable
             }
 
             var scores = new double[rows];
-            try
+            using (Autograd.NoGrad())
+            using (var scope = new TensorScope())
             {
-                Pass();
-            }
-            catch (ResourceLimitExceededException)
-            {
-                // Memory the garbage collector has not returned yet: collect it and try the pass once more.
-                Array.Clear(scores);
-                FreeDeviceMemory(Device);
-                Pass();
-            }
-
-            void Pass()
-            {
-                using var noGrad = Autograd.NoGrad();
-                using var scope = new TensorScope();
-                var hidden = Tensor.From(input, [rows, length], Device);
-                for (int i = 0; i < modules.Count - 1; i++)
-                {
-                    hidden = modules[i].Forward(hidden);
-                }
+                var hidden = _model.Network.ForwardFirst(Tensor.From(input, [rows, length], Device), modules.Count - 1);
 
                 int dim = hidden.Shape[^1];
                 var all = hidden.ToArray();
@@ -380,7 +356,7 @@ public sealed class TunedClassifier : IDisposable
                 {
                     // Not even an empty message fits: MaxLength is too small for the instruction; no intent can be preferred.
                     float even = 1f / Labels.Count;
-                    predictions.Add(new TextPrediction(Labels[0], even, [.. Labels.Select(l => (l, even))]));
+                    predictions[indices[m]] = new TextPrediction(Labels[0], even, [.. Labels.Select(l => (l, even))]);
                     continue;
                 }
 
@@ -388,13 +364,13 @@ public sealed class TunedClassifier : IDisposable
                 var weights = own.Select(x => Math.Exp(x - best)).ToArray();
                 double total = weights.Sum();
                 var probabilities = Labels.Select((l, i) => (Label: l, Probability: (float)(weights[i] / total))).OrderByDescending(p => p.Probability).ToList();
-                predictions.Add(new TextPrediction(probabilities[0].Label, probabilities[0].Probability, probabilities));
+                predictions[indices[m]] = new TextPrediction(probabilities[0].Label, probabilities[0].Probability, probabilities);
             }
 
-            progress?.Invoke(predictions.Count);
+            progress?.Invoke(first + chunk.Count);
         }
 
-        return predictions;
+        return [.. predictions];
     }
 
     private sealed class SynchronousProgress(Action<FineTuningProgress> report) : IProgress<FineTuningProgress>

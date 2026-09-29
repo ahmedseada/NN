@@ -35,6 +35,9 @@ public sealed class TensorScope : IDisposable
 
     internal static void Track(Tensor tensor) => t_current?._tensors.Add(tensor);
 
+    /// <summary>Whether <paramref name="tensor"/> was created in this scope (and is still to be disposed by it).</summary>
+    internal bool Owns(Tensor tensor) => _tensors.FindLastIndex(t => ReferenceEquals(t, tensor)) >= 0;
+
     /// <summary>Keeps <paramref name="tensor"/> alive past this scope (it moves to the enclosing scope, if any).</summary>
     public Tensor Keep(Tensor tensor)
     {

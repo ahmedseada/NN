@@ -37,12 +37,59 @@ public sealed class Sequential : Module, IEnumerable<Module>, ICachedModule
     public void Add(Module module) => _modules.Add(module ?? throw new ArgumentNullException(nameof(module)));
 
     /// <inheritdoc />
-    protected override Tensor ForwardCore(Tensor input)
+    protected override Tensor ForwardCore(Tensor input) => Run(input, _modules.Count);
+
+    /// <summary>
+    /// Runs only the first <paramref name="layers"/> layers (for example everything but the output layer, to get the
+    /// hidden states), as <see cref="Module.Forward"/> runs them all.
+    /// </summary>
+    public Tensor ForwardFirst(Tensor input, int layers)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        ArgumentOutOfRangeException.ThrowIfNegative(layers);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(layers, _modules.Count);
+        return Run(input, layers);
+    }
+
+    private Tensor Run(Tensor input, int layers)
     {
         var x = input;
-        foreach (var module in _modules)
+        if (Autograd.IsEnabled || ComputeGraph.IsCapturing)
         {
-            x = module.Forward(x);
+            for (int i = 0; i < layers; i++)
+            {
+                x = _modules[i].Forward(x);
+            }
+
+            return x;
+        }
+
+        // Without autograd, nothing needs a layer's intermediate results once the next layer has its input: each layer
+        // runs in a scope of its own that frees them, and the previous layer's output goes as soon as it is used. A pass
+        // then holds one layer's worth of memory, not the whole network's until the caller's scope ends. (Not while a
+        // graph is being recorded: its work keeps using those buffers.)
+        bool ownsX = false;
+        for (int i = 0; i < layers; i++)
+        {
+            Tensor next;
+            bool created;
+            using (var layer = new TensorScope())
+            {
+                next = _modules[i].Forward(x);
+                created = layer.Owns(next);
+                layer.Keep(next);
+            }
+
+            if (!ReferenceEquals(next, x))
+            {
+                if (ownsX)
+                {
+                    x.Dispose();
+                }
+
+                ownsX = created;
+                x = next;
+            }
         }
 
         return x;

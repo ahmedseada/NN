@@ -35,6 +35,12 @@ public sealed class ComputeGraph : IDisposable
         FailureReason = failure;
     }
 
+    [ThreadStatic]
+    private static int t_capturing;
+
+    /// <summary>Whether work on this thread is being recorded into a graph (its buffers must outlive the recording).</summary>
+    internal static bool IsCapturing => t_capturing > 0;
+
     /// <summary>True when replays use a real device graph; false when they re-run the step (CPU, or recording failed).</summary>
     public bool IsRecorded => _executable != IntPtr.Zero;
 
@@ -59,7 +65,15 @@ public sealed class ComputeGraph : IDisposable
         {
             using (Autograd.NoGrad())
             {
-                step();
+                t_capturing++;
+                try
+                {
+                    step();
+                }
+                finally
+                {
+                    t_capturing--;
+                }
             }
 
             var (executable, graph, owned) = backend.EndCapture();

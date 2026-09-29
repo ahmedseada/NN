@@ -13,6 +13,7 @@ internal static partial class Tests
     private static readonly (string Name, Action<Device> Run)[] Simplified =
     [
         ("builder: same layers, shapes and weights as new Sequential { ... }", BuilderMatchesSequential),
+        ("sequential: inference frees each layer's intermediates; ForwardFirst runs the first layers", SequentialInferenceFreesLayers),
         ("builder: CNN, RNN and GPT shapes; JSON round trip; clear shape errors", BuilderShapesAndJson),
         ("data: Split/Standardize/Batches equal the manual steps", DataExtensionsMatchManual),
         ("training: factory Trainer and TrainingRun give the same history as the manual trainer", TrainingRunMatchesTrainer),
@@ -40,6 +41,45 @@ internal static partial class Tests
 
     private static NetworkBuilder BuiltMlp(Device device) =>
         Network.Input(9).OnDevice(device).Seed(7).Linear(16).ReLU().Dropout(0.1f).Linear(8).Tanh().Linear(1);
+
+    private static void SequentialInferenceFreesLayers(Device device)
+    {
+        var builder = Network.Input(128).OnDevice(device).Seed(3);
+        for (int i = 0; i < 6; i++)
+        {
+            builder = builder.Linear(128).ReLU();
+        }
+
+        using var net = builder.Linear(8).Build();
+        var random = new Random(5);
+        var data = Enumerable.Range(0, 256 * 128).Select(_ => (float)random.NextDouble() - 0.5f).ToArray();
+        using var x = Tensor.From(data, [256, 128], device);
+
+        float[] expected, firstFour;
+        using (var scope = new TensorScope())
+        {
+            expected = net.Forward(x).ToArray();                                          // autograd on: every result kept
+            var h = x;
+            for (int i = 0; i < 4; i++)
+            {
+                h = net[i].Forward(h);
+            }
+
+            firstFour = h.ToArray();
+        }
+
+        using (Autograd.NoGrad())
+        using (var scope = new TensorScope())
+        {
+            long before = ComputeResources.GetMemoryUsage(device).InUse;
+            var y = net.Forward(x);
+            long held = ComputeResources.GetMemoryUsage(device).InUse - before;
+            Check(y.ToArray().SequenceEqual(expected), "same outputs without autograd");
+            Check(held < 256 * 128 * sizeof(float), $"only the output is held after the pass ({held:N0} bytes; one hidden layer is {256 * 128 * 4:N0})");
+            Check(x.ToArray().SequenceEqual(data), "the input is left alone");
+            Check(net.ForwardFirst(x, 4).ToArray().SequenceEqual(firstFour), "ForwardFirst matches the first layers run one by one");
+        }
+    }
 
     private static void BuilderMatchesSequential(Device device)
     {
