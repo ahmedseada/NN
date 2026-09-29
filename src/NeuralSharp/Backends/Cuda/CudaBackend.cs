@@ -205,7 +205,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     // Kernel name and declared parameter count per loaded function: a launch with the wrong number of arguments
     // would make the driver read past the argument array (CUDA_ERROR_INVALID_VALUE or silent garbage).
     private readonly Dictionary<IntPtr, (string Name, int Parameters)> _signatures = [];
-    private readonly IntPtr _fill, _affine, _axpy, _mulAdd, _add, _sub, _mul, _clipFactor;
+    private readonly IntPtr _fill, _affine, _axpy, _mulAdd, _add, _sub, _mul, _clipFactor, _packBFloat16;
     private readonly IntPtr _sigmoid, _tanh, _relu, _square, _abs;
     private readonly IntPtr _sigmoidBwd, _tanhBwd, _reluBwd, _squareBwd, _absBwd, _dropout;
     private readonly IntPtr _addRowVec, _addScalar, _sumRows, _sum, _sgdMomentum, _adam, _matmul;
@@ -241,6 +241,7 @@ internal sealed unsafe partial class CudaBackend : Backend
         _fill = Fn("fill_f32");
         _affine = Fn("affine_f32");
         _clipFactor = Fn("clip_factor_f32");
+        _packBFloat16 = Fn("bf16_pack_f32");
         _axpy = Fn("axpy_f32");
         _mulAdd = Fn("muladd_f32");
         _add = Fn("add_f32");
@@ -696,7 +697,7 @@ internal sealed unsafe partial class CudaBackend : Backend
     public override void Affine(Storage x, Storage y, int n, float alpha, float beta) => Launch1D(_affine, n, P(x), P(y), F(alpha), F(beta), U(n));
 
     public override void PackBFloat16(Storage x, Storage packed, int n) =>
-        Launch1D(K("bf16_pack_f32"), (n + 1) / 2, P(x), P(packed), U(n), U((n + 1) / 2));
+        Launch1D(_packBFloat16, (n + 1) / 2, P(x), P(packed), U(n), U((n + 1) / 2));
 
     public override void ClipFactor(Storage sumSquares, Storage factor, float maxNorm) => Launch1D(_clipFactor, 1, P(sumSquares), P(factor), F(maxNorm), U(1));
 
