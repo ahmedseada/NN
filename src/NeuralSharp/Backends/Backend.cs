@@ -241,6 +241,14 @@ internal abstract class Backend
     public virtual bool MatMulLowRank(Storage a, Storage b, Storage c, int m, int n, int k, bool transB, float beta, Storage u, Storage v, int rank) => false;
 
     /// <summary>
+    /// c = beta·c + a · Wᵀ (+ u · vᵀ) with W a bfloat16 weight [n, k] as <see cref="Layers.BFloat16Weight"/> packs it (two
+    /// values per word along k), read as stored: the input gradient through a frozen bfloat16 layer (and its adapter's
+    /// dt · Aᵀ with u = dt [m, rank], v = A [n, rank]) without expanding the weight to float. u null: no low-rank term.
+    /// False when the device has no such kernel (callers then expand the weight).
+    /// </summary>
+    public virtual bool BFloat16TransposedMatMul(Storage a, Storage packed, Storage c, int m, int n, int k, float beta, Storage? u, Storage? v, int rank) => false;
+
+    /// <summary>
     /// k rounded up for <see cref="Float8QuantizeWeight"/>'s values (0 when the device has no FP8 products): the values
     /// take n · paddedK bytes, n · paddedK / 4 floats of storage.
     /// </summary>

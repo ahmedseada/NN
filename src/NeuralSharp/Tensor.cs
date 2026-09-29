@@ -527,6 +527,14 @@ public sealed partial class Tensor : IDisposable
             return;
         }
 
+        if (Grad is null && gradient.Size == Size)
+        {
+            // The first gradient: copied (one pass), not added to a zero-filled buffer (a fill and a read-add-write pass).
+            Grad = Empty(_shape, Device, track: false);
+            Backend.Copy(gradient.Storage, Grad.Storage, Size);
+            return;
+        }
+
         Backend.Axpy(gradient.Storage, GradStorage(), Size, 1f);
     }
 

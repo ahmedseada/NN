@@ -59,6 +59,7 @@ internal static partial class PtxKernels
             // LoRA: the adapter's low-rank term as one more k step of the product (…_lr_f32).
             TensorCoreGemm(sb, false, false, 0, lowRank: true);
             TensorCoreGemm(sb, false, true, 0, lowRank: true);
+            TensorCoreGemm(sb, false, true, 0, lowRank: true, bf16B: true);     // dx = g · Wᵀ (+ dt · Aᵀ) over bfloat16 weights
             foreach (int packed in new[] { 2, 3 })
             {
                 TensorCoreGemm(sb, false, false, 0, packed: packed, lowRank: true);
@@ -147,16 +148,25 @@ internal static partial class PtxKernels
     // added as one more k step of at most 32: u [m, r] (p_u, rows of r floats), v [r, n] (b as stored; rows of n floats)
     // or [n, r] (b transposed), r = p_r ≤ 32; multi takes p_u1 / p_v1 and p_u2 / p_v2 for its other products. p_u = 0
     // skips the term. With split k only block z = 0 adds it.
+    //
+    // bf16B (B transposed, …_nt_bf16w_lr_f32): B is a bfloat16 weight W [n][k] stored as BFloat16Weight packs it (two
+    // values per 32-bit word along k; ldb = words per row): dx = g · Wᵀ reads the weight as stored, with no float copy. Each
+    // thread's pair of k is one word, copied to shared memory as it is (the tile holds bfloat16 pairs anyway).
     private static void TensorCoreGemm(StringBuilder sb, bool ta, bool tb, int mode, int packed = 0, bool multi = false, int tileM = TensorTile,
-        bool lowRank = false)
+        bool lowRank = false, bool bf16B = false)
     {
         if (lowRank && (ta || mode != 0 || packed == 1 || tileM != TensorTile))
         {
             throw new ArgumentException("The low-rank stage needs A as stored, no epilogue, no int8 column scales and 128-row tiles.");
         }
 
+        if (bf16B && (!tb || ta || mode != 0 || packed != 0 || multi))
+        {
+            throw new ArgumentException("bfloat16 B words need B transposed, A as stored, no epilogue and no other packing.");
+        }
+
         string name = $"gemm_tc_{(ta ? 't' : 'n')}{(tb ? 't' : 'n')}{mode switch { 1 => "_gelu", 2 => "_gelugrad", _ => "" }}"
-                      + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}{(multi ? "_multi" : "")}{(tileM == 64 ? "_m64" : "")}{(lowRank ? "_lr" : "")}_f32";
+                      + $"{packed switch { 1 => "_int8w", 2 => "_int4w", 3 => "_bf16w", _ => "" }}{(bf16B ? "_bf16w" : "")}{(multi ? "_multi" : "")}{(tileM == 64 ? "_m64" : "")}{(lowRank ? "_lr" : "")}_f32";
         int mts = tileM / 32, warpRowShift = (int)Math.Log2(tileM / 2);          // m16 slices per warp; the warp's first row
         int cpw = packed switch { 1 => 4, 2 => 8, _ => 2 }, tileWords = TensorTile / cpw, wordRows = TensorThreads / tileWords;
         int wordsPerThread = TensorK * tileWords / TensorThreads;
@@ -443,6 +453,7 @@ internal static partial class PtxKernels
         // Global → registers for the k tile starting at %r30: 8 pairs of adjacent floats per operand, zero outside the matrix.
         void Load(TileLoad t, string baseAddress, string leading, string row, string column, string staging)
         {
+            bool words = bf16B && t.Name == "b";                              // one bfloat16 pair per 32-bit word
             // outer / inner index of the thread's first pair.
             string outerBase = t.KIsOuter ? "%r30" : t.Tile, innerBase = t.KIsOuter ? t.Tile : "%r30";
             s.AppendLine($"""
@@ -453,13 +464,27 @@ internal static partial class PtxKernels
                     setp.lt.u32 %p2, %r33, {t.InnerLimit};
                     cvt.u64.u32 %rd11, %r31;
                     mul.lo.u64 %rd11, %rd11, {leading};
-                    mul.wide.u32 %rd12, %r32, 4;
+                    mul.wide.u32 %rd12, %r32, {(words ? 2 : 4)};
                     add.u64 %rd11, %rd11, %rd12;
                     add.u64 %rd11, %rd11, {baseAddress};
                     mul.lo.u64 %rd13, {leading}, {t.RowStep};
                 """);
             for (int r = 0; r < t.Pairs; r++)
             {
+                if (words)
+                {
+                    // The pair (k, k + 1) is one word; a row's odd last value is paired with the weight's zero padding.
+                    s.AppendLine($"""
+                            setp.lt.u32 %p3, %r31, {t.OuterLimit};
+                            and.pred %p4, %p3, %p1;
+                            mov.b32 %gw{r}, 0;
+                            @%p4 ld.global.b32 %gw{r}, [%rd11];
+                            add.u32 %r31, %r31, {t.RowStep};
+                            add.u64 %rd11, %rd11, %rd13;
+                        """);
+                    continue;
+                }
+
                 s.AppendLine($"""
                         setp.lt.u32 %p3, %r31, {t.OuterLimit};
                         and.pred %p4, %p3, %p1;
@@ -480,6 +505,12 @@ internal static partial class PtxKernels
             s.AppendLine($"    add.u32 %r35, {store}, %r34;");
             for (int r = 0; r < t.Pairs; r++)
             {
+                if (bf16B && t.Name == "b")
+                {
+                    s.AppendLine($"    st.shared.b32 [%r35+{r * t.RowStep * t.Stride}], %gw{r};");
+                    continue;
+                }
+
                 s.AppendLine($"""
                         cvt.rn.bf16x2.f32 %r36, {staging}{2 * r + 1}, {staging}{2 * r};
                         st.shared.b32 [%r35+{r * t.RowStep * t.Stride}], %r36;

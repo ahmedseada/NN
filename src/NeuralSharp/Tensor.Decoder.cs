@@ -242,9 +242,10 @@ public sealed partial class Tensor
     /// one rank ≤ 32, with each low-rank term computed inside its base product (one more k step of the tensor-core kernel)
     /// instead of in separate passes over the full-width output. The backward pass does the same for the input's
     /// gradient: dx = g·Wᵀ + (scale · g·Bᵀ)·Aᵀ in one product. Null (nothing computed) when the device has no fused
-    /// version; callers then run the base products and <see cref="AddLowRank"/>. No bias: callers add it.
+    /// version; callers then run the base products and <see cref="AddLowRank"/>. A frozen bias is added to each output in
+    /// place (a bias that trains is not: null then).
     /// </summary>
-    internal static Tensor[]? LoraProducts(Tensor input, IReadOnlyList<Layers.Linear> layers)
+    internal static Tensor[]? LoraProducts(Tensor input, IReadOnlyList<Layers.Linear> layers, bool withBias = true)
     {
         input.ThrowIfDisposed();
         int k = input._shape[^1], m = input.Size / Math.Max(1, k);
@@ -260,7 +261,7 @@ public sealed partial class Tensor
         {
             int own = layer.BFloat16 is not null ? 2 : layer.Int4 is not null ? 1 : layer.Int8 is null && layer.TiedTo is null ? 3 : -1;
             if (own != kind || kind < 0 || layer.InFeatures != k || layer.Adapter is not { } adapter || adapter.Rank != first.Rank
-                || adapter.A.Device != input.Device || kind == 3 && (layers.Count > 1 || layer.Weight.RequiresGrad))
+                || adapter.A.Device != input.Device || kind == 3 && (layers.Count > 1 || layer.Weight.RequiresGrad) || withBias && layer.Bias is { RequiresGrad: true })
             {
                 return null;
             }
@@ -325,6 +326,11 @@ public sealed partial class Tensor
         for (int j = 0; j < layers.Count; j++)
         {
             var layer = layers[j];
+            if (withBias && layer.Bias is { } bias)
+            {
+                backend.AddRowVector(outputs[j].Storage, bias.Storage, outputs[j].Storage, m, layer.OutFeatures);   // frozen: no gradient
+            }
+
             var (a, b, scale) = (layer.Adapter!.A, layer.Adapter.B, layer.Adapter.Scale);
             var u = us[j];
             int n = layer.OutFeatures;
@@ -345,7 +351,12 @@ public sealed partial class Tensor
                         backend.BatchedMatMul(flat.Storage, dt.Storage, a.GradStorage(), 1, k, rank, m, true, false, 1f);   // dA += xᵀ·dt
                     }
 
-                    if (flat.RequiresGrad)
+                    if (flat.RequiresGrad && kind == 2
+                        && backend.BFloat16TransposedMatMul(g.Storage, layer.BFloat16!.Packed.Storage, flat.GradStorage(), m, k, n, 1f, dt.Storage, a.Storage, rank))
+                    {
+                        // dx += g·Wᵀ + dt·Aᵀ with W read as the bfloat16 words it is stored in.
+                    }
+                    else if (flat.RequiresGrad)
                     {
                         // dx += g·Wᵀ + dt·Aᵀ (W [k, n] as float32; packed weights expanded first).
                         Tensor? expanded = null;
@@ -411,6 +422,11 @@ public sealed partial class Tensor
             int n = layer.OutFeatures;
             outputs[j].Record("matmul_packed", g =>
             {
+                if (layer.BFloat16 is { } h && input.Backend.BFloat16TransposedMatMul(g.Storage, h.Packed.Storage, input.GradStorage(), m, k, n, 1f, null, null, 0))
+                {
+                    return;                                                                        // dx += g · Wᵀ, W as stored
+                }
+
                 using var w = layer.Int8?.Dequantize() ?? layer.Int4?.Dequantize() ?? layer.BFloat16!.Dequantize();
                 input.Backend.BatchedMatMul(g.Storage, w.Storage, input.GradStorage(), 1, m, k, n, false, true, 1f);   // dx += g · wᵀ
             }, input);

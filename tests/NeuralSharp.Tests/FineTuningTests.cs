@@ -15,6 +15,7 @@ internal static partial class Tests
         ("generation: prompts of different lengths decoded together (left-padded, per-row starts) give each row its own logits and greedy replies", RaggedBatchDecoding),
         ("memory: a full GPU raises a clear error, or with offloading places tensors in system memory the kernels still use", HostOffload),
         ("fine-tuning: activation checkpointing gives the same loss and gradients (adapters and input)", CheckpointingGradients),
+        ("fine-tuning: the input gradient through bfloat16 weights reads them as stored (with and without the adapter's term, odd widths, split k)", BFloat16InputGradient),
         ("fine-tuning: releasing results no backward step reads, and recomputing feed-forward activations, give the same loss and gradients with less memory (RoPE, biases, q/k norms, post norms, parallel blocks, layer norms, dropout)", ReleasedActivations),
         ("fine-tuning: checkpointing is off by default and turns on (the step run again) when a step runs out of memory", AutomaticCheckpointing),
         ("models: a Hugging Face model id is downloaded (only the files the library reads, sharded weights) into the cache, loads, and works offline", ModelDownload),
@@ -165,6 +166,42 @@ internal static partial class Tests
 
             Check(released.Held < kept.Held, $"{name}: releasing holds less after the forward pass ({released.Held:N0} vs {kept.Held:N0} bytes)");
             Check(spec.Gated == false || recomputed.Held < released.Held, $"{name}: recomputing holds less still ({recomputed.Held:N0} vs {released.Held:N0} bytes)");
+        }
+    }
+
+    private static void BFloat16InputGradient(Device device)
+    {
+        if (device.Type != DeviceType.Cuda || MixedPrecision.TensorCoresUnavailable(device) is not null)
+        {
+            return;                                                              // a tensor-core kernel; others expand the weight
+        }
+
+        using var precision = MixedPrecision.BFloat16();
+        var r = new Random(51);
+        float[] Values(int n) => [.. Enumerable.Range(0, n).Select(_ => (float)(r.NextDouble() * 2 - 1))];
+        foreach (var (m, inputs, outputs) in new[] { (300, 150, 201), (4096, 96, 2049) })
+        {
+            using var scope = new TensorScope();
+            using var weight = BFloat16Weight.FromValues(Values(inputs * outputs), inputs, outputs, device);     // W [inputs, outputs]
+            var g = Tensor.From(Values(m * outputs), [m, outputs], device);
+            var dt = Tensor.From(Values(m * 16), [m, 16], device);
+            var a = Tensor.From(Values(inputs * 16), [inputs, 16], device);
+            var start = Values(m * inputs);
+            foreach (bool lowRank in new[] { false, true })
+            {
+                var direct = Tensor.From(start, [m, inputs], device);
+                Check(g.Backend.BFloat16TransposedMatMul(g.Storage, weight.Packed.Storage, direct.Storage, m, inputs, outputs, 1f,
+                    lowRank ? dt.Storage : null, lowRank ? a.Storage : null, 16), "the kernel ran");
+                var expected = Tensor.From(start, [m, inputs], device);
+                using var w = weight.Dequantize();
+                g.Backend.BatchedMatMul(g.Storage, w.Storage, expected.Storage, 1, m, inputs, outputs, false, true, 1f);
+                if (lowRank)
+                {
+                    g.Backend.BatchedMatMul(dt.Storage, a.Storage, expected.Storage, 1, m, inputs, 16, false, true, 1f);
+                }
+
+                CloseByNorm(expected.ToArray(), direct.ToArray(), 1e-3f, $"{m}×{inputs}×{outputs}{(lowRank ? " + low rank" : "")}");
+            }
         }
     }
 

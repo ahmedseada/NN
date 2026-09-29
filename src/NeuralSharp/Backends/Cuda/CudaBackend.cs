@@ -795,7 +795,10 @@ internal sealed unsafe partial class CudaBackend : Backend
         // side of 8-63 (a LoRA adapter's rank-16 products: x·A, g·Bᵀ, xᵀ·dt, u·B), which the float kernels ran at 1-3
         // TFLOPS; with k split across blocks they read their wide operand about as fast as memory allows.
         bool large = m >= 64 && n >= 64 && k >= 32;
-        bool skinny = batch == 1 && Math.Min(m, n) >= 8 && Math.Max(m, n) >= 256 && k >= 16 && (long)m * n * k >= 1 << 24;
+        // (Also a long k over a small output, such as the rank-16 gradient of a 128-wide key/value projection: 16 × 128 ×
+        // tokens, which the 16 × 16 float kernel ran at 0.1 TFLOPS with 8 blocks.)
+        bool skinny = batch == 1 && Math.Min(m, n) >= 8 && k >= 16
+            && (Math.Max(m, n) >= 256 && (long)m * n * k >= 1 << 24 || Math.Max(m, n) >= 64 && k >= 2048);
         var tensorCore = !few && (large || skinny) && MixedPrecision.UsesTensorCores ? TensorCoreKernels() : null;
         if (tensorCore is not null && large && MixedPrecision.Current == MatMulPrecision.Float8 && EightBitReady(fp8: true) && batch <= 64)
         {
@@ -935,6 +938,29 @@ internal sealed unsafe partial class CudaBackend : Backend
         return true;
     }
 
+    public override bool BFloat16TransposedMatMul(Storage a, Storage packed, Storage c, int m, int n, int k, float beta, Storage? u, Storage? v, int rank)
+    {
+        if (m == 0 || n == 0 || k < 16 || u is not null && rank is < 1 or > 32 || !MixedPrecision.UsesTensorCores
+            || MixedPrecision.Current == MatMulPrecision.Float8 || TensorCoreKernels() is not { } tensorCore
+            || !tensorCore.TryGetValue("gemm_tc_nt_bf16w_lr_f32", out var function))
+        {
+            return false;
+        }
+
+        if (_profile is not null)
+        {
+            _profileLabel = $"gemm_tc_nt_bf16w{(u is null ? "" : "_lr")} {m}x{n}x{k}{(u is null ? "" : $"+{rank}")}";
+            _profileFlops = 2.0 * m * n * (k + (u is null ? 0 : rank));
+        }
+
+        int splits = TensorSplits(m, n, k, beta, P(c), n);
+        Launch(function, (uint)((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile), (uint)((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile),
+            (uint)splits, PtxKernels.TensorThreads, 1, P(a), P(packed), P(c), U(m), U(n), U(k), F(beta), 0UL, 0UL, 0UL, 0UL,
+            U(k), U((k + 1) / 2), U(n), 0UL, u is null ? 0UL : P(u), v is null ? 0UL : P(v), U(u is null ? 0 : rank));
+        Interlocked.Increment(ref TensorCoreLaunches);
+        return true;
+    }
+
     public override bool GemmStrided(Storage a, long aOffset, int lda, bool transA, Storage b, long bOffset, int ldb, bool transB,
         Storage c, long cOffset, int ldc, int m, int n, int k, float beta, Storage? bias = null, GemmEpilogue epilogue = GemmEpilogue.None,
         Storage? aux = null, long auxOffset = 0)
@@ -988,7 +1014,10 @@ internal sealed unsafe partial class CudaBackend : Backend
         int sms = Math.Max(1, _multiprocessors);
         int tiles = ((m + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile) * ((n + PtxKernels.TensorTile - 1) / PtxKernels.TensorTile);
         int wanted = TensorSplitsOverride ?? (tiles >= 4 * sms ? 1 : (16 * sms + tiles - 1) / tiles);
-        int splits = Math.Clamp(wanted, 1, Math.Max(1, Math.Min(8, k / 1024)));
+        // A few output tiles over a long k (a LoRA adapter's gradients, [rank, width] or [width, rank] over every token):
+        // up to 64 chunks of 256 or more, so the blocks cover the multiprocessors; otherwise at most 8 of 1024 or more.
+        int limit = tiles <= 8 ? Math.Min(64, k / 256) : Math.Min(8, k / 1024);
+        int splits = Math.Clamp(wanted, 1, Math.Max(1, limit));
         if (splits > 1 && beta == 0f)
         {
             Check(cuMemsetD32Async(c, 0, (nuint)((long)m * n), _stream), nameof(cuMemsetD32Async));

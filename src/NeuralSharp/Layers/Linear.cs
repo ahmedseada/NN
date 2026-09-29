@@ -122,6 +122,11 @@ public sealed class Linear : Module
             return Tensor.MatMulBias(input, _weight, Bias);                 // one pass on tensor cores
         }
 
+        if (Bias is { RequiresGrad: false } && Adapter is not null && Tensor.LoraProducts(input, [this]) is [var withBias])
+        {
+            return withBias;                                            // the frozen bias added inside the fused product
+        }
+
         var product = ProjectWithoutBias(input);
         if (Bias is null)
         {
@@ -161,7 +166,7 @@ public sealed class Linear : Module
         }
 
         // Adapters on every layer (LoRA / QLoRA, training or evaluation): one pass with each low-rank term inside its product.
-        if (layers.All(l => l.Adapter is not null && l.Bias is null) && Tensor.LoraProducts(input, layers) is { } lora)
+        if (layers.All(l => l.Adapter is not null && l.Bias is not { RequiresGrad: true }) && Tensor.LoraProducts(input, layers) is { } lora)
         {
             return lora;
         }
@@ -181,7 +186,7 @@ public sealed class Linear : Module
     /// <summary>x·W, plus the adapter's low-rank term when an adapter is attached.</summary>
     internal Tensor ProjectWithoutBias(Tensor input)
     {
-        if (Adapter is not null && Tensor.LoraProducts(input, [this]) is [var fused])
+        if (Adapter is not null && Tensor.LoraProducts(input, [this], withBias: false) is [var fused])
         {
             return fused;
         }

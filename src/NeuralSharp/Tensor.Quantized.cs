@@ -82,6 +82,11 @@ public sealed partial class Tensor
         {
             y.Record("matmul_bf16", g =>
             {
+                if (flat.Backend.BFloat16TransposedMatMul(g.Storage, weight.Packed.Storage, flat.GradStorage(), m, k, n, 1f, null, null, 0))
+                {
+                    return;                                                                        // dx += dy · wᵀ, w as stored
+                }
+
                 using var w = Empty([k, n], weight.Packed.Device, track: false);
                 weight.Packed.Backend.BFloat16Dequantize(weight.Packed.Storage, w.Storage, k, n);
                 flat.Backend.BatchedMatMul(g.Storage, w.Storage, flat.GradStorage(), 1, m, k, n, false, true, 1f);   // dx += dy · wᵀ
