@@ -83,6 +83,53 @@ public sealed class ChatGenerator(TextGenerator generator, ChatTemplate? templat
         return replies;
     }
 
+    /// <summary>
+    /// <see cref="ChatBatch"/> streamed: each request's reply as it is generated (content, thinking and tool calls parsed
+    /// as <see cref="Stream"/> parses them), tagged with the request's index, then each request's final chunk (with the
+    /// whole message and statistics) once all are done. The options of the first request apply to all.
+    /// </summary>
+    public IEnumerable<(int Index, ChatChunk Chunk)> StreamBatch(IReadOnlyList<ChatRequest> requests, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(requests);
+        if (requests.Count == 0)
+        {
+            yield break;
+        }
+
+        var options = requests[0].Options ?? new GenerationOptions();
+        options = options with { Stop = [.. options.Stop, .. Template.StopSequences] };
+        var parsers = requests.Select(r => new ChatOutputParser(Template, separateThinking: r.Think != false, toolNames: r.Tools?.Select(t => t.Name).ToHashSet())).ToArray();
+        var content = requests.Select(_ => new System.Text.StringBuilder()).ToArray();
+        var thinking = requests.Select(_ => new System.Text.StringBuilder()).ToArray();
+        var calls = requests.Select(_ => new List<ToolCall>()).ToArray();
+        foreach (var chunk in Generator.StreamBatch([.. requests.Select(RenderPrompt)], options, cancellationToken))
+        {
+            int i = chunk.Index;
+            var delta = chunk.Done ? parsers[i].Finish() : parsers[i].Feed(chunk.Text);
+            content[i].Append(delta.Content);
+            thinking[i].Append(delta.Thinking);
+            calls[i].AddRange(delta.ToolCalls);
+            if (!chunk.Done)
+            {
+                if (delta.Content.Length > 0 || delta.Thinking.Length > 0 || delta.ToolCalls.Count > 0)
+                {
+                    yield return (i, new ChatChunk(delta));
+                }
+
+                continue;
+            }
+
+            string thought = thinking[i].ToString();
+            var message = new ChatMessage("assistant", content[i].ToString().Trim(), thought.Length > 0 ? thought.Trim() : null,
+                calls[i].Count > 0 ? [.. calls[i]] : null);
+            yield return (i, new ChatChunk(delta, true, chunk.DoneReason, message, chunk.Stats));
+        }
+    }
+
+    /// <summary><see cref="StreamBatch"/> on a background thread, as an <c>await foreach</c> stream.</summary>
+    public IAsyncEnumerable<(int Index, ChatChunk Chunk)> StreamBatchAsync(IReadOnlyList<ChatRequest> requests, CancellationToken cancellationToken = default) =>
+        BackgroundStream.Run(token => StreamBatch(requests, token), cancellationToken);
+
     /// <summary>Streams the reply.</summary>
     public IEnumerable<ChatChunk> Stream(ChatRequest request, CancellationToken cancellationToken = default)
     {

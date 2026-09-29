@@ -132,23 +132,36 @@ public sealed class TunedClassifier : IDisposable
     /// The model's own answer to <paramref name="text"/>, streamed as it is generated (greedy): text pieces, then the scored
     /// prediction (the same as <see cref="Predict(string)"/>) as the final item.
     /// </summary>
-    public async IAsyncEnumerable<TunedStreamItem> StreamAsync(string text, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<TunedStreamItem> StreamAsync(string text, CancellationToken cancellationToken = default) =>
+        StreamAsync([text], cancellationToken);
+
+    /// <summary>
+    /// The model's own answers to <paramref name="texts"/>, generated together and streamed as they come (the library's
+    /// batched chat stream: one pass through the model per token for all of them), each piece tagged with its message's
+    /// index; then every message's scored prediction (the same as <see cref="Predict(IReadOnlyList{string})"/>).
+    /// </summary>
+    public async IAsyncEnumerable<TunedStreamItem> StreamAsync(IReadOnlyList<string> texts, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            _chat ??= _model.CreateChat(contextLength: Math.Min(_model.MaxPositions, _maxLength + 32));
-            var request = new ChatRequest(_scorer.Fit(Prompt(text), Labels) ?? Prompt(""), null, false,
-                new GenerationOptions { Temperature = 0f, TopK = 1, TopP = 1f, RepeatPenalty = 1f, NumPredict = 16, ChunkSize = 1, NumCtx = Math.Min(_model.MaxPositions, _maxLength + 32) });
-            await foreach (var chunk in _chat.StreamAsync(request, cancellationToken).ConfigureAwait(false))
+            int context = Math.Min(_model.MaxPositions, _maxLength + 32);
+            _chat ??= _model.CreateChat(contextLength: context);
+            var options = new GenerationOptions { Temperature = 0f, TopK = 1, TopP = 1f, RepeatPenalty = 1f, NumPredict = 16, ChunkSize = 1, NumCtx = context };
+            var requests = texts.Select(t => new ChatRequest(_scorer.Fit(Prompt(t), Labels) ?? Prompt(""), null, false, options)).ToList();
+            await foreach (var (index, chunk) in _chat.StreamBatchAsync(requests, cancellationToken).ConfigureAwait(false))
             {
                 if (chunk.Delta.Content.Length > 0)
                 {
-                    yield return new TunedStreamItem(chunk.Delta.Content, null);
+                    yield return new TunedStreamItem(index, chunk.Delta.Content, null);
                 }
             }
 
-            yield return new TunedStreamItem(null, Score(text));
+            var predictions = Score(texts);
+            for (int i = 0; i < predictions.Count; i++)
+            {
+                yield return new TunedStreamItem(i, null, predictions[i]);
+            }
         }
         finally
         {
@@ -185,4 +198,4 @@ public sealed class TunedClassifier : IDisposable
 /// <summary>One item of <see cref="TunedClassifier.StreamAsync"/>: a piece of the generated answer, or the final prediction.</summary>
 /// <param name="Token">Text the model generated (null on the final item).</param>
 /// <param name="Prediction">The scored prediction (only on the final item).</param>
-public sealed record TunedStreamItem(string? Token, TextPrediction? Prediction);
+public sealed record TunedStreamItem(int Index, string? Token, TextPrediction? Prediction);

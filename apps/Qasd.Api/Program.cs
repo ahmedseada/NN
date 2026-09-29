@@ -183,33 +183,35 @@ static async Task StreamEvents(IReadOnlyList<string> texts, string model, HttpCo
     double firstToken = -1;
     try
     {
-        for (int i = 0; i < texts.Count; i++)
+        if (model == "tuned")
         {
-            TextPrediction prediction;
-            if (model == "tuned")
+            // The answers of every message generated together (one pass through the model per token), then the results.
+            await foreach (var item in tuned.Classifier!.StreamAsync(texts, cancel))
             {
-                prediction = null!;
-                await foreach (var item in tuned.Classifier!.StreamAsync(texts[i], cancel))
+                firstToken = firstToken < 0 ? clock.Elapsed.TotalMilliseconds : firstToken;
+                if (item.Token is { } token)
                 {
-                    if (item.Token is { } token)
-                    {
-                        firstToken = firstToken < 0 ? clock.Elapsed.TotalMilliseconds : firstToken;
-                        await Send("token", new TokenEvent(i, token));
-                    }
-                    else
-                    {
-                        prediction = item.Prediction!;
-                    }
+                    await Send("token", new TokenEvent(item.Index, token));
+                }
+                else
+                {
+                    await Send("result", new ResultEvent(item.Index, Response(texts[item.Index], item.Prediction!, model, options)));
                 }
             }
-            else
+        }
+        else
+        {
+            for (int i = 0; i < texts.Count; i++)
             {
-                using var lease = host.Lease();
-                prediction = lease.Classifier.Predict(texts[i]);
-            }
+                TextPrediction prediction;
+                using (var lease = host.Lease())
+                {
+                    prediction = lease.Classifier.Predict(texts[i]);
+                }
 
-            firstToken = firstToken < 0 ? clock.Elapsed.TotalMilliseconds : firstToken;
-            await Send("result", new ResultEvent(i, Response(texts[i], prediction, model, options)));
+                firstToken = firstToken < 0 ? clock.Elapsed.TotalMilliseconds : firstToken;
+                await Send("result", new ResultEvent(i, Response(texts[i], prediction, model, options)));
+            }
         }
 
         await Send("done", new DoneEvent(texts.Count, clock.Elapsed.TotalMilliseconds, firstToken, model));

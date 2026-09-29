@@ -1460,6 +1460,42 @@ internal static partial class Tests
                 Check(together[i].Message!.Content == alone.Message!.Content && together[i].DoneReason == alone.DoneReason,
                     $"reply {i}: batched '{together[i].Message!.Content}' ({together[i].DoneReason}), alone '{alone.Message!.Content}' ({alone.DoneReason})");
             }
+
+            // Streamed together, a token at a time: the pieces add up to the batched replies, each request ends once.
+            foreach (int chunkSize in new[] { 1, 3 })
+            {
+                var streamed = requests.Select(r => r with { Options = r.Options! with { ChunkSize = chunkSize } }).ToList();
+                var content = requests.Select(_ => new System.Text.StringBuilder()).ToArray();
+                var finals = new ChatChunk?[requests.Count];
+                foreach (var (index, chunk) in chat.StreamBatch(streamed))
+                {
+                    Check(finals[index] is null, $"chunk size {chunkSize}, reply {index}: nothing after its final chunk");
+                    content[index].Append(chunk.Delta.Content);
+                    finals[index] = chunk.Done ? chunk : null;
+                }
+
+                for (int i = 0; i < requests.Count; i++)
+                {
+                    Check(finals[i] is { } last && last.Message!.Content == together[i].Message!.Content && last.DoneReason == together[i].DoneReason
+                          && content[i].ToString().Trim() == together[i].Message!.Content,
+                        $"chunk size {chunkSize}, reply {i}: streamed '{content[i]}' ({finals[i]?.DoneReason}), batched '{together[i].Message!.Content}'");
+                }
+            }
+
+            // Raw text with a stop sequence: the streamed pieces are the batched texts, cut before the stop.
+            var raw = new[] { "once upon", "a b c d", "zzz" };
+            var stopping = options with { Stop = ["e"], ChunkSize = 1 };
+            var texts = chat.Generator.GenerateBatch(raw, stopping);
+            var pieces = raw.Select(_ => new System.Text.StringBuilder()).ToArray();
+            foreach (var chunk in chat.Generator.StreamBatch(raw, stopping))
+            {
+                pieces[chunk.Index].Append(chunk.Text);
+            }
+
+            for (int i = 0; i < raw.Length; i++)
+            {
+                Check(pieces[i].ToString() == texts[i].Text && !texts[i].Text.Contains('e'), $"text {i}: streamed '{pieces[i]}', batched '{texts[i].Text}' ({texts[i].DoneReason})");
+            }
         }
         finally
         {

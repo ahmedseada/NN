@@ -24,6 +24,14 @@ public sealed record GenerationStats(int PromptTokens, TimeSpan PromptDuration, 
 /// <param name="Stats">Statistics, on the final chunk only.</param>
 public sealed record GenerationChunk(string Text, bool Done = false, string? DoneReason = null, GenerationStats? Stats = null);
 
+/// <summary>A piece of one prompt's continuation in <see cref="TextGenerator.StreamBatch"/>.</summary>
+/// <param name="Index">The prompt's index in the batch.</param>
+/// <param name="Text">Newly generated text (empty on the final chunk).</param>
+/// <param name="Done">True for the prompt's final chunk.</param>
+/// <param name="DoneReason">"stop" or "length" on the final chunk.</param>
+/// <param name="Stats">Statistics, on the final chunk only.</param>
+public sealed record BatchChunk(int Index, string Text, bool Done = false, string? DoneReason = null, GenerationStats? Stats = null);
+
 /// <summary>
 /// Autoregressive text generation for a causal language model built as a <see cref="Sequential"/> of
 /// <see cref="ICachedModule"/>-capable layers (embedding, positional encoding, causal transformer blocks, norm, head).
@@ -144,15 +152,46 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(prompts);
+        var results = new (string Text, string DoneReason, GenerationStats Stats)[prompts.Count];
+        var texts = prompts.Select(_ => new System.Text.StringBuilder()).ToArray();
+        foreach (var chunk in StreamBatch(prompts, options, cancellationToken))
+        {
+            texts[chunk.Index].Append(chunk.Text);
+            if (chunk.Done)
+            {
+                results[chunk.Index] = (texts[chunk.Index].ToString(), chunk.DoneReason!, chunk.Stats!);
+            }
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// <see cref="GenerateBatch"/> streamed: each prompt's text as it is generated (every <see cref="GenerationOptions.ChunkSize"/>
+    /// tokens, pieces tagged with the prompt's index; a possible stop sequence is held back until it is ruled out), then one
+    /// final chunk per prompt (<see cref="BatchChunk.Done"/>, with its reason and statistics) once all are done. The pieces
+    /// of a prompt add up to the text <see cref="GenerateBatch"/> returns for it.
+    /// </summary>
+    public IEnumerable<BatchChunk> StreamBatch(IReadOnlyList<string> prompts, GenerationOptions options, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(prompts);
         if (prompts.Count == 0)
         {
-            return [];
+            yield break;
         }
 
         bool penalties = options.RepeatPenalty != 1f || options.PresencePenalty != 0f || options.FrequencyPenalty != 0f;
         if (prompts.Count == 1 || penalties || !SupportsBatches)
         {
-            return [.. prompts.Select(p => Generate(p, options, cancellationToken))];
+            for (int p = 0; p < prompts.Count; p++)
+            {
+                foreach (var chunk in Stream(prompts[p], options, cancellationToken))
+                {
+                    yield return new BatchChunk(p, chunk.Text, chunk.Done, chunk.DoneReason, chunk.Stats);
+                }
+            }
+
+            yield break;
         }
 
         var total = Stopwatch.StartNew();
@@ -172,6 +211,7 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
         int limit = Math.Min(options.NumPredict > 0 ? Math.Min(options.NumPredict, MaxTokens) : MaxTokens, context - promptLength);
         limit = Math.Max(1, limit);
         var stops = options.Stop.Where(x => x.Length > 0).ToArray();
+        int holdBack = stops.Length == 0 ? 0 : stops.Max(x => x.Length) - 1;
         var starts = tokens.Select(t => promptLength - t.Count).ToArray();
         var input = new float[rows * promptLength];
         for (int r = 0; r < rows; r++)
@@ -194,6 +234,7 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
         decoding.SetRowStarts(starts);
         var generated = Enumerable.Range(0, rows).Select(_ => new List<int>()).ToList();
         var ends = new int?[rows];                                            // text length where a stop sequence begins
+        var emitted = new int[rows];                                          // characters handed out so far
         Model.Eval();
         TimeSpan promptDuration;
         using (Autograd.NoGrad())
@@ -204,7 +245,11 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
 
         promptDuration = total.Elapsed;
         int produced = 1, read = 0;
-        bool Finished()
+        var pieces = new List<BatchChunk>();
+
+        // Reads the new tokens, finds stop sequences and collects each row's new text (the tail that could still become
+        // a stop sequence, or ends in an incomplete character, is held back while the row goes on).
+        bool Finished(bool final)
         {
             foreach (var step in sampler.Read(read, produced))
             {
@@ -220,14 +265,26 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
             read = produced;
             for (int r = 0; r < rows; r++)
             {
+                string text = Tokenizer.Decode(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(generated[r]));
                 if (ends[r] is null && stops.Length > 0)
                 {
-                    string text = Tokenizer.Decode(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(generated[r]));
                     int at = stops.Select(x => text.IndexOf(x, StringComparison.Ordinal)).Where(i => i >= 0).DefaultIfEmpty(-1).Min();
                     if (at >= 0)
                     {
                         ends[r] = at;
                     }
+                }
+
+                int until = ends[r] ?? (final ? text.Length : Math.Max(0, text.Length - holdBack));
+                if (ends[r] is null && !final && until > 0 && text[until - 1] == '\uFFFD')
+                {
+                    until--;                                                   // an incomplete character: wait for its other bytes
+                }
+
+                if (until > emitted[r])
+                {
+                    pieces.Add(new BatchChunk(r, text[emitted[r]..until]));
+                    emitted[r] = until;
                 }
             }
 
@@ -236,9 +293,19 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
 
         while (produced < limit && !cancellationToken.IsCancellationRequested)
         {
-            if (produced % Math.Max(1, options.ChunkSize) == 0 && Finished())
+            if (produced % Math.Max(1, options.ChunkSize) == 0)
             {
-                break;
+                bool done = Finished(final: false);
+                foreach (var piece in pieces)
+                {
+                    yield return piece;
+                }
+
+                pieces.Clear();
+                if (done)
+                {
+                    break;
+                }
             }
 
             using (Autograd.NoGrad())
@@ -250,13 +317,16 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
             produced++;
         }
 
-        Finished();
+        Finished(final: true);
+        foreach (var piece in pieces)
+        {
+            yield return piece;
+        }
+
         var elapsed = total.Elapsed;
-        var results = new List<(string, string, GenerationStats)>(rows);
         for (int r = 0; r < rows; r++)
         {
             var ids = generated[r];
-            string text = Tokenizer.Decode(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(ids));
             int count = ids.Count;
             if (ends[r] is int end)
             {
@@ -266,15 +336,11 @@ public sealed class TextGenerator(Sequential model, ITokenizer tokenizer, int co
                 {
                     count++;
                 }
-
-                text = text[..end];
             }
 
-            results.Add((text, ends[r] is null ? "length" : "stop",
-                new GenerationStats(tokens[r].Count, promptDuration, count, elapsed - promptDuration, elapsed, 0)));
+            yield return new BatchChunk(r, "", true, ends[r] is null ? "length" : "stop",
+                new GenerationStats(tokens[r].Count, promptDuration, count, elapsed - promptDuration, elapsed, 0));
         }
-
-        return results;
     }
 
     /// <summary>
