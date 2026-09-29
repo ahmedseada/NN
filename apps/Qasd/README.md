@@ -132,7 +132,7 @@ settings come from `appsettings.json` (section `IntentModel`), or environment va
 | `MaxTextLength` | 4000 | longest message in characters |
 | `AdminKey` | empty | the `X-Admin-Key` for `POST /v1/model/reload`; empty disables reloading |
 | `TunedPath` | empty | the tuned adapter folder (from `idrak-tune train`); empty: `apps/Qasd/models/tuned` when it holds one; `none`: the classifier only |
-| `TunedDevice` | `cpu` | where the tuned model runs (`cuda` recommended) |
+| `TunedDevice` | `auto` | where the tuned model runs: the GPU when there is one (`cpu`, `cuda`, `cuda:N`) |
 | `MaxTunedBatch` | 32 | most messages per batch request to the tuned model |
 | `DefaultModel` | `classifier` | the model requests use when they name none |
 
@@ -190,10 +190,29 @@ npx newman run apps/Qasd.Api/Qasd.postman_collection.json --env-var adminKey=<th
 ## Publish
 
 ```
-dotnet publish apps/Qasd.Api -c Release -o artifacts/intent-api        (then copy the model next to it)
-dotnet publish apps/Qasd -c Release -r win-x64 -o artifacts/qasd
+dotnet publish apps/Qasd.Api -c Release -o D:\Services\Qasd
 ```
 
-`Qasd.Core` references the Idrak packages from nuget.org (`Idrak`, `Idrak.Datasets`, `Idrak.LanguageModels`, version
-0.1.0); to move to a newer release, change the three versions in `apps/Qasd.Core/Qasd.Core.csproj` and the tool's in
-`.config/dotnet-tools.json`.
+The folder runs on its own: the trained models (`apps/Qasd/models`: `intents.qasd` and `tuned/`) are copied to
+`models/` next to the service, and the test page, the Scalar reference and `appsettings.json` come with it. The machine
+needs the ASP.NET Core 10 runtime (or add `-r win-x64 --self-contained` to publish without it) and, for the GPU, the
+NVIDIA driver. The tuned model's base weights (named in `models/tuned/idrak-tuning.json`) are read from the download
+cache (`%USERPROFILE%\.cache\idrak`, or `IDRAK_CACHE`): on a machine without internet access, copy that folder over.
+
+```
+cd D:\Services\Qasd
+.\Qasd.Api.exe                                          (http://localhost:5080)
+.\Qasd.Api.exe --urls http://0.0.0.0:5080               (reachable from other machines)
+```
+
+As a Windows service (an administrator PowerShell; it starts with Windows):
+
+```
+sc.exe create Qasd binPath= "D:\Services\Qasd\Qasd.Api.exe --urls http://0.0.0.0:5080" start= auto
+sc.exe start Qasd
+sc.exe stop Qasd; sc.exe delete Qasd                      (to remove it)
+```
+
+Settings go in `appsettings.json` in that folder (section `IntentModel`; `TunedDevice` is `auto`: the GPU when there is
+one) or in environment variables. After retraining, publish again (or copy the new models into `models/`) and restart
+the service. The command line publishes the same way: `dotnet publish apps/Qasd -c Release -r win-x64 -o D:\Tools\qasd`.

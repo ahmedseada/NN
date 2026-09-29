@@ -10,7 +10,8 @@ using Scalar.AspNetCore;
 
 // The intent service: serves the classifier from 'qasd train' and, when there is one, the chat model tuned on the intents
 // with idrak-tune (Idrak's fine-tuning tool). Test page at /, API reference (Scalar) at /scalar.
-var builder = WebApplication.CreateBuilder(args);
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions { Args = args, ContentRootPath = AppContext.BaseDirectory });
+builder.Host.UseWindowsService(o => o.ServiceName = "Qasd");                   // runs as a Windows service when installed as one (sc create)
 builder.Services.Configure<IntentModelOptions>(builder.Configuration.GetSection("IntentModel"));
 builder.Services.AddSingleton<ModelHost>();
 builder.Services.AddSingleton<TunedHost>();

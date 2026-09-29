@@ -3,7 +3,7 @@ namespace Qasd;
 /// <summary>
 /// Where Qasd's models and data live by default, in the Qasd project: apps/Qasd/models/intents.qasd (the classifier),
 /// apps/Qasd/models/tuned (the chat model tuned with idrak-tune) and apps/Qasd/data (the intent data and its split). The apps folder is found from the running program (the folder
-/// holding Qasd.slnx, looking up from it); a published copy without the sources uses models/ next to itself.
+/// holding Qasd.slnx, looking up from it). A published copy uses models/ next to itself when it has one.
 /// </summary>
 public static class QasdPaths
 {
@@ -28,13 +28,17 @@ public static class QasdPaths
         return null;
     });
 
-    /// <summary>The classifier's model file: apps/Qasd/models/intents.qasd.</summary>
-    public static string Classifier => Apps.Value is { } apps
+    // models/ next to the program: a published copy (dotnet publish puts the trained models there).
+    private static readonly string? Published = Directory.Exists(Path.Combine(AppContext.BaseDirectory, "models"))
+        ? Path.Combine(AppContext.BaseDirectory, "models") : null;
+
+    /// <summary>The classifier's model file: apps/Qasd/models/intents.qasd (models/intents.qasd in a published copy).</summary>
+    public static string Classifier => Published is { } published ? Path.Combine(published, "intents.qasd") : Apps.Value is { } apps
         ? Path.Combine(apps, "Qasd", "models", "intents.qasd")
         : Path.Combine(AppContext.BaseDirectory, "models", "intents.qasd");
 
-    /// <summary>The tuned model's folder (the adapter idrak-tune writes): apps/Qasd/models/tuned.</summary>
-    public static string Tuned => Apps.Value is { } apps
+    /// <summary>The tuned model's folder (the adapter idrak-tune writes): apps/Qasd/models/tuned (models/tuned in a published copy).</summary>
+    public static string Tuned => Published is { } published ? Path.Combine(published, "tuned") : Apps.Value is { } apps
         ? Path.Combine(apps, "Qasd", "models", "tuned")
         : Path.Combine(AppContext.BaseDirectory, "models", "tuned");
 

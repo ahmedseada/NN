@@ -10,10 +10,19 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.*" />
     <PackageReference Include="Scalar.AspNetCore" Version="2.*" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.*" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Qasd.Core\Qasd.Core.csproj" />
+  </ItemGroup>
+
+  <!-- dotnet publish copies the trained models (apps/Qasd/models: intents.qasd and tuned/) to models/ next to the
+       service, so the published folder runs on its own. -->
+  <ItemGroup>
+    <QasdModel Include="..\Qasd\models\**\*" />
+    <ResolvedFileToPublish Include="@(QasdModel)" RelativePath="models\%(RecursiveDir)%(Filename)%(Extension)"
+                           CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
