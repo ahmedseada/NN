@@ -509,24 +509,32 @@ public sealed class TextClassifier : IDisposable
     }
 
     /// <summary>
-    /// Splits labeled texts so that every copy of a text (after normalization) lands on the same side: a test score on
-    /// the second part is then a score on texts the model never saw. <paramref name="testFraction"/> of the distinct texts
-    /// go to the second part.
+    /// Splits labeled texts with the library's <see cref="Idrak.Datasets.Dataset.Split"/>, keyed by the text as
+    /// <see cref="ArabicTextNormalizer"/> writes it: every copy of a text lands on the same side, so a test score on the
+    /// second part is a score on texts the model never saw. A text's side comes from a hash of the key and the seed, so
+    /// about <paramref name="testFraction"/> of the distinct texts go to the second part, the same ones whatever the order.
     /// </summary>
     public static (List<LabeledText> Train, List<LabeledText> Test) Split(IEnumerable<LabeledText> examples, double testFraction, int seed = 0)
     {
-        var random = new Random(seed);
-        var groups = examples.GroupBy(e => TextFeatures.Normalize(e.Text)).OrderBy(g => g.Key, StringComparer.Ordinal).ToList();
-        random.Shuffle(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(groups));
-        int test = (int)Math.Round(groups.Count * Math.Clamp(testFraction, 0, 1));
-        return ([.. groups.Skip(test).SelectMany(g => g)], [.. groups.Take(test).SelectMany(g => g)]);
+        var list = examples as IReadOnlyList<LabeledText> ?? [.. examples];
+        if (testFraction <= 0)
+        {
+            return ([.. list], []);
+        }
+
+        // Each key once; the rows the library splits are only the index, so nothing is copied but the result.
+        var keys = new string[list.Count];
+        Parallel.For(0, list.Count, i => keys[i] = ArabicTextNormalizer.Instance.Normalize(list[i].Text));
+        var rows = new Idrak.Datasets.Dataset(() => Enumerable.Range(0, list.Count).Select(i => new JsonObject { ["i"] = i }), "texts");
+        var (train, test) = rows.Split(Math.Min(testFraction, 1), seed, key: row => keys[(int)row["i"]!]);
+        return ([.. train.Select(r => list[(int)r["i"]!])], [.. test.Select(r => list[(int)r["i"]!])]);
     }
 
     /// <summary>
     /// Labeled texts from any dataset source Idrak.Datasets reads: a CSV, JSON Lines, JSON or Parquet file or folder,
     /// a URL, or a spec such as <c>hf:owner/name?split=train</c> (see <see cref="DatasetSpec"/>). Rows without a text or
-    /// label are skipped; numbers and booleans are read as their text. Repeated rows (the same text, ignoring case and
-    /// spacing, with the same label) are read once unless <paramref name="removeDuplicates"/> is false.
+    /// label are skipped; numbers and booleans are read as their text. Repeated rows (the same text by
+    /// <see cref="ArabicTextNormalizer"/>, with the same label) are read once unless <paramref name="removeDuplicates"/> is false.
     /// </summary>
     public static List<LabeledText> Read(string source, string textColumn = "text", string labelColumn = "label", Downloader? downloader = null,
         bool removeDuplicates = true) =>
@@ -535,7 +543,7 @@ public sealed class TextClassifier : IDisposable
     /// <summary>
     /// Labeled texts from several sources (each with its own text and label columns), read as one: with
     /// <paramref name="removeDuplicates"/> (the default) a row repeated in any of them is read once, by the library's
-    /// <see cref="Idrak.Datasets.Dataset.Deduplicate"/> on the text and the label (ignoring case and spacing). A text with
+    /// <see cref="Idrak.Datasets.Dataset.Deduplicate"/> on the label and the text as <see cref="ArabicTextNormalizer"/> writes it. A text with
     /// different labels keeps one row per label: that is a conflict to fix in the data (see qasd audit), not a repeat.
     /// <paramref name="duplicates"/> is how many rows were dropped.
     /// </summary>
@@ -572,7 +580,8 @@ public sealed class TextClassifier : IDisposable
         var data = Idrak.Datasets.Dataset.Concat(parts);
         if (removeDuplicates)
         {
-            data = data.Deduplicate(["text", "label"], normalize: true);
+            // Qasd's rule for "the same text" (the split's key too), then the library's exact deduplication on it.
+            data = data.Normalize(ArabicTextNormalizer.Instance, "text", into: "key").Deduplicate(["key", "label"]);
         }
 
         var examples = new List<LabeledText>();

@@ -51,13 +51,19 @@ is only needed for gated models. `IDRAK_DISABLE_CUDA=1` forces the CPU.
 dotnet run -c Release --project apps/Qasd -- train apps/Qasd/data/plan-queries.csv
 ```
 
-Repeated rows (the same text, ignoring case and spacing, with the same label) are read once, by Idrak's
-`Dataset.Deduplicate`, in every command but `audit` (which counts them): a message counts once in training and in the
-scores, however often it was logged. A text with two labels keeps a row for each (a conflict for `qasd audit`, not a
-repeat). The columns default to `raw_question` (text) and `intent` (label); `--text` / `--label` pick others. 20% of the distinct
-messages are held out (all copies of a message stay on one side, so the score is on messages the model never saw):
-accuracy, per-intent precision / recall / F1 and the confusion matrix are printed. For the model you deploy, train on
-everything with `--test-fraction 0`. Other options: `--epochs`, `--batch-size`, `--buckets`, `--hidden`, `--lr`, `--seed`.
+Two messages are the same text when Qasd's `ArabicTextNormalizer` (an Idrak `ITextNormalizer`) writes them the same:
+lower case, no diacritics or tatweel, one form of alef, yaa and taa marbuta, ASCII digits, punctuation as spaces. With
+that rule the library does the rest: repeated rows (the same text with the same label) are read once, by
+`Dataset.Normalize(rules, "text", into: "key").Deduplicate(["key", "label"])`, in every command but `audit` (which
+counts them), so a message counts once in training and in the scores however often it was logged; and the split is
+the library's `Dataset.Split(fraction, seed, key)` on the same key, so every copy of a text stays on one side. A text
+with two labels keeps a row for each (a conflict for `qasd audit`, not a repeat).
+
+The columns default to `raw_question` (text) and `intent` (label); `--text` / `--label` pick others. About 20% of the
+distinct messages are held out (each text's side comes from a hash of its key and the seed: the same texts for the same
+seed, whatever the order of the rows), and the score is on messages the model never saw: accuracy, per-intent
+precision / recall / F1 and the confusion matrix are printed. For the model you deploy, train on everything with
+`--test-fraction 0`. Other options: `--epochs`, `--batch-size`, `--buckets`, `--hidden`, `--lr`, `--seed`.
 
 ## A smaller network (overfitting check)
 

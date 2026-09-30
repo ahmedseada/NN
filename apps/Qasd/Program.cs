@@ -515,12 +515,12 @@ void WriteErrors(TextClassifierReport report)
     Console.WriteLine($"{errors.Count:N0} texts classified wrong written to {Path.GetFullPath(errorsPath)} (the most confident first)");
 }
 
-// audit: labels given differently to the same text (after trimming, lower-casing and joining spaces), and the share of
+// audit: labels given differently to the same text (by ArabicTextNormalizer, the rule of the deduplication and the split), and the share of
 // short messages per label: a two-word reply ("Tuesday", "yes", a phone number) is often only one intent in context. The
 // ceiling is the accuracy a model that sees only the message could reach at best: each text's most common label.
 void Audit(List<LabeledText> examples)
 {
-    static string Key(string text) => string.Join(' ', text.Trim().ToLowerInvariant().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+    static string Key(string text) => ArabicTextNormalizer.Instance.Normalize(text);
     var rows = examples.Select(e => (Key: Key(e.Text), Label: e.Label.Trim(), e.Text)).ToList();         // each key computed once
     var texts = rows.GroupBy(r => r.Key).Select(g => (g.Key, Rows: g.ToList(), Labels: g.GroupBy(r => r.Label).ToDictionary(l => l.Key, l => l.Count()))).ToList();
     var conflicts = texts.Where(t => t.Labels.Count > 1).OrderByDescending(t => t.Rows.Count).ToList();
@@ -578,7 +578,8 @@ static void WriteCsv(string path, string textColumn, string labelColumn, IEnumer
 }
 
 // Labeled texts from every source; the columns default to raw_question / intent when the data has them, else text / label.
-// Repeated rows (same text and label) are always read once, by Idrak's Dataset.Deduplicate; only audit reads every row
+// Repeated rows (the same text by ArabicTextNormalizer, and label) are always read once, by Idrak's Normalize and
+// Deduplicate; only audit reads every row
 // (it counts the repeats and the conflicting labels).
 List<LabeledText> ReadAll(IEnumerable<string> sources, bool removeDuplicates = true)
 {
