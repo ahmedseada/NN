@@ -51,7 +51,10 @@ is only needed for gated models. `IDRAK_DISABLE_CUDA=1` forces the CPU.
 dotnet run -c Release --project apps/Qasd -- train apps/Qasd/data/plan-queries.csv
 ```
 
-The columns default to `raw_question` (text) and `intent` (label); `--text` / `--label` pick others. 20% of the distinct
+Repeated rows (the same text, ignoring case and spacing, with the same label) are read once, by Idrak's
+`Dataset.Deduplicate`, in every command but `audit` (which counts them): a message counts once in training and in the
+scores, however often it was logged. A text with two labels keeps a row for each (a conflict for `qasd audit`, not a
+repeat). The columns default to `raw_question` (text) and `intent` (label); `--text` / `--label` pick others. 20% of the distinct
 messages are held out (all copies of a message stay on one side, so the score is on messages the model never saw):
 accuracy, per-intent precision / recall / F1 and the confusion matrix are printed. For the model you deploy, train on
 everything with `--test-fraction 0`. Other options: `--epochs`, `--batch-size`, `--buckets`, `--hidden`, `--lr`, `--seed`.
@@ -191,8 +194,7 @@ var p = classifier.Predict(message);          // p.Label, p.Confidence, p.Probab
 
 `apps/Qasd/data/plan-queries.csv`: 5,177 labeled messages (1,872 distinct; Arabic, English and mixed) with the columns
 `raw_question` (the text), `semantic_query`, `intent` (the label: `retrieve` 2,983, `function_call` 1,096,
-`direct_reply` 973, `identity` 125) and `confidence`. Retrain after adding rows; later rows of the same message count
-as more examples of it.
+`direct_reply` 973, `identity` 125) and `confidence`; 1,980 once repeated rows are read once. Retrain after adding rows.
 
 ## Postman
 

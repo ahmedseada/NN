@@ -525,28 +525,63 @@ public sealed class TextClassifier : IDisposable
     /// <summary>
     /// Labeled texts from any dataset source Idrak.Datasets reads: a CSV, JSON Lines, JSON or Parquet file or folder,
     /// a URL, or a spec such as <c>hf:owner/name?split=train</c> (see <see cref="DatasetSpec"/>). Rows without a text or
-    /// label are skipped; numbers and booleans are read as their text.
+    /// label are skipped; numbers and booleans are read as their text. Repeated rows (the same text, ignoring case and
+    /// spacing, with the same label) are read once unless <paramref name="removeDuplicates"/> is false.
     /// </summary>
-    public static List<LabeledText> Read(string source, string textColumn = "text", string labelColumn = "label", Downloader? downloader = null)
-    {
-        ArgumentNullException.ThrowIfNull(source);
-        var examples = new List<LabeledText>();
-        bool any = false;
-        foreach (var row in DatasetSpec.Parse(source).Open(downloader))
-        {
-            if (!any && (!row.ContainsKey(textColumn) || !row.ContainsKey(labelColumn)))
-            {
-                throw new ArgumentException($"{source} needs columns '{textColumn}' and '{labelColumn}'; its rows have {string.Join(", ", row.Select(p => p.Key))}.");
-            }
+    public static List<LabeledText> Read(string source, string textColumn = "text", string labelColumn = "label", Downloader? downloader = null,
+        bool removeDuplicates = true) =>
+        Read([(source, textColumn, labelColumn)], removeDuplicates, out _, downloader);
 
-            any = true;
-            string? text = Cell(row[textColumn]), label = Cell(row[labelColumn]);
-            if (!string.IsNullOrWhiteSpace(text) && !string.IsNullOrWhiteSpace(label))
+    /// <summary>
+    /// Labeled texts from several sources (each with its own text and label columns), read as one: with
+    /// <paramref name="removeDuplicates"/> (the default) a row repeated in any of them is read once, by the library's
+    /// <see cref="Idrak.Datasets.Dataset.Deduplicate"/> on the text and the label (ignoring case and spacing). A text with
+    /// different labels keeps one row per label: that is a conflict to fix in the data (see qasd audit), not a repeat.
+    /// <paramref name="duplicates"/> is how many rows were dropped.
+    /// </summary>
+    public static List<LabeledText> Read(IEnumerable<(string Source, string TextColumn, string LabelColumn)> sources, bool removeDuplicates,
+        out int duplicates, Downloader? downloader = null)
+    {
+        int read = 0;
+        var parts = sources.Select(s =>
+        {
+            bool checkedColumns = false;
+            return DatasetSpec.Parse(s.Source).Open(downloader).Select(row =>
             {
-                examples.Add(new LabeledText(text, label));
-            }
+                if (!checkedColumns)
+                {
+                    if (!row.ContainsKey(s.TextColumn) || !row.ContainsKey(s.LabelColumn))
+                    {
+                        throw new ArgumentException($"{s.Source} needs columns '{s.TextColumn}' and '{s.LabelColumn}'; its rows have {string.Join(", ", row.Select(p => p.Key))}.");
+                    }
+
+                    checkedColumns = true;
+                }
+
+                string? text = Cell(row[s.TextColumn]), label = Cell(row[s.LabelColumn]);
+                if (string.IsNullOrWhiteSpace(text) || string.IsNullOrWhiteSpace(label))
+                {
+                    return null;
+                }
+
+                read++;
+                return new JsonObject { ["text"] = text, ["label"] = label };
+            });
+        }).ToArray();
+
+        var data = Idrak.Datasets.Dataset.Concat(parts);
+        if (removeDuplicates)
+        {
+            data = data.Deduplicate(["text", "label"], normalize: true);
         }
 
+        var examples = new List<LabeledText>();
+        foreach (var row in data)
+        {
+            examples.Add(new LabeledText((string)row["text"]!, (string)row["label"]!));
+        }
+
+        duplicates = read - examples.Count;
         return examples;
 
         static string? Cell(JsonNode? node) => node switch

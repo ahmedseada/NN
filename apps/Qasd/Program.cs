@@ -282,7 +282,7 @@ try
 
         case "audit":
         {
-            Audit(ReadAll(positional.Skip(1)));
+            Audit(ReadAll(positional.Skip(1), removeDuplicates: false));
             return 0;
         }
 
@@ -578,16 +578,23 @@ static void WriteCsv(string path, string textColumn, string labelColumn, IEnumer
 }
 
 // Labeled texts from every source; the columns default to raw_question / intent when the data has them, else text / label.
-List<LabeledText> ReadAll(IEnumerable<string> sources)
+// Repeated rows (same text and label) are always read once, by Idrak's Dataset.Deduplicate; only audit reads every row
+// (it counts the repeats and the conflicting labels).
+List<LabeledText> ReadAll(IEnumerable<string> sources, bool removeDuplicates = true)
 {
-    var all = new List<LabeledText>();
+    var columns = new List<(string, string, string)>();
     foreach (string source in sources)
     {
         var first = DatasetSpec.Parse(source).Open().FirstOrDefault()
                     ?? throw new InvalidDataException($"{source} has no rows.");
-        string text = textColumn ?? (first.ContainsKey("raw_question") ? "raw_question" : "text");
-        string label = labelColumn ?? (first.ContainsKey("intent") ? "intent" : "label");
-        all.AddRange(TextClassifier.Read(source, text, label));
+        columns.Add((source, textColumn ?? (first.ContainsKey("raw_question") ? "raw_question" : "text"),
+            labelColumn ?? (first.ContainsKey("intent") ? "intent" : "label")));
+    }
+
+    var all = TextClassifier.Read(columns, removeDuplicates, out int duplicates);
+    if (removeDuplicates && duplicates > 0)
+    {
+        Console.WriteLine($"{duplicates:N0} repeated rows (same text and label) read once");
     }
 
     return all;
