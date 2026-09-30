@@ -187,6 +187,15 @@ public sealed class TextClassifier : IDisposable
         _dropout = dropout;
     }
 
+    // A network trained elsewhere (LightTextClassifier) with the same layers: Linear, ReLU, Dropout, Linear.
+    internal static TextClassifier FromTrained(Sequential model, TextFeatures features, string[] labels, int hidden, float dropout)
+    {
+        model.Eval();
+        var classifier = new TextClassifier(model, features, labels, hidden, dropout);
+        classifier.SnapshotWeights();
+        return classifier;
+    }
+
     /// <summary>The labels, in the order of <see cref="TextPrediction.Probabilities"/> before sorting.</summary>
     public IReadOnlyList<string> Labels { get; }
 

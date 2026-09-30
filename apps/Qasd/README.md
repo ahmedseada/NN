@@ -56,6 +56,23 @@ messages are held out (all copies of a message stay on one side, so the score is
 accuracy, per-intent precision / recall / F1 and the confusion matrix are printed. For the model you deploy, train on
 everything with `--test-fraction 0`. Other options: `--epochs`, `--batch-size`, `--buckets`, `--hidden`, `--lr`, `--seed`.
 
+## A smaller network (overfitting check)
+
+```
+dotnet run -c Release --project apps/Qasd -- train-light apps/Qasd/data/split/train.csv --test-fraction 0
+dotnet run -c Release --project apps/Qasd -- evaluate apps/Qasd/models/intents-light.qasd apps/Qasd/data/split/test.csv
+```
+
+`qasd train-light` trains the same kind of model with far fewer weights: 2,048 features and 64 hidden units (about
+130 thousand weights, a 0.5 MB file) instead of 16,384 and 256 (4.2 million, 15 MB). It is written with Idrak's
+simplified API (`Network.Input(…).Linear(…).ReLU().Dropout(…).Linear(…).Build()` and one `TrainingRun`); the large
+trainer stays as it is. Both `train` commands end with the accuracy on the training texts, on the held-out texts, and
+the gap between them: if the small network scores about the same on held-out texts with a smaller gap, the large one's
+extra weights were memorizing. The file is an ordinary `.qasd` model, so `predict`, `evaluate` and the API
+(`IntentModel__Path=…/intents-light.qasd`) use it as they use the large one. It holds every training text as a dense
+row in memory (texts × features × 4 bytes: about 2.7 GB for 330,000 texts at 2,048); `--buckets`, `--hidden`,
+`--epochs`, `--batch-size`, `--lr`, `--patience` and `--seed` set its own values.
+
 ## Use
 
 ```

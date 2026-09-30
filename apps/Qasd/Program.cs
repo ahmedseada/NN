@@ -13,6 +13,11 @@ const string Usage = """
 
       qasd train <data…> [--out F]         train on labeled texts, report the score on held-out texts, save the model
                                           (default apps/Qasd/models/intents.qasd)
+      qasd train-light <data…> [--out F]   the same, with a much smaller network (2,048 features, 64 hidden units; the
+                                          large one has 16,384 and 256), written with Idrak's simplified API: compare the
+                                          two gaps between training and held-out accuracy to see how much is memorized
+                                          (default apps/Qasd/models/intents-light.qasd; --buckets, --hidden, --epochs,
+                                          --batch-size, --lr, --patience, --seed set its own values)
       qasd evaluate [model] <data…>        score a model on labeled texts (accuracy, per-label F1, confusion matrix)
       qasd predict [model] [text…]         classify texts (arguments, else one per line from standard input)
       qasd info [model]                    labels and settings of a model
@@ -53,6 +58,7 @@ double testFraction = 0.2, minConfidence = 0;
 bool json = false, tuned = false, stream = false;
 string? tunedFolder = null, labelList = null, errorsPath = null;
 var options = new TextClassifierOptions();
+var light = new LightTextClassifierOptions();
 try
 {
     for (int i = 0; i < args.Length; i++)
@@ -69,13 +75,13 @@ try
             case "--cpu": deviceName = "cpu"; break;
             case "--cuda" or "--gpu": deviceName = "cuda"; break;
             case "--test-fraction": testFraction = double.Parse(Next(), CultureInfo.InvariantCulture); break;
-            case "--epochs": options = options with { Epochs = NextInt() }; break;
-            case "--batch-size": options = options with { BatchSize = NextInt() }; break;
-            case "--buckets": options = options with { Buckets = NextInt() }; break;
-            case "--hidden": options = options with { Hidden = NextInt() }; break;
-            case "--seed": options = options with { Seed = NextInt() }; break;
-            case "--patience": options = options with { Patience = NextInt() }; break;
-            case "--lr": options = options with { LearningRate = float.Parse(Next(), CultureInfo.InvariantCulture) }; break;
+            case "--epochs": { var v = NextInt(); options = options with { Epochs = v }; light = light with { Epochs = v }; break; }
+            case "--batch-size": { var v = NextInt(); options = options with { BatchSize = v }; light = light with { BatchSize = v }; break; }
+            case "--buckets": { var v = NextInt(); options = options with { Buckets = v }; light = light with { Buckets = v }; break; }
+            case "--hidden": { var v = NextInt(); options = options with { Hidden = v }; light = light with { Hidden = v }; break; }
+            case "--seed": { var v = NextInt(); options = options with { Seed = v }; light = light with { Seed = v }; break; }
+            case "--patience": { var v = NextInt(); options = options with { Patience = v }; light = light with { Patience = v }; break; }
+            case "--lr": { var v = float.Parse(Next(), CultureInfo.InvariantCulture); options = options with { LearningRate = v }; light = light with { LearningRate = v }; break; }
             case "--json": json = true; break;
             case "--tuned": tuned = true; break;
             case "--folder": tunedFolder = Next(); tuned = true; break;
@@ -98,7 +104,7 @@ catch (Exception ex) when (ex is ArgumentException or FormatException)
 string command = positional.Count > 0 ? positional[0] : "";
 bool valid = command switch
 {
-    "train" or "split" or "audit" => positional.Count >= 2,
+    "train" or "train-light" or "split" or "audit" => positional.Count >= 2,
     "benchmark" => positional.Count >= 2,
     "evaluate" => positional.Count >= 2,
     "predict" or "info" => positional.Count >= 1,
@@ -115,6 +121,7 @@ output ??= command switch
 {
     "split" => Path.Combine(QasdPaths.Data, "split"),
     "audit" => null,                                                    // only when asked: never over the model file
+    "train-light" => Path.Combine(Path.GetDirectoryName(QasdPaths.Classifier)!, "intents-light.qasd"),
     _ => QasdPaths.Classifier,
 };
 tunedFolder ??= QasdPaths.Tuned;
@@ -128,8 +135,9 @@ var jsonOutput = new System.Text.Json.JsonSerializerOptions { Encoder = System.T
 try
 {
     // Training on the GPU when there is one; evaluation and prediction on the CPU (fast enough for this model) unless asked.
-    var device = ParseDevice(deviceName ?? (command == "train" ? "auto" : "cpu"));
-    if (command == "train" && deviceName is null && device.Type == DeviceType.Cpu)
+    bool training = command is "train" or "train-light";
+    var device = ParseDevice(deviceName ?? (training ? "auto" : "cpu"));
+    if (training && deviceName is null && device.Type == DeviceType.Cpu)
     {
         Console.WriteLine("no CUDA GPU found: training on the CPU");
     }
@@ -150,6 +158,41 @@ try
             {
                 Console.WriteLine();
                 Console.WriteLine(classifier.Evaluate(test));
+                Fit(classifier, train, test);
+            }
+
+            classifier.Save(output!);
+            Console.WriteLine($"saved {output} ({new FileInfo(output!).Length / 1048576.0:F1} MB)");
+            return 0;
+        }
+
+        case "train-light":
+        {
+            var examples = ReadAll(positional.Skip(1));
+            var (train, test) = testFraction > 0 ? TextClassifier.Split(examples, testFraction, light.Seed + 7) : (examples, []);
+            Console.WriteLine($"{examples.Count:N0} texts, training on {train.Count:N0} on {device.Name}{(test.Count > 0 ? $", testing on {test.Count:N0} (texts not in training)" : "")}");
+            Console.WriteLine($"network: {light.Buckets:N0} features → {light.Hidden} hidden → labels ({(light.Buckets + 1L) * light.Hidden + (light.Hidden + 1L) * 4:N0} weights for 4 labels); "
+                              + $"training data in memory: {(long)train.Count * light.Buckets * 4 / 1048576.0:N0} MB");
+            var status = new ConsoleStatus();
+            var clock = Stopwatch.StartNew();
+            using var classifier = LightTextClassifier.Train(train, light with { Device = device }, e =>
+            {
+                string line = $"  epoch {e.Epoch,3}/{e.Epochs}: loss {e.Loss:F4}, accuracy {e.Metrics.GetValueOrDefault("accuracy"):P1}";
+                if (e.ValidationLoss is { } validationLoss)
+                {
+                    line += $" | validation loss {validationLoss:F4}, accuracy {e.ValidationMetrics?.GetValueOrDefault("accuracy"):P1}";
+                }
+
+                status.Log(line + $"  ({e.Duration.TotalSeconds:F1} s){(e.IsBest ? "  *" : "")}");
+            });
+            status.Finish();
+            Console.WriteLine($"trained in {clock.Elapsed.TotalSeconds:F1} s (the epoch with the lowest validation loss, *, is kept; the training "
+                              + "accuracy above is measured with dropout on)");
+            if (test.Count > 0)
+            {
+                Console.WriteLine();
+                Console.WriteLine(classifier.Evaluate(test));
+                Fit(classifier, train, test);
             }
 
             classifier.Save(output!);
@@ -548,6 +591,13 @@ List<LabeledText> ReadAll(IEnumerable<string> sources)
     }
 
     return all;
+}
+
+// Accuracy on the texts trained on against the held-out texts: the gap is what the model memorized rather than learned.
+static void Fit(TextClassifier classifier, IReadOnlyList<LabeledText> train, IReadOnlyList<LabeledText> test)
+{
+    double trained = classifier.Evaluate(train).Accuracy, heldOut = classifier.Evaluate(test).Accuracy;
+    Console.WriteLine($"overfitting: accuracy {trained:P1} on the training texts, {heldOut:P1} on held-out texts, gap {(trained - heldOut) * 100:F1} points");
 }
 
 static Device ParseDevice(string name) => name.ToLowerInvariant() switch

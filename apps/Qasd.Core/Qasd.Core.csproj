@@ -8,9 +8,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Idrak" Version="0.1.0" />
-    <PackageReference Include="Idrak.Datasets" Version="0.1.0" />
-    <PackageReference Include="Idrak.LanguageModels" Version="0.1.0" />
+    <PackageReference Include="Idrak" Version="0.1.1" />
+    <PackageReference Include="Idrak.Datasets" Version="0.1.1" />
+    <PackageReference Include="Idrak.LanguageModels" Version="0.1.1" />
   </ItemGroup>
 
 </Project>
