@@ -90,7 +90,7 @@ public static class LightTextClassifier
         {
             new TrainingRun
             {
-                Model = model, Loss = (logits, targets) => Losses.CrossEntropy(logits, targets), Optimizer = p => new AdamW(p, options.LearningRate, weightDecay: options.WeightDecay),
+                Model = model, Loss = Losses.CrossEntropy, Optimizer = p => new AdamW(p, options.LearningRate, weightDecay: options.WeightDecay),
                 Train = Encode(train, features, labels, weights).Batches(options.BatchSize, shuffle: true, device: device, seed: options.Seed),
                 Validation = validation.Count > 0 ? Encode(validation, features, labels, weights).Batches(1024, device: device) : null,
                 Epochs = Math.Max(1, options.Epochs), Metrics = [Metric.Accuracy],
